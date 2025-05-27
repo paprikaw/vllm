@@ -31,6 +31,7 @@ from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
 from vllm.worker.pooling_model_runner import PoolingModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
+                                
 
 logger = init_logger(__name__)
 
@@ -178,7 +179,7 @@ class Worker(LocalOrDistributedWorkerBase):
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-            self.baseline_snapshot = MemorySnapshot()
+            self.baseline_snapshot = MemorySnapshot(rank=self.rank)
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
@@ -240,7 +241,8 @@ class Worker(LocalOrDistributedWorkerBase):
         torch.cuda.reset_peak_memory_stats()
 
         free_memory_pre_profile, total_gpu_memory = torch.cuda.mem_get_info()
-
+        if envs.VLLM_PIPELINE_MEMORY_LIMIT is not None:
+            total_gpu_memory = envs.VLLM_PIPELINE_MEMORY_LIMIT[self.rank]
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(

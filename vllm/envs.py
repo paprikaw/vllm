@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     VLLM_LOGGING_LEVEL: str = "INFO"
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_CONFIG_PATH: Optional[str] = None
+    VLLM_PIPELINE_MEMORY_LIMIT: Optional[list[int]] = None
     VLLM_LOGITS_PROCESSOR_THREADS: Optional[int] = None
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: Optional[str] = None
@@ -191,6 +192,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )),
 
     # ================== Runtime Env Vars ==================
+    # Limit the maximum memory usage for the pipeline. This variable
+    # is only used when pipeline stages are running in a single node.
+    # The input format is a comma-separated list of memory limits for each pipeline stage.
+    "VLLM_PIPELINE_MEMORY_LIMIT": 
+    lambda: (
+        None if os.getenv("VLLM_PIPELINE_MEMORY_LIMIT", "") == "" else [
+            int(float(m.strip()[:-2]) * (1024 ** {"KB": 1, "MB": 2, "GB": 3}[m.strip()[-2:].upper()]))
+            if m.strip()[-2:].upper() in ["KB", "MB", "GB"] else int(m.strip())
+            for m in os.getenv("VLLM_PIPELINE_MEMORY_LIMIT").split(",")
+        ]
+    ),
 
     # Root directory for vLLM cache files
     # Defaults to `~/.cache/vllm` unless `XDG_CACHE_HOME` is set

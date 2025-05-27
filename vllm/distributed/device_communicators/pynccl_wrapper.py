@@ -219,7 +219,7 @@ class NCCLLibrary:
     def __init__(self, so_file: Optional[str] = None):
 
         so_file = so_file or find_nccl_library()
-
+        print(f"Loading1 NCCL library from {so_file}")
         try:
             if so_file not in NCCLLibrary.path_to_dict_mapping:
                 lib = ctypes.CDLL(so_file)

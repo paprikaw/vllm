@@ -2122,6 +2122,7 @@ class MemorySnapshot:
     non_torch_memory: int = 0
     timestamp: float = 0.0
     auto_measure: bool = True
+    rank: int = -1
 
     def __post_init__(self):
         if self.auto_measure:
@@ -2135,9 +2136,12 @@ class MemorySnapshot:
         # when we call `torch.cuda.empty_cache()` or OOM happens.
         self.torch_peak = torch.cuda.memory_stats().get(
             "allocated_bytes.all.peak", 0)
+        free_memory, total_memory = torch.cuda.mem_get_info()
+        if envs.VLLM_PIPELINE_MEMORY_LIMIT is not None:
+            assert self.rank != -1, "rank is required when VLLM_PIPELINE_MEMORY_LIMIT is set"
+            total_memory = envs.VLLM_PIPELINE_MEMORY_LIMIT[self.rank]
 
-        self.cuda_memory = torch.cuda.mem_get_info(
-        )[1] - torch.cuda.mem_get_info()[0]
+        self.cuda_memory = total_memory - free_memory
 
         # torch.cuda.memory_reserved() is how many bytes
         # PyTorch gets from cuda (by calling cudaMalloc, etc.)
@@ -2226,7 +2230,9 @@ def memory_profiling(
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
-    result = MemoryProfilingResult()
+    result = MemoryProfilingResult(before_create=MemorySnapshot(rank=baseline_snapshot.rank), 
+                                before_profile=MemorySnapshot(rank=baseline_snapshot.rank), 
+                                after_profile=MemorySnapshot(rank=baseline_snapshot.rank))
 
     result.before_create = baseline_snapshot
     # the part of memory used for holding the model weights
