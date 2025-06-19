@@ -27,6 +27,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
+from .utils import get_total_gpu_memory
 
 logger = init_logger(__name__)
 
@@ -178,8 +179,7 @@ class Worker(WorkerBase):
         """
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-
-        _, total_gpu_memory = torch.cuda.mem_get_info()
+        total_gpu_memory = get_total_gpu_memory(self.rank)
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         self.model_runner.profile_run()
@@ -202,15 +202,20 @@ class Worker(WorkerBase):
         torch.cuda.empty_cache()
         torch_allocated_bytes = torch.cuda.memory_stats(
         )["allocated_bytes.all.current"]
-        total_allocated_bytes = torch.cuda.mem_get_info(
-        )[1] - torch.cuda.mem_get_info()[0]
+        total_allocated_bytes = get_total_gpu_memory(self.rank) - torch.cuda.mem_get_info()[0]
         non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
         if non_torch_allocations > 0:
             peak_memory += non_torch_allocations
+        
         available_kv_cache_memory = (
             total_gpu_memory * self.cache_config.gpu_memory_utilization -
             peak_memory)
 
+        logger.info(f"free_gpu_memory: {free_gpu_memory/GiB_bytes}GB")
+        logger.info(f"total gpu memory: {total_gpu_memory/GiB_bytes}GB")
+        logger.info(f"torch_allocated_bytes: {torch_allocated_bytes/GiB_bytes}GB")
+        logger.info(f"total_allocated_bytes: {total_allocated_bytes/GiB_bytes}GB")
+        logger.info(f"non_torch_allocations: {non_torch_allocations/GiB_bytes}GB")
         return int(available_kv_cache_memory)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:

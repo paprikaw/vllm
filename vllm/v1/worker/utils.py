@@ -2,7 +2,7 @@
 from typing import Optional
 
 import torch
-
+import vllm.envs as envs
 
 def sanity_check_mm_encoder_outputs(
     mm_embeddings: object,
@@ -72,3 +72,10 @@ def gather_mm_placeholders(
         return placeholders
 
     return placeholders[is_embed]
+
+def get_total_gpu_memory(rank: int) -> int:
+    if envs.VLLM_PIPELINE_MEMORY_LIMIT:
+        total_gpu_memory = envs.VLLM_PIPELINE_MEMORY_LIMIT[rank]
+    else:   
+        _, total_gpu_memory = torch.cuda.mem_get_info()
+    return total_gpu_memory

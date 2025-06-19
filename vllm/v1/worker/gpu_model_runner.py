@@ -573,7 +573,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             block_table: BlockTable = self.input_batch.block_table[
                 kv_cache_group_id]
             # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-            # -> [0, 0, K, K, K + 1, K + 1, K + 2, 2 * K, 2 * K, 2 * K + 1]
+            # block_table_indices: -> [0, 0, K, K, K + 1, K + 1, K + 2, 2 * K, 2 * K, 2 * K + 1]
             # where K is the max_num_blocks_per_req and the block size is 2.
             # NOTE(woosuk): We can't simply use `token_indices // block_size`
             # here because M (max_model_len) is not necessarily divisible by
@@ -585,10 +585,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             block_numbers = block_table_cpu.flatten(
             )[block_table_indices].numpy()
             block_offsets = positions_np % block_size
+
             np.add(
                 block_numbers * block_size,
                 block_offsets,
                 out=block_table.slot_mapping_np[:total_num_scheduled_tokens])
+            # logger.info(f"block_table_indices: {block_table_indices}")
+            # logger.info(f"block_table_cpu: {block_table_cpu.flatten()}")
+            # logger.info(f"block_numbers: {block_numbers}")
+            # logger.info(f"block_offsets: {block_offsets}")
+            # logger.info(f"block_table.slot_mapping_np: {block_table.slot_mapping_np[:total_num_scheduled_tokens]}")
 
         # Prepare the attention metadata.
         self.query_start_loc_np[0] = 0

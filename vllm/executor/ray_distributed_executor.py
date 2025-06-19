@@ -62,11 +62,11 @@ class RayDistributedExecutor(DistributedExecutorBase):
     # from the driver to the Ray workers.
     non_carry_over_env_vars_file = os.path.join(
         config_home, "ray_non_carry_over_env_vars.json")
-    if os.path.exists(non_carry_over_env_vars_file):
-        with open(non_carry_over_env_vars_file) as f:
-            non_carry_over_env_vars = set(json.load(f))
-    else:
-        non_carry_over_env_vars = set()
+    # if os.path.exists(non_carry_over_env_vars_file):
+    #     with open(non_carry_over_env_vars_file) as f:
+    #         non_carry_over_env_vars = set(json.load(f))
+    # else:
+    non_carry_over_env_vars = set()
 
     uses_ray: bool = True
 

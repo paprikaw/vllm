@@ -131,11 +131,11 @@ class EngineCore:
 
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
-
+        # print(f"kv_cache_specs: {kv_cache_specs}")
         # Profiles the peak memory usage of the model to determine how much
         # memory can be allocated for kv cache.
         available_gpu_memory = self.model_executor.determine_available_memory()
-
+        # print(f"available_gpu_memory: {available_gpu_memory}")
         assert len(kv_cache_specs) == len(available_gpu_memory)
         # Get the kv cache tensor size
         kv_cache_configs = [

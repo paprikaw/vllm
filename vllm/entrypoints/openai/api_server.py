@@ -547,6 +547,7 @@ async def show_version():
                      "model": ErrorResponse
                  }
              })
+# 函数推理入口
 @with_cancellation
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest,
@@ -557,7 +558,6 @@ async def create_chat_completion(request: ChatCompletionRequest,
             message="The model does not support Chat Completions API")
 
     generator = await handler.create_chat_completion(request, raw_request)
-
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
                             status_code=generator.code)

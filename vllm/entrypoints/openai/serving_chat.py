@@ -116,7 +116,7 @@ class OpenAIServingChat(OpenAIServing):
             source = "model" if source == "auto" else source
             logger.info("Using default chat sampling params from %s: %s",
                         source, self.default_sampling_params)
-
+    # Handler for chat completion
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -194,6 +194,9 @@ class OpenAIServingChat(OpenAIServing):
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
                 add_special_tokens=request.add_special_tokens,
             )
+            # logger.info(f"engine_prompts: {engine_prompts}")
+            # logger.info(f"request_prompts: {request_prompts}")
+            # logger.info(f"conversation: {conversation}")
         except (ValueError, TypeError, RuntimeError,
                 jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -237,6 +240,7 @@ class OpenAIServingChat(OpenAIServing):
                         request_id=request_id,
                         params=sampling_params,
                     )
+                # 使用engine_client.generate kick engine core
                 else:
                     generator = self.engine_client.generate(
                         engine_prompt,

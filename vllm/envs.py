@@ -118,6 +118,8 @@ if TYPE_CHECKING:
     VLLM_NIXL_SIDE_CHANNEL_PORT: int = 5557
     VLLM_ALL2ALL_BACKEND: str = "naive"
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
+    NCCL_DEBUG: str = "INFO"
+    VLLM_PIPELINE_MEMORY_LIMIT: Optional[list[int]] = None
 
 
 def get_default_cache_root():
@@ -186,6 +188,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rocm, neuron, cpu]
     "VLLM_TARGET_DEVICE":
     lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda"),
+
+    "NCCL_DEBUG":
+    lambda: os.getenv("NCCL_DEBUG", "INFO"),
+
+    "VLLM_PIPELINE_MEMORY_LIMIT":
+    lambda: (
+        None if os.getenv("VLLM_PIPELINE_MEMORY_LIMIT", "") == "" else [
+            int(float(m.strip()[:-2]) * (1024 ** {"KB": 1, "MB": 2, "GB": 3}[m.strip()[-2:].upper()]))
+            if m.strip()[-2:].upper() in ["KB", "MB", "GB"] else int(m.strip())
+            for m in os.getenv("VLLM_PIPELINE_MEMORY_LIMIT").split(",")
+        ]
+    ),
 
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
