@@ -468,6 +468,7 @@ def safetensors_weights_iterator(
         with safe_open(st_file, framework="pt") as f:
             for name in f.keys():  # noqa: SIM118
                 param = f.get_tensor(name)
+                logger.info(f"name: {name}, param: {param.shape}")
                 yield name, param
 
 

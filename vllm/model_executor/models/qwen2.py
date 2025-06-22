@@ -380,6 +380,8 @@ class Qwen2Model(nn.Module):
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
+        # 这里的fuse操作有可能导致GPU显存不足。
+        # 我们不能假设模型加载的最小显存开支就等于模型权重大小。
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue

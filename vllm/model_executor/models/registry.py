@@ -318,7 +318,7 @@ class _RegisteredModel(_BaseRegisteredModel):
     def load_model_cls(self) -> type[nn.Module]:
         return self.model_cls
 
-
+# 在这里懒加载模型
 @dataclass(frozen=True)
 class _LazyRegisteredModel(_BaseRegisteredModel):
     """
