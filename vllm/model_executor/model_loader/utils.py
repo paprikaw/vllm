@@ -218,7 +218,6 @@ def resolve_transformers_arch(model_config: ModelConfig,
 def get_model_architecture(
         model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     architectures = getattr(model_config.hf_config, "architectures", [])
-
     # Special handling for quantized Mixtral.
     # FIXME(woosuk): This is a temporary hack.
     mixtral_supported = [
@@ -235,7 +234,7 @@ def get_model_architecture(
           and model_config.quantization not in mixtral_supported
           and "MixtralForCausalLM" in architectures):
         architectures = ["QuantMixtralForCausalLM"]
-
+    # 在这里加载模型
     model_cls, arch = ModelRegistry.resolve_model_cls(architectures)
     if model_config.task == "embed":
         model_cls = as_embedding_model(model_cls)

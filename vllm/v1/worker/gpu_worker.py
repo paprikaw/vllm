@@ -232,11 +232,16 @@ class Worker(WorkerBase):
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
+    def load_model_layers(self, layer_names: list[str]) -> None:
+        logger.info(f"Load Model Layers: {layer_names}")
+        # self.model_runner.load_model_layers(layer_names)
+
     def compile_or_warm_up_model(self) -> None:
         # warm up sizes that are not in cudagraph capture sizes,
         # but users still want to compile for better performance,
         # e.g. for the max-num-batched token size in chunked prefill.
         warmup_sizes = self.vllm_config.compilation_config.compile_sizes.copy()
+        assert self.model_config.enforce_eager == True, "Dynamic model weights only support Enforce eager"
         if not self.model_config.enforce_eager:
             warmup_sizes = [
                 x for x in warmup_sizes if x not in
