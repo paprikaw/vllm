@@ -2,7 +2,7 @@
 """A GPU worker class."""
 import gc
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -218,6 +218,16 @@ class Worker(WorkerBase):
         logger.info(f"non_torch_allocations: {non_torch_allocations/GiB_bytes}GB")
         return int(available_kv_cache_memory)
 
+    # def add_layers(self, rank: int, layers: Tuple[int, int]) -> None:
+    #     if self.rank != rank:
+    #         logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip adding layers")
+    #         return
+    #     logger.debug(f"Add Model Layers: {layers}")
+    #     self.model_runner.add_model_layers(layers)
+
+    def hello_world(self) -> None:
+        logger.debug(f"Hello World from Worker {self.rank}")
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
@@ -232,11 +242,16 @@ class Worker(WorkerBase):
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
+    def load_model_layers(self, layer_names: list[str]) -> None:
+        logger.info(f"Load Model Layers: {layer_names}")
+        # self.model_runner.load_model_layers(layer_names)
+
     def compile_or_warm_up_model(self) -> None:
         # warm up sizes that are not in cudagraph capture sizes,
         # but users still want to compile for better performance,
         # e.g. for the max-num-batched token size in chunked prefill.
         warmup_sizes = self.vllm_config.compilation_config.compile_sizes.copy()
+        assert self.model_config.enforce_eager == True, "Dynamic model weights only support Enforce eager"
         if not self.model_config.enforce_eager:
             warmup_sizes = [
                 x for x in warmup_sizes if x not in

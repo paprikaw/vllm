@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from concurrent.futures import Future
-from typing import Callable, Union
+from typing import Callable, Union, Tuple
 
 import torch
 import torch.distributed as dist
@@ -64,6 +64,11 @@ class Executor(ExecutorBase):
                             args=(kv_cache_configs, ))
         self.collective_rpc("compile_or_warm_up_model")
 
+    def add_layers(self, rank: int, layers: Tuple[int, int]):
+        self.collective_rpc("add_layers", args=(rank, layers))
+
+    def hello_world(self):
+        self.collective_rpc("hello_world")
     def register_failure_callback(self, callback: FailureCallback):
         """
         Register a function to be called if the executor enters a permanent
