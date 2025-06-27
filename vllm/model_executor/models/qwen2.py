@@ -24,8 +24,9 @@
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 from collections.abc import Iterable
-from typing import Any, Optional, Union
-
+from typing import Any, Optional, Union, List, Tuple
+from threading import Lock
+import gc
 import torch
 from torch import nn
 from transformers import Qwen2Config
@@ -303,7 +304,8 @@ class Qwen2Model(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
-
+        self.prefix = prefix
+        self.weight_loaded = [False for _ in range(config.num_hidden_layers)]
         if get_pp_group().is_first_rank or (config.tie_word_embeddings
                                             and get_pp_group().is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
@@ -333,7 +335,32 @@ class Qwen2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        self.model_lock = Lock()
 
+    def add_layers(self, 
+                    layers: Tuple[int, int], 
+                    decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
+                    ) -> None:
+        from vllm.model_executor.models.utils import add_layers
+        # 首先update model的layers
+        new_module = add_layers(
+            self.layers, 
+            layers,
+            (self.start_layer, self.end_layer),
+            lambda prefix: decoder_layer_type(config=self.config,
+                                              cache_config=self.cache_config,
+                                              quant_config=self.quant_config,
+                                              prefix=prefix),
+            prefix=f"{self.prefix}.layers",
+            )
+        old_layers = self.layers
+        with self.model_lock:
+            self.layers = new_module
+        del old_layers
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -344,28 +371,29 @@ class Qwen2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+        with self.model_lock:
+            if get_pp_group().is_first_rank:
+                if inputs_embeds is not None:
+                    hidden_states = inputs_embeds
+                else:
+                    hidden_states = self.get_input_embeddings(input_ids)
+                residual = None
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-        for layer in self.layers[self.start_layer:self.end_layer]:
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-            )
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({
-                "hidden_states": hidden_states,
-                "residual": residual
-            })
-        hidden_states, _ = self.norm(hidden_states, residual)
+                assert intermediate_tensors is not None
+                hidden_states = intermediate_tensors["hidden_states"]
+                residual = intermediate_tensors["residual"]
+            for layer in self.layers[self.start_layer:self.end_layer]:
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                )
+            if not get_pp_group().is_last_rank:
+                return IntermediateTensors({
+                    "hidden_states": hidden_states,
+                    "residual": residual
+                })
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str,
@@ -380,6 +408,8 @@ class Qwen2Model(nn.Module):
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
+        # 这里的fuse操作有可能导致GPU显存不足。
+        # 我们不能假设模型加载的最小显存开支就等于模型权重大小。
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -424,6 +454,65 @@ class Qwen2Model(nn.Module):
             loaded_params.add(name)
         return loaded_params
 
+    def load_layer_weights(self, weights: Iterable[tuple[str, torch.Tensor]], layers: Tuple[int, int])->set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: set[str] = set()
+        # 这里的fuse操作有可能导致GPU显存不足。
+        # 我们不能假设模型加载的最小显存开支就等于模型权重大小。
+        for name, loaded_weight in weights:
+            layer_index = extract_layer_index(name)
+            if layer_index not in range(layers[0], layers[1]+1):
+                continue
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if (self.quant_config is not None and
+                (scale_name := self.quant_config.get_cache_scale(name))):
+                # Loading kv cache quantization scales
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else
+                                 loaded_weight[0])
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                continue
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Remapping the name of FP8 kv-scale.
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params 
 
 class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     packed_modules_mapping = {

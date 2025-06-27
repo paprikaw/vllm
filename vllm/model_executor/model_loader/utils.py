@@ -5,7 +5,7 @@ import inspect
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import transformers
@@ -23,6 +23,7 @@ from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.adapters import (as_classification_model,
                                                  as_embedding_model,
                                                  as_reward_model)
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils import is_pin_memory_available
 
 logger = init_logger(__name__)
@@ -92,6 +93,36 @@ def initialize_model(
 def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
                                   target_device: torch.device) -> None:
     for _, module in model.named_modules():
+        if isinstance(module, QKVCrossParallelLinear):
+            # NOTE(Isotr0py): special case for cross QKV layer because
+            # q and kv proj aren't registered as submodules intentionally
+            module.process_weights_after_loading()
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if isinstance(quant_method, QuantizeMethodBase):
+            # When quant methods need to process weights after loading
+            # (for repacking, quantizing, etc), they expect parameters
+            # to be on the global target device. This scope is for the
+            # case where cpu offloading is used, where we will move the
+            # parameters onto device for processing and back off after.
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
+
+    # Currently only used by MLA.
+    # NOTE: This intentionally happens after other modules so we can easily
+    # decompress the weights for MLA.
+    for _, module in model.named_modules():
+        if isinstance(module, Attention) and \
+            hasattr(module, "process_weights_after_loading"):
+            # TODO(lucas): see if there is a way to unify the signatures
+            # of process_weights_after_loading
+            module.process_weights_after_loading(model_config.dtype)
+
+def process_layer_weights_after_loading(model: nn.Module, model_config: ModelConfig,
+                                  target_device: torch.device, layers: Tuple[int, int]) -> None:
+    for name, module in model.named_modules():
+        if extract_layer_index(name) not in range(layers[0], layers[1]+1):
+            continue
         if isinstance(module, QKVCrossParallelLinear):
             # NOTE(Isotr0py): special case for cross QKV layer because
             # q and kv proj aren't registered as submodules intentionally
@@ -218,7 +249,6 @@ def resolve_transformers_arch(model_config: ModelConfig,
 def get_model_architecture(
         model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     architectures = getattr(model_config.hf_config, "architectures", [])
-
     # Special handling for quantized Mixtral.
     # FIXME(woosuk): This is a temporary hack.
     mixtral_supported = [
@@ -235,7 +265,7 @@ def get_model_architecture(
           and model_config.quantization not in mixtral_supported
           and "MixtralForCausalLM" in architectures):
         architectures = ["QuantMixtralForCausalLM"]
-
+    # 在这里加载模型
     model_cls, arch = ModelRegistry.resolve_model_cls(architectures)
     if model_config.task == "embed":
         model_cls = as_embedding_model(model_cls)

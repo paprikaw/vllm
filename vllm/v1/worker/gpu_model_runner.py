@@ -2000,7 +2000,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
                 "supported yet.")
-        self.kv_cache_config = kv_cache_config
         self.initialize_attn_backend(kv_cache_config)
 
         kv_caches: dict[str, torch.Tensor] = {}

@@ -470,6 +470,28 @@ def safetensors_weights_iterator(
                 param = f.get_tensor(name)
                 yield name, param
 
+# def layers_safetensors_weights_iterator(
+#     hf_weights_files: list[str],
+#     use_tqdm_on_load: bool,
+#     layer_index: list[int],
+# ) -> Generator[tuple[str, torch.Tensor], None, None]:
+#     """Iterate over the weights in the model safetensor files."""
+#     for st_file in tqdm(
+#             hf_weights_files,
+#             desc="Loading safetensors checkpoint shards",
+#             disable=not enable_tqdm(use_tqdm_on_load),
+#             bar_format=_BAR_FORMAT,
+#     ):
+#         import re
+#         layer_pattern = re.compile(r"model\.layers\.(\d+)\.")
+#         with safe_open(st_file, framework="pt") as f: # type: ignore
+#             for name in f.keys():  # noqa: SIM118
+#                 match = layer_pattern.match(name)
+#                 if match and int(match.group(1)) in layer_index:
+#                     param = f.get_tensor(name)
+#                     logger.info(f"name: {name}, param: {param.shape}")
+#                     yield name, param
+
 
 def runai_safetensors_weights_iterator(
     hf_weights_files: list[str],

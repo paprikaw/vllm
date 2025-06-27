@@ -151,3 +151,16 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    # Execution layer configs for each pipeline workers.
+    # Here each pipeline worker is able to execute a subset of the layers.
+    # This allows us to perform pipeline parallelism with different configurations.
+    #   .e.g With a model with 12 layers, we can have two workers with below layers:
+    #       worker 0: [0, 1, 2, 3, 4, 5, 6]
+    #       worker 1: [6, 7, 8, 9, 10, 11]
+    #   With this setup, we can have two different configurations:
+    #     Configuration 1: [0, 1, 2, 3, 4, 5] -> [6, 7, 8, 9, 10, 11]
+    #     Configuration 2: [0, 1, 2, 3, 4, 5, 6] -> [7, 8, 9, 10, 11]
+    #   This is useful for the case where we want to perform pipeline parallelism
+    #   with different configurations.
+    pp_execution_layer_configs: Optional[list[list[int]]] = None

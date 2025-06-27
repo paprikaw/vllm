@@ -82,7 +82,10 @@ class DynamicGPUWorker(Worker):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
-    def add_layers(self, layers: Tuple[int, int]) -> None:
+    def add_layers(self, rank: int, layers: Tuple[int, int]) -> None:
+        if self.rank != rank:
+            logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip adding model layers")
+            return None
         logger.info(f"Add Model Layers: {layers}")
         self.model_runner.add_model_layers(layers)
         # self.model_runner.load_model_layers(layer_names)
@@ -94,7 +97,10 @@ class DynamicGPUWorker(Worker):
         logger.debug(f"Get kv cache spec for layers: {layer_range}")
         return self.model_runner.get_kv_cache_spec_for_layers(layer_range)
 
-    def initialize_kv_cache_for_layers(self, kv_cache_specs: dict[str, KVCacheSpec], 
+    def initialize_kv_cache_for_layers(self, rank: int, kv_cache_specs: dict[str, KVCacheSpec], 
                                        kv_cache_size: int, 
                                        kv_cache_num_blocks: int) -> None:
+        if self.rank != rank:
+            logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip initializing kv cache for layers")
+            return
         self.model_runner.initialize_kv_cache_for_layers(kv_cache_specs, kv_cache_size, kv_cache_num_blocks)

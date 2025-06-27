@@ -3,7 +3,7 @@
 import itertools
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional, Protocol, Union, overload
+from typing import Callable, Literal, Optional, Protocol, Union, overload, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -628,6 +628,37 @@ def make_layers(
         ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
     return start_layer, end_layer, modules
 
+def add_layers(
+    module: torch.nn.ModuleList,
+    added_layers: Tuple[int, int],
+    old_layers: Tuple[int, int],
+    layer_fn: LayerFn,
+    prefix: str,
+) -> torch.nn.ModuleList:
+    """
+    Replace layers in `old_layers` range with new layers defined by `added_layers`,
+    and use `PPMissingLayer()` as placeholders for the rest.
+
+    The ranges are inclusive: [start, end]
+    - model: original model's ModuleList
+    - added_layers: range of new layers to insert
+    - layer_fn: factory function to generate a new layer
+    - prefix: prefix for naming the new layers
+    """
+
+    num_layers = len(module)
+    new_module = torch.nn.ModuleList()
+    assert added_layers[0] <= added_layers[1], "added_layers[0] must be less than added_layers[1]"
+    assert added_layers[1] == old_layers[0] - 1 or added_layers[0] == old_layers[1] + 1, "added_layers must be adjacent to old_layers"
+
+    for idx in range(num_layers):
+        if old_layers[0] <= idx <= old_layers[1]:
+            new_module.append(module[idx])
+        elif added_layers[0] <= idx <= added_layers[1]:
+            new_module.append(maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}")))
+        else:
+            new_module.append(module[idx])
+    return new_module
 
 # NOTE: don't use lru_cache here because it can prevent garbage collection
 _model_to_pp_missing_layer_names: dict[int, list[str]] = {}

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
+from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.models.qwen3 import Qwen3Model
 import glob
 import os
 import time
 from collections.abc import Generator, Iterable
-from typing import Optional, cast
+from typing import Optional, cast, List, Tuple
 
 import huggingface_hub
 import torch
@@ -16,7 +18,7 @@ from vllm.config import LoadConfig, LoadFormat, ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import (
-    initialize_model, process_weights_after_loading, set_default_torch_dtype)
+    initialize_model, process_weights_after_loading, set_default_torch_dtype, process_layer_weights_after_loading)
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf, download_weights_from_hf,
     fastsafetensors_weights_iterator, filter_duplicate_safetensors_files,
@@ -293,3 +295,34 @@ class DefaultModelLoader(BaseModelLoader):
             process_weights_after_loading(model, model_config, target_device)
 
         return model.eval()
+
+class CustomModelLoader(DefaultModelLoader):
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+
+    def load_qwen3_layers(self, vllm_config: VllmConfig,
+                   model_config: ModelConfig,
+                   layers: Tuple[int, int],
+                   model: Qwen3Model,
+                   ) -> None:
+        device_config = vllm_config.device_config
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(model_config.dtype): 
+            # 只收集属于指定层范围的参数名，更易读
+            model.add_layers(layers)
+            weights_to_load = {
+                name
+                for name, _ in model.named_parameters()
+                if extract_layer_index(name) in range(layers[0], layers[1]+1)
+            }
+            loaded_weights = model.load_layer_weights(
+                self.get_all_weights(model_config, model),
+                layers) 
+            if model_config.quantization is None and loaded_weights is not None:
+                weights_not_loaded = weights_to_load - loaded_weights
+                if weights_not_loaded:
+                    raise ValueError(
+                        "Following weights were not initialized from "
+                        f"checkpoint: {weights_not_loaded}")
+            process_layer_weights_after_loading(model, model_config, target_device, layers)
+        return

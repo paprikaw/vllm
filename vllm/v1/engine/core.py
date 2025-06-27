@@ -9,7 +9,7 @@ from collections import deque
 from concurrent.futures import Future
 from inspect import isclass, signature
 from logging import DEBUG
-from typing import Any, Callable, Optional, TypeVar, Union
+from typing import Any, Callable, Optional, TypeVar, Union, Tuple
 
 import msgspec
 import zmq
@@ -32,6 +32,7 @@ from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType, UtilityOutput)
 from vllm.v1.engine.mm_input_cache import MirroredProcessingCache
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.executor.dynamic_ray_distributed_executor import DynamicRayDistributedExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -79,6 +80,12 @@ class EngineCore:
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+
+
+        # We assume that we only care about gpu blocks at the moment.
+        assert num_cpu_blocks == 0 
+        # TODO: Maybe make the status of kv blocks and block size to a class
+        # or managed by some class
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
@@ -156,9 +163,23 @@ class EngineCore:
             cfg.num_blocks == kv_cache_configs[0].num_blocks
             for cfg in kv_cache_configs
         ])
+
+        # All layers have the same kv cache size
+        # We assume this so we manage all kv cache tensor all together 
+        assert all([
+            cfg.tensors[layer_name].size == kv_cache_configs[0].tensors[layer_name].size
+            for cfg in kv_cache_configs
+            for layer_name in cfg.tensors.keys()
+        ])
+
         num_gpu_blocks = kv_cache_configs[0].num_blocks
         num_cpu_blocks = 0
         scheduler_kv_cache_config = kv_cache_configs[0]
+
+        # Here we initialize the unified kv cache size and num blocks
+        # We maintain these variables to dynamically manage the kv cache
+        self.kv_cache_size = next(iter(kv_cache_configs[0].tensors.values())).size
+        self.kv_cache_num_blocks = num_gpu_blocks
 
         # Initialize kv cache and warmup the execution
         self.model_executor.initialize_from_config(kv_cache_configs)
@@ -167,6 +188,21 @@ class EngineCore:
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
+
+    def migrate_layers(self, rank_from: int, rank_to: int, layers: Tuple[int, int]):
+        start = time.time()
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+
+        available_gpu_memory = self.model_executor.determine_available_memory()[rank_to]
+        assert available_gpu_memory > self.kv_cache_size * self.kv_cache_num_blocks * (layers[1] - layers[0] + 1)
+
+        # Get all kv cache needed by the model
+        kv_cache_spec = self.model_executor.get_kv_cache_spec_for_layers(rank_to, layers)
+        self.model_executor.add_layers(rank_to, layers)
+        self.model_executor.initialize_kv_cache_for_layers(rank_to, kv_cache_spec, self.kv_cache_size, self.kv_cache_num_blocks)
+
+        end = time.time()
+        logger.info(f"Added layers to {rank_to} took {end - start} seconds")
 
     def add_request(self, request: EngineCoreRequest):
         """Add request to the scheduler."""
@@ -508,6 +544,7 @@ class EngineCoreProc(EngineCore):
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
+
 
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
