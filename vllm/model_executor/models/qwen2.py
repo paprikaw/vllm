@@ -54,11 +54,10 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors, PoolerOutput
 
 from .interfaces import SupportsLoRA, SupportsPP
-from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
-                    extract_layer_index, is_pp_missing_parameter,
+from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
-
+from vllm.model_executor.utils import extract_layer_index
 logger = init_logger(__name__)
 
 

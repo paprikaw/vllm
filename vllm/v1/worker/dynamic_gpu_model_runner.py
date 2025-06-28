@@ -140,7 +140,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         return kv_cache_spec
     def add_model_layers(self, layers: Tuple[int, int]) -> None:
         from vllm.model_executor.models.qwen3 import Qwen3Model
-        from vllm.model_executor.model_loader.default_loader import CustomModelLoader
+        from vllm.model_executor.model_loader.dynamic_qwen3_loader import CustomModelLoader
         assert isinstance(self.model, Qwen3Model)
         model: Qwen3Model = self.model
         loader = CustomModelLoader(self.vllm_config.load_config)
