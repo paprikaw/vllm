@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.models.qwen3 import Qwen3Model
 import glob
 import os
@@ -305,6 +304,7 @@ class CustomModelLoader(DefaultModelLoader):
                    layers: Tuple[int, int],
                    model: Qwen3Model,
                    ) -> None:
+        from vllm.model_executor.utils import extract_layer_index
         device_config = vllm_config.device_config
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype): 

@@ -23,7 +23,6 @@ from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.adapters import (as_classification_model,
                                                  as_embedding_model,
                                                  as_reward_model)
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils import is_pin_memory_available
 
 logger = init_logger(__name__)
@@ -120,6 +119,7 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
 
 def process_layer_weights_after_loading(model: nn.Module, model_config: ModelConfig,
                                   target_device: torch.device, layers: Tuple[int, int]) -> None:
+    from vllm.model_executor.utils import extract_layer_index
     for name, module in model.named_modules():
         if extract_layer_index(name) not in range(layers[0], layers[1]+1):
             continue
