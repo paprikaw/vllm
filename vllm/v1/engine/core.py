@@ -166,11 +166,9 @@ class EngineCore:
 
         # All layers have the same kv cache size
         # We assume this so we manage all kv cache tensor all together 
-        assert all([
-            cfg.tensors[layer_name].size == kv_cache_configs[0].tensors[layer_name].size
-            for cfg in kv_cache_configs
-            for layer_name in cfg.tensors.keys()
-        ])
+        for cfg in kv_cache_configs:
+            sizes = [tensor.size for tensor in cfg.tensors.values()]
+            assert all(s == sizes[0] for s in sizes), "Inconsistent KV sizes within config"
 
         num_gpu_blocks = kv_cache_configs[0].num_blocks
         num_cpu_blocks = 0
