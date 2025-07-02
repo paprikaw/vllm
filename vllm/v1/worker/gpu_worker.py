@@ -42,7 +42,7 @@ class Worker(WorkerBase):
         self,
         vllm_config: VllmConfig,
         local_rank: int,
-        rank: int,
+    rank: int,
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):

@@ -77,6 +77,7 @@ try:
                     None unless if it is provided because it is > 0 pipeline
                     stage. The request is serialized by msgspec.
             """
+            assert False
             if isinstance(req_or_tuple, bytes):
                 serialized_req, intermediate_tensors = req_or_tuple, None
             else:

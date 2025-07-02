@@ -2000,6 +2000,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
                 "supported yet.")
+        self.kv_cache_config = kv_cache_config
         self.initialize_attn_backend(kv_cache_config)
 
         kv_caches: dict[str, torch.Tensor] = {}
@@ -2053,7 +2054,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
-
+        logger.info(f"invoking kv cache spec")
         layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         block_size = self.vllm_config.cache_config.block_size
         use_mla = self.vllm_config.model_config.use_mla

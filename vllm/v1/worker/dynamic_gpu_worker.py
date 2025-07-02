@@ -4,31 +4,17 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.distributed
-import torch.nn as nn
-
-import vllm.envs as envs
-from vllm.config import VllmConfig
-from vllm.device_allocator.cumem import CuMemAllocator
-from vllm.distributed import (ensure_model_parallel_initialized,
-                              init_distributed_environment,
-                              set_custom_all_reduce)
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
-from vllm.platforms import current_platform
-from vllm.sequence import IntermediateTensors
-from vllm.utils import GiB_bytes
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.worker_base import WorkerBase
-from .utils import get_total_gpu_memory
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.dynamic_gpu_model_runner import DynamicGPUModelRunner
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment, _check_if_gpu_supports_dtype
+from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
+from dataclasses import asdict
+
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -37,6 +23,7 @@ if TYPE_CHECKING:
 
 class DynamicGPUWorker(Worker):
     def __init__(self, *args, **kwargs):
+        logger.info("start to initialize")
         super().__init__(*args, **kwargs)
 
     def init_device(self):
@@ -81,14 +68,21 @@ class DynamicGPUWorker(Worker):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: "DynamicSchedulerOutput",
+    ) -> Optional[ModelRunnerOutput]:
+        self.model_runner.execute_model(
+            SchedulerOutput(**asdict(scheduler_output)), 
+            scheduler_output.pp_layer_config[self.rank])
 
     def add_layers(self, rank: int, layers: Tuple[int, int]) -> None:
         if self.rank != rank:
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip adding model layers")
             return None
         logger.info(f"Add Model Layers: {layers}")
-        self.model_runner.add_model_layers(layers)
-        # self.model_runner.load_model_layers(layer_names)
+        self.model_runner.add_layers(layers)
 
     def get_kv_cache_spec_for_layers(self, rank: int, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
         if self.rank != rank:

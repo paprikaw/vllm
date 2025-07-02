@@ -507,6 +507,7 @@ class WorkerWrapperBase:
         All workers have rpc_rank=0, but they have different ranks in the TP
         group.
         """
+        logger.info("start to init worker wrapper")
         self.rpc_rank = rpc_rank
         self.worker: Optional[WorkerBase] = None
         # do not store this `vllm_config`, `init_worker` will set the final
@@ -545,6 +546,7 @@ class WorkerWrapperBase:
         Here we inject some common logic before initializing the worker.
         Arguments are passed to the worker class constructor.
         """
+        logger.info("Start to init worker")
         kwargs = all_kwargs[self.rpc_rank]
         self.vllm_config = kwargs.get("vllm_config", None)
         assert self.vllm_config is not None, (
@@ -557,6 +559,8 @@ class WorkerWrapperBase:
         if isinstance(self.vllm_config.parallel_config.worker_cls, str):
             worker_class = resolve_obj_by_qualname(
                 self.vllm_config.parallel_config.worker_cls)
+            logger.info("here1")
+            logger.info(worker_class)
         else:
             logger.warning(
                 "passing worker_cls as a class object is strongly deprecated,"

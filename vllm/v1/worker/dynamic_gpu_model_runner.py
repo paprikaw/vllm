@@ -10,41 +10,24 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
-
-from vllm.attention import AttentionType, get_attn_backend
-from vllm.attention.backends.abstract import (AttentionBackend,
-                                              AttentionMetadataBuilder)
 from vllm.attention.layer import Attention
-from vllm.attention.utils.fa_utils import get_flash_attn_version
-from vllm.config import (CompilationLevel, VllmConfig,
-                         get_layers_from_vllm_config)
+from vllm.attention import AttentionType
+from vllm.config import (get_layers_from_vllm_config)
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
-from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
-from vllm.distributed.parallel_state import (
-    get_pp_group, get_tp_group, graph_capture,
-    prepare_communication_buffer_for_model)
-from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-from vllm.model_executor.model_loader import TensorizerLoader, get_model
-from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
-from vllm.multimodal.utils import group_mm_inputs_by_modality
-from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
-from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
-                        GiB_bytes, LazyLoader, async_tensor_h2d, cdiv,
-                        check_use_alibi, is_pin_memory_available)
-from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
+from vllm.utils import (LazyLoader)
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheSpec,
                                         SlidingWindowSpec)
 from vllm.v1.utils import extract_layer_index
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.utils import bind_kv_cache
+from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
+from vllm.model_executor.model_loader.dynamic_qwen3_loader import CustomModelLoader
 
 
 if TYPE_CHECKING:
@@ -61,6 +44,10 @@ logger = init_logger(__name__)
 class DynamicGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+    # def load_model(self)->float:
+    #     super().load_model()
+    #     return self.model_memory_usage
 
     def initialize_kv_cache_for_layers(self, 
             kv_cache_specs: dict[str, KVCacheSpec],
@@ -97,7 +84,18 @@ class DynamicGPUModelRunner(GPUModelRunner):
         if has_kv_transfer_group():
             raise NotImplementedError("KV transfer group is not supported for dynamic weights")
 
-   
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        layer_config: Tuple[int, int],
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+        logger.info(f"model class: {self.model.__class__.__name__}")
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        self.model.set_sched_layers(layer_config[0], layer_config[1])
+        return super().execute_model(scheduler_output, intermediate_tensors)
+    
     def get_kv_cache_spec_for_layers(self, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
         """
         Get the KV cache spec for the given layers.
@@ -138,10 +136,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     f"Unknown attention type: {attn_module.attn_type}")
 
         return kv_cache_spec
-    def add_model_layers(self, layers: Tuple[int, int]) -> None:
-        from vllm.model_executor.models.qwen3 import Qwen3Model
-        from vllm.model_executor.model_loader.dynamic_qwen3_loader import CustomModelLoader
-        assert isinstance(self.model, Qwen3Model)
-        model: Qwen3Model = self.model
+    def add_layers(self, layers: Tuple[int, int]) -> None:
+        logger.info(f"model class: {self.model.__class__.__name__}")
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        model: DynamicQwen3ForCausalLM = self.model
         loader = CustomModelLoader(self.vllm_config.load_config)
         loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model)

@@ -4,7 +4,7 @@ from vllm.model_executor.utils import extract_layer_index
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype, process_layer_weights_after_loading
 from typing import Tuple
 import torch
-
+from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
 
 class CustomModelLoader(DefaultModelLoader):
     def __init__(self, load_config: LoadConfig):
@@ -13,7 +13,7 @@ class CustomModelLoader(DefaultModelLoader):
     def load_qwen3_layers(self, vllm_config: VllmConfig,
                    model_config: ModelConfig,
                    layers: Tuple[int, int],
-                   model,
+                   model: DynamicQwen3ForCausalLM,
                    ) -> None:
         device_config = vllm_config.device_config
         target_device = torch.device(device_config.device)

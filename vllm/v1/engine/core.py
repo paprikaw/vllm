@@ -9,7 +9,7 @@ from collections import deque
 from concurrent.futures import Future
 from inspect import isclass, signature
 from logging import DEBUG
-from typing import Any, Callable, Optional, TypeVar, Union, Tuple
+from typing import Any, Callable, Optional, TypeVar, Union, Tuple, List
 
 import msgspec
 import zmq
@@ -38,7 +38,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.core.sched.dynamic_scheduler import DynamicScheduler
+from vllm.v1.core.sched.dynamic_scheduler import MigrationStatus
 from vllm.version import __version__ as VLLM_VERSION
+from .utils import get_new_layer_config_with_migration_action
 
 logger = init_logger(__name__)
 
@@ -135,7 +138,7 @@ class EngineCore:
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
-
+        assert(isinstance(self.model_executor, DynamicRayDistributedExecutor))
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
         # print(f"kv_cache_specs: {kv_cache_specs}")
@@ -145,6 +148,9 @@ class EngineCore:
         # print(f"available_gpu_memory: {available_gpu_memory}")
         assert len(kv_cache_specs) == len(available_gpu_memory)
         # Get the kv cache tensor size
+        logger.info("here")
+        logger.info(kv_cache_specs)
+        logger.info(available_gpu_memory)
         kv_cache_configs = [
             get_kv_cache_config(vllm_config, kv_cache_spec_one_worker,
                                 available_gpu_memory_one_worker)
@@ -187,18 +193,37 @@ class EngineCore:
                      "warmup model) took %.2f seconds"), elapsed)
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
-    def migrate_layers(self, rank_from: int, rank_to: int, layers: Tuple[int, int]):
+    def migrate_layers(self, rank_from: int, rank_to: int, num_layers: int):
         start = time.time()
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        assert isinstance(self.scheduler, DynamicScheduler)
+        assert self.scheduler.migration_status == MigrationStatus.NOT_MIGRATING
+        # Check if the memory is enough for the new layers
 
         available_gpu_memory = self.model_executor.determine_available_memory()[rank_to]
-        assert available_gpu_memory > self.kv_cache_size * self.kv_cache_num_blocks * (layers[1] - layers[0] + 1)
+        logger.info(f"available_gpu_memory: {available_gpu_memory}")
+        logger.info(f"self.kv_cache_size: {self.kv_cache_size}")
+        logger.info(f"self.kv_cache_num_blocks: {self.kv_cache_num_blocks}")
+        logger.info(f"num_layers: {num_layers}")
+        assert available_gpu_memory > self.kv_cache_size * num_layers
 
-        # Get all kv cache needed by the model
-        kv_cache_spec = self.model_executor.get_kv_cache_spec_for_layers(rank_to, layers)
+        # Get the new layer configuration 
+        layers, next_layer_config = get_new_layer_config_with_migration_action(rank_from, 
+                                                                       rank_to, 
+                                                                       num_layers, 
+                                                                       self.scheduler.pp_layer_config_status.get_cur_pp_layer_config())
+        logger.info(f"current layer config:") 
+        logger.info(f"layers: {layers}")
+        logger.info(f"next_layer_config: {next_layer_config}")
         self.model_executor.add_layers(rank_to, layers)
+        # Get the kv cache spec for the new layers
+        kv_cache_spec = self.model_executor.get_kv_cache_spec_for_layers(rank_to, layers)
         self.model_executor.initialize_kv_cache_for_layers(rank_to, kv_cache_spec, self.kv_cache_size, self.kv_cache_num_blocks)
 
+        # Start migration process in the scheduler
+        future = self.scheduler.start_migration(next_layer_config)
+        future.result()
+        # 删除不需要的layers
         end = time.time()
         logger.info(f"Added layers to {rank_to} took {end - start} seconds")
 
