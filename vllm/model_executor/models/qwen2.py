@@ -214,7 +214,7 @@ class Qwen2DecoderLayer(nn.Module):
             attn_type = AttentionType.DECODER
         else:
             attn_type = AttentionType.ENCODER_ONLY
-
+        logger.info(f"making, Qwen2DecoderLayer: {prefix}")
         self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,

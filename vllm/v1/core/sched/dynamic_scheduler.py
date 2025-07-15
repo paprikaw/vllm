@@ -4,10 +4,15 @@ from threading import Lock
 import vllm.envs as envs
 from enum import Enum
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput
 from dataclasses import asdict
 from concurrent.futures import Future
 from collections import deque
 from vllm.v1.request import Request
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class DynamicScheduler(Scheduler):
     def __init__(self, *args, **kwargs):
@@ -22,7 +27,7 @@ class DynamicScheduler(Scheduler):
         layer_configs = []
         for pp_rank in range(len(partitions)):
             start_layer = sum(partitions[:pp_rank])
-            end_layer = start_layer + partitions[pp_rank]
+            end_layer = start_layer + partitions[pp_rank] - 1
             layer_configs.append((start_layer, end_layer))
         self.pp_layer_config_status = PPLayerConfigStatus(layer_configs)
 
@@ -47,7 +52,9 @@ class DynamicScheduler(Scheduler):
 
 
     def start_migration(self, layer_config: List[Tuple[int,int]])->Future:
+        logger.info(f"scheduler start migration before lock")
         with self.lock:
+            logger.info(f"scheduler start migration, layer_config: {layer_config}")
             self.migration_status = MigrationStatus.MIGRATING
             self.cur_running = self.running
             self.cur_waiting = deque()
@@ -95,10 +102,7 @@ class DynamicScheduler(Scheduler):
 
                 if len(self.cur_running) == 0:
                     self._complete_migration()
-                    return DynamicSchedulerOutput(
-                        pp_layer_config=self.pp_layer_config_status.get_cur_pp_layer_config(),
-                        **asdict(super().schedule()),
-                    )
+                    return create_dynamic_scheduler_output(super().schedule(), self.pp_layer_config_status.get_cur_pp_layer_config())
 
                 if self.round_robin_index == 0:
                     self.running = self.cur_running 
@@ -117,10 +121,8 @@ class DynamicScheduler(Scheduler):
                 assert self.round_robin_index == 0, "round_robin_index should be 0"
                 pp_layer_config = self.pp_layer_config_status.get_cur_pp_layer_config()
 
-            return DynamicSchedulerOutput(
-                pp_layer_config=pp_layer_config,
-                **asdict(super().schedule()),
-            )
+
+        return create_dynamic_scheduler_output(super().schedule(), pp_layer_config)
 
     def _add_layer_config(self, layer_config: List[Tuple[int,int]]):
             self.pp_layer_config_status.update_with_next_pp_layer_config(layer_config)
@@ -172,3 +174,36 @@ class PPLayerConfigStatus:
 class MigrationStatus(Enum):
     NOT_MIGRATING = 0 
     MIGRATING = 1
+
+def create_dynamic_scheduler_output(scheduler_output: SchedulerOutput, pp_layer_config: List[Tuple[int,int]]) -> DynamicSchedulerOutput:
+    return DynamicSchedulerOutput(
+                scheduled_new_reqs=scheduler_output.scheduled_new_reqs,
+                scheduled_cached_reqs=scheduler_output.scheduled_cached_reqs,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                scheduled_spec_decode_tokens=scheduler_output.scheduled_spec_decode_tokens,
+                scheduled_encoder_inputs=scheduler_output.scheduled_encoder_inputs,
+                num_common_prefix_blocks=scheduler_output.num_common_prefix_blocks,
+                finished_req_ids=scheduler_output.finished_req_ids,
+                free_encoder_input_ids=scheduler_output.free_encoder_input_ids,
+                structured_output_request_ids=scheduler_output.structured_output_request_ids,
+                grammar_bitmask=scheduler_output.grammar_bitmask,
+                kv_connector_metadata=scheduler_output.kv_connector_metadata,
+                pp_layer_config=pp_layer_config,
+            )
+
+def create_from_dynamic_scheduler_output(dynamic_scheduler_output: DynamicSchedulerOutput) -> SchedulerOutput:
+    return SchedulerOutput(
+                scheduled_new_reqs=dynamic_scheduler_output.scheduled_new_reqs,
+                scheduled_cached_reqs=dynamic_scheduler_output.scheduled_cached_reqs,
+                num_scheduled_tokens=dynamic_scheduler_output.num_scheduled_tokens,
+                total_num_scheduled_tokens=dynamic_scheduler_output.total_num_scheduled_tokens,
+                scheduled_spec_decode_tokens=dynamic_scheduler_output.scheduled_spec_decode_tokens,
+                scheduled_encoder_inputs=dynamic_scheduler_output.scheduled_encoder_inputs,
+                num_common_prefix_blocks=dynamic_scheduler_output.num_common_prefix_blocks,
+                finished_req_ids=dynamic_scheduler_output.finished_req_ids,
+                free_encoder_input_ids=dynamic_scheduler_output.free_encoder_input_ids,
+                structured_output_request_ids=dynamic_scheduler_output.structured_output_request_ids,
+                grammar_bitmask=dynamic_scheduler_output.grammar_bitmask,
+                kv_connector_metadata=dynamic_scheduler_output.kv_connector_metadata
+            )

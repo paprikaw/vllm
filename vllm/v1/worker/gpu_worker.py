@@ -211,11 +211,11 @@ class Worker(WorkerBase):
             total_gpu_memory * self.cache_config.gpu_memory_utilization -
             peak_memory)
 
-        logger.info(f"free_gpu_memory: {free_gpu_memory/GiB_bytes}GB")
-        logger.info(f"total gpu memory: {total_gpu_memory/GiB_bytes}GB")
-        logger.info(f"torch_allocated_bytes: {torch_allocated_bytes/GiB_bytes}GB")
-        logger.info(f"total_allocated_bytes: {total_allocated_bytes/GiB_bytes}GB")
-        logger.info(f"non_torch_allocations: {non_torch_allocations/GiB_bytes}GB")
+        # logger.info(f"free_gpu_memory: {free_gpu_memory/GiB_bytes}GB")
+        # logger.info(f"total gpu memory: {total_gpu_memory/GiB_bytes}GB")
+        # logger.info(f"torch_allocated_bytes: {torch_allocated_bytes/GiB_bytes}GB")
+        # logger.info(f"total_allocated_bytes: {total_allocated_bytes/GiB_bytes}GB")
+        # logger.info(f"non_torch_allocations: {non_torch_allocations/GiB_bytes}GB")
         return int(available_kv_cache_memory)
 
     # def add_layers(self, rank: int, layers: Tuple[int, int]) -> None:

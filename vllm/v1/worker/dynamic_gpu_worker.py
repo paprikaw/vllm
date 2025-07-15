@@ -14,7 +14,9 @@ from vllm.v1.worker.dynamic_gpu_model_runner import DynamicGPUModelRunner
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment, _check_if_gpu_supports_dtype
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from dataclasses import asdict
-
+from vllm.sequence import IntermediateTensors
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+import time
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -73,9 +75,29 @@ class DynamicGPUWorker(Worker):
         self,
         scheduler_output: "DynamicSchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
-        self.model_runner.execute_model(
+        logger.info(f"start to execute_model in gpu worker")
+        intermediate_tensors = None
+        if not get_pp_group().is_first_rank:
+            intermediate_tensors = IntermediateTensors(
+                get_pp_group().recv_tensor_dict(
+                    all_gather_group=get_tp_group()))
+
+        output = self.model_runner.execute_model(
             SchedulerOutput(**asdict(scheduler_output)), 
-            scheduler_output.pp_layer_config[self.rank])
+            scheduler_output.pp_layer_config[self.rank],
+            intermediate_tensors)
+
+        time.sleep(5)
+        parallel_config = self.vllm_config.parallel_config
+        if parallel_config.distributed_executor_backend != "external_launcher" \
+            and not get_pp_group().is_last_rank:
+            assert isinstance(output, IntermediateTensors)
+            get_pp_group().send_tensor_dict(output.tensors,
+                                            all_gather_group=get_tp_group())
+            return None
+        assert isinstance(output, ModelRunnerOutput)
+        return output if self.is_driver_worker else None
+
 
     def add_layers(self, rank: int, layers: Tuple[int, int]) -> None:
         if self.rank != rank:
@@ -93,8 +115,9 @@ class DynamicGPUWorker(Worker):
 
     def initialize_kv_cache_for_layers(self, rank: int, kv_cache_specs: dict[str, KVCacheSpec], 
                                        kv_cache_size: int, 
-                                       kv_cache_num_blocks: int) -> None:
+                                       kv_cache_num_blocks: int,
+                                       layers: Tuple[int, int]) -> None:
         if self.rank != rank:
-            logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip initializing kv cache for layers")
             return
-        self.model_runner.initialize_kv_cache_for_layers(kv_cache_specs, kv_cache_size, kv_cache_num_blocks)
+        self.model_runner.initialize_kv_cache_for_layers(kv_cache_specs, kv_cache_size, kv_cache_num_blocks, layers)
+        return

@@ -18,7 +18,7 @@ from vllm.multimodal import MultiModalPlaceholderMap, NestedTensors
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (get_cuda_view_from_cpu_tensor, is_pin_memory_available,
                         is_uva_available)
-
+import time
 logger = init_logger(__name__)
 
 WeightsMapping = Mapping[str, Optional[str]]
@@ -199,7 +199,6 @@ class AutoWeightsLoader:
     ) -> Iterable[str]:
         if isinstance(module, PPMissingLayer):
             return
-
         # Avoid infinite recursion since this function is typically
         # called inside load_weights of the module itself
         if module != self.module:
@@ -228,7 +227,7 @@ class AutoWeightsLoader:
 
             if child_prefix in child_modules:
                 if self._can_skip(prefix + "."):
-                    logger.debug("Skipping module %s", prefix)
+                    logger.info("Skipping module %s", prefix)
 
                     continue
 
@@ -237,7 +236,7 @@ class AutoWeightsLoader:
                                              child_weights)
             elif child_prefix in child_params:
                 if self._can_skip(prefix):
-                    logger.debug("Skipping param %s", prefix)
+                    logger.info("Skipping param %s", prefix)
 
                     continue
 
@@ -273,7 +272,6 @@ class AutoWeightsLoader:
         # filter out weights with first-prefix/substr to skip in name
         weights = ((name, weight) for name, weight in weights
                    if not self._can_skip(name))
-
         autoloaded_weights = set(self._load_module("", self.module, weights))
         return autoloaded_weights
 
@@ -621,6 +619,7 @@ def make_layers(
     start_layer, end_layer = get_pp_indices(num_hidden_layers,
                                             get_pp_group().rank_in_group,
                                             get_pp_group().world_size)
+    logger.info(f"start_layer: {start_layer}, end_layer: {end_layer}")
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)] + [
             maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
@@ -628,37 +627,7 @@ def make_layers(
         ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
     return start_layer, end_layer, modules
 
-def add_layers(
-    module: torch.nn.ModuleList,
-    added_layers: Tuple[int, int],
-    old_layers: Tuple[int, int],
-    layer_fn: LayerFn,
-    prefix: str,
-) -> torch.nn.ModuleList:
-    """
-    Replace layers in `old_layers` range with new layers defined by `added_layers`,
-    and use `PPMissingLayer()` as placeholders for the rest.
 
-    The ranges are inclusive: [start, end]
-    - model: original model's ModuleList
-    - added_layers: range of new layers to insert
-    - layer_fn: factory function to generate a new layer
-    - prefix: prefix for naming the new layers
-    """
-
-    num_layers = len(module)
-    new_module = torch.nn.ModuleList()
-    assert added_layers[0] <= added_layers[1], "added_layers[0] must be less than added_layers[1]"
-    assert added_layers[1] == old_layers[0] - 1 or added_layers[0] == old_layers[1] + 1, "added_layers must be adjacent to old_layers"
-
-    for idx in range(num_layers):
-        if old_layers[0] <= idx <= old_layers[1]:
-            new_module.append(module[idx])
-        elif added_layers[0] <= idx <= added_layers[1]:
-            new_module.append(maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}")))
-        else:
-            new_module.append(module[idx])
-    return new_module
 
 # NOTE: don't use lru_cache here because it can prevent garbage collection
 _model_to_pp_missing_layer_names: dict[int, list[str]] = {}

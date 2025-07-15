@@ -20,7 +20,10 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
+from vllm.utils import init_logger
+import time
 
+logger = init_logger(__name__)
 
 class Attention(nn.Module):
     """Attention layer.
@@ -146,10 +149,19 @@ class Attention(nn.Module):
         ) and not current_platform.is_cpu()
 
         self.use_output = attn_backend.accept_output_buffer
-        compilation_config = get_current_vllm_config().compilation_config
+        vllm_config = get_current_vllm_config()
+        compilation_config = vllm_config.compilation_config
+        logger.info(f"adding layer to static forward context{prefix}")
+        logger.info(f"Current vllm compilation config: {compilation_config}")
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        logger.info(f"after compliation config: {compilation_config}")
+        logger.info(f"after compliation config static_forward_context: {compilation_config.static_forward_context}")
+        try:
+            logger.info(f"after vllm config: {vllm_config}")
+        except Exception as e:
+            logger.info(f"error: {e}")
         self.layer_name = prefix
         self.attn_type = attn_type
         # use a placeholder kv cache tensor during init, which will be replaced

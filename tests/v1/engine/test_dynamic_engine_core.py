@@ -14,6 +14,7 @@ from vllm.platforms import current_platform
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.core.sched.dynamic_scheduler import DynamicScheduler
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.executor.dynamic_ray_distributed_executor import DynamicRayDistributedExecutor
 from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
 from vllm.v1.worker.dynamic_gpu_worker import DynamicGPUWorker
@@ -27,7 +28,7 @@ if not current_platform.is_cuda():
     pytest.skip(reason="V1 currently only supported on CUDA.",
                 allow_module_level=True)
 
-MODEL_NAME = "/root/.cache/huggingface/Qwen3-32B-AWQ"
+MODEL_NAME = "/root/.cache/huggingface/Qwen/Qwen3-32B-AWQ"
 TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
 PROMPT = "Hello my name is Robert and I love quantization kernels ha"
 PROMPT_TOKENS = TOKENIZER(PROMPT).input_ids
@@ -265,10 +266,11 @@ def test_engine_core_migration(monkeypatch: pytest.MonkeyPatch):
         m.setenv("VLLM_USE_V1", "1")
         m.setenv("VLLM_PP_LAYER_PARTITION", "48,16")
         m.setenv("VLLM_PIPELINE_MEMORY_LIMIT", "24GB,24GB")
+        m.setenv("RAY_DEDUP_LOGS", "0")
         engine_args = EngineArgs(
             model=MODEL_NAME,
             pipeline_parallel_size=2,
-            gpu_memory_utilization=0.9,
+            gpu_memory_utilization=0.85,
             max_model_len=5000,
             max_num_batched_tokens=10,
             max_num_seqs=2,
@@ -281,17 +283,18 @@ def test_engine_core_migration(monkeypatch: pytest.MonkeyPatch):
             )
         vllm_config = engine_args.create_engine_config()
         executor_class = DynamicRayDistributedExecutor
+        print("initilize engine core")
         engine_core = EngineCore(vllm_config=vllm_config,
                                  executor_class=executor_class,
                                  log_stats=False)
         assert engine_core.batch_queue is not None
-
         # Add two requests in a row. Each request have 12 prompt tokens.
+        print("add requests")
         req0 = make_request_with_max_tokens(0, 5)
         engine_core.add_request(req0)
         req1 = make_request_with_max_tokens(1, 5)
         engine_core.add_request(req1)
-
+        print("step with batch queue")
         # Schedule Batch 1: (10, req0)
         assert engine_core.step_with_batch_queue() is None
         assert engine_core.batch_queue.qsize() == 1
@@ -300,8 +303,7 @@ def test_engine_core_migration(monkeypatch: pytest.MonkeyPatch):
         # num_computed_tokens should have been updated immediately.
         assert engine_core.scheduler.requests[
             req0.request_id].num_computed_tokens == 10
-
-        engine_core.migrate_layers(0, 1, 1)
+        future = engine_core.migrate_layers(0, 1, 1)
         # Schedule Batch 2: (2, req0), (8, req1)
         assert engine_core.step_with_batch_queue() is None
         assert engine_core.batch_queue.qsize() == 2

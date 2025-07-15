@@ -115,13 +115,9 @@ docopt==0.6.2
 einops==0.8.0
     # via
     #   -r requirements/test.in
-    #   encodec
-    #   vocos
 einx==0.3.0
 email-validator==2.2.0
     # via pydantic
-encodec==0.1.1
-    # via vocos
 eval-type-backport==0.2.2
     # via mteb
 evaluate==0.4.3
@@ -184,10 +180,8 @@ huggingface-hub==0.30.1
     #   evaluate
     #   peft
     #   sentence-transformers
-    #   timm
     #   tokenizers
     #   transformers
-    #   vocos
 humanize==4.11.0
     # via runai-model-streamer
 hypothesis==6.131.0
@@ -318,7 +312,6 @@ numpy==1.26.4
     #   cupy-cuda12x
     #   datasets
     #   einx
-    #   encodec
     #   evaluate
     #   fastparquet
     #   genai-perf
@@ -342,7 +335,6 @@ numpy==1.26.4
     #   tensorizer
     #   transformers
     #   tritonclient
-    #   vocos
 nvidia-cublas-cu12==12.6.4.1
     # via
     #   nvidia-cudnn-cu12
@@ -520,9 +512,7 @@ pyyaml==6.0.2
     #   ray
     #   responses
     #   schemathesis
-    #   timm
     #   transformers
-    #   vocos
 rapidfuzz==3.12.1
     # via jiwer
 ray==2.43.0
@@ -584,7 +574,6 @@ safetensors==0.4.5
     # via
     #   accelerate
     #   peft
-    #   timm
     #   transformers
 schemathesis==3.39.15
     # via -r requirements/test.in
@@ -601,7 +590,6 @@ scipy==1.13.1
     #   scikit-learn
     #   sentence-transformers
     #   statsmodels
-    #   vocos
 sentence-transformers==3.2.1
     # via
     #   -r requirements/test.in
@@ -663,7 +651,6 @@ tiktoken==0.7.0
     # via
     #   lm-eval
     #   mistral-common
-timm==1.0.11
     # via -r requirements/test.in
 tokenizers==0.21.1
     # via
@@ -677,7 +664,6 @@ tomli-w==1.2.0
     #   -r requirements/test.in
     #   accelerate
     #   bitsandbytes
-    #   encodec
     #   fastsafetensors
     #   lm-eval
     #   mteb
@@ -685,15 +671,10 @@ tomli-w==1.2.0
     #   runai-model-streamer
     #   sentence-transformers
     #   tensorizer
-    #   timm
-    #   vocos
     # via
     #   -r requirements/test.in
-    #   encodec
-    #   vocos
     # via
     #   -r requirements/test.in
-    #   timm
 tqdm==4.66.6
     # via
     #   datasets
@@ -755,7 +736,6 @@ urllib3==2.2.3
     #   responses
     #   tritonclient
     # via -r requirements/test.in
-vocos==0.1.0
     # via -r requirements/test.in
 webcolors==24.11.1
     # via jsonschema

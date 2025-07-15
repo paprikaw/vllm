@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_COMPILED_DAG: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
+    RAY_DEDUP_LOGS: int = 0
     VLLM_WORKER_MULTIPROC_METHOD: str = "fork"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
     VLLM_IMAGE_FETCH_TIMEOUT: int = 5
@@ -437,6 +438,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run vLLM with VLLM_USE_RAY_SPMD_WORKER=1 to enable it.
     "VLLM_USE_RAY_SPMD_WORKER":
     lambda: bool(int(os.getenv("VLLM_USE_RAY_SPMD_WORKER", "0"))),
+
+    "RAY_DEDUP_LOGS":
+    lambda: bool(int(os.getenv("RAY_DEDUP_LOGS", "0"))),
 
     # If the env var is set, it uses the Ray's Compiled Graph
     # (previously known as ADAG) API which optimizes the

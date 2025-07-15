@@ -737,7 +737,6 @@ def unify_kv_cache_configs(kv_cache_configs: list[KVCacheConfig]):
                 kv_cache_config.kv_cache_groups):
             assert group_rank_0.kv_cache_spec == group_rank_i.kv_cache_spec
 
-    logger.info(f"Before Unify: kv_cache_configs: {kv_cache_configs}")
 
     # Change the num_blocks of each rank to the smallest among all ranks. We
     # do not need to shrink the tensor size because it is valid to only use the
@@ -755,5 +754,4 @@ def unify_kv_cache_configs(kv_cache_configs: list[KVCacheConfig]):
             for layer_name in kv_cache_config.tensors
         }
 
-    logger.info(f"After Unify: kv_cache_configs: {kv_cache_configs}")
     return kv_cache_configs

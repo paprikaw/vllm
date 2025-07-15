@@ -47,6 +47,7 @@ from .interfaces import SupportsLoRA, SupportsPP
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
 from .utils import AutoWeightsLoader, PPMissingLayer, maybe_prefix
+import time
 
 logger = init_logger(__name__)
 
@@ -156,6 +157,7 @@ class Qwen3DecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        logger.info(f"making, Qwen3DecoderLayer: {prefix}")
         self.hidden_size = config.hidden_size
         # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 1000000)
@@ -169,7 +171,6 @@ class Qwen3DecoderLayer(nn.Module):
             attn_type = AttentionType.DECODER
         else:
             attn_type = AttentionType.ENCODER_ONLY
-
         self.self_attn = Qwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,

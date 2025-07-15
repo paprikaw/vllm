@@ -6,6 +6,7 @@ from collections import defaultdict
 from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
 from vllm.executor.ray_distributed_executor import RayWorkerMetaData
 from vllm.v1.executor.dynamic_utils import DynamicRayWorkerWrapper
+from vllm.v1.core.sched.dynamic_scheduler import DynamicSchedulerOutput
 import vllm.envs as envs
 from vllm.executor.ray_utils import (RayWorkerWrapper, 
                                      ray)
@@ -27,8 +28,9 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
     def initialize_kv_cache_for_layers(self, rank: int, 
                                         kv_cache_specs: dict[str, KVCacheSpec], 
                                         kv_cache_size: int, 
-                                        kv_cache_num_blocks: int) -> None:
-        self.collective_rpc("initialize_kv_cache_for_layers", args=(rank, kv_cache_specs, kv_cache_size, kv_cache_num_blocks))
+                                        kv_cache_num_blocks: int,
+                                        layers: Tuple[int, int]) -> None:
+        self.collective_rpc("initialize_kv_cache_for_layers", args=(rank, kv_cache_specs, kv_cache_size, kv_cache_num_blocks, layers))
 
     def get_kv_cache_spec_for_layers(self, rank: int, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
         output = self.collective_rpc("get_kv_cache_spec_for_layers", args=(rank, layer_range))
@@ -36,6 +38,32 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
     def add_layers(self, rank: int, layers: Tuple[int, int]):
         self.collective_rpc("add_layers", args=(rank, layers))
+
+    # def execute_model(
+    #     self,
+    #     scheduler_output: DynamicSchedulerOutput,
+    # ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
+    #     """Execute the model on the Ray workers.
+
+    #     Args:
+    #         scheduler_output: The scheduler output to execute.
+
+    #     Returns:
+    #         The model runner output.
+    #     """
+    #     # Build the compiled DAG for the first time.
+    #     if self.forward_dag is None:  # type: ignore
+    #         self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
+
+    #     refs = self.forward_dag.execute(scheduler_output)  # type: ignore
+
+    #     # When PP is not used, we block here until the result is available.
+    #     if self.max_concurrent_batches == 1:
+    #         return refs[0].get()
+
+    #     # When PP is used, we return a FutureWrapper immediately so that
+    #     # the scheduler can yield to the next batch.
+    #     return FutureWrapper(refs[0])
 
     def _init_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
@@ -129,13 +157,11 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                     # If the worker is on the same node as the driver, we use it
                     # as the resource holder for the driver process.
                     self.driver_dummy_worker = worker
-                    self.driver_worker = RayWorkerWrapper(
+                    self.driver_worker = DynamicRayWorkerWrapper(
                         vllm_config=self.vllm_config, rpc_rank=0)
                     worker_metadata.pop(i)
                     break
 
-        logger.debug("workers: %s", worker_metadata)
-        logger.debug("driver_dummy_worker: %s", self.driver_dummy_worker)
         if not self.use_ray_spmd_worker and self.driver_dummy_worker is None:
             raise ValueError(
                 "Ray does not allocate any GPUs on the driver node."
@@ -298,11 +324,11 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         # This is the list of workers that are rank 0 of each TP group EXCEPT
         # global rank 0. These are the workers that will broadcast to the
         # rest of the workers.
-        self.tp_driver_workers: List[RayWorkerWrapper] = []
+        self.tp_driver_workers: List[DynamicRayWorkerWrapper] = []
         # This is the list of workers that are not drivers and not the first
         # worker in a TP group. These are the workers that will be
         # broadcasted to.
-        self.non_driver_workers: List[RayWorkerWrapper] = []
+        self.non_driver_workers: List[DynamicRayWorkerWrapper] = []
 
         # Enforce rank order for correct rank to return final output.
         for index, worker in enumerate(self.workers):

@@ -7,8 +7,7 @@ from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.executor.ray_utils import RayWorkerWrapper
 from vllm.v1.worker.dynamic_gpu_worker import DynamicGPUWorker
-from vllm.v1.core.sched.output import SchedulerOutput
-from dataclasses import asdict
+from vllm.v1.core.sched.dynamic_scheduler import create_from_dynamic_scheduler_output
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
@@ -51,16 +50,19 @@ try:
             else:
                 scheduler_output, intermediate_tensors = scheduler_output, None
 
-            output = self.worker.model_runner.execute_model(
-                SchedulerOutput(**asdict(scheduler_output)), 
+            try:
+                output = self.worker.model_runner.execute_model(
+                create_from_dynamic_scheduler_output(scheduler_output), 
                 scheduler_output.pp_layer_config[self.rpc_rank], 
                 intermediate_tensors)
+            except Exception as e:
+                logger.exception("Exception occurred during execute_model")
+                raise e
             if isinstance(output, IntermediateTensors):
                 output = scheduler_output, output
+            logger.info(f"finished the results:{output}")
             return output
 
-        def override_env_vars(self, vars: Dict[str, str]):
-            os.environ.update(vars)
 except ImportError as e:
     ray = None  # type: ignore
     ray_import_err = e

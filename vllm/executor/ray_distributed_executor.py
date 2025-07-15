@@ -601,8 +601,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
                 # and the TP group executes in SPMD fashion.
                 if self.use_v1:
                     outputs = [
-                        worker.execute_model_ray.
-                        bind(  # type: ignore[attr-defined]
+                        worker.execute_model_ray.bind(  # type: ignore[attr-defined]
                             outputs[i]) for i, worker in enumerate(tp_group)
                     ]
                 else:
@@ -623,8 +622,8 @@ class RayDistributedExecutor(DistributedExecutorBase):
                         output.with_tensor_transport(transport=transport)
                         for output in outputs
                     ]
-
             forward_dag = MultiOutputNode(outputs)
+            logger.info(f"Building DAG with {len(outputs)} outputs: {outputs}")
 
         return forward_dag.experimental_compile(
             enable_asyncio=enable_asyncio,

@@ -171,7 +171,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     raise ValueError("Unknown speculative decoding method: "
                                      f"{self.speculative_config.method}")
                 self.rejection_sampler = RejectionSampler()
-
+        logger.info(f"intilialized vllm config forward context: {self.vllm_config.compilation_config.static_forward_context}")
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
 
@@ -2042,7 +2042,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches)
-
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 

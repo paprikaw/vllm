@@ -28,7 +28,8 @@ from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
 from vllm.model_executor.model_loader.dynamic_qwen3_loader import CustomModelLoader
-
+from collections import defaultdict
+from vllm.config import set_current_vllm_config
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -44,7 +45,6 @@ logger = init_logger(__name__)
 class DynamicGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
     # def load_model(self)->float:
     #     super().load_model()
     #     return self.model_memory_usage
@@ -53,9 +53,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
             kv_cache_specs: dict[str, KVCacheSpec],
             kv_cache_size: int,
             kv_cache_num_blocks: int,
+            layers: Tuple[int, int],
             ) -> None:
+        logger.info(f"before initialize_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
         assert len(self.attn_backends) == 1, "Only one attention backend is supported for now"
         kv_caches: dict[str, torch.Tensor] = {} 
+        logger.info(f"kv_cache_specs: {kv_cache_specs}")
         for layer_name, kv_cache_spec in kv_cache_specs.items():
                 assert kv_cache_size % kv_cache_spec.page_size_bytes == 0
                 num_blocks = kv_cache_size // kv_cache_spec.page_size_bytes
@@ -65,6 +68,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
                         num_blocks, kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                     dtype = kv_cache_spec.dtype
+                    logger.info(f"layer_name: {layer_name}, kv_cache_shape: {kv_cache_shape}, dtype: {dtype}")
                     kv_caches[layer_name] = torch.zeros(kv_cache_shape,
                                                         dtype=dtype,
                                                         device=self.device)
@@ -76,13 +80,17 @@ class DynamicGPUModelRunner(GPUModelRunner):
         if self.speculative_config and self.speculative_config.use_eagle():
             raise NotImplementedError("Eagle is not supported for dynamic weights")
 
-        bind_kv_cache(
+        bind_kv_cache_for_layers(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches)
+            self.kv_caches,
+            layers)
 
         if has_kv_transfer_group():
             raise NotImplementedError("KV transfer group is not supported for dynamic weights")
+
+        logger.info(f"after initialize_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+        return
 
     @torch.inference_mode()
     def execute_model(
@@ -91,8 +99,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
         layer_config: Tuple[int, int],
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
-        logger.info(f"model class: {self.model.__class__.__name__}")
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        logger.info("start to execute model in gpu model runner")
+        if not isinstance(self.model, DynamicQwen3ForCausalLM):
+            raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
         self.model.set_sched_layers(layer_config[0], layer_config[1])
         return super().execute_model(scheduler_output, intermediate_tensors)
     
@@ -106,7 +115,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         use_mla = self.vllm_config.model_config.use_mla
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         for layer_name, attn_module in layers.items():
-            if extract_layer_index(layer_name) not in range(layer_range[0], layer_range[1]):
+            if extract_layer_index(layer_name) not in range(layer_range[0], layer_range[1]+1):
                 continue
             # TODO: Support other attention modules, e.g., cross-attention
             if attn_module.attn_type == AttentionType.DECODER:
@@ -134,11 +143,45 @@ class DynamicGPUModelRunner(GPUModelRunner):
             else:
                 raise ValueError(
                     f"Unknown attention type: {attn_module.attn_type}")
-
         return kv_cache_spec
     def add_layers(self, layers: Tuple[int, int]) -> None:
-        logger.info(f"model class: {self.model.__class__.__name__}")
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        if not isinstance(self.model, DynamicQwen3ForCausalLM):
+            raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
         model: DynamicQwen3ForCausalLM = self.model
         loader = CustomModelLoader(self.vllm_config.load_config)
-        loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model)
+        with set_current_vllm_config(self.vllm_config):
+            loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model)
+
+def bind_kv_cache_for_layers(
+    kv_caches: dict[str, torch.Tensor],
+    forward_context: dict[str, "Attention"],
+    runner_kv_caches: list[torch.Tensor],
+    layers: Tuple[int, int],
+) -> None:
+    """
+    Bind the allocated KV cache of layers to ModelRunner and forward context.
+    """
+    # Bind kv_caches to ModelRunner
+    assert len(runner_kv_caches) != 0
+
+    # Convert kv_caches dict to a list of tensors in the order of layer_index.
+    index2name = defaultdict(list)
+    for layer_name in kv_caches:
+        layer_index = extract_layer_index(layer_name)
+        assert layer_index in range(layers[0], layers[1]+1), f"layer_index: {layer_index} not in range({layers[0]}, {layers[1]+1})"
+        index2name[layer_index].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        if len(layer_names) > 1:
+            # One typical case is encoder-decoder model, e.g., bart.
+            # The cross attention and self attention in the same decoder layer
+            # has different layer_name but the same layer_index.
+            raise NotImplementedError
+        layer_name = layer_names[0]
+        runner_kv_caches.insert(layer_index, kv_caches[layer_name])
+
+    # Bind kv_caches to forward context
+    for layer_name, kv_cache in kv_caches.items():
+        # NOTE: Use list because of v0 PP virtual engine.
+        forward_context[layer_name].kv_cache = [kv_cache]
