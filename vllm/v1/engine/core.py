@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+from pyexpat import model
 import queue
 import signal
 import sys
@@ -9,7 +10,7 @@ from collections import deque
 from concurrent.futures import Future
 from inspect import isclass, signature
 from logging import DEBUG
-from typing import Any, Callable, Optional, TypeVar, Union, Tuple, List
+from typing import Any, Callable, Optional, TypeVar, Union
 
 import msgspec
 import zmq
@@ -32,16 +33,12 @@ from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType, UtilityOutput)
 from vllm.v1.engine.mm_input_cache import MirroredProcessingCache
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.executor.dynamic_ray_distributed_executor import DynamicRayDistributedExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.core.sched.dynamic_scheduler import DynamicScheduler
-from vllm.v1.core.sched.dynamic_scheduler import MigrationStatus
 from vllm.version import __version__ as VLLM_VERSION
-from .utils import get_new_layer_config_with_migration_action
 
 logger = init_logger(__name__)
 
@@ -83,12 +80,6 @@ class EngineCore:
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
-
-
-        # We assume that we only care about gpu blocks at the moment.
-        assert num_cpu_blocks == 0 
-        # TODO: Maybe make the status of kv blocks and block size to a class
-        # or managed by some class
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
@@ -138,14 +129,13 @@ class EngineCore:
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
-        assert(isinstance(self.model_executor, DynamicRayDistributedExecutor))
+
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
-        # print(f"kv_cache_specs: {kv_cache_specs}")
         # Profiles the peak memory usage of the model to determine how much
         # memory can be allocated for kv cache.
         available_gpu_memory = self.model_executor.determine_available_memory()
-        # print(f"available_gpu_memory: {available_gpu_memory}")
+
         assert len(kv_cache_specs) == len(available_gpu_memory)
         # Get the kv cache tensor size
         kv_cache_configs = [
@@ -166,21 +156,9 @@ class EngineCore:
             cfg.num_blocks == kv_cache_configs[0].num_blocks
             for cfg in kv_cache_configs
         ])
-
-        # All layers have the same kv cache size
-        # We assume this so we manage all kv cache tensor all together 
-        for cfg in kv_cache_configs:
-            sizes = [tensor.size for tensor in cfg.tensors.values()]
-            assert all(s == sizes[0] for s in sizes), "Inconsistent KV sizes within config"
-
         num_gpu_blocks = kv_cache_configs[0].num_blocks
         num_cpu_blocks = 0
         scheduler_kv_cache_config = kv_cache_configs[0]
-
-        # Here we initialize the unified kv cache size and num blocks
-        # We maintain these variables to dynamically manage the kv cache
-        self.kv_cache_size = next(iter(kv_cache_configs[0].tensors.values())).size
-        self.kv_cache_num_blocks = num_gpu_blocks
 
         # Initialize kv cache and warmup the execution
         self.model_executor.initialize_from_config(kv_cache_configs)
@@ -189,45 +167,6 @@ class EngineCore:
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
-
-    def migrate_layers(self, rank_from: int, rank_to: int, num_layers: int) -> Future:
-        logger.info(f"migrating layers from {rank_from} to {rank_to} with {num_layers} layers")
-        start = time.time()
-        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
-        assert isinstance(self.scheduler, DynamicScheduler)
-        assert self.scheduler.migration_status == MigrationStatus.NOT_MIGRATING
-        # Check if the memory is enough for the new layers
-
-        available_gpu_memory = self.model_executor.determine_available_memory()[rank_to]
-        logger.info(f"available_gpu_memory: {available_gpu_memory}")
-        logger.info(f"self.kv_cache_size: {self.kv_cache_size}")
-        logger.info(f"self.kv_cache_num_blocks: {self.kv_cache_num_blocks}")
-        logger.info(f"num_layers: {num_layers}")
-        assert available_gpu_memory > self.kv_cache_size * num_layers
-
-        # Get the new layer configuration 
-        layers, next_layer_config = get_new_layer_config_with_migration_action(rank_from, 
-                                                                       rank_to, 
-                                                                       num_layers, 
-                                                                       self.scheduler.pp_layer_config_status.get_cur_pp_layer_config())
-        logger.info(f"current layer config: {self.scheduler.pp_layer_config_status.get_cur_pp_layer_config()}") 
-        logger.info(f"layers: {layers}")
-        logger.info(f"next_layer_config: {next_layer_config}")
-        self.model_executor.add_layers(rank_to, layers)
-        # Get the kv cache spec for the new layers
-        kv_cache_spec = self.model_executor.get_kv_cache_spec_for_layers(rank_to, layers)
-        self.model_executor.initialize_kv_cache_for_layers(rank_to, 
-            kv_cache_spec, 
-            self.kv_cache_size, 
-            self.kv_cache_num_blocks, 
-            layers)
-
-        # Start migration process in the scheduler
-        future = self.scheduler.start_migration(next_layer_config)
-        # 删除不需要的layers
-        end = time.time()
-        logger.info(f"Added layers to {rank_to} took {end - start} seconds")
-        return future
 
     def add_request(self, request: EngineCoreRequest):
         """Add request to the scheduler."""
@@ -305,8 +244,6 @@ class EngineCore:
         3. Update the scheduler from the output.
         """
         assert self.batch_queue is not None
-        print("model executing")
-
         engine_core_outputs = None
         scheduler_output = None
         # Try to schedule a new batch if the batch queue is not full, but
@@ -321,7 +258,7 @@ class EngineCore:
 
         scheduled_batch = (scheduler_output is not None
                            and scheduler_output.total_num_scheduled_tokens > 0)
-        time.sleep(5)
+
         # If no more requests can be scheduled and the job queue is not empty,
         # block until the first batch in the job queue is finished.
         # TODO(comaniac): Ideally we should peek the first batch in the
@@ -329,15 +266,9 @@ class EngineCore:
         # but peeking the first element in a queue is not thread-safe,
         # so we need more work.
         if not scheduled_batch and not self.batch_queue.empty():
-            print("batch_queue get_nowait")
             future, scheduler_output = self.batch_queue.get_nowait()
             # Blocking until the first result is available.
-            time.sleep(5)
-
-
-            print("get result of model_output")
             model_output = future.result()
-            time.sleep(5)
             self.batch_queue.task_done()
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output)
@@ -576,7 +507,6 @@ class EngineCoreProc(EngineCore):
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
-
 
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""

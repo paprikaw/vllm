@@ -1,5 +1,6 @@
 
 from dataclasses import dataclass
+from operator import is_
 from typing import TYPE_CHECKING, Optional, Tuple
 from .output import NewRequestData, CachedRequestData
 import numpy as np
@@ -61,6 +62,9 @@ class DynamicSchedulerOutput():
     #   This is useful for the case where we want to perform pipeline parallelism
     #   with different configurations.
     pp_layer_config: list[Tuple[int, int]]
+    
+    # Whether the scheduling output is from before the migration was started.  
+    request_queue_id: int
 
     # the bitmask for the whole batch
     grammar_bitmask: Optional[npt.NDArray[np.int32]]

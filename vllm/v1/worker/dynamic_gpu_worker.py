@@ -87,7 +87,6 @@ class DynamicGPUWorker(Worker):
             scheduler_output.pp_layer_config[self.rank],
             intermediate_tensors)
 
-        time.sleep(5)
         parallel_config = self.vllm_config.parallel_config
         if parallel_config.distributed_executor_backend != "external_launcher" \
             and not get_pp_group().is_last_rank:
@@ -98,6 +97,13 @@ class DynamicGPUWorker(Worker):
         assert isinstance(output, ModelRunnerOutput)
         return output if self.is_driver_worker else None
 
+
+    @torch.inference_mode()
+    def get_current_available_memory(self) -> int:
+        """Get the current available memory in bytes.
+        """
+        free_gpu_memory, _ = torch.cuda.mem_get_info()
+        return int(free_gpu_memory)
 
     def add_layers(self, rank: int, layers: Tuple[int, int]) -> None:
         if self.rank != rank:

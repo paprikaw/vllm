@@ -151,17 +151,13 @@ class Attention(nn.Module):
         self.use_output = attn_backend.accept_output_buffer
         vllm_config = get_current_vllm_config()
         compilation_config = vllm_config.compilation_config
-        logger.info(f"adding layer to static forward context{prefix}")
-        logger.info(f"Current vllm compilation config: {compilation_config}")
+        # logger.info(f"adding layer to static forward context{prefix}")
+        # logger.info(f"Current vllm compilation config: {compilation_config}")
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-        logger.info(f"after compliation config: {compilation_config}")
-        logger.info(f"after compliation config static_forward_context: {compilation_config.static_forward_context}")
-        try:
-            logger.info(f"after vllm config: {vllm_config}")
-        except Exception as e:
-            logger.info(f"error: {e}")
+        # logger.info(f"after compliation config: {compilation_config}")
+        # logger.info(f"after compliation config static_forward_context: {compilation_config.static_forward_context}")
         self.layer_name = prefix
         self.attn_type = attn_type
         # use a placeholder kv cache tensor during init, which will be replaced

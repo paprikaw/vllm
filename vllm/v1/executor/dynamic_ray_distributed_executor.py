@@ -338,3 +338,6 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                 self.tp_driver_workers.append(worker)
             else:
                 self.non_driver_workers.append(worker)
+
+    def get_current_available_memory(self) -> List[int]:
+        return self.collective_rpc("get_current_available_memory")

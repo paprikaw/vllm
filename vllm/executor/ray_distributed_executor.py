@@ -623,7 +623,6 @@ class RayDistributedExecutor(DistributedExecutorBase):
                         for output in outputs
                     ]
             forward_dag = MultiOutputNode(outputs)
-            logger.info(f"Building DAG with {len(outputs)} outputs: {outputs}")
 
         return forward_dag.experimental_compile(
             enable_asyncio=enable_asyncio,

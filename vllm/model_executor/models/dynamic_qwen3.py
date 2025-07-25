@@ -145,7 +145,7 @@ class DynamicQwen3Model(Qwen3Model):
                          start_layer: int, 
                          end_layer: int) -> None:
         self.sched_start_layer = start_layer
-        self.sched_end_layer = end_layer
+        self.sched_end_layer = end_layer + 1
 
     def get_sched_layers(self) -> Tuple[int, int]:
         return self.sched_start_layer, self.sched_end_layer
@@ -170,7 +170,7 @@ class DynamicQwen3Model(Qwen3Model):
                 assert intermediate_tensors is not None
                 hidden_states = intermediate_tensors["hidden_states"]
                 residual = intermediate_tensors["residual"]
-            logger.info(f"Forwarding with layers:{self.start_layer} to {self.end_layer}")
+            logger.warning(f"Forwarding with layers:{self.sched_start_layer} to {self.sched_end_layer}")
             for layer in self.layers[self.sched_start_layer:self.sched_end_layer]:
                 hidden_states, residual = layer(
                     positions,

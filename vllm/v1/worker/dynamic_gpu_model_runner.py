@@ -30,6 +30,7 @@ from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
 from vllm.model_executor.model_loader.dynamic_qwen3_loader import CustomModelLoader
 from collections import defaultdict
 from vllm.config import set_current_vllm_config
+from threading import Lock
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -45,6 +46,7 @@ logger = init_logger(__name__)
 class DynamicGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.forward_lock = Lock()
     # def load_model(self)->float:
     #     super().load_model()
     #     return self.model_memory_usage
@@ -76,6 +78,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     # TODO: add new branches when introducing more types of
                     # KV cache specs.
                     raise ValueError("Unknown KV cache spec type.")
+                # Added the kv cache spec to kv cache config.
+                assert len(self.kv_cache_config.kv_cache_groups) == 1
+                self.kv_cache_config.kv_cache_groups[0].layer_names.append(layer_name)
 
         if self.speculative_config and self.speculative_config.use_eagle():
             raise NotImplementedError("Eagle is not supported for dynamic weights")
@@ -99,12 +104,21 @@ class DynamicGPUModelRunner(GPUModelRunner):
         layer_config: Tuple[int, int],
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
-        logger.info("start to execute model in gpu model runner")
-        if not isinstance(self.model, DynamicQwen3ForCausalLM):
-            raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
-        self.model.set_sched_layers(layer_config[0], layer_config[1])
+        with self.forward_lock:
+            # logger.info("start to execute model in gpu model runner")
+            if not isinstance(self.model, DynamicQwen3ForCausalLM):
+                raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+            self.model.set_sched_layers(layer_config[0], layer_config[1])
         return super().execute_model(scheduler_output, intermediate_tensors)
-    
+
+    def profile_run(self) -> None: 
+        """
+        Profile run can be run during the model is running,
+        Needed to acquire a lock
+        """
+        with self.forward_lock:
+            super().profile_run()
+
     def get_kv_cache_spec_for_layers(self, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
         """
         Get the KV cache spec for the given layers.

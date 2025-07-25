@@ -60,7 +60,7 @@ try:
                 raise e
             if isinstance(output, IntermediateTensors):
                 output = scheduler_output, output
-            logger.info(f"finished the results:{output}")
+            # logger.info(f"finished the results:{output}")
             return output
 
 except ImportError as e:
