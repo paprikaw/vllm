@@ -100,6 +100,12 @@ class DynamicEngineCore(EngineCore):
         # Initialize kv cache and warmup the execution
         self.model_executor.initialize_from_config(kv_cache_configs)
 
+        # This is different from the scheduler's migration status
+        # - Scheduler migration status is used to trace whether the old
+        #   requests before migration are finished
+        # - Engine migration status is used to trace whether the migration is done.
+        self.migration_status = MigrationStatus.NOT_MIGRATING
+
         elapsed = time.time() - start
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
@@ -111,8 +117,10 @@ class DynamicEngineCore(EngineCore):
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
         assert isinstance(self.scheduler, DynamicScheduler)
         assert self.scheduler.migration_status == MigrationStatus.NOT_MIGRATING
+        assert self.migration_status == MigrationStatus.NOT_MIGRATING
         # Check if the memory is enough for the new layers
 
+        self.migration_status = MigrationStatus.MIGRATING
         available_gpu_memory = self.model_executor.get_current_available_memory()[rank_to]
         logger.info(f"available_gpu_memory: {available_gpu_memory}")
         logger.info(f"self.kv_cache_size: {self.kv_cache_size}")
@@ -125,6 +133,8 @@ class DynamicEngineCore(EngineCore):
                                                                        rank_to, 
                                                                        num_layers, 
                                                                        self.scheduler.pp_layer_config_status.get_cur_pp_layer_config())
+        self.migrating_layers = layers
+        self.rank_from = rank_from
         self.model_executor.add_layers(rank_to, layers)
         # Get the kv cache spec for the new layers
         kv_cache_spec = self.model_executor.get_kv_cache_spec_for_layers(rank_to, layers)
@@ -136,52 +146,17 @@ class DynamicEngineCore(EngineCore):
 
         # Start migration process in the scheduler
         future = self.scheduler.start_migration(next_layer_config)
-        # 删除不需要的layers
         end = time.time()
         logger.info(f"Added layers to {rank_to} took {end - start} seconds")
         return future
-    # def step_with_batch_queue(self) -> Optional[EngineCoreOutputs]:
-    #     """Schedule and execute batches with the batch queue.
-    #     Note that if nothing to output in this step, None is returned.
-
-    #     The execution flow is as follows:
-    #     1. Try to schedule a new batch if the batch queue is not full.
-    #     If a new batch is scheduled, directly return an empty engine core
-    #     output. In other words, fulfilling the batch queue has a higher priority
-    #     than getting model outputs.
-    #     2. If there is no new scheduled batch, meaning that the batch queue
-    #     is full or no other requests can be scheduled, we block until the first
-    #     batch in the job queue is finished.
-    #     3. Update the scheduler from the output.
-    #     """
-    #     assert self.batch_queue is not None
-
-    #     engine_core_outputs = None
-    #     scheduler_output = None
-    #     # Try to schedule a new batch if the batch queue is not full, but
-    #     # the scheduler may return an empty batch if all requests are scheduled.
-    #     # Note that this is not blocking.
-    #     if not self.batch_queue.full():
-    #         scheduler_output = self.scheduler.schedule()
-    #         if scheduler_output.total_num_scheduled_tokens > 0:
-    #             future = self.model_executor.execute_model(scheduler_output)
-    #             self.batch_queue.put_nowait(
-    #                 (future, scheduler_output))  # type: ignore
-
-    #     scheduled_batch = (scheduler_output is not None
-    #                        and scheduler_output.total_num_scheduled_tokens > 0)
-    #     # If no more requests can be scheduled and the job queue is not empty,
-    #     # block until the first batch in the job queue is finished.
-    #     # TODO(comaniac): Ideally we should peek the first batch in the
-    #     # job queue to check if it's finished before scheduling a new batch,
-    #     # but peeking the first element in a queue is not thread-safe,
-    #     # so we need more work.
-    #     if not scheduled_batch and not self.batch_queue.empty():
-    #         future, scheduler_output = self.batch_queue.get_nowait()
-    #         # Blocking until the first result is available.
-    #         model_output = future.result()
-    #         self.batch_queue.task_done()
-    #         engine_core_outputs = self.scheduler.update_from_output(
-    #             scheduler_output, model_output)
-
-    #     return engine_core_outputs
+    
+    def done_migration(self):
+        assert self.migration_status == MigrationStatus.MIGRATING
+        assert self.migrating_layers is not None
+        assert self.rank_from is not None
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        self.model_executor.remove_layers(self.rank_from, self.migrating_layers)
+        self.model_executor.release_kv_cache_for_layers(self.rank_from, self.migrating_layers)
+        self.migration_status = MigrationStatus.NOT_MIGRATING
+        self.layers_to_be_removed = None
+        self.rank_from = None

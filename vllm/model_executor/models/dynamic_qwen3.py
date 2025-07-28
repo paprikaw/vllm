@@ -79,6 +79,9 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
     def get_sched_layers(self) -> Tuple[int, int]:
         return self.model.get_sched_layers()
 
+    def delete_layers(self, layers: Tuple[int, int]):
+        self.model.delete_layers(layers)
+
     def forward(self, 
                 input_ids: torch.Tensor, 
                 positions: torch.Tensor, 
@@ -141,6 +144,34 @@ class DynamicQwen3Model(Qwen3Model):
         gc.collect()
         torch.cuda.empty_cache()
 
+    def delete_layers(self, layers: Tuple[int, int]):
+        """Delete the layer module and its parameters at the given index."""
+        with self.model_lock:
+            for layer_idx in range(layers[0], layers[1]+1):
+                if not (0 <= layer_idx < len(self.layers)):
+                    raise IndexError(f"Layer index {layer_idx} out of range.")
+                # # 1. 删除子模块引用
+                layer = self.layers[layer_idx]
+                assert layer is not None, "Layer is None"
+                assert layer is not PPMissingLayer, "Layer is PPMissingLayer"
+                # for name, _ in list(layer.named_parameters(recurse=True)):
+                #     # 删除每个参数
+                #     delattr(layer, name.split(".")[-1])
+                # for name, _ in list(layer.named_children()):
+                #     delattr(layer, name)
+                self.layers[layer_idx] = PPMissingLayer()  # 占位符
+                logger.info(f"Layer {layer_idx} deleted successfully.")
+                del layer
+                # 2. 显式从 _modules 中删除（可选但更保险）
+                # 由于 nn.ModuleList 自动注册子模块，这一步确保彻底清除
+                # prefix = f"layers.{layer_idx}"
+                # keys_to_delete = (k for k in self._modules if k.startswith(prefix))
+                # for key in keys_to_delete:
+                #     self._modules.pop(key)
+            # 3. 强制垃圾回收（释放 CPU/GPU 内存）
+            gc.collect()
+            torch.cuda.empty_cache()
+        return
     def set_sched_layers(self, 
                          start_layer: int, 
                          end_layer: int) -> None:

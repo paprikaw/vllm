@@ -57,6 +57,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             kv_cache_num_blocks: int,
             layers: Tuple[int, int],
             ) -> None:
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
         logger.info(f"before initialize_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
         assert len(self.attn_backends) == 1, "Only one attention backend is supported for now"
         kv_caches: dict[str, torch.Tensor] = {} 
@@ -84,8 +85,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
         if self.speculative_config and self.speculative_config.use_eagle():
             raise NotImplementedError("Eagle is not supported for dynamic weights")
-
+        start_layer = self.model.model.start_layer
         bind_kv_cache_for_layers(
+            start_layer,
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches,
@@ -166,7 +168,41 @@ class DynamicGPUModelRunner(GPUModelRunner):
         with set_current_vllm_config(self.vllm_config):
             loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model)
 
+    def remove_layers(self, layers: Tuple[int, int]) -> None:
+        if not isinstance(self.model, DynamicQwen3ForCausalLM):
+            raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+        logger.info(f"before delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+        self.model.delete_layers(layers)
+        # Delete the layer from forward context
+        self.vllm_config.compilation_config.static_forward_context = {
+            layer_name: attn_module for layer_name, attn_module in self.vllm_config.compilation_config.static_forward_context.items()
+            if extract_layer_index(layer_name) not in range(layers[0], layers[1]+1)
+        }
+        logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+    
+    def release_kv_cache_for_layers(self, layers: Tuple[int, int]) -> None:
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        logger.info(f"before release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+        start_layer = self.model.model.start_layer
+        # Delete the kv cache from kv_cache list
+        self.kv_caches = [
+            kv_cache for idx, kv_cache in enumerate(self.kv_caches) 
+            if idx not in range(layers[0]+start_layer, layers[1]+start_layer+1)
+        ]
+
+        # Delete layer name from kv_cache_config
+        group = self.kv_cache_config.kv_cache_groups[0]
+        group.layer_names = [
+            name for name in group.layer_names
+            if extract_layer_index(name) not in range(layers[0], layers[1] + 1)
+        ]
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+
 def bind_kv_cache_for_layers(
+    start_layer_index: int,
     kv_caches: dict[str, torch.Tensor],
     forward_context: dict[str, "Attention"],
     runner_kv_caches: list[torch.Tensor],
@@ -193,7 +229,7 @@ def bind_kv_cache_for_layers(
             # has different layer_name but the same layer_index.
             raise NotImplementedError
         layer_name = layer_names[0]
-        runner_kv_caches.insert(layer_index, kv_caches[layer_name])
+        runner_kv_caches.insert(layer_index - start_layer_index, kv_caches[layer_name])
 
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():

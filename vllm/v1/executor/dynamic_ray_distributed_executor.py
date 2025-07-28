@@ -39,6 +39,12 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
     def add_layers(self, rank: int, layers: Tuple[int, int]):
         self.collective_rpc("add_layers", args=(rank, layers))
 
+    def remove_layers(self, rank: int, layers: Tuple[int, int]):
+        self.collective_rpc("remove_layers", args=(rank, layers))
+
+    def release_kv_cache_for_layers(self, rank: int, layers: Tuple[int, int]):
+        self.collective_rpc("release_kv_cache_for_layers", args=(rank, layers))
+
     # def execute_model(
     #     self,
     #     scheduler_output: DynamicSchedulerOutput,

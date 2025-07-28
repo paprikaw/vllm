@@ -251,6 +251,7 @@ def test_engine_core_migration(monkeypatch: pytest.MonkeyPatch):
         assert output is not None
         print(f"output: {output}")
 
+        engine_core.done_migration()
         step = 0
     
         print(f"###########loop until request 1 and 2 is finished")
