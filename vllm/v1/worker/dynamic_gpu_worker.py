@@ -123,8 +123,10 @@ class DynamicGPUWorker(Worker):
         if self.rank != rank:
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip releasing kv cache for layers")
             return None
-        logger.info(f"Release kv cache for layers: {layers}")
         self.model_runner.release_kv_cache_for_layers(layers)
+
+    def release_kv_cache(self) -> None:
+        self.model_runner.release_kv_cache()
 
     def get_kv_cache_spec_for_layers(self, rank: int, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
         if self.rank != rank:

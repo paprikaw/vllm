@@ -5,7 +5,7 @@ import gc
 import time
 import weakref
 from typing import TYPE_CHECKING, Optional, Union, Tuple
-
+import sys
 import numpy as np
 import torch
 import torch.distributed
@@ -31,6 +31,7 @@ from vllm.model_executor.model_loader.dynamic_qwen3_loader import CustomModelLoa
 from collections import defaultdict
 from vllm.config import set_current_vllm_config
 from threading import Lock
+import traceback
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -82,7 +83,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 # Added the kv cache spec to kv cache config.
                 assert len(self.kv_cache_config.kv_cache_groups) == 1
                 self.kv_cache_config.kv_cache_groups[0].layer_names.append(layer_name)
-
         if self.speculative_config and self.speculative_config.use_eagle():
             raise NotImplementedError("Eagle is not supported for dynamic weights")
         start_layer = self.model.model.start_layer
@@ -163,6 +163,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def add_layers(self, layers: Tuple[int, int]) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
             raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+        available_memory = torch.cuda.mem_get_info()[0]
+        assert available_memory > len(layers) * self.model.get_layer_weight_size(), f"Available memory: {available_memory} is not enough for {len(layers)} layers"
+
         model: DynamicQwen3ForCausalLM = self.model
         loader = CustomModelLoader(self.vllm_config.load_config)
         with set_current_vllm_config(self.vllm_config):
@@ -201,6 +204,23 @@ class DynamicGPUModelRunner(GPUModelRunner):
         torch.cuda.empty_cache()
         logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
+    def release_kv_cache(self) -> None:
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        logger.info(f"before release_kv_cache: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+
+        # 清除引用
+        self.kv_caches = []
+        self.kv_cache_config.kv_cache_groups[0].layer_names = []
+        forward_context = self.vllm_config.compilation_config.static_forward_context 
+        for _, attn_module in forward_context.items():
+            attn_module.kv_cache = [torch.tensor([]) for _ in range(self.vllm_config.parallel_config.pipeline_parallel_size)]
+        # 强制回收 + 清空缓存
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        logger.info(f"after release_kv_cache: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+
 def bind_kv_cache_for_layers(
     start_layer_index: int,
     kv_caches: dict[str, torch.Tensor],
@@ -235,3 +255,32 @@ def bind_kv_cache_for_layers(
     for layer_name, kv_cache in kv_caches.items():
         # NOTE: Use list because of v0 PP virtual engine.
         forward_context[layer_name].kv_cache = [kv_cache]
+
+def _debug_tensor_referrers(tensor, max_referrers=10):
+    """打印引用该 tensor 的对象及可能的变量名或容器索引。"""
+    logger.info("=" * 60)
+    logger.info(f"🧠 Tensor device: {tensor.device}, shape: {tensor.shape}, dtype: {tensor.dtype}")
+    logger.info(f"📦 Tensor refcount: {sys.getrefcount(tensor) - 1}")
+
+    referrers = gc.get_referrers(tensor)
+    logger.info(f"🔎 Found {len(referrers)} referrers for tensor (showing up to {max_referrers}):")
+
+    for i, ref in enumerate(referrers[:max_referrers]):
+        logger.info(f"{i}: type={type(ref)}, id={id(ref)}")
+
+        # 如果是 dict，例如 locals()/globals() 或模块字段
+        if isinstance(ref, dict):
+            for k, v in ref.items():
+                if v is tensor:
+                    logger.info(f"    ↳ 📌 Found in dict key: {repr(k)}")
+
+        # 如果是 list/tuple/set 等容器
+        elif isinstance(ref, (list, tuple, set)):
+            for idx, item in enumerate(ref):
+                if item is tensor:
+                    logger.info(f"    ↳ 🧩 Found in {type(ref).__name__} at index {idx}")
+
+        # 如果是某个实例对象
+        elif hasattr(ref, "__class__"):
+            logger.info(f"    ↳ 🧷 Possibly from instance of: {ref.__class__.__name__}")
+    logger.info("=" * 60)

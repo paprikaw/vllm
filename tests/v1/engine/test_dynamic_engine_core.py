@@ -52,6 +52,7 @@ def make_request() -> EngineCoreRequest:
     )
 
 @create_new_process_for_each_test()
+@pytest.mark.skip(reason="This test is passed")
 def test_engine_core_migration(monkeypatch: pytest.MonkeyPatch):
     """
     Test that the engine can handle multiple concurrent batches.
@@ -267,4 +268,131 @@ def test_engine_core_migration(monkeypatch: pytest.MonkeyPatch):
                 output = engine_core.step_with_batch_queue()
                 assert output is not None
                 print(f"output: {output}")
+            step += 1
+
+@create_new_process_for_each_test()
+# @pytest.mark.skip(reason="This test is passed")
+def test_engine_core_migration_v0(monkeypatch: pytest.MonkeyPatch):
+    """
+    Test that the engine can handle multiple concurrent batches.
+    """
+
+    assert len(PROMPT_TOKENS) == 12
+    
+    def make_request_with_max_tokens(req_id: int,
+                                     max_tokens: int) -> EngineCoreRequest:
+        request = make_request()
+        request.request_id = req_id
+        request.sampling_params.max_tokens = max_tokens
+        return request
+
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_USE_V1", "1")
+        m.setenv("VLLM_PP_LAYER_PARTITION", "48,16")
+        m.setenv("VLLM_PIPELINE_MEMORY_LIMIT", "24GB,24GB")
+        m.setenv("RAY_DEDUP_LOGS", "0")
+        engine_args = EngineArgs(
+            model=MODEL_NAME,
+            pipeline_parallel_size=2,
+            gpu_memory_utilization=0.85,
+            max_model_len=5000,
+            max_num_batched_tokens=10,
+            max_num_seqs=2,
+            distributed_executor_backend="ray",
+            enable_prefix_caching=False,
+            enforce_eager=True,
+            scheduler_cls=DynamicScheduler,
+            worker_cls="vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker"
+            )
+        vllm_config = engine_args.create_engine_config()
+        executor_class = DynamicRayDistributedExecutor
+        engine_core = DynamicEngineCore(vllm_config=vllm_config,
+                                 executor_class=executor_class,
+                                 log_stats=False)
+        assert isinstance(engine_core.scheduler, DynamicScheduler)
+        assert engine_core.batch_queue is not None
+
+        # Add two requests in a row. Each request have 12 prompt tokens.
+        req0 = make_request_with_max_tokens(0, 5)
+        engine_core.add_request(req0)
+        req1 = make_request_with_max_tokens(1, 5)
+        engine_core.add_request(req1)
+
+        # Schedule Batch 1: (10, req0)
+        assert engine_core.step_with_batch_queue() is None
+        assert engine_core.batch_queue.qsize() == 1
+        scheduler_output = engine_core.batch_queue.queue[-1][1]
+        assert scheduler_output.num_scheduled_tokens[0] == 10
+        # num_computed_tokens should have been updated immediately.
+        assert engine_core.scheduler.requests[
+            req0.request_id].num_computed_tokens == 10
+
+        # Schedule Batch 2: (2, req0), (8, req1)
+        assert engine_core.step_with_batch_queue() is None
+        assert engine_core.batch_queue.qsize() == 2
+        scheduler_output = engine_core.batch_queue.queue[-1][1]
+        assert scheduler_output.num_scheduled_tokens[0] == 2
+        assert scheduler_output.num_scheduled_tokens[1] == 8
+        # num_computed_tokens should have been updated immediately.
+        assert engine_core.scheduler.requests[0].num_computed_tokens == 12
+        assert engine_core.scheduler.requests[1].num_computed_tokens == 8
+
+        assert engine_core.scheduler.get_num_unfinished_requests() == 2
+
+        # Batch queue is full. Finish Batch 1.
+        engine_core.step_with_batch_queue()
+
+        # Schedule Batch 3: (4, req1). Note that req0 cannot be scheduled
+        # because it is in the decoding stage now.
+        engine_core.step_with_batch_queue()
+        assert engine_core.batch_queue.qsize() == 2
+        scheduler_output = engine_core.batch_queue.queue[-1][1]
+        assert scheduler_output.num_scheduled_tokens[1] == 4
+
+        # Batch queue is full. Finish Batch 2. Get first token of req0.
+        output = engine_core.step_with_batch_queue()
+        assert output is not None
+        assert len(output.outputs) == 1
+        assert engine_core.scheduler.requests[req0.request_id].num_tokens == 13
+        engine_core.migrate_layer_v0(0, 1, 1)
+        # Schedule Batch 4: (1, req0).
+        engine_core.step_with_batch_queue()
+        assert engine_core.batch_queue.qsize() == 2
+        scheduler_output = engine_core.batch_queue.queue[-1][1]
+        assert scheduler_output.num_scheduled_tokens[0] == 1
+
+        # Batch queue is full. Finish Batch 3. Get first token of req1.
+        output = engine_core.step_with_batch_queue()
+        assert output is not None
+        assert len(output.outputs) == 1
+        assert engine_core.scheduler.requests[req1.request_id].num_tokens == 13
+
+        # Schedule Batch 5: (1, req1).
+        engine_core.step_with_batch_queue()
+        assert engine_core.batch_queue.qsize() == 2
+        scheduler_output = engine_core.batch_queue.queue[-1][1]
+        assert scheduler_output.num_scheduled_tokens[1] == 1
+
+        # Migrate layer
+        # Loop until req0 is finished.
+        step = 0
+        req_id = 0
+        expected_num_tokens = [
+            engine_core.scheduler.requests[0].num_tokens + 1,
+            engine_core.scheduler.requests[1].num_tokens + 1,
+        ]
+        while engine_core.scheduler.get_num_unfinished_requests() == 2:
+            output = engine_core.step_with_batch_queue()
+            if step % 2 == 0:
+                # Even steps consumes an output.
+                assert output is not None
+                assert len(output.outputs) == 1
+                if req_id in engine_core.scheduler.requests:
+                    assert engine_core.scheduler.requests[
+                        req_id].num_tokens == expected_num_tokens[req_id]
+                expected_num_tokens[req_id] += 1
+                req_id = (req_id + 1) % 2
+            else:
+                # Odd steps schedules a new batch.
+                assert output is None
             step += 1

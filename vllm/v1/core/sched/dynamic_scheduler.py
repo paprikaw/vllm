@@ -39,6 +39,8 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+import torch
+import gc
 logger = init_logger(__name__)
 T = TypeVar("T")
 
@@ -103,6 +105,10 @@ class DynamicScheduler(Scheduler):
             self._migration_future = Future()
             return self._migration_future
 
+    def update_layer_config(self, layer_config: List[Tuple[int,int]]):
+        # Update the configuration of layers stored in the scheduler
+        self.pp_layer_config_status.pp_layer_configs["cur"] = (layer_config)
+
     def _complete_migration(self):
         assert self.migration_status == MigrationStatus.MIGRATING
         assert len(self.running_controller.get_cur()[1]) == 0
@@ -161,6 +167,32 @@ class DynamicScheduler(Scheduler):
                     pp_layer_config=pp_layer_config,
                     request_queue_id=id
                 )
+
+    def re_initialize_kv_cache_manager(self,  kv_cache_config: KVCacheConfig):
+        # When doing naive stop and go layer migration, we free the old kv cache
+        # and allocate a new one after the layer is migrated. 
+
+        self.kv_cache_manager = KVCacheManager(
+            kv_cache_config=kv_cache_config,
+            max_model_len=self.max_model_len,
+            enable_caching=self.cache_config.enable_prefix_caching,
+            caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
+            use_eagle=self.use_eagle,
+            log_stats=self.log_stats,
+            enable_kv_cache_events=self.enable_kv_cache_events,
+        )
+        # Free the old kv cache manager
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def preempt_all_requests(self):
+        while self.running:
+            preempt_request = self.running.pop()
+            # Mabe not free preempt request, because we will reconstruct it anyway
+            # self.kv_cache_manager.free(preempt_request)
+            preempt_request.status = RequestStatus.PREEMPTED
+            preempt_request.num_computed_tokens = 0
+            self.waiting.appendleft(preempt_request)
 
     def schedule(self) -> DynamicSchedulerOutput:
         with self.lock:

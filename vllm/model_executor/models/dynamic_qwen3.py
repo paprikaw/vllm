@@ -68,6 +68,7 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+        self.layer_weight_size = -1
     def add_layers(self, layers: Tuple[int, int], decoder_layer_type: type[nn.Module] = Qwen3DecoderLayer) -> None:
         self.model.add_layers(layers, decoder_layer_type)
 
@@ -93,12 +94,34 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
     #     return self.model.load_layer_weights(weights, layers)
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
+        # 在weights读出的时候，记录layer 0的weight权重大小。
+        # 只记录layer 0，因为我们假设所有weight的大小相同。
+        def weight_size_record_generator(weights: Iterable[tuple[str, torch.Tensor]]):
+            if self.layer_weight_size != -1:
+                return weights
+
+            first_layer_index = -1
+            for name, weight in weights:
+                # 只记录第一个出现的 layer 的权重大小，假设所有 layer 权重大小一致
+                layer_idx = extract_layer_index(name) if "layers" in name else None
+                if layer_idx is not None and (first_layer_index == -1 or layer_idx == first_layer_index):
+                    if first_layer_index == -1:
+                        first_layer_index = layer_idx
+                        self.layer_weight_size = 0  # 初始化为0，避免累加多次
+                    self.layer_weight_size += weight.numel() * weight.element_size()
+                yield name, weight
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        return loader.load_weights(weight_size_record_generator(weights))
+
+    def get_layer_weight_size(self) -> int:
+        if self.layer_weight_size == -1:
+            raise ValueError("Layer weight size not recorded")
+        return self.layer_weight_size
 
 class DynamicQwen3Model(Qwen3Model):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -169,6 +192,8 @@ class DynamicQwen3Model(Qwen3Model):
                 # for key in keys_to_delete:
                 #     self._modules.pop(key)
             # 3. 强制垃圾回收（释放 CPU/GPU 内存）
+            self.sched_start_layer = -1
+            self.sched_end_layer = -1
             gc.collect()
             torch.cuda.empty_cache()
         return
@@ -203,11 +228,15 @@ class DynamicQwen3Model(Qwen3Model):
                 residual = intermediate_tensors["residual"]
             logger.warning(f"Forwarding with layers:{self.sched_start_layer} to {self.sched_end_layer}")
             for layer in self.layers[self.sched_start_layer:self.sched_end_layer]:
-                hidden_states, residual = layer(
+                try:
+                    hidden_states, residual = layer(
                     positions,
-                    hidden_states,
-                    residual,
-                )
+                        hidden_states,
+                        residual,
+                    )
+                except Exception as e:
+                    print(f"error is raised, layer: {layer}")
+                    raise e
             if not get_pp_group().is_last_rank:
                 return IntermediateTensors({
                     "hidden_states": hidden_states,

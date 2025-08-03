@@ -50,6 +50,10 @@ _R = TypeVar('_R')  # Return type for collective_rpc
 
 class DynamicEngineCore(EngineCore):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.migration_status = MigrationStatus.NOT_MIGRATING
+
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
@@ -110,6 +114,39 @@ class DynamicEngineCore(EngineCore):
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
+
+    def migrate_layer_v0(self, rank_from: int, rank_to: int, num_layers: int) -> None:
+        # First, we need to wait for all batch to be finished
+        assert self.batch_queue is not None
+        assert isinstance(self.scheduler, DynamicScheduler)
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        while not self.batch_queue.empty():
+            future, scheduler_output = self.batch_queue.get_nowait()
+            # Blocking until the first result is available.
+            model_output = future.result()
+            self.batch_queue.task_done()
+            self.scheduler.update_from_output(
+                scheduler_output, model_output)
+        self.scheduler.preempt_all_requests()
+
+        # Release the kv cache
+        self.model_executor.release_kv_cache()
+
+        # Doing the model layer weight migration 
+        layers, next_layer_config = \
+            get_new_layer_config_with_migration_action(
+                rank_from,
+                rank_to, 
+                num_layers, 
+                self.scheduler.pp_layer_config_status.get_cur_pp_layer_config()
+                )
+        self.model_executor.add_layers(rank_to, layers)
+        self.model_executor.remove_layers(rank_from, layers)
+        self.scheduler.update_layer_config(next_layer_config)
+
+        # Reinitialize the kv cache
+        _, _, kv_cache_config = self._initialize_kv_caches(self.vllm_config)
+        self.scheduler.re_initialize_kv_cache_manager(kv_cache_config)
 
     def migrate_layers(self, rank_from: int, rank_to: int, num_layers: int) -> Future:
         logger.info(f"migrating layers from {rank_from} to {rank_to} with {num_layers} layers")
