@@ -12,6 +12,9 @@ from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
 
+import msgspec
+import zmq
+
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
@@ -54,7 +57,7 @@ class DynamicEngineCore(EngineCore):
         super().__init__(*args, **kwargs)
         self.migration_status = MigrationStatus.NOT_MIGRATING
 
-    def _initialize_kv_caches(
+    def _reinitialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
         assert(isinstance(self.model_executor, DynamicRayDistributedExecutor))
@@ -73,7 +76,6 @@ class DynamicEngineCore(EngineCore):
             for kv_cache_spec_one_worker, available_gpu_memory_one_worker in
             zip(kv_cache_specs, available_gpu_memory)
         ]
-
         # Since we use a shared centralized controller, we need the
         # `kv_cache_config` to be consistent across all workers to make sure
         # all the memory operators can be applied to all workers.
@@ -101,8 +103,8 @@ class DynamicEngineCore(EngineCore):
         self.kv_cache_size = next(iter(kv_cache_configs[0].tensors.values())).size
         self.kv_cache_num_blocks = num_gpu_blocks
 
-        # Initialize kv cache and warmup the execution
-        self.model_executor.initialize_from_config(kv_cache_configs)
+        # Reinitialize kv cache and warmup the execution
+        self.model_executor.reinitialize_kv_cache(kv_cache_configs)
 
         # This is different from the scheduler's migration status
         # - Scheduler migration status is used to trace whether the old
@@ -115,18 +117,21 @@ class DynamicEngineCore(EngineCore):
                      "warmup model) took %.2f seconds"), elapsed)
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
-    def migrate_layer_v0(self, rank_from: int, rank_to: int, num_layers: int) -> None:
+    def migrate_layer_v0(self, rank_from: int, rank_to: int, num_layers: int) -> list[EngineCoreOutputs]:
+        logger.info(f"migrating layer from {rank_from} to {rank_to} with {num_layers} layers")
         # First, we need to wait for all batch to be finished
         assert self.batch_queue is not None
         assert isinstance(self.scheduler, DynamicScheduler)
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        engine_core_outputs = []
         while not self.batch_queue.empty():
             future, scheduler_output = self.batch_queue.get_nowait()
             # Blocking until the first result is available.
             model_output = future.result()
             self.batch_queue.task_done()
-            self.scheduler.update_from_output(
-                scheduler_output, model_output)
+            engine_core_outputs.append(self.scheduler.update_from_output(
+                scheduler_output, model_output))
+
         self.scheduler.preempt_all_requests()
 
         # Release the kv cache
@@ -145,8 +150,9 @@ class DynamicEngineCore(EngineCore):
         self.scheduler.update_layer_config(next_layer_config)
 
         # Reinitialize the kv cache
-        _, _, kv_cache_config = self._initialize_kv_caches(self.vllm_config)
+        _, _, kv_cache_config = self._reinitialize_kv_caches(self.vllm_config)
         self.scheduler.re_initialize_kv_cache_manager(kv_cache_config)
+        return engine_core_outputs
 
     def migrate_layers(self, rank_from: int, rank_to: int, num_layers: int) -> Future:
         logger.info(f"migrating layers from {rank_from} to {rank_to} with {num_layers} layers")
@@ -197,3 +203,323 @@ class DynamicEngineCore(EngineCore):
         self.migration_status = MigrationStatus.NOT_MIGRATING
         self.layers_to_be_removed = None
         self.rank_from = None
+
+class DynamicEngineCoreProc(DynamicEngineCore):
+    """ZMQ-wrapper for running EngineCore in background process.
+    This whole class is replicated from the vllm EngineCoreProc.
+    We use this class to adapt DynamicEngineCore
+    """
+
+    ENGINE_CORE_DEAD = b'ENGINE_CORE_DEAD'
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        on_head_node: bool,
+        input_address: str,
+        executor_class: type[Executor],
+        log_stats: bool,
+        engine_index: int = 0,
+    ):
+        input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
+
+        executor_fail_callback = lambda: input_queue.put_nowait(
+            (EngineCoreRequestType.EXECUTOR_FAILED, b''))
+
+        # Create input socket.
+        input_ctx = zmq.Context()
+        identity = engine_index.to_bytes(length=2, byteorder="little")
+        input_socket = make_zmq_socket(input_ctx,
+                                       input_address,
+                                       zmq.DEALER,
+                                       identity=identity,
+                                       bind=False)
+        try:
+            # Register engine with front-end.
+            output_address = self.startup_handshake(
+                input_socket, on_head_node, vllm_config.parallel_config)
+
+            # Update config which may have changed from the handshake.
+            vllm_config.__post_init__()
+
+            # Set up data parallel environment.
+            self._init_data_parallel(vllm_config)
+
+            # Initialize engine core and model.
+            super().__init__(vllm_config, executor_class, log_stats,
+                             executor_fail_callback)
+
+            self.step_fn = (self.step if self.batch_queue is None else
+                            self.step_with_batch_queue)
+            self.engines_running = False
+
+            # Send ready message.
+            num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
+            input_socket.send(
+                msgspec.msgpack.encode({
+                    "status": "READY",
+                    "local": on_head_node,
+                    "num_gpu_blocks": num_gpu_blocks,
+                }))
+
+            # Background Threads and Queues for IO. These enable us to
+            # overlap ZMQ socket IO with GPU since they release the GIL,
+            # and to overlap some serialization/deserialization with the
+            # model forward pass.
+            # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
+            self.input_queue = input_queue
+            self.output_queue = queue.Queue[Union[EngineCoreOutputs, bytes]]()
+            threading.Thread(target=self.process_input_socket,
+                             args=(input_socket, ),
+                             daemon=True).start()
+            input_socket = None
+            self.output_thread = threading.Thread(
+                target=self.process_output_socket,
+                args=(output_address, engine_index),
+                daemon=True)
+            self.output_thread.start()
+            threading.Thread(target=self.migration_thread, daemon=True).start()
+        finally:
+            if input_socket is not None:
+                input_socket.close(linger=0)
+
+    @staticmethod
+    def startup_handshake(input_socket: zmq.Socket, on_head_node: bool,
+                          parallel_config: ParallelConfig) -> str:
+
+        # Send registration message.
+        input_socket.send(
+            msgspec.msgpack.encode({
+                "status": "HELLO",
+                "local": on_head_node,
+            }))
+
+        # Receive initialization message.
+        logger.info("Waiting for init message from front-end.")
+        if not input_socket.poll(timeout=HANDSHAKE_TIMEOUT_MINS * 60 * 1000):
+            raise RuntimeError("Did not receive response from front-end "
+                               f"process within {HANDSHAKE_TIMEOUT_MINS} "
+                               f"minutes")
+        init_bytes = input_socket.recv()
+        init_message = msgspec.msgpack.decode(init_bytes)
+        logger.debug("Received init message: %s", init_message)
+
+        output_socket_address = init_message["output_socket_address"]
+        #TBD(nick) maybe replace IP with configured head node address
+
+        received_parallel_config = init_message["parallel_config"]
+        for key, value in received_parallel_config.items():
+            setattr(parallel_config, key, value)
+
+        return output_socket_address
+
+    @staticmethod
+    def run_engine_core(*args,
+                        dp_rank: int = 0,
+                        local_dp_rank: int = 0,
+                        **kwargs):
+        """Launch EngineCore busy loop in background process."""
+
+        # Signal handler used for graceful termination.
+        # SystemExit exception is only raised once to allow this and worker
+        # processes to terminate without error
+        shutdown_requested = False
+
+        # Ensure we can serialize transformer config after spawning
+        maybe_register_config_serialize_by_value()
+
+        def signal_handler(signum, frame):
+            nonlocal shutdown_requested
+            if not shutdown_requested:
+                shutdown_requested = True
+                raise SystemExit()
+
+        # Either SIGTERM or SIGINT will terminate the engine_core
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        engine_core: DynamicEngineCoreProc
+        try:
+            parallel_config: ParallelConfig = kwargs[
+                "vllm_config"].parallel_config
+            assert parallel_config.data_parallel_size == 1, "DynamicEngineCoreProc only supports data parallel size 1"
+            engine_core = DynamicEngineCoreProc(*args, **kwargs)
+
+            engine_core.run_busy_loop()
+
+        except SystemExit:
+            logger.debug("EngineCore exiting.")
+            raise
+        except Exception as e:
+            if engine_core is None:
+                logger.exception("EngineCore failed to start.")
+            else:
+                logger.exception("EngineCore encountered a fatal error.")
+                engine_core._send_engine_dead()
+            raise e
+        finally:
+            if engine_core is not None:
+                engine_core.shutdown()
+
+    def _init_data_parallel(self, vllm_config: VllmConfig):
+        pass
+
+    def run_busy_loop(self):
+        """Core busy loop of the EngineCore."""
+
+        # Loop until process is sent a SIGINT or SIGTERM
+        while True:
+            # 1) Poll the input queue until there is work to do.
+            self._process_input_queue()
+            # 2) Step the engine core and return the outputs.
+            self._process_engine_step()
+
+    def _process_input_queue(self):
+        """Exits when an engine step needs to be performed."""
+
+        waited = False
+        while not self.engines_running and not (self.scheduler.has_requests()):
+            if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
+                logger.debug("EngineCore waiting for work.")
+                waited = True
+            req = self.input_queue.get()
+            self._handle_client_request(*req)
+
+        if waited:
+            logger.debug("EngineCore loop active.")
+
+        # Handle any more client requests.
+        while not self.input_queue.empty():
+            req = self.input_queue.get_nowait()
+            self._handle_client_request(*req)
+
+    def _process_engine_step(self):
+        """Called only when there are unfinished local requests."""
+
+        # Step the engine core.
+        outputs = self.step_fn()
+        # Put EngineCoreOutputs into the output queue.
+        if outputs is not None:
+            self.output_queue.put_nowait(outputs)
+
+    def _handle_client_request(self, request_type: EngineCoreRequestType,
+                               request: Any) -> None:
+        """Dispatch request from client."""
+
+        if request_type == EngineCoreRequestType.ADD:
+            self.add_request(request)
+        elif request_type == EngineCoreRequestType.ABORT:
+            self.abort_requests(request)
+        elif request_type == EngineCoreRequestType.UTILITY:
+            call_id, method_name, args = request
+            output = UtilityOutput(call_id)
+            try:
+                method = getattr(self, method_name)
+                output.result = method(
+                    *self._convert_msgspec_args(method, args))
+            except BaseException as e:
+                logger.exception("Invocation of %s method failed", method_name)
+                output.failure_message = (f"Call to {method_name} method"
+                                          f" failed: {str(e)}")
+            self.output_queue.put_nowait(
+                EngineCoreOutputs(utility_output=output))
+        elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
+            raise RuntimeError("Executor failed.")
+        else:
+            logger.error("Unrecognized input request type encountered: %s",
+                         request_type)
+
+    @staticmethod
+    def _convert_msgspec_args(method, args):
+        """If a provided arg type doesn't match corresponding target method
+         arg type, try converting to msgspec object."""
+        if not args:
+            return args
+        arg_types = signature(method).parameters.values()
+        assert len(args) <= len(arg_types)
+        return tuple(
+            msgspec.convert(v, type=p.annotation) if isclass(p.annotation)
+            and issubclass(p.annotation, msgspec.Struct)
+            and not isinstance(v, p.annotation) else v
+            for v, p in zip(args, arg_types))
+
+    def _send_engine_dead(self):
+        """Send EngineDead status to the EngineCoreClient."""
+
+        # Put ENGINE_CORE_DEAD in the queue.
+        self.output_queue.put_nowait(DynamicEngineCoreProc.ENGINE_CORE_DEAD)
+
+        # Wait until msg sent by the daemon before shutdown.
+        self.output_thread.join(timeout=5.0)
+        if self.output_thread.is_alive():
+            logger.fatal("vLLM shutdown signal from EngineCore failed "
+                         "to send. Please report this issue.")
+
+    def process_input_socket(self, input_socket: zmq.Socket):
+        """Input socket IO thread."""
+
+        # Msgpack serialization decoding.
+        add_request_decoder = MsgpackDecoder(EngineCoreRequest)
+        generic_decoder = MsgpackDecoder()
+
+        while True:
+            # (RequestType, RequestData)
+            type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+            request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+
+            # Deserialize the request data.
+            decoder = add_request_decoder if (
+                request_type == EngineCoreRequestType.ADD) else generic_decoder
+            request = decoder.decode(data_frames)
+
+            # Push to input queue for core busy loop.
+            self.input_queue.put_nowait((request_type, request))
+
+    def process_output_socket(self, output_path: str, engine_index: int):
+        """Output socket IO thread."""
+
+        # Msgpack serialization encoding.
+        encoder = MsgpackEncoder()
+        # Send buffers to reuse.
+        reuse_buffers: list[bytearray] = []
+        # Keep references to outputs and buffers until zmq is finished
+        # with them (outputs may contain tensors/np arrays whose
+        # backing buffers were extracted for zero-copy send).
+        pending = deque[tuple[zmq.MessageTracker, Any, bytearray]]()
+
+        # We must set linger to ensure the ENGINE_CORE_DEAD
+        # message is sent prior to closing the socket.
+        with zmq_socket_ctx(output_path, zmq.constants.PUSH,
+                            linger=4000) as socket:
+            while True:
+                outputs = self.output_queue.get()
+                if outputs == DynamicEngineCoreProc.ENGINE_CORE_DEAD:
+                    socket.send(outputs, copy=False)
+                    break
+                assert not isinstance(outputs, bytes)
+                outputs.engine_index = engine_index
+
+                # Reclaim buffers that zmq is finished with.
+                while pending and pending[-1][0].done:
+                    reuse_buffers.append(pending.pop()[2])
+
+                buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
+                buffers = encoder.encode_into(outputs, buffer)
+                tracker = socket.send_multipart(buffers,
+                                                copy=False,
+                                                track=True)
+                if not tracker.done:
+                    ref = outputs if len(buffers) > 1 else None
+                    pending.appendleft((tracker, ref, buffer))
+                elif len(reuse_buffers) < 2:
+                    # Keep at most 2 buffers to reuse.
+                    reuse_buffers.append(buffer)
+
+    def migration_thread(self):
+        if os.environ.get("TEST_MIGRATION") == "1":
+            logger.info(f"starting counting down 60s")
+            time.sleep(60)
+            self.migrate_layer_v0(0, 1, 1)
+        else:
+            logger.info(f"TEST_MIGRATION is not set, skipping migration")
+            return

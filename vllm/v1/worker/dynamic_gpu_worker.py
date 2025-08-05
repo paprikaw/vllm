@@ -6,7 +6,8 @@ import torch
 import torch.distributed
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
+from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker
@@ -99,11 +100,23 @@ class DynamicGPUWorker(Worker):
 
 
     @torch.inference_mode()
+    def determine_available_memory(self) -> int:
+        """Get the current available memory in bytes.
+        """
+        assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        assert self.model_runner.model.get_sched_layers() == (self.model_runner.model.model.start_layer, self.model_runner.model.model.end_layer), "model should be in the initial state"
+        return super().determine_available_memory()
+
+    @torch.inference_mode()
     def get_current_available_memory(self) -> int:
         """Get the current available memory in bytes.
         """
         free_gpu_memory, _ = torch.cuda.mem_get_info()
         return int(free_gpu_memory)
+
+    def reinitialize_kv_cache(self, kv_cache_configs: list[KVCacheConfig]) -> None:
+        self.model_runner.reinitialize_kv_cache(kv_cache_configs[self.rank])
+        return
 
     def add_layers(self, rank: int, layers: Tuple[int, int]) -> None:
         if self.rank != rank:

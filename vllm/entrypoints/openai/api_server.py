@@ -179,10 +179,10 @@ async def build_async_engine_client_from_engine_args(
                 "V1 is enabled, but got --disable-frontend-multiprocessing. "
                 "To disable frontend multiprocessing, set VLLM_USE_V1=0.")
 
-        from vllm.v1.engine.async_llm import AsyncLLM
-        async_llm: Optional[AsyncLLM] = None
+        from vllm.v1.engine.dynamic_async_llm import DynamicAsyncLLM
+        async_llm: Optional[DynamicAsyncLLM] = None
         try:
-            async_llm = AsyncLLM.from_vllm_config(
+            async_llm = DynamicAsyncLLM.from_vllm_config(
                 vllm_config=vllm_config,
                 usage_context=usage_context,
                 disable_log_requests=engine_args.disable_log_requests,

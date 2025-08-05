@@ -30,8 +30,8 @@ if not current_platform.is_cuda():
     pytest.skip(reason="V1 currently only supported on CUDA.",
                 allow_module_level=True)
 
-MODEL_NAME = "/root/.cache/huggingface/Qwen/Qwen3-32B-AWQ"
-TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
+MODEL_NAME = "/root/.cache/huggingface/Qwen3-32B-AWQ"
+TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME, local_files_only=True)
 PROMPT = "Hello my name is Robert and I love quantization kernels ha"
 PROMPT_TOKENS = TOKENIZER(PROMPT).input_ids
 
@@ -354,26 +354,63 @@ def test_engine_core_migration_v0(monkeypatch: pytest.MonkeyPatch):
         assert output is not None
         assert len(output.outputs) == 1
         assert engine_core.scheduler.requests[req0.request_id].num_tokens == 13
-        engine_core.migrate_layer_v0(0, 1, 1)
-        # Schedule Batch 4: (1, req0).
+
+        # Migrate layers, finish batch 3
+        outputs = engine_core.migrate_layer_v0(0, 1, 1)
+        assert len(outputs) == 1
+        assert engine_core.scheduler.requests[req1.request_id].num_tokens == 13
+
+        # Schedule Batch 4: (10, req0)
+        engine_core.step_with_batch_queue()
+        assert engine_core.batch_queue.qsize() == 1
+        scheduler_output = engine_core.batch_queue.queue[-1][1]
+        assert len(scheduler_output.num_scheduled_tokens) == 1
+        assert scheduler_output.num_scheduled_tokens[0] == 10
+
+        # Schedule Batch 5: (3, req0), (7, req1)
         engine_core.step_with_batch_queue()
         assert engine_core.batch_queue.qsize() == 2
         scheduler_output = engine_core.batch_queue.queue[-1][1]
-        assert scheduler_output.num_scheduled_tokens[0] == 1
+        assert len(scheduler_output.num_scheduled_tokens) == 2
+        assert scheduler_output.num_scheduled_tokens[0] == 3
+        assert scheduler_output.num_scheduled_tokens[1] == 7
 
-        # Batch queue is full. Finish Batch 3. Get first token of req1.
+        # Batch queue is full. Finish Batch 4.
+        engine_core.step_with_batch_queue()
+        assert engine_core.scheduler.requests[req1.request_id].num_tokens == 13
+
+        # Schedule Batch 6: (6, req1). Note that req0 cannot be scheduled
+        # because it is in the decoding stage now.
+        engine_core.step_with_batch_queue()
+        assert engine_core.batch_queue.qsize() == 2
+        scheduler_output = engine_core.batch_queue.queue[-1][1]
+        assert scheduler_output.num_scheduled_tokens[1] == 6
+
+        # Batch queue is full. Finish Batch 5.
         output = engine_core.step_with_batch_queue()
         assert output is not None
         assert len(output.outputs) == 1
-        assert engine_core.scheduler.requests[req1.request_id].num_tokens == 13
+        assert engine_core.scheduler.requests[req0.request_id].num_tokens == 14
 
-        # Schedule Batch 5: (1, req1).
+        # Schedule Batch 7: (1, req0). 
         engine_core.step_with_batch_queue()
         assert engine_core.batch_queue.qsize() == 2
         scheduler_output = engine_core.batch_queue.queue[-1][1]
+        assert len(scheduler_output.num_scheduled_tokens) == 1
+        assert scheduler_output.num_scheduled_tokens[0] == 1
+
+        # Batch queue is full. Finish Batch 6.
+        output = engine_core.step_with_batch_queue()
+        assert output is not None
+        assert len(output.outputs) == 1
+
+        # Schedule Batch 8: (1, req1). 
+        engine_core.step_with_batch_queue()
+        assert engine_core.batch_queue.qsize() == 2
+        scheduler_output = engine_core.batch_queue.queue[-1][1]
+        assert len(scheduler_output.num_scheduled_tokens) == 1
         assert scheduler_output.num_scheduled_tokens[1] == 1
 
-        # Migrate layer
         # Loop until req0 is finished.
         step = 0
         req_id = 0

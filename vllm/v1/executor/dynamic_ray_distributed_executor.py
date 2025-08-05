@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
 import os
 from collections import defaultdict
 from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
@@ -46,31 +46,9 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         self.collective_rpc("release_kv_cache_for_layers", args=(rank, layers))
     def release_kv_cache(self) -> None:
         self.collective_rpc("release_kv_cache")
-    # def execute_model(
-    #     self,
-    #     scheduler_output: DynamicSchedulerOutput,
-    # ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
-    #     """Execute the model on the Ray workers.
-
-    #     Args:
-    #         scheduler_output: The scheduler output to execute.
-
-    #     Returns:
-    #         The model runner output.
-    #     """
-    #     # Build the compiled DAG for the first time.
-    #     if self.forward_dag is None:  # type: ignore
-    #         self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
-
-    #     refs = self.forward_dag.execute(scheduler_output)  # type: ignore
-
-    #     # When PP is not used, we block here until the result is available.
-    #     if self.max_concurrent_batches == 1:
-    #         return refs[0].get()
-
-    #     # When PP is used, we return a FutureWrapper immediately so that
-    #     # the scheduler can yield to the next batch.
-    #     return FutureWrapper(refs[0])
+    def reinitialize_kv_cache(self, kv_cache_configs: list[KVCacheConfig]) -> None:
+        assert len(kv_cache_configs) == self.parallel_config.world_size, "kv_cache_configs must have the same length as world_size"
+        self.collective_rpc("reinitialize_kv_cache", args=(kv_cache_configs,))
 
     def _init_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):

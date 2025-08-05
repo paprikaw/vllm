@@ -169,10 +169,18 @@ class DynamicQwen3Model(Qwen3Model):
 
     def delete_layers(self, layers: Tuple[int, int]):
         """Delete the layer module and its parameters at the given index."""
+
+        # Adapt input layers to the model's layers open internal representation
+        deleted_start_layer, deleted_end_layer = layers[0], layers[1] + 1
+
+        assert deleted_start_layer < deleted_end_layer, "layers[0] must be less than layers[1]"
+        old_start_layer, old_end_layer = self.start_layer, self.end_layer
+        assert deleted_start_layer >= old_start_layer and deleted_end_layer <= old_end_layer, "layers must be in the range of start_layer and end_layer"
+        assert deleted_start_layer == old_start_layer or deleted_end_layer == old_end_layer, f"model layers must be continuous after delete layers, start_layer: {old_start_layer}, end_layer: {old_end_layer}, layers: {layers}"
+
         with self.model_lock:
-            for layer_idx in range(layers[0], layers[1]+1):
-                if not (0 <= layer_idx < len(self.layers)):
-                    raise IndexError(f"Layer index {layer_idx} out of range.")
+            for layer_idx in range(deleted_start_layer, deleted_end_layer):
+                layer_idx = layer_idx - old_start_layer
                 # # 1. 删除子模块引用
                 layer = self.layers[layer_idx]
                 assert layer is not None, "Layer is None"
@@ -191,11 +199,16 @@ class DynamicQwen3Model(Qwen3Model):
                 # keys_to_delete = (k for k in self._modules if k.startswith(prefix))
                 # for key in keys_to_delete:
                 #     self._modules.pop(key)
-            # 3. 强制垃圾回收（释放 CPU/GPU 内存）
-            self.sched_start_layer = -1
-            self.sched_end_layer = -1
             gc.collect()
             torch.cuda.empty_cache()
+        # Update the start_layer and end_layer
+        if deleted_start_layer == old_start_layer:
+            self.start_layer = deleted_end_layer
+        if deleted_end_layer == old_end_layer:
+            self.end_layer = deleted_start_layer
+        logger.info(f"after delete_layers, start_layer: {self.start_layer}, end_layer: {self.end_layer}")
+        # 同步更新sched_layers
+        self.set_sched_layers(self.start_layer, self.end_layer-1)
         return
     def set_sched_layers(self, 
                          start_layer: int, 

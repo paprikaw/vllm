@@ -19,7 +19,7 @@ from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (LazyLoader)
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
-                                        KVCacheSpec,
+                                        KVCacheSpec, KVCacheConfig,
                                         SlidingWindowSpec)
 from vllm.v1.utils import extract_layer_index
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -31,7 +31,7 @@ from vllm.model_executor.model_loader.dynamic_qwen3_loader import CustomModelLoa
 from collections import defaultdict
 from vllm.config import set_current_vllm_config
 from threading import Lock
-import traceback
+from vllm.v1.spec_decode.eagle import EagleProposer
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -170,6 +170,57 @@ class DynamicGPUModelRunner(GPUModelRunner):
         loader = CustomModelLoader(self.vllm_config.load_config)
         with set_current_vllm_config(self.vllm_config):
             loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model)
+
+    def reinitialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        """
+        Copied from initialize_kv_cache() but only called when reinitialize the kv cache.
+        The only difference is that we don't need to initialize the attention backend again.
+        """
+        if len(kv_cache_config.kv_cache_groups) > 1:
+            raise NotImplementedError(
+                "Hybrid models with more than one KV cache type are not "
+                "supported yet.")
+        self.kv_cache_config = kv_cache_config
+        kv_caches: dict[str, torch.Tensor] = {}
+        for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            for layer_name in kv_cache_group.layer_names:
+                tensor_config = kv_cache_config.tensors[layer_name]
+                assert tensor_config.size % kv_cache_spec.page_size_bytes == 0
+                num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
+                # `num_blocks` is the number of blocks the model runner can use.
+                # `kv_cache_config.num_blocks` is the number of blocks that
+                # KVCacheManager may allocate.
+                # Since different GPUs may have different number of layers and
+                # different memory capacities, `num_blocks` can be different on
+                # different GPUs, and `kv_cache_config.num_blocks` is set to
+                # the min of all `num_blocks`. Verify it here.
+                assert num_blocks >= kv_cache_config.num_blocks
+                if isinstance(kv_cache_spec, AttentionSpec):
+                    kv_cache_shape = self.attn_backends[i].get_kv_cache_shape(
+                        num_blocks, kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                    dtype = kv_cache_spec.dtype
+                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
+                                                        dtype=dtype,
+                                                        device=self.device)
+                else:
+                    # TODO: add new branches when introducing more types of
+                    # KV cache specs.
+                    raise ValueError("Unknown KV cache spec type.")
+
+        if self.speculative_config and self.speculative_config.use_eagle():
+            assert isinstance(self.drafter, EagleProposer)
+            # validate all draft model layers belong to the same kv cache
+            # group
+            self.drafter.validate_same_kv_cache_group(kv_cache_config)
+
+        bind_kv_cache(
+            kv_caches,
+            self.vllm_config.compilation_config.static_forward_context,
+            self.kv_caches)
+        if has_kv_transfer_group():
+            get_kv_transfer_group().register_kv_caches(kv_caches)
 
     def remove_layers(self, layers: Tuple[int, int]) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
