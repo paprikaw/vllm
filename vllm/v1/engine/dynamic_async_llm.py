@@ -16,7 +16,8 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import (StatLoggerBase, StatLoggerFactory,
                                      setup_default_loggers)
 from .async_llm import AsyncLLM
-from .dynamic_async_llm import DynamicAsyncLLM
+from .dynamic_core_client import DynamicAsyncMPClient
+from ..executor.dynamic_ray_distributed_executor import DynamicRayDistributedExecutor 
 
 logger = init_logger(__name__)
 
@@ -102,7 +103,7 @@ class DynamicAsyncLLM(AsyncLLM):
         # EngineCore (starts the engine in background process).
         assert vllm_config.parallel_config.data_parallel_size == 1, "DynamicAsyncLLM only supports data parallel size 1"
 
-        self.engine_core = DynamicAsyncLLM(
+        self.engine_core = DynamicAsyncMPClient(
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=self.log_stats,
@@ -137,7 +138,7 @@ class DynamicAsyncLLM(AsyncLLM):
         # Create the LLMEngine.
         return cls(
             vllm_config=vllm_config,
-            executor_class=Executor.get_class(vllm_config),
+            executor_class=DynamicRayDistributedExecutor,
             start_engine_loop=start_engine_loop,
             stat_loggers=stat_loggers,
             log_requests=not disable_log_requests,

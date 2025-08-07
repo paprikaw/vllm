@@ -2,6 +2,7 @@ from collections.abc import Iterable
 from typing import Optional, Union, Tuple
 import gc
 
+from huggingface_hub import delete_space_secret
 import torch
 from torch import nn
 
@@ -69,6 +70,7 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
         self.layer_weight_size = -1
+
     def add_layers(self, layers: Tuple[int, int], decoder_layer_type: type[nn.Module] = Qwen3DecoderLayer) -> None:
         self.model.add_layers(layers, decoder_layer_type)
 
@@ -143,27 +145,26 @@ class DynamicQwen3Model(Qwen3Model):
                     ) -> None:
         # First update model's layers
         assert layers[0] <= layers[1], "layers[0] must be less than layers[1]"
-        assert layers[1] == self.start_layer - 1 or layers[0] == self.start_layer + 1, "layers must be adjacent to old_layers"
-        if layers[1] == self.start_layer:
-            self.start_layer = layers[0]
-        if layers[0] == self.end_layer:
-            self.end_layer = layers[1]
+        assert layers[1] == self.start_layer - 1 or layers[0] == self.end_layer, f"layers must be adjacent to old_layers, layers: {layers}, start_layer: {self.start_layer}, end_layer: {self.end_layer}"
         # with set_current_vllm_config(self.vllm_config):
         new_module = add_layers(
             self.layers, 
             layers,
-            (self.start_layer, self.end_layer),
+            (self.start_layer, self.end_layer-1),
             lambda prefix: decoder_layer_type(config=self.config,
                                               cache_config=self.cache_config,
                                               quant_config=self.quant_config,
                                               prefix=prefix),
             prefix=f"{self.prefix}.layers",
             )
-        # logger.info(f"after add_layers, vllm_config static_forward_context: {self.vllm_config.compilation_config.static_forward_context}")
-        old_layers = self.layers
+
+        if layers[1] == self.start_layer-1:
+            self.start_layer = layers[0]
+        if layers[0] == self.end_layer:
+            self.end_layer = layers[1] + 1
+        self.sync_sched_layers()
         with self.model_lock:
             self.layers = new_module
-        del old_layers
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -172,11 +173,11 @@ class DynamicQwen3Model(Qwen3Model):
 
         # Adapt input layers to the model's layers open internal representation
         deleted_start_layer, deleted_end_layer = layers[0], layers[1] + 1
+        old_start_layer, old_end_layer = self.start_layer, self.end_layer
 
         assert deleted_start_layer < deleted_end_layer, "layers[0] must be less than layers[1]"
-        old_start_layer, old_end_layer = self.start_layer, self.end_layer
-        assert deleted_start_layer >= old_start_layer and deleted_end_layer <= old_end_layer, "layers must be in the range of start_layer and end_layer"
-        assert deleted_start_layer == old_start_layer or deleted_end_layer == old_end_layer, f"model layers must be continuous after delete layers, start_layer: {old_start_layer}, end_layer: {old_end_layer}, layers: {layers}"
+        assert deleted_start_layer >= old_start_layer and deleted_end_layer <= old_end_layer, f"layers must be in the range of start_layer and end_layer, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
+        assert deleted_start_layer == old_start_layer or deleted_end_layer == old_end_layer, f"model layers must be continuous after delete layers, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
 
         with self.model_lock:
             for layer_idx in range(deleted_start_layer, deleted_end_layer):
@@ -206,9 +207,10 @@ class DynamicQwen3Model(Qwen3Model):
             self.start_layer = deleted_end_layer
         if deleted_end_layer == old_end_layer:
             self.end_layer = deleted_start_layer
+        
+        # Update the scheduled layers
+        self.sync_sched_layers()
         logger.info(f"after delete_layers, start_layer: {self.start_layer}, end_layer: {self.end_layer}")
-        # 同步更新sched_layers
-        self.set_sched_layers(self.start_layer, self.end_layer-1)
         return
     def set_sched_layers(self, 
                          start_layer: int, 
@@ -218,6 +220,10 @@ class DynamicQwen3Model(Qwen3Model):
 
     def get_sched_layers(self) -> Tuple[int, int]:
         return self.sched_start_layer, self.sched_end_layer
+
+    def sync_sched_layers(self) -> None:
+        self.sched_start_layer = self.start_layer
+        self.sched_end_layer = self.end_layer
 
     def forward(
         self,
@@ -239,7 +245,7 @@ class DynamicQwen3Model(Qwen3Model):
                 assert intermediate_tensors is not None
                 hidden_states = intermediate_tensors["hidden_states"]
                 residual = intermediate_tensors["residual"]
-            logger.warning(f"Forwarding with layers:{self.sched_start_layer} to {self.sched_end_layer}")
+            logger.debug(f"Forwarding with layers:{self.sched_start_layer} to {self.sched_end_layer}")
             for layer in self.layers[self.sched_start_layer:self.sched_end_layer]:
                 try:
                     hidden_states, residual = layer(
@@ -345,7 +351,7 @@ def add_layers(
     num_layers = len(module)
     new_module = torch.nn.ModuleList()
     assert added_layers[0] <= added_layers[1], "added_layers[0] must be less than added_layers[1]"
-    assert added_layers[1] == old_layers[0] - 1 or added_layers[0] == old_layers[1] + 1, "added_layers must be adjacent to old_layers"
+    assert added_layers[1] == old_layers[0] - 1 or added_layers[0] == old_layers[1]+1, f"added_layers must be adjacent to old_layers, added_layers:{added_layers}, old_layers:{old_layers}"
 
     for idx in range(num_layers):
         if old_layers[0] <= idx <= old_layers[1]:

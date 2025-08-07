@@ -219,7 +219,7 @@ class Qwen3DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        logger.info(f"inside decoder layer")
+        logger.debug(f"inside decoder layer")
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
