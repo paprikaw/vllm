@@ -8,6 +8,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.executor.ray_utils import RayWorkerWrapper
 from vllm.v1.worker.dynamic_gpu_worker import DynamicGPUWorker
 from vllm.v1.core.sched.dynamic_scheduler import create_from_dynamic_scheduler_output
+import time
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
@@ -57,6 +58,7 @@ try:
                 intermediate_tensors)
             except Exception as e:
                 logger.exception("Exception occurred during execute_model")
+                time.sleep(10)
                 raise e
             if isinstance(output, IntermediateTensors):
                 output = scheduler_output, output

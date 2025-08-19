@@ -299,8 +299,13 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, intermediate_tensors,
+        try:
+            hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
+        except Exception as e:
+            logger.error(f"Error in forward: {e}")
+            time.sleep(3)
+            raise e
         return hidden_states
 
     def compute_logits(

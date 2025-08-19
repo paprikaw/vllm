@@ -118,25 +118,25 @@ class DynamicGPUWorker(Worker):
         self.model_runner.reinitialize_kv_cache(kv_cache_configs[self.rank])
         return
 
-    def add_layers(self, rank: int, layers: Tuple[int, int]) -> None:
+    def add_layers(self, rank: int, layer_list: list[Tuple[int, int]]) -> None:
         if self.rank != rank:
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip adding model layers")
             return None
-        logger.info(f"Add Model Layers: {layers}")
-        self.model_runner.add_layers(layers)
+        logger.info(f"Add Model Layers: {layer_list}")
+        self.model_runner.add_layers(layer_list)
 
-    def remove_layers(self, rank: int, layers: Tuple[int, int]) -> None:
+    def remove_layers(self, rank: int, layer_list: list[Tuple[int, int]]) -> None:
         if self.rank != rank:
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip removing model layers")
             return None
-        logger.info(f"Remove Model Layers: {layers}")
-        self.model_runner.remove_layers(layers)
+        logger.info(f"Remove Model Layers: {layer_list}")
+        self.model_runner.remove_layers(layer_list)
 
-    def release_kv_cache_for_layers(self, rank: int, layers: Tuple[int, int]) -> None:
+    def release_kv_cache_for_layers(self, rank: int, layers_list: list[Tuple[int, int]]) -> None:
         if self.rank != rank:
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip releasing kv cache for layers")
             return None
-        self.model_runner.release_kv_cache_for_layers(layers)
+        self.model_runner.release_kv_cache_for_layers(layers_list)
 
     def release_kv_cache(self) -> None:
         self.model_runner.release_kv_cache()

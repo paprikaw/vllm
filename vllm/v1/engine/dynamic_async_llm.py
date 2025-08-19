@@ -18,6 +18,7 @@ from vllm.v1.metrics.loggers import (StatLoggerBase, StatLoggerFactory,
 from .async_llm import AsyncLLM
 from .dynamic_core_client import DynamicAsyncMPClient
 from ..executor.dynamic_ray_distributed_executor import DynamicRayDistributedExecutor 
+from vllm.dynamic_config import DynamicConfig
 
 logger = init_logger(__name__)
 
@@ -29,6 +30,7 @@ class DynamicAsyncLLM(AsyncLLM):
     def __init__(
         self,
         vllm_config: VllmConfig,
+        dynamic_config: DynamicConfig,
         executor_class: type[Executor],
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
@@ -107,6 +109,7 @@ class DynamicAsyncLLM(AsyncLLM):
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=self.log_stats,
+            dynamic_config=dynamic_config,
         )
         if self.stat_loggers:
             for stat_logger in self.stat_loggers[0]:
@@ -118,10 +121,12 @@ class DynamicAsyncLLM(AsyncLLM):
             self._run_output_handler()
         except RuntimeError:
             pass
+
     @classmethod
-    def from_vllm_config(
+    def from_vllm_config_with_dynamic_config(
         cls,
         vllm_config: VllmConfig,
+        dynamic_config: DynamicConfig,
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[list[StatLoggerFactory]] = None,
@@ -138,6 +143,7 @@ class DynamicAsyncLLM(AsyncLLM):
         # Create the LLMEngine.
         return cls(
             vllm_config=vllm_config,
+            dynamic_config=dynamic_config,
             executor_class=DynamicRayDistributedExecutor,
             start_engine_loop=start_engine_loop,
             stat_loggers=stat_loggers,

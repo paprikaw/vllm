@@ -11,6 +11,7 @@ from concurrent.futures import Future
 from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
+from vllm.dynamic_config import DynamicConfig
 
 import msgspec
 import zmq
@@ -170,7 +171,6 @@ class EngineCore:
 
     def add_request(self, request: EngineCoreRequest):
         """Add request to the scheduler."""
-
         if request.mm_hashes is not None:
             # Here, if hash exists for a multimodal input, then it will be
             # fetched from the cache, else it will be added to the cache.
@@ -409,6 +409,7 @@ class EngineCoreProc(EngineCore):
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
             self.input_queue = input_queue
             self.output_queue = queue.Queue[Union[EngineCoreOutputs, bytes]]()
+            self.metrics_queue = queue.Queue[Union[EngineCoreOutputs, bytes]]()
             threading.Thread(target=self.process_input_socket,
                              args=(input_socket, ),
                              daemon=True).start()

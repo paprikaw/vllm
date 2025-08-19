@@ -18,6 +18,7 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import get_mp_context, kill_process_tree
 from vllm.v1.executor.abstract import Executor
+from vllm.dynamic_config import DynamicConfig
 
 if TYPE_CHECKING:
     from vllm.attention.layer import Attention
@@ -108,6 +109,7 @@ class CoreEngineProcManager:
         start_index: int,
         local_start_index: int,
         vllm_config: VllmConfig,
+        dynamic_config: DynamicConfig,
         on_head_node: bool,
         input_address: str,
         executor_class: type[Executor],
@@ -120,6 +122,7 @@ class CoreEngineProcManager:
             "input_address": input_address,
             "executor_class": executor_class,
             "log_stats": log_stats,
+            "dynamic_config": dynamic_config,
         }
 
         self.processes: list[Process] = []

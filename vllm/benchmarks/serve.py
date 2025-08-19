@@ -26,6 +26,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
+import csv
 
 import numpy as np
 from tqdm.asyncio import tqdm
@@ -178,6 +179,7 @@ def calculate_metrics(
     itls: list[float] = []
     tpots: list[float] = []
     all_tpots: list[float] = []
+    all_itls: list[list[float]] = []
     ttfts: list[float] = []
     e2els: list[float] = []
     for i in range(len(outputs)):
@@ -203,11 +205,22 @@ def calculate_metrics(
             # Note: if output_len <= 1, we regard tpot as 0 for goodput
             all_tpots.append(tpot)
             itls += outputs[i].itl
+            all_itls.append(outputs[i].itl)
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             completed += 1
         else:
             actual_output_lens.append(0)
+    # 将以上这些metrics作为csv输出到文件中
+    try:
+        file_name = os.environ["METRICS_FILE_NAME"]
+    except KeyError:
+        raise ValueError("Environment variable METRICS_FILE_NAME is not set")
+    print(f"Writing metrics to {file_name}")
+    with open(file_name, "w") as f:
+        writer = csv.writer(f)
+        writer.writerow(["tpots", "itls", "ttfts", "e2els"])
+        writer.writerow([tpots, all_itls, ttfts, e2els])
 
     if goodput_config_dict:
         valid_metrics = []

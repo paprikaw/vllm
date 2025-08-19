@@ -32,7 +32,8 @@ import warnings
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
+import csv
 
 import numpy as np
 from tqdm.asyncio import tqdm
@@ -71,7 +72,7 @@ from benchmark_dataset import (
     VisionArenaDataset,
 )
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
-
+from dynamic_benchmark_dataset import PatternDataset
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
 
@@ -167,6 +168,7 @@ def calculate_metrics(
     tpots: list[float] = []
     all_tpots: list[float] = []
     ttfts: list[float] = []
+    all_itls: list[list[float]] = []
     e2els: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
@@ -194,11 +196,24 @@ def calculate_metrics(
             all_tpots.append(tpot)
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
+            all_itls.append(outputs[i].itl)
             e2els.append(outputs[i].latency)
             completed += 1
         else:
             actual_output_lens.append(0)
 
+    # 将以上这些metrics作为csv输出到文件中
+    try:
+        file_name = os.environ["METRICS_FILE_NAME"]
+    except KeyError:
+        raise ValueError("Environment variable METRICS_FILE_NAME is not set")
+    print(f"Writing metrics to {file_name}")
+    with open(file_name, "w") as f:
+        writer = csv.writer(f)
+        writer.writerow(["tpots", "itls", "ttfts", "e2els"])
+        # 确保几个 list 长度一致
+        for t,  tf, e in zip(tpots, ttfts, e2els):
+            writer.writerow([t, tf, e])
     if goodput_config_dict:
         valid_metrics = []
         slo_values = []
@@ -378,6 +393,7 @@ async def benchmark(
             request.expected_output_len,
             request.multi_modal_data,
         )
+        print(f"input, output length: {prompt_len}, {output_len}")
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -712,6 +728,25 @@ def main(args: argparse.Namespace):
             output_len=args.hf_output_len,
         )
 
+    elif args.dataset_name == "pattern":
+        BENCHMARK_CONFIG_PATH = os.environ.get("BENCHMARK_CONFIG_PATH")
+        assert BENCHMARK_CONFIG_PATH is not None, "BENCHMARK_CONFIG_PATH is not set"
+        config_data = json.load(open(BENCHMARK_CONFIG_PATH))
+        input_ouput_len_data = config_data["input_output_lens"]        
+        request_nums = config_data["request_nums"]        
+        input_output_len: list[Tuple[int,int]] = []
+        assert isinstance(input_ouput_len_data,list)
+        for ele in input_ouput_len_data:
+            assert isinstance(ele,list)
+            assert len(ele) == 2
+            input_output_len.append((ele[0],ele[1]))
+        input_requests =  PatternDataset(dataset_path=args.dataset_path).pattern_sample(
+            tokenizer=tokenizer,
+            num_requests=request_nums,
+            input_output_len=input_output_len,
+            prefix_len=args.pattern_prefix_len,
+            range_ratio=args.pattern_range_ratio,
+        )
     else:
         # For datasets that follow a similar structure, use a mapping.
         dataset_mapping = {
@@ -886,7 +921,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "pattern"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1109,6 +1144,37 @@ if __name__ == "__main__":
     )
     random_group.add_argument(
         "--random-prefix-len",
+        type=int,
+        default=0,
+        help=(
+            "Number of fixed prefix tokens before the random context "
+            "in a request. "
+            "The total input length is the sum of `random-prefix-len` and "
+            "a random "
+            "context length sampled from [input_len * (1 - range_ratio), "
+            "input_len * (1 + range_ratio)]."
+        ),
+    )
+
+    pattern_group = parser.add_argument_group("pattern dataset options")
+    pattern_group.add_argument(
+        "--pattern-batch-size",
+        type=int,
+        default=60,
+        help="Time interval (in seconds) to change the input/output length.",
+    )
+
+    pattern_group.add_argument(
+        "--pattern-range-ratio",
+        type=float,
+        default=0.0,
+        help="Range ratio for sampling input/output length, "
+        "used only for random sampling. Must be in the range [0, 1) to define "
+        "a symmetric sampling range"
+        "[length * (1 - range_ratio), length * (1 + range_ratio)].",
+    )
+    pattern_group.add_argument(
+        "--pattern-prefix-len",
         type=int,
         default=0,
         help=(

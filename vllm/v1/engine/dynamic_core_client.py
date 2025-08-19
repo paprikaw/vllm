@@ -32,6 +32,7 @@ from vllm.v1.utils import CoreEngineProcManager
 from .core_client import MPClient, BackgroundResources, CoreEngine
 from .dynamic_core import DynamicEngineCoreProc
 from .core_client import AnyFuture, _R
+from vllm.dynamic_config import DynamicConfig
 
 class DynamicMPClient(MPClient):
     """
@@ -44,10 +45,12 @@ class DynamicMPClient(MPClient):
         self,
         asyncio_mode: bool,
         vllm_config: VllmConfig,
+        dynamic_config: DynamicConfig,
         executor_class: type[Executor],
         log_stats: bool,
     ):
         self.vllm_config = vllm_config
+        self.dynamic_config = dynamic_config
         # Serialization setup.
         self.encoder = MsgpackEncoder()
         self.decoder = MsgpackDecoder(EngineCoreOutputs)
@@ -101,6 +104,7 @@ class DynamicMPClient(MPClient):
                 self.resources.local_engine_manager = CoreEngineProcManager(
                     DynamicEngineCoreProc.run_engine_core, 
                     vllm_config=vllm_config,
+                    dynamic_config=dynamic_config,
                     executor_class=executor_class,
                     log_stats=log_stats,
                     input_address=input_address,
@@ -140,12 +144,13 @@ class DynamicAsyncMPClient(DynamicMPClient):
     """Asyncio-compatible client for multi-proc EngineCore."""
 
     def __init__(self, vllm_config: VllmConfig, executor_class: type[Executor],
-                 log_stats: bool):
+                 log_stats: bool, dynamic_config: DynamicConfig):
         super().__init__(
             asyncio_mode=True,
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=log_stats,
+            dynamic_config=dynamic_config,
         )
 
         self.outputs_queue = asyncio.Queue[Union[EngineCoreOutputs,

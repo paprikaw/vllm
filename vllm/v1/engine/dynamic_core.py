@@ -10,7 +10,7 @@ from collections import deque
 from concurrent.futures import Future
 from inspect import isclass, signature
 from logging import DEBUG
-from typing import Any, Callable, Optional, TypeVar, Union
+from typing import Any, Callable, Optional, Tuple, TypeVar, Union
 
 import msgspec
 import zmq
@@ -41,8 +41,13 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.core.sched.dynamic_scheduler import DynamicScheduler
 from vllm.v1.core.sched.dynamic_scheduler import MigrationStatus
+from vllm.dynamic_config import PPLayerConfigs
 from vllm.version import __version__ as VLLM_VERSION
 from .utils import get_new_layer_config_with_migration_action
+import vllm.envs as envs
+from dataclasses import dataclass
+from vllm.dynamic_config import DynamicConfig
+
 
 logger = init_logger(__name__)
 
@@ -53,10 +58,20 @@ _R = TypeVar('_R')  # Return type for collective_rpc
 
 class DynamicEngineCore(EngineCore):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, 
+                        dynamic_config: DynamicConfig, 
+                        **kwargs):
+
         super().__init__(*args, **kwargs)
+        assert isinstance(self.scheduler, DynamicScheduler)
+
+        # Make sure dynamic_config is not in the kwargs, but pulling out from it.
+        assert "dynamic_config" not in kwargs
         self.migration_status = MigrationStatus.NOT_MIGRATING
         self.engine_lock = threading.Lock()
+        self.dynamic_config = dynamic_config
+        # TODO: Load initial configurations properly
+        self.cur_pp_layer_config = self.scheduler.pp_layer_config_status.get_cur_pp_layer_config()
 
     def _reinitialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -125,6 +140,77 @@ class DynamicEngineCore(EngineCore):
     def step(self) -> EngineCoreOutputs:
         assert False, "step is not supported for dynamic engine core"
 
+    def change_model_configuration(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
+        with self.engine_lock:
+            logger.info(f"Change configuration  from {self.cur_pp_layer_config} to {pp_layer_config}")
+            start_time = time.time()
+            # First, we need to wait for all batch to be finished
+            assert self.batch_queue is not None
+            assert isinstance(self.scheduler, DynamicScheduler)
+            assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+            engine_core_outputs = []
+            while not self.batch_queue.empty():
+                future, scheduler_output = self.batch_queue.get_nowait()
+                # Blocking until the first result is available.
+                model_output = future.result()
+                self.batch_queue.task_done()
+                engine_core_outputs.append(self.scheduler.update_from_output(
+                    scheduler_output, model_output))
+            drain_out_time = time.time()
+            self.scheduler.preempt_all_requests()
+            preempt_time = time.time()
+            # Release the kv cache
+            self.model_executor.release_kv_cache()
+            release_kv_cache_time = time.time()
+
+            # Adding the layers 
+            for rank, layers in enumerate(pp_layer_config):
+                start_layer, end_layer = self.cur_pp_layer_config[rank][0], self.cur_pp_layer_config[rank][1]
+                adding_layer_list = []
+                if layers[0] < start_layer:
+                    adding_layer_list.append((layers[0], start_layer - 1))
+                if layers[1] > end_layer:
+                    adding_layer_list.append((end_layer + 1, layers[1]))
+                if len(adding_layer_list) == 0:
+                    continue
+                self.model_executor.add_layers(rank, adding_layer_list)
+
+            # remove the layers 
+            for rank, layers in enumerate(pp_layer_config):
+                start_layer, end_layer = self.cur_pp_layer_config[rank][0], self.cur_pp_layer_config[rank][1]
+                deleting_layer_list = []
+                if layers[0] > start_layer:
+                    deleting_layer_list.append((start_layer, layers[0] - 1))
+                if layers[1] < end_layer:
+                    deleting_layer_list.append((layers[1] + 1, end_layer))
+                if len(deleting_layer_list) == 0:
+                    continue
+                self.model_executor.remove_layers(rank, deleting_layer_list)
+            
+            self.scheduler.update_layer_config(pp_layer_config)
+            weight_migration_time = time.time()
+
+            # Reinitialize the kv cache
+            _, _, kv_cache_config = self._reinitialize_kv_caches(self.vllm_config)
+            reinitialize_kv_cache_time = time.time()
+            self.scheduler.re_initialize_kv_cache_manager(kv_cache_config)
+            end_time = time.time()
+
+            self.cur_pp_layer_config = pp_layer_config
+            from datetime import timedelta
+
+            def format_duration(seconds):
+                return str(timedelta(seconds=seconds))
+
+            logger.info(f"drain_out_time: {format_duration(drain_out_time - start_time)}")
+            logger.info(f"preempt_time: {format_duration(preempt_time - drain_out_time)}")
+            logger.info(f"release_kv_cache_time: {format_duration(release_kv_cache_time - preempt_time)}")
+            logger.info(f"weight_migration_time: {format_duration(weight_migration_time - release_kv_cache_time)}")
+            logger.info(f"reinitialize_kv_cache_time: {format_duration(reinitialize_kv_cache_time - weight_migration_time)}")
+            logger.info(f"end_time: {format_duration(end_time - reinitialize_kv_cache_time)}")
+
+            return engine_core_outputs
+
     def migrate_layer_v0(self, rank_from: int, rank_to: int, num_layers: int) -> list[EngineCoreOutputs]:
         with self.engine_lock:
             logger.info(f"migrating layer from {rank_from} to {rank_to} with {num_layers} layers")
@@ -155,8 +241,9 @@ class DynamicEngineCore(EngineCore):
                     num_layers, 
                     self.scheduler.pp_layer_config_status.get_cur_pp_layer_config()
                     )
-            self.model_executor.add_layers(rank_to, layers)
-            self.model_executor.remove_layers(rank_from, layers)
+            
+            self.model_executor.add_layers(rank_to, [layers])
+            self.model_executor.remove_layers(rank_from, [layers])
             self.scheduler.update_layer_config(next_layer_config)
             weight_migration_time = time.time()
 
@@ -244,6 +331,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
     def __init__(
         self,
         vllm_config: VllmConfig,
+        dynamic_config: DynamicConfig,
         on_head_node: bool,
         input_address: str,
         executor_class: type[Executor],
@@ -275,8 +363,12 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             self._init_data_parallel(vllm_config)
 
             # Initialize engine core and model.
-            super().__init__(vllm_config, executor_class, log_stats,
-                             executor_fail_callback)
+            super().__init__(vllm_config, 
+                            executor_class, 
+                            log_stats, 
+                            executor_fail_callback,
+                            dynamic_config=dynamic_config
+                            )
 
             self.step_fn = (self.step if self.batch_queue is None else
                             self.step_with_batch_queue)
@@ -298,6 +390,8 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
             self.input_queue = input_queue
             self.output_queue = queue.Queue[Union[EngineCoreOutputs, bytes]]()
+            self.metrics_queue = queue.Queue[DynamicMetricsOutput]()
+            self.request_num_queue = queue.Queue[int]()
             threading.Thread(target=self.process_input_socket,
                              args=(input_socket, ),
                              daemon=True).start()
@@ -308,6 +402,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                 daemon=True)
             self.output_thread.start()
             threading.Thread(target=self.migration_thread, daemon=True).start()
+            threading.Thread(target=self.metrics_thread, daemon=True).start()
         finally:
             if input_socket is not None:
                 input_socket.close(linger=0)
@@ -406,7 +501,6 @@ class DynamicEngineCoreProc(DynamicEngineCore):
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
-
         waited = False
         while not self.engines_running and not (self.scheduler.has_requests()):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
@@ -426,16 +520,20 @@ class DynamicEngineCoreProc(DynamicEngineCore):
     def _process_engine_step(self):
         """Called only when there are unfinished local requests."""
         # Step the engine core.
+        assert isinstance(self.scheduler, DynamicScheduler)
         outputs = self.step_fn()
+        kv_cache_utilization = self.scheduler.get_kv_cache_utilization()
         # Put EngineCoreOutputs into the output queue.
         if outputs is not None:
             self.output_queue.put_nowait(outputs)
+        self.metrics_queue.put_nowait(DynamicMetricsOutput(kv_cache_utilization=kv_cache_utilization))
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:
         """Dispatch request from client."""
 
         if request_type == EngineCoreRequestType.ADD:
+            self.request_num_queue.put_nowait(1)
             self.add_request(request)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
@@ -544,18 +642,18 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                     # Keep at most 2 buffers to reuse.
                     reuse_buffers.append(buffer)
 
-    def migration_thread(self):
-
+    def migration_thread_rr(self):
         if os.environ.get("TEST_MIGRATION") == "1":
-            migration_interval = int(os.environ.get("MIGRATION_INTERVAL", "60"))
+            migration_interval = envs.MIGRATION_INTERVAL
+            assert migration_interval > 0
             step = 0
             while True:
-                logger.info(f"starting counting down {migration_interval}s")
+                logger.info(f"sleep for {migration_interval} seconds")
                 time.sleep(migration_interval)
                 if step % 2 == 0:
-                    engine_core_outputs = self.migrate_layer_v0(0, 1, 1)
+                    engine_core_outputs = self.migrate_layer_v0(0, 1, 10)
                 else:
-                    engine_core_outputs = self.migrate_layer_v0(1, 0, 1)
+                    engine_core_outputs = self.migrate_layer_v0(1, 0, 10)
                 if engine_core_outputs is not None:
                     for output in engine_core_outputs:
                         self.output_queue.put_nowait(output)
@@ -563,3 +661,187 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         else:
             logger.info(f"TEST_MIGRATION is not set, skipping migration")
             return
+
+    # def migration_thread(self):
+    #     if os.environ.get("TEST_MIGRATION") == "1":
+    #         # Each configuration name must be an integer
+    #         alternative_configs = {int(k): v for k, v in self.dynamic_config.alternative_configs.pp_layer_configs.items()}
+    #         max_index = max(alternative_configs.keys())
+    #         cur_config_index = 0
+    #         kv_utilizations = deque()
+    #         while True:
+    #             metrics = self.metrics_queue.get()
+    #             logger.info(f"kv_cache_utilization: {metrics.kv_cache_utilization}")
+    #             outputs = None
+    #             if len metrics.kv_cache_utilization > 0.8 and cur_config_index < max_index:
+    #                 outputs = self.change_model_configuration(alternative_configs[cur_config_index+1])
+    #                 cur_config_index += 1
+
+    #             if metrics.kv_cache_utilization < 0.5 and cur_config_index > 0:
+    #                 outputs = self.change_model_configuration(alternative_configs[cur_config_index-1])
+    #                 cur_config_index -= 1
+
+    #             if outputs is not None:
+    #                 for output in outputs:
+    #                     self.output_queue.put_nowait(output)
+    #                 break
+    #             # clear out the queue
+    #             while not self.metrics_queue.empty():
+    #                 self.metrics_queue.get_nowait()
+
+    #     else:
+    #         logger.info(f"TEST_MIGRATION is not set, skipping migration")
+    #         return
+
+    def migration_thread(self):
+        import os
+        import time
+        import queue
+        from collections import deque
+
+        if os.environ.get("TEST_MIGRATION") != "1":
+            logger.info("TEST_MIGRATION is not set, skipping migration")
+            return
+
+        # --- config choices & indices ---
+        # Each configuration name must be an integer
+        alternative_configs = {
+            int(k): v for k, v in self.dynamic_config.alternative_configs.pp_layer_configs.items()
+        }
+        migration_steps = set(self.dynamic_config.migration_steps)
+        max_index = max(alternative_configs.keys())
+        cur_config_index = min(alternative_configs.keys())  # 若你希望从0开始，也可直接置0
+
+        logger.info(f"alternative_configs: {alternative_configs}")
+        logger.info(f"migration_steps: {migration_steps}")
+        # --- sliding window settings ---
+        WINDOW = 50 
+        UP_THRESHOLD = 0.8   # 只有窗口满且均值>0.6才上调
+        DOWN_THRESHOLD = 0.5 # 滞回：窗口满且均值<0.5才下调
+        kv_utilizations = deque(maxlen=WINDOW)
+
+        # 可选：迁移动作最小间隔，避免连续迁移过于频繁
+        COOLDOWN_SEC = 3.0
+        last_migration_ts = 0.0
+
+        logger.info(
+            f"[migration] window={WINDOW}, up={UP_THRESHOLD}, down={DOWN_THRESHOLD}, cooldown={COOLDOWN_SEC}s"
+        )
+        num_of_requests = 0 
+        while True:
+            num_of_requests += self.request_num_queue.get()
+            logger.info("num_of_requests: " + str(num_of_requests))
+            if num_of_requests in migration_steps:
+                logger.info("change model configuration")
+                outputs = self.change_model_configuration(alternative_configs[1])
+                for output in outputs:
+                    self.output_queue.put_nowait(output)
+        
+        while True:
+            # 阻塞等待新指标
+            metrics = self.metrics_queue.get()
+            util = getattr(metrics, "kv_cache_utilization", None)
+
+            # 指标校验
+            if util is None:
+                logger.debug("[migration] got metrics without kv_cache_utilization, skip")
+                continue
+            if not isinstance(util, (int, float)):
+                try:
+                    util = float(util)
+                except Exception:
+                    logger.debug(f"[migration] bad kv_cache_utilization={util!r}, skip")
+                    continue
+
+            kv_utilizations.append(util)
+            logger.info(f"[migration] kv_cache_utilization={util:.3f} "
+                        f"(filled={len(kv_utilizations)}/{WINDOW})")
+
+            outputs = None
+
+            # 仅当窗口已满才评估
+            if len(kv_utilizations) == WINDOW:
+                avg_util = sum(kv_utilizations) / WINDOW
+                now = time.time()
+                logger.info(f"[migration] window_avg={avg_util:.3f}, cur_config_index={cur_config_index}")
+
+                # 冷却期内不迁移
+                if now - last_migration_ts >= COOLDOWN_SEC:
+                    # 上调：均值大于0.6 且尚未到达最大配置
+                    if avg_util > UP_THRESHOLD and cur_config_index < max_index:
+                        next_index = cur_config_index + 1
+                        logger.info(f"[migration] ↑ upgrade: {cur_config_index} -> {next_index}")
+                        outputs = self.change_model_configuration(alternative_configs[next_index])
+                        cur_config_index = next_index
+                        last_migration_ts = now
+
+                    # # 下调：均值小于0.5 且尚未到达最小配置
+                    # elif avg_util < DOWN_THRESHOLD and cur_config_index > 0:
+                    #     next_index = cur_config_index - 1
+                    #     logger.info(f"[migration] ↓ downgrade: {cur_config_index} -> {next_index}")
+                    #     outputs = self.change_model_configuration(alternative_configs[next_index])
+                    #     cur_config_index = next_index
+                    #     last_migration_ts = now
+                else:
+                    logger.debug("[migration] in cooldown, skip decision")
+
+            # 处理迁移产生的输出（不退出线程，继续监听）
+            if outputs is not None:
+                for output in outputs:
+                    self.output_queue.put_nowait(output)
+                break
+
+            # 清空 metrics_queue 避免滞后（把队列里旧样本丢掉，用最新的节律）
+            try:
+                while True:
+                    self.metrics_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+    def metrics_thread(self):
+        while True:
+            metrics = self.metrics_queue.get()
+            util = getattr(metrics, "kv_cache_utilization", None)
+            logger.info(f"kv_cache_utilization: {util}")
+
+@dataclass
+class DynamicMetricsOutput:
+    kv_cache_utilization: float
+    num_of_total_serving_request: int = 0
+
+
+# def derive_migration_actions_from_deployments(
+#         from_deployment: list[Tuple[int, int]],
+#         to_deployment: list[Tuple[int, int]],
+#         ) -> 'list[Tuple[int, int, int]]':
+#     """Derive migration actions from two deployments.
+#     Args:
+#         from_deployment: The current deployment.
+#         to_deployment: The target deployment.
+#     Returns:
+#         A list of migration actions. Each action is a tuple of
+#         (rank_from, rank_to, num_layers).
+#     """
+#     # [1, 4], [5, 6], [, 7]
+#     # [1, 1], [2, 3], [4, 7]
+#     output = []
+#     assert len(from_deployment) == len(to_deployment)
+#     for i in range(len(from_deployment)-1):
+#         # when from_deployments have layers to migrate to right GPU
+#         from_deployment_layers = from_deployment[i]
+#         to_deployment_layers = to_deployment[i]
+
+#         num_migrate_layer = abs(from_deployment_layers[1] - to_deployment_layers[1])
+#         if from_deployment_layers[1] > to_deployment_layers[1]:
+#             output.append((i, i+1, num_migrate_layer))
+
+#         if from_deployment_layers[1] < to_deployment_layers[1]:
+#             output.append((i+1, i, num_migrate_layer))
+
+#         # Update the state
+#         from_deployment[i], \
+#             from_deployment[i+1] = \
+#         (from_deployment[i][0], to_deployment[i][1]), \
+#             (to_deployment[i+1][0], from_deployment[i+1][1])
+
+#     return output

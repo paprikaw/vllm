@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
     NCCL_DEBUG: str = "INFO"
     VLLM_PIPELINE_MEMORY_LIMIT: Optional[list[int]] = None
+    MIGRATION_INTERVAL: int = 60
 
 
 def get_default_cache_root():
@@ -201,6 +202,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
             for m in os.getenv("VLLM_PIPELINE_MEMORY_LIMIT").split(",")
         ]
     ),
+    "MIGRATION_INTERVAL":
+    lambda: int(os.getenv("MIGRATION_INTERVAL", "60")),
 
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs

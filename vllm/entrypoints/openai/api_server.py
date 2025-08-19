@@ -33,6 +33,7 @@ from typing_extensions import assert_never
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.dynamic_config import DynamicConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine  # type: ignore
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
@@ -171,7 +172,11 @@ async def build_async_engine_client_from_engine_args(
     # Create the EngineConfig (determines if we can use V1).
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+    deployment_config_path = os.environ.get("DEPLOYMENT_CONFIG_PATH")
+    assert deployment_config_path is not None, "DEPLOYMENT_CONFIG_PATH is not set"
 
+    dynamic_config = DynamicConfig.load_config(
+        deployment_config_path)
     # V1 AsyncLLM.
     if envs.VLLM_USE_V1:
         if disable_frontend_multiprocessing:
@@ -182,8 +187,9 @@ async def build_async_engine_client_from_engine_args(
         from vllm.v1.engine.dynamic_async_llm import DynamicAsyncLLM
         async_llm: Optional[DynamicAsyncLLM] = None
         try:
-            async_llm = DynamicAsyncLLM.from_vllm_config(
+            async_llm = DynamicAsyncLLM.from_vllm_config_with_dynamic_config(
                 vllm_config=vllm_config,
+                dynamic_config=dynamic_config,
                 usage_context=usage_context,
                 disable_log_requests=engine_args.disable_log_requests,
                 disable_log_stats=engine_args.disable_log_stats)

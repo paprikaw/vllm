@@ -1,44 +1,29 @@
 from regex import P
 from vllm.v1.core.sched.scheduler import Scheduler
-from typing import List, Tuple, Dict, Optional, Any,TypeVar, Generic, Type, Union
+from typing import List, Tuple, Optional, TypeVar, Union
 from threading import Lock
 import vllm.envs as envs
 from enum import Enum
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.v1.core.sched.output import SchedulerOutput
-from dataclasses import asdict
 from concurrent.futures import Future
-from collections import UserList, deque
+from collections import deque
 from vllm.v1.request import Request
 from vllm.logger import init_logger
-import time
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
-from vllm.config import VllmConfig
-from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
-from vllm.distributed.kv_transfer.kv_connector.factory import (
-    KVConnectorFactory)
-from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1,
-                                                          KVConnectorRole)
 from vllm.logger import init_logger
-from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
-                                                compute_encoder_budget)
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
-from vllm.v1.core.sched.interface import SchedulerInterface
-from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
-                                       SchedulerOutput)
-from vllm.v1.core.sched.utils import check_stop
-from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
-                            EngineCoreOutputs)
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import EngineCoreOutputs
+from vllm.dynamic_config import PPLayerConfigs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
-from vllm.v1.structured_output import StructuredOutputManager
 import torch
 import gc
 logger = init_logger(__name__)
@@ -60,8 +45,8 @@ class DynamicScheduler(Scheduler):
             start_layer = sum(partitions[:pp_rank])
             end_layer = start_layer + partitions[pp_rank] - 1
             layer_configs.append((start_layer, end_layer))
-        self.pp_layer_config_status = PPLayerConfigStatus(layer_configs)
-
+        self.pp_layer_config_status = SchedulerPPLayerConfigStatus(layer_configs)
+        
         # # Used to track the config of each request
         # self.config_request_ids: Dict[str, List[str]] = {}
 
@@ -107,7 +92,7 @@ class DynamicScheduler(Scheduler):
 
     def update_layer_config(self, layer_config: List[Tuple[int,int]]):
         # Update the configuration of layers stored in the scheduler
-        self.pp_layer_config_status.pp_layer_configs["cur"] = (layer_config)
+        self.pp_layer_config_status.update_pp_layer_config(layer_config)
 
     def _complete_migration(self):
         assert self.migration_status == MigrationStatus.MIGRATING
@@ -317,7 +302,10 @@ class DynamicScheduler(Scheduler):
             prefix_cache_stats=prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,
         )
-class PPLayerConfigStatus:
+    def get_kv_cache_utilization(self) -> float:
+        return self.kv_cache_manager.usage
+
+class SchedulerPPLayerConfigStatus:
     #   Keep two list, first one represent current pp layer configuration, 
     #   second one represent next pp layer configuration
     #   For each configuration, we keep a list of layer range ids
@@ -335,30 +323,31 @@ class PPLayerConfigStatus:
     #       After live migration is finished, the pp_layer_configs will be updated to:
     #           cur_pp_layer_configs: [(0, 3), (4, 9)]
     #           next_pp_layer_configs: None
-
-    pp_layer_configs: Dict[str, Optional[List[Tuple[int,int]]]]
-
-    def __init__(self, pp_layer_config:List[Tuple[int,int]]):
-        self.pp_layer_configs = {
-            "cur": pp_layer_config,
-            "next": None
-        }
-        self.request_id_config_map = {}
+    def __init__(self, pp_layer_configs: Optional[List[Tuple[int,int]]] = None):
+        self.pp_layer_configs = PPLayerConfigs()
+        if pp_layer_configs is not None:
+            self.pp_layer_configs.set_pp_layer_config("cur", pp_layer_configs)
 
     def update_with_next_pp_layer_config(self, pp_layer_configs: List[Tuple[int,int]]):
-        self.pp_layer_configs["next"] = pp_layer_configs
+        self.pp_layer_configs.set_pp_layer_config("next", pp_layer_configs)
 
     def finish_migration_and_update_config(self):
-        self.pp_layer_configs["cur"] = self.pp_layer_configs["next"]
-        self.pp_layer_configs["next"] = None
+        self.pp_layer_configs.set_pp_layer_config("cur", self.pp_layer_configs.get_pp_layer_config("next"))
+        self.pp_layer_configs.delete_pp_layer_config("next")
 
     def get_cur_pp_layer_config(self) -> List[Tuple[int,int]]:
-        assert self.pp_layer_configs["cur"] is not None, "Current pp layer config is not set"
-        return self.pp_layer_configs["cur"]
+        return self.pp_layer_configs.get_pp_layer_config("cur")
         
     def get_next_pp_layer_config(self) -> List[Tuple[int,int]]:
-        assert self.pp_layer_configs["next"] is not None, "Next pp layer config is not set"
-        return self.pp_layer_configs["next"]
+        return self.pp_layer_configs.get_pp_layer_config("next")
+
+    def update_pp_layer_config(self, pp_layer_configs: List[Tuple[int,int]]):
+        # At the moment, we only support update current pp layer config
+        # without next pp layer config
+        # This is because we only update current pp layer configuration 
+        # when using v0 style migration 
+        assert not self.pp_layer_configs.is_key_exist("next"), "Next pp layer config is not None"
+        self.pp_layer_configs.set_pp_layer_config("cur", pp_layer_configs)
 
 class MigrationStatus(Enum):
     NOT_MIGRATING = 0 

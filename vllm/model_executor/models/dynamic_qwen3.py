@@ -28,6 +28,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.utils import LayerFn
 from vllm.model_executor.models.utils import maybe_offload_to_cpu
 from vllm.config import set_current_vllm_config
+import time
 logger = init_logger(__name__)
 
 @support_torch_compile(
@@ -174,14 +175,14 @@ class DynamicQwen3Model(Qwen3Model):
         # Adapt input layers to the model's layers open internal representation
         deleted_start_layer, deleted_end_layer = layers[0], layers[1] + 1
         old_start_layer, old_end_layer = self.start_layer, self.end_layer
-
+        logger.info(f"deleted_start_layer: {deleted_start_layer}, deleted_end_layer: {deleted_end_layer}")
+        logger.info(f"old_start_layer: {old_start_layer}, old_end_layer: {old_end_layer}")
         assert deleted_start_layer < deleted_end_layer, "layers[0] must be less than layers[1]"
         assert deleted_start_layer >= old_start_layer and deleted_end_layer <= old_end_layer, f"layers must be in the range of start_layer and end_layer, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
         assert deleted_start_layer == old_start_layer or deleted_end_layer == old_end_layer, f"model layers must be continuous after delete layers, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
 
         with self.model_lock:
             for layer_idx in range(deleted_start_layer, deleted_end_layer):
-                layer_idx = layer_idx - old_start_layer
                 # # 1. 删除子模块引用
                 layer = self.layers[layer_idx]
                 assert layer is not None, "Layer is None"
@@ -202,6 +203,7 @@ class DynamicQwen3Model(Qwen3Model):
                 #     self._modules.pop(key)
             gc.collect()
             torch.cuda.empty_cache()
+
         # Update the start_layer and end_layer
         if deleted_start_layer == old_start_layer:
             self.start_layer = deleted_end_layer
@@ -245,7 +247,6 @@ class DynamicQwen3Model(Qwen3Model):
                 assert intermediate_tensors is not None
                 hidden_states = intermediate_tensors["hidden_states"]
                 residual = intermediate_tensors["residual"]
-            logger.debug(f"Forwarding with layers:{self.sched_start_layer} to {self.sched_end_layer}")
             for layer in self.layers[self.sched_start_layer:self.sched_end_layer]:
                 try:
                     hidden_states, residual = layer(

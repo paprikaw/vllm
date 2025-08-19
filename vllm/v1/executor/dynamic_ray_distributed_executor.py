@@ -36,14 +36,14 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         output = self.collective_rpc("get_kv_cache_spec_for_layers", args=(rank, layer_range))
         return output[rank]
 
-    def add_layers(self, rank: int, layers: Tuple[int, int]):
-        self.collective_rpc("add_layers", args=(rank, layers))
+    def add_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
+        self.collective_rpc("add_layers", args=(rank, layers_list))
 
-    def remove_layers(self, rank: int, layers: Tuple[int, int]):
-        self.collective_rpc("remove_layers", args=(rank, layers))
+    def remove_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
+        self.collective_rpc("remove_layers", args=(rank, layers_list))
 
-    def release_kv_cache_for_layers(self, rank: int, layers: Tuple[int, int]):
-        self.collective_rpc("release_kv_cache_for_layers", args=(rank, layers))
+    def release_kv_cache_for_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
+        self.collective_rpc("release_kv_cache_for_layers", args=(rank, layers_list))
     def release_kv_cache(self) -> None:
         self.collective_rpc("release_kv_cache")
     def reinitialize_kv_cache(self, kv_cache_configs: list[KVCacheConfig]) -> None:

@@ -136,6 +136,7 @@ class KVCacheManager:
 
         # The block hashes for the request may already be computed
         # if the scheduler has tried to schedule the request before.
+        # For each of request, we need to calclulate block hashes
         block_hashes = self.req_to_block_hashes[request.request_id]
         if not block_hashes:
             block_hashes = hash_request_tokens(self.caching_hash_fn,

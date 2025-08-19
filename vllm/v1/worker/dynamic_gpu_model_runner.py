@@ -111,7 +111,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             if not isinstance(self.model, DynamicQwen3ForCausalLM):
                 raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
             self.model.set_sched_layers(layer_config[0], layer_config[1])
-        return super().execute_model(scheduler_output, intermediate_tensors)
+            return super().execute_model(scheduler_output, intermediate_tensors)
 
     def profile_run(self) -> None: 
         """
@@ -160,16 +160,20 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 raise ValueError(
                     f"Unknown attention type: {attn_module.attn_type}")
         return kv_cache_spec
-    def add_layers(self, layers: Tuple[int, int]) -> None:
+    def add_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
             raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
         available_memory = torch.cuda.mem_get_info()[0]
-        assert available_memory > len(layers) * self.model.get_layer_weight_size(), f"Available memory: {available_memory} is not enough for {len(layers)} layers"
+        num_added_layers = sum([layer[1] - layer[0] + 1 for layer in layers_list])
+        assert available_memory > num_added_layers * self.model.get_layer_weight_size(), \
+            f"Available memory: {available_memory} is not enough for {num_added_layers} layers"
 
         model: DynamicQwen3ForCausalLM = self.model
         loader = CustomModelLoader(self.vllm_config.load_config)
         with set_current_vllm_config(self.vllm_config):
-            loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model)
+            for layers in layers_list:
+                assert len(layers) == 2
+                loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model)
 
     def reinitialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -222,33 +226,48 @@ class DynamicGPUModelRunner(GPUModelRunner):
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
-    def remove_layers(self, layers: Tuple[int, int]) -> None:
+    def remove_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
             raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
         logger.info(f"before delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-        self.model.delete_layers(layers)
+        for layers in layers_list:
+            logger.info(f"Deleting layers {layers}")
+            self.model.delete_layers(layers)
+
+        deleted_layers = set(layer for layers in layers_list for layer in range(layers[0], layers[1]+1))
+        logger.info(f"deleted layer set {deleted_layers}")
         # Delete the layer from forward context
         self.vllm_config.compilation_config.static_forward_context = {
             layer_name: attn_module for layer_name, attn_module in self.vllm_config.compilation_config.static_forward_context.items()
-            if extract_layer_index(layer_name) not in range(layers[0], layers[1]+1)
+            if extract_layer_index(layer_name) not in deleted_layers
         }
+        logger.info(f"forward context:{self.vllm_config.compilation_config.static_forward_context}")
+        gc.collect()
+        torch.cuda.empty_cache()
         logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+
     
-    def release_kv_cache_for_layers(self, layers: Tuple[int, int]) -> None:
+    def release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
+        '''
+        目前release_kv_cache依赖于model.start_layers来进行kv cache list的删除。
+        因此只能先release kv cache再删除layers
+        '''
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
         logger.info(f"before release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-        start_layer = self.model.model.start_layer
+
         # Delete the kv cache from kv_cache list
+        start_layer = self.model.model.start_layer
         self.kv_caches = [
             kv_cache for idx, kv_cache in enumerate(self.kv_caches) 
-            if idx not in range(layers[0]+start_layer, layers[1]+start_layer+1)
+            if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
         ]
 
         # Delete layer name from kv_cache_config
+        deleted_layers = set(layer for layers in layers_list for layer in range(layers[0], layers[1]+1))
         group = self.kv_cache_config.kv_cache_groups[0]
         group.layer_names = [
             name for name in group.layer_names
-            if extract_layer_index(name) not in range(layers[0], layers[1] + 1)
+            if extract_layer_index(name) not in deleted_layers
         ]
 
         gc.collect()
