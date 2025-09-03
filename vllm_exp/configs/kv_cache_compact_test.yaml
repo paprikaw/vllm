@@ -1,0 +1,29 @@
+envs:
+  NCCL_DEBUG: INFO
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/usr/lib/x86_64-linux-gnu/libnccl.so.2.21.5"
+  VLLM_TORCH_PROFILER_DIR: /root/vllm_workbench/profiler/
+  RAY_CGRAPH_get_timeout: "10000"
+  BENCHMARK_CONFIG_PATH: "/tmp/vllm_exp/benchmark_config.json"
+  DEPLOYMENT_CONFIG_PATH: "/tmp/vllm_exp/vllm_config.json"
+projects:
+  - project: "kv_cache_compact_test"
+    type: "test_compact_kv"
+    vllm:
+      pipeline_parallel_size: 2
+      gpu_memory_utilization: 0.9
+      start_pp_layer_partitions:
+        - "32,32"
+    migration:
+      is_migration: false
+      is_compact_kv: true
+      compact_steps:
+        - 20
+    benchmark:
+      running_num_requests: [60, 60]
+      running_request_rates: [3, 1]
+      profile: false
+      data_num_requests: [120]
+      input_output_lens: 
+        - [512, 128]
+is_log_cover: true

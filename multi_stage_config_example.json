@@ -1,0 +1,14 @@
+{
+  "benchmark_type": "multi_stage",
+  "description": "三阶段渐进式负载测试配置",
+  "request_rates": [5.0, 15.0, 25.0],
+  "num_requests": [200, 300, 500],
+  "stage_descriptions": [
+    "阶段1: 预热阶段，低负载 (5 req/s)",
+    "阶段2: 正常负载阶段 (15 req/s)",
+    "阶段3: 高负载压力测试 (25 req/s)"
+  ],
+  "total_requests": 1000,
+  "expected_duration": "约60秒",
+  "notes": "这是一个渐进式负载测试，从低负载开始逐步增加到高负载"
+}

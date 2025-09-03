@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional, Tuple, TypeVar, Union
 
 import msgspec
 import zmq
+from bitarray import bitarray
 
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
@@ -133,6 +134,21 @@ class DynamicEngineCore(EngineCore):
                      "warmup model) took %.2f seconds"), elapsed)
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
+    def _drain_out_running_queue(self) -> list[EngineCoreOutputs]:
+        assert self.batch_queue is not None
+        assert isinstance(self.scheduler, DynamicScheduler)
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+
+        engine_core_outputs = []
+        while not self.batch_queue.empty():
+            future, scheduler_output = self.batch_queue.get_nowait()
+            # Blocking until the first result is available.
+            model_output = future.result()
+            self.batch_queue.task_done()
+            engine_core_outputs.append(self.scheduler.update_from_output(
+                scheduler_output, model_output))
+        return engine_core_outputs
+
     def step_with_batch_queue(self) -> Optional[EngineCoreOutputs]:
         with self.engine_lock:
             return super().step_with_batch_queue()
@@ -148,14 +164,7 @@ class DynamicEngineCore(EngineCore):
             assert self.batch_queue is not None
             assert isinstance(self.scheduler, DynamicScheduler)
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
-            engine_core_outputs = []
-            while not self.batch_queue.empty():
-                future, scheduler_output = self.batch_queue.get_nowait()
-                # Blocking until the first result is available.
-                model_output = future.result()
-                self.batch_queue.task_done()
-                engine_core_outputs.append(self.scheduler.update_from_output(
-                    scheduler_output, model_output))
+            engine_core_outputs = self._drain_out_running_queue()
             drain_out_time = time.time()
             self.scheduler.preempt_all_requests()
             preempt_time = time.time()
@@ -309,6 +318,7 @@ class DynamicEngineCore(EngineCore):
     def execute_model(self, scheduler_output: SchedulerOutput):
         with self.engine_lock:
             return super().execute_model(scheduler_output)
+
     def done_migration(self):
         assert self.migration_status == MigrationStatus.MIGRATING
         assert self.migrating_layers is not None
@@ -319,6 +329,17 @@ class DynamicEngineCore(EngineCore):
         self.migration_status = MigrationStatus.NOT_MIGRATING
         self.layers_to_be_removed = None
         self.rank_from = None
+
+    def test_compact_kv_cache(self, compacted_length: int) -> list[EngineCoreOutputs]:
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        assert isinstance(self.scheduler, DynamicScheduler)
+        with self.engine_lock:
+            engine_outputs = self._drain_out_running_queue()
+
+            bitmap = self.scheduler.get_bitmap()
+            self.model_executor.compact_kv_cache(compacted_length, bitmap)
+            self.scheduler.compact_kv_cache(compacted_length)
+            return engine_outputs
 
 class DynamicEngineCoreProc(DynamicEngineCore):
     """ZMQ-wrapper for running EngineCore in background process.
@@ -403,6 +424,8 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             self.output_thread.start()
             threading.Thread(target=self.migration_thread, daemon=True).start()
             threading.Thread(target=self.metrics_thread, daemon=True).start()
+            threading.Thread(target=self.test_kv_cache_compact_thread, daemon=True).start()
+            logger.info(f"kv cache config: {self.vllm_config.cache_config}")
         finally:
             if input_socket is not None:
                 input_socket.close(linger=0)
@@ -662,41 +685,8 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             logger.info(f"TEST_MIGRATION is not set, skipping migration")
             return
 
-    # def migration_thread(self):
-    #     if os.environ.get("TEST_MIGRATION") == "1":
-    #         # Each configuration name must be an integer
-    #         alternative_configs = {int(k): v for k, v in self.dynamic_config.alternative_configs.pp_layer_configs.items()}
-    #         max_index = max(alternative_configs.keys())
-    #         cur_config_index = 0
-    #         kv_utilizations = deque()
-    #         while True:
-    #             metrics = self.metrics_queue.get()
-    #             logger.info(f"kv_cache_utilization: {metrics.kv_cache_utilization}")
-    #             outputs = None
-    #             if len metrics.kv_cache_utilization > 0.8 and cur_config_index < max_index:
-    #                 outputs = self.change_model_configuration(alternative_configs[cur_config_index+1])
-    #                 cur_config_index += 1
-
-    #             if metrics.kv_cache_utilization < 0.5 and cur_config_index > 0:
-    #                 outputs = self.change_model_configuration(alternative_configs[cur_config_index-1])
-    #                 cur_config_index -= 1
-
-    #             if outputs is not None:
-    #                 for output in outputs:
-    #                     self.output_queue.put_nowait(output)
-    #                 break
-    #             # clear out the queue
-    #             while not self.metrics_queue.empty():
-    #                 self.metrics_queue.get_nowait()
-
-    #     else:
-    #         logger.info(f"TEST_MIGRATION is not set, skipping migration")
-    #         return
-
     def migration_thread(self):
         import os
-        import time
-        import queue
         from collections import deque
 
         if os.environ.get("TEST_MIGRATION") != "1":
@@ -720,13 +710,6 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         DOWN_THRESHOLD = 0.5 # 滞回：窗口满且均值<0.5才下调
         kv_utilizations = deque(maxlen=WINDOW)
 
-        # 可选：迁移动作最小间隔，避免连续迁移过于频繁
-        COOLDOWN_SEC = 3.0
-        last_migration_ts = 0.0
-
-        logger.info(
-            f"[migration] window={WINDOW}, up={UP_THRESHOLD}, down={DOWN_THRESHOLD}, cooldown={COOLDOWN_SEC}s"
-        )
         num_of_requests = 0 
         while True:
             num_of_requests += self.request_num_queue.get()
@@ -736,68 +719,31 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                 outputs = self.change_model_configuration(alternative_configs[1])
                 for output in outputs:
                     self.output_queue.put_nowait(output)
-        
+
+    def test_kv_cache_compact_thread(self):
+        import os
+        assert isinstance(self.scheduler, DynamicScheduler)
+        if os.environ.get("TEST_KV_COMPACT") != "1":
+            logger.info("TEST_KV_COMPACT is not set, skipping migration")
+            return
+
+        compact_steps = set(self.dynamic_config.compact_steps)
+        logger.info(f"compact kv when steps: {compact_steps}")
+        assert len(compact_steps) > 0, "compact_steps must be set"
+
+        num_of_requests = 0
         while True:
-            # 阻塞等待新指标
-            metrics = self.metrics_queue.get()
-            util = getattr(metrics, "kv_cache_utilization", None)
-
-            # 指标校验
-            if util is None:
-                logger.debug("[migration] got metrics without kv_cache_utilization, skip")
-                continue
-            if not isinstance(util, (int, float)):
-                try:
-                    util = float(util)
-                except Exception:
-                    logger.debug(f"[migration] bad kv_cache_utilization={util!r}, skip")
+            num_of_requests += self.request_num_queue.get()
+            logger.info("num_of_requests: " + str(num_of_requests))
+            if num_of_requests in compact_steps:
+                logger.info("compact kv cache")
+                num_kv_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
+                kv_cache_ratio = self.scheduler.get_kv_cache_utilization()
+                if kv_cache_ratio >= 0.9:
                     continue
-
-            kv_utilizations.append(util)
-            logger.info(f"[migration] kv_cache_utilization={util:.3f} "
-                        f"(filled={len(kv_utilizations)}/{WINDOW})")
-
-            outputs = None
-
-            # 仅当窗口已满才评估
-            if len(kv_utilizations) == WINDOW:
-                avg_util = sum(kv_utilizations) / WINDOW
-                now = time.time()
-                logger.info(f"[migration] window_avg={avg_util:.3f}, cur_config_index={cur_config_index}")
-
-                # 冷却期内不迁移
-                if now - last_migration_ts >= COOLDOWN_SEC:
-                    # 上调：均值大于0.6 且尚未到达最大配置
-                    if avg_util > UP_THRESHOLD and cur_config_index < max_index:
-                        next_index = cur_config_index + 1
-                        logger.info(f"[migration] ↑ upgrade: {cur_config_index} -> {next_index}")
-                        outputs = self.change_model_configuration(alternative_configs[next_index])
-                        cur_config_index = next_index
-                        last_migration_ts = now
-
-                    # # 下调：均值小于0.5 且尚未到达最小配置
-                    # elif avg_util < DOWN_THRESHOLD and cur_config_index > 0:
-                    #     next_index = cur_config_index - 1
-                    #     logger.info(f"[migration] ↓ downgrade: {cur_config_index} -> {next_index}")
-                    #     outputs = self.change_model_configuration(alternative_configs[next_index])
-                    #     cur_config_index = next_index
-                    #     last_migration_ts = now
-                else:
-                    logger.debug("[migration] in cooldown, skip decision")
-
-            # 处理迁移产生的输出（不退出线程，继续监听）
-            if outputs is not None:
-                for output in outputs:
-                    self.output_queue.put_nowait(output)
-                break
-
-            # 清空 metrics_queue 避免滞后（把队列里旧样本丢掉，用最新的节律）
-            try:
-                while True:
-                    self.metrics_queue.get_nowait()
-            except queue.Empty:
-                pass
-
+                compact_ratio = kv_cache_ratio + 0.1
+                self.test_compact_kv_cache(int(compact_ratio * num_kv_blocks))
+         
     def metrics_thread(self):
         while True:
             metrics = self.metrics_queue.get()

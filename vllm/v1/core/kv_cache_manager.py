@@ -91,6 +91,7 @@ class KVCacheManager:
         # Mapping from request ID to kv block hashes.
         # This is to avoid recomputing the block hashes for each call of
         # `get_computed_blocks` or `allocate_slots`.
+        # 这个不需要更改
         self.req_to_block_hashes: defaultdict[
             str, list[BlockHashType]] = defaultdict(list)
 

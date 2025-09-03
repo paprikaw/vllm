@@ -32,6 +32,9 @@ from collections import defaultdict
 from vllm.config import set_current_vllm_config
 from threading import Lock
 from vllm.v1.spec_decode.eagle import EagleProposer
+from bitarray import bitarray
+from vllm.v1.core.dynamic_kv_cache_utils import compact_cache
+from vllm.distributed.kv_transfer.kv_connector.dynamic_layer_kv_connector import DynamicLayerKVConnector
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -290,6 +293,55 @@ class DynamicGPUModelRunner(GPUModelRunner):
         torch.cuda.empty_cache()
 
         logger.info(f"after release_kv_cache: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+
+    def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
+        time_start = time.time()
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        logger.info(f"start to compact kv cache for layers {self.model.model.start_layer} to {self.model.model.end_layer}")
+        num_blocks = len(bitmap)
+        assert num_blocks == len(self.kv_caches[0][0]), f"bitmap length mismatch: num_blocks: {num_blocks} != kv_cache_tensor_length: {len(self.kv_caches[0][0])}"
+
+        def is_used(idx):
+            return bitmap[idx]
+        compact_cache(self._migrate_block, is_used, compacted_length, num_blocks)
+        time_end = time.time()
+        logger.info(f"compacted kv cache in {time_end - time_start} seconds")
+
+    def resize_kv_cache(self, new_length: int) -> None:
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+
+        logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+        time_start = time.time()
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        kv, _, T, H, Dh = self.kv_caches[0].shape
+
+        for layer_name, attn_module in forward_context.items():
+            idx = extract_layer_index(layer_name) - self.model.model.start_layer
+            cache = self.kv_caches[idx]
+
+            tmp_cache = torch.zeros((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
+            tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...])
+
+            self.kv_caches[idx] = tmp_cache
+            attn_module.kv_cache = [tmp_cache]
+        time_end = time.time()
+        logger.info(f"resize kv cache in {time_end - time_start} seconds")
+        logger.info(f"before allocate a 5GB tensor, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+        # Allocate a 5GB tensor
+        # 5GB 大小的 float32 tensor
+        num_elements = int(5 * 1024**3 / 4)   # 元素个数
+        big_tensor = torch.empty(num_elements, dtype=torch.float32, device=self.device)
+        logger.info(f"after allocate a 5GB tensor, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+        time_tensor_end = time.time()
+        logger.info(f"allocate a 5GB tensor in {time_tensor_end - time_end} seconds")
+    def _migrate_block(self, new_block_id: int, old_block_id: int):
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert len(self.kv_caches) != 0
+        for cache in self.kv_caches:
+            # loop for k and v tensor
+            for i in range(2):
+                cache[i][new_block_id].copy_(cache[i][old_block_id])
+                # 这里我们只将旧的搬迁到新的，我们不对旧的block数据制0
 
 def bind_kv_cache_for_layers(
     start_layer_index: int,

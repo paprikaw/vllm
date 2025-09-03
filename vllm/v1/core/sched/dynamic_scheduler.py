@@ -1,38 +1,160 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from regex import P
+from vllm.v1.core.dynamic_kv_cache_manager import DynamicKVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
 from typing import List, Tuple, Optional, TypeVar, Union
 from threading import Lock
 import vllm.envs as envs
 from enum import Enum
-from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
-from vllm.v1.core.sched.output import SchedulerOutput
 from concurrent.futures import Future
-from collections import deque
-from vllm.v1.request import Request
-from vllm.logger import init_logger
-from collections import deque
+import torch
+import gc
+from collections import defaultdict, deque
 from collections.abc import Iterable
-from typing import Optional, Union
+from bitarray import bitarray
 
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.dynamic_config import PPLayerConfigs
+from vllm.distributed.kv_events import EventPublisherFactory
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+
+from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager, compute_encoder_budget)
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.sched.output import (CachedRequestData, SchedulerOutput)
+from vllm.v1.core.sched.utils import check_stop
+from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
+from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
-import torch
-import gc
+from vllm.v1.structured_output import StructuredOutputManager
+
 logger = init_logger(__name__)
 T = TypeVar("T")
 
 
 class DynamicScheduler(Scheduler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+        structured_output_manager: StructuredOutputManager,
+        mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+        include_finished_set: bool = False,
+        log_stats: bool = False,
+    ) -> None:
+        """
+        Completely copied from parent class, we need to initialize new dynamic kv cache manager in __init_
+        """
+        self.vllm_config = vllm_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.cache_config = vllm_config.cache_config
+        self.lora_config = vllm_config.lora_config
+        self.kv_cache_config = kv_cache_config
+        self.kv_events_config = vllm_config.kv_events_config
+        self.log_stats = log_stats
+        self.structured_output_manager = structured_output_manager
+
+        # include_finished_set controls whether a separate set of finished
+        # request ids should be included in the EngineCoreOutputs returned
+        # by update_from_outputs(). This is currently used in the multi-engine
+        # case to track request lifetimes efficiently.
+        self.include_finished_set = include_finished_set
+
+        # Scheduling constraints.
+        self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        self.max_num_scheduled_tokens = \
+            self.scheduler_config.max_num_batched_tokens
+        self.max_model_len = self.scheduler_config.max_model_len
+        self.enable_kv_cache_events = (
+            self.kv_events_config is not None
+            and self.kv_events_config.enable_kv_cache_events)
+
+        # Create KVConnector for the Scheduler. Note that each Worker
+        # will have a corresponding KVConnector with Role=WORKER.
+        # KV Connector pushes/pull of remote KVs for P/D and offloading.
+        self.connector = None
+        if self.vllm_config.kv_transfer_config is not None:
+            self.connector = KVConnectorFactory.create_connector_v1(
+                config=self.vllm_config, role=KVConnectorRole.SCHEDULER)
+
+        self.kv_event_publisher = EventPublisherFactory.create(
+            self.kv_events_config)
+
+        num_gpu_blocks = self.cache_config.num_gpu_blocks
+        assert num_gpu_blocks is not None and num_gpu_blocks > 0
+
+        self.block_size = self.cache_config.block_size
+
+        # req_id -> Request
+        self.requests: dict[str, Request] = {}
+        # Priority queues for requests.
+        self.waiting: deque[Request] = deque()
+        self.running: list[Request] = []
+
+        # The request IDs that are finished in between the previous and the
+        # current steps. This is used to notify the workers about the finished
+        # requests so that they can free the cached states for those requests.
+        # This is flushed at the end of each scheduling step.
+        self.finished_req_ids: set[str] = set()
+
+        # P/D: requests in process of recving KV transfers
+        self.finished_recving_kv_req_ids: set[str] = set()
+
+        # OPTIMIZATION: Cache the CachedRequestData objects to avoid creating
+        # them at each scheduling step.
+        # Request id -> deque of CachedRequestData
+        self._cached_reqs_data: dict[
+            str, deque[CachedRequestData]] = defaultdict(deque)
+
+        # Encoder-related.
+        # Calculate encoder cache size if applicable
+        # NOTE: For now we use the same budget for both compute and space.
+        # This can be changed when we make encoder cache for embedding caching
+        # across requests.
+        encoder_compute_budget, encoder_cache_size = compute_encoder_budget(
+            model_config=vllm_config.model_config,
+            scheduler_config=vllm_config.scheduler_config,
+            mm_registry=mm_registry,
+        )
+
+        # NOTE(woosuk): Here, "encoder" includes the vision encoder (and
+        # projector if needed). Currently, we assume that the encoder also
+        # has the Transformer architecture (e.g., ViT).
+        self.max_num_encoder_input_tokens = encoder_compute_budget
+        # NOTE: For the models without encoder (e.g., text-only models),
+        # the encoder cache will not be initialized because cache size is 0
+        # for these models.
+        self.encoder_cache_manager = EncoderCacheManager(
+            cache_size=encoder_cache_size)
+
+        speculative_config = vllm_config.speculative_config
+
+        self.use_eagle = False
+        self.num_spec_tokens = self.num_lookahead_tokens = 0
+        if speculative_config:
+            self.num_spec_tokens = speculative_config.num_speculative_tokens
+            if speculative_config.use_eagle():
+                self.use_eagle = True
+                self.num_lookahead_tokens = self.num_spec_tokens
+
+        # Create the KV cache manager.
+        self.kv_cache_manager = DynamicKVCacheManager(
+            kv_cache_config=kv_cache_config,
+            max_model_len=self.max_model_len,
+            enable_caching=self.cache_config.enable_prefix_caching,
+            caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
+            use_eagle=self.use_eagle,
+            log_stats=self.log_stats,
+            enable_kv_cache_events=self.enable_kv_cache_events,
+        )
+
 
         # Initialize pp layer config status
         assert envs.VLLM_PP_LAYER_PARTITION is not None, "VLLM_PP_LAYER_PARTITION is not set"
@@ -304,6 +426,14 @@ class DynamicScheduler(Scheduler):
         )
     def get_kv_cache_utilization(self) -> float:
         return self.kv_cache_manager.usage
+    
+    def compact_kv_cache(self, compacted_length: int) -> None:
+        assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
+        self.kv_cache_manager.compact_kv_cache(compacted_length)
+
+    def get_bitmap(self) -> bitarray:
+        assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
+        return self.kv_cache_manager.get_bitmap()
 
 class SchedulerPPLayerConfigStatus:
     #   Keep two list, first one represent current pp layer configuration, 

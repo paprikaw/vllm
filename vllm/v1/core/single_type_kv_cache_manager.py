@@ -9,7 +9,9 @@ from vllm.v1.core.kv_cache_utils import BlockHashType, KVCacheBlock
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheSpec,
                                         SlidingWindowSpec)
 from vllm.v1.request import Request
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 
 class SingleTypeKVCacheManager(ABC):
     """
@@ -46,6 +48,7 @@ class SingleTypeKVCacheManager(ABC):
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
         # is finished.
+        # 这个需要更改，但是需要一个反向dict来实现
         self.req_to_blocks: defaultdict[str,
                                         list[KVCacheBlock]] = defaultdict(list)
 

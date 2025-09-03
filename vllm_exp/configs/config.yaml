@@ -1,0 +1,52 @@
+envs:
+  NCCL_DEBUG: INFO
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/usr/lib/x86_64-linux-gnu/libnccl.so.2.21.5"
+  VLLM_TORCH_PROFILER_DIR: /root/vllm_workbench/profiler/
+  RAY_CGRAPH_get_timeout: "10000"
+  BENCHMARK_CONFIG_PATH: "/tmp/vllm_exp/benchmark_config.json"
+  DEPLOYMENT_CONFIG_PATH: "/tmp/vllm_exp/vllm_config.json"
+projects:
+  # - project: "extream-500"
+  #   type: "test_migration_with_different_pp"
+  #   vllm:
+  #     pipeline_parallel_size: 2
+  #     gpu_memory_utilization: 0.9
+  #     start_pp_layer_partitions:
+  #       - "8,56"
+  #   migration:
+  #     is_migration: true 
+  #     migration_steps: [350]
+  #     alternative_configs:
+  #       "0": [8, 56]
+  #       "1": [24, 40]
+  #   benchmark:
+  #     num_requests:
+  #       - 350
+  #       - 150
+  #     input_output_lens:
+  #       - [512, 64]
+  #       - [512, 256]
+  #     request_rates: [2.5]
+  #     profile: false
+  - project: "extream-constant"
+    type: "test_migration_with_different_pp"
+    vllm:
+      pipeline_parallel_size: 2
+      gpu_memory_utilization: 0.9
+      start_pp_layer_partitions:
+        - "8,56"
+        - "16,48"
+        - "20,44"
+        - "24,40"
+        - "28,36"
+    migration:
+      is_migration: false
+    benchmark:
+      request_rates: [2.5]
+      profile: false
+      num_requests:
+        - 500 
+      input_output_lens:
+        - [512, 64]
+is_log_cover: true

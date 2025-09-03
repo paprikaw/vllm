@@ -95,6 +95,7 @@ class PPLayerConfigs(BaseModel):
 class DynamicConfig(BaseModel):
     alternative_configs: PPLayerConfigs
     migration_steps: list[int] = Field(default_factory=list)
+    compact_steps: list[int] = Field(default_factory=list)
     """
     Configurations that is used when switching between different pipeline configurations.
     """

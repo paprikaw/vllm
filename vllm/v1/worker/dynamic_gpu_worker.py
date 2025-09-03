@@ -17,7 +17,9 @@ from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from dataclasses import asdict
 from vllm.sequence import IntermediateTensors
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from bitarray import bitarray
 import time
+from vllm.distributed.kv_transfer.kv_connector.dynamic_layer_kv_connector import DynamicLayerKVConnector
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -28,6 +30,12 @@ class DynamicGPUWorker(Worker):
     def __init__(self, *args, **kwargs):
         logger.info("start to initialize")
         super().__init__(*args, **kwargs)
+
+        self.dynamic_layer_kv_connector = DynamicLayerKVConnector(
+            rank=self.rank,
+            local_rank=self.local_rank,
+            config=self.vllm_config,
+        )
 
     def init_device(self):
         # This function is copied from Worker.init_device
@@ -156,3 +164,10 @@ class DynamicGPUWorker(Worker):
             return
         self.model_runner.initialize_kv_cache_for_layers(kv_cache_specs, kv_cache_size, kv_cache_num_blocks, layers)
         return
+
+    def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
+        self.model_runner.compact_kv_cache(compacted_length, bitmap)
+        self.model_runner.resize_kv_cache(compacted_length)
+
+    def send_layers_kv_cache(self, target_rank: int, layers_list: list[Tuple[int, int]]) -> None:
+        self.dynamic_layer_kv_connector.send_kv_cache_to_rank(target_rank, layers_list)

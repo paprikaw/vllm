@@ -274,7 +274,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
         self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
                                         dtype=torch.int32,
-                                        device="cpu",
+                                       device="cpu",
                                         pin_memory=self.pin_memory)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
 
@@ -2030,6 +2030,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # TODO: add new branches when introducing more types of
                     # KV cache specs.
                     raise ValueError("Unknown KV cache spec type.")
+                logger.info(f"kv_caches shape: {kv_cache_shape}")
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)

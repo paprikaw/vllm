@@ -13,7 +13,7 @@ On the client side, run:
         --model <your_model> \
         --dataset-name sharegpt \
         --dataset-path <path to dataset> \
-        --request-rate <request_rate> \ # By default <request_rate> is inf
+        --request-rate <request_rate> # By default <request_rate> is inf
         --num-prompts <num_prompts> # By default <num_prompts> is 1000
 
     when using tgi backend, add
@@ -27,6 +27,7 @@ import gc
 import json
 import os
 import random
+import shutil
 import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable
@@ -36,6 +37,8 @@ from typing import Any, Optional, Tuple
 import csv
 
 import numpy as np
+from pydantic import BaseModel
+from vllm_exp.data import BenchCfg 
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -74,6 +77,7 @@ from benchmark_dataset import (
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from dynamic_benchmark_dataset import PatternDataset
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+
 
 
 @dataclass
@@ -208,9 +212,9 @@ def calculate_metrics(
     except KeyError:
         raise ValueError("Environment variable METRICS_FILE_NAME is not set")
     print(f"Writing metrics to {file_name}")
-    with open(file_name, "w") as f:
+    with open(file_name, "a", newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["tpots", "itls", "ttfts", "e2els"])
+        writer.writerow(["tpots", "ttfts", "e2els"])
         # 确保几个 list 长度一致
         for t,  tf, e in zip(tpots, ttfts, e2els):
             writer.writerow([t, tf, e])
@@ -283,6 +287,237 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+async def run_multi_stage_benchmark(
+    request_func,
+    input_requests: list[SampleRequest],
+    request_rate_list: list[float],
+    running_num_requests: list[int],
+    burstiness: float,
+    disable_tqdm: bool,
+    max_concurrency: Optional[int],
+    lora_modules: Optional[Iterable[str]],
+    model_id: str,
+    model_name: str,
+    api_url: str,
+    logprobs: Optional[int],
+    ignore_eos: bool,
+    extra_body: Optional[dict],
+    profile: bool,
+    base_url: str,
+    test_prompt: str,
+    test_prompt_len: int,
+    test_output_len: int,
+    test_mm_content: Optional[dict],
+    tokenizer: PreTrainedTokenizerBase,
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    goodput_config_dict: dict[str, float],
+):
+    """
+    执行多阶段基准测试，每个阶段使用不同的请求速率和请求数量
+    """
+    
+    metrics = []
+    results = []
+    
+    # 计算每个阶段的起始索引
+    start_indices = [0]
+    for num_req in running_num_requests[:-1]:
+        start_indices.append(start_indices[-1] + num_req)
+    
+    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+    
+    async def limited_request_func(request_func_input, pbar):
+        if semaphore is None:
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
+        async with semaphore:
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
+    
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    start_time = time.perf_counter()
+    tasks: list[asyncio.Task] = []
+        
+    for stage_idx, (request_rate, num_req) in enumerate(zip(request_rate_list, running_num_requests)):
+        print(f"\n{'='*20} Stage {stage_idx + 1} {'='*20}")
+        print(f"Request rate: {request_rate} req/s")
+        print(f"Number of requests: {num_req}")
+        
+        # 获取当前阶段的请求
+        start_idx = start_indices[stage_idx]
+        end_idx = start_idx + num_req
+        stage_requests = input_requests[start_idx:end_idx]
+        
+        # 为当前阶段创建 LoRA 模块迭代器（如果需要）
+        stage_lora_modules = None
+        if lora_modules:
+            stage_lora_modules = iter(
+                [random.choice(list(lora_modules)) for _ in range(len(stage_requests))]
+            )
+        
+        async for request in get_request(stage_requests, request_rate, burstiness):
+            prompt, prompt_len, output_len, mm_content = (
+                request.prompt,
+                request.prompt_len,
+                request.expected_output_len,
+                request.multi_modal_data,
+            )
+            
+            req_model_id, req_model_name = model_id, model_name
+            if stage_lora_modules:
+                req_lora_module = next(stage_lora_modules)
+                req_model_id, req_model_name = req_lora_module, req_lora_module
+
+            request_func_input = RequestFuncInput(
+                model=req_model_id,
+                model_name=req_model_name,
+                prompt=prompt,
+                api_url=api_url,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                logprobs=logprobs,
+                multi_modal_content=mm_content,
+                ignore_eos=ignore_eos,
+                extra_body=extra_body,
+            )
+            
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                )
+            )
+        
+    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+        
+    if pbar is not None:
+        pbar.close()
+        
+    duration = time.perf_counter() - start_time
+        
+    # 计算指标
+    metrics, actual_output_lens = calculate_metrics(
+        input_requests=input_requests,
+        outputs=outputs,
+        dur_s=duration,
+        tokenizer=tokenizer,
+        selected_percentile_metrics=selected_percentile_metrics,
+        selected_percentiles=selected_percentiles,
+        goodput_config_dict=goodput_config_dict,
+    )
+        
+    # 打印当前阶段的结果
+    print("{s:{c}^{n}}".format(s=" Benchmark Result ", n=50, c="-"))
+    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    print("{:<40} {:<10.2f}".format("Duration (s):", duration))
+    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Request throughput (req/s):", metrics.request_throughput
+        )
+    )
+    if goodput_config_dict:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Request goodput (req/s):", metrics.request_goodput
+            )
+        )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Output token throughput (tok/s):", metrics.output_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Total Token throughput (tok/s):", metrics.total_token_throughput
+        )
+    )
+        
+    # 保存当前阶段的结果
+    result = {
+        "request_rate": request_rate,
+        "num_requests": num_req,
+        "duration": duration,
+        "completed": metrics.completed,
+        "total_input_tokens": metrics.total_input,
+        "total_output_tokens": metrics.total_output,
+        "request_throughput": metrics.request_throughput,
+        "request_goodput": metrics.request_goodput if goodput_config_dict else None,
+        "output_throughput": metrics.output_throughput,
+        "total_token_throughput": metrics.total_token_throughput,
+        "mean_ttft_ms": metrics.mean_ttft_ms,
+        "median_ttft_ms": metrics.median_ttft_ms,
+        "std_ttft_ms": metrics.std_ttft_ms,
+        "mean_tpot_ms": metrics.mean_tpot_ms,
+        "median_tpot_ms": metrics.median_tpot_ms,
+        "std_tpot_ms": metrics.std_tpot_ms,
+        "mean_itl_ms": metrics.mean_itl_ms,
+        "median_itl_ms": metrics.median_itl_ms,
+        "std_itl_ms": metrics.std_itl_ms,
+        "mean_e2el_ms": metrics.mean_e2el_ms,
+        "median_e2el_ms": metrics.median_e2el_ms,
+        "std_e2el_ms": metrics.std_e2el_ms,
+    }
+        
+    # 添加百分位数指标
+    for p, value in metrics.percentiles_ttft_ms:
+        p_word = str(int(p)) if int(p) == p else str(p)
+        result[f"p{p_word}_ttft_ms"] = value
+        
+    for p, value in metrics.percentiles_tpot_ms:
+        p_word = str(int(p)) if int(p) == p else str(p)
+        result[f"p{p_word}_tpot_ms"] = value
+        
+    for p, value in metrics.percentiles_itl_ms:
+        p_word = str(int(p)) if int(p) == p else str(p)
+        result[f"p{p_word}_itl_ms"] = value
+        
+    for p, value in metrics.percentiles_e2el_ms:
+        p_word = str(int(p)) if int(p) == p else str(p)
+        result[f"p{p_word}_e2el_ms"] = value
+        
+    print("-" * 50)
+    
+    # 停止分析器（如果启用）
+    if profile:
+        print("Stopping profiler...")
+        profile_input = RequestFuncInput(
+            model=model_id,
+            prompt=test_prompt,
+            api_url=base_url + "/stop_profile",
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+        )
+        profile_output = await request_func(request_func_input=profile_input)
+        if profile_output.success:
+            print("Profiler stopped")
+    
+    # # 计算总体指标
+    # total_duration = sum(result["duration"] for result in stage_results)
+    # total_completed = sum(result["completed"] for result in stage_results)
+    # total_input_tokens = sum(result["total_input_tokens"] for result in stage_results)
+    # total_output_tokens = sum(result["total_output_tokens"] for result in stage_results)
+    
+    # # 打印总体结果摘要
+    # print("\n" + "="*60)
+    # print("MULTI-STAGE BENCHMARK SUMMARY")
+    # print("="*60)
+    # print(f"{'Stage':<6} {'Rate':<10} {'Requests':<10} {'Duration':<12} {'Throughput':<15} {'Success':<10}")
+    # print("-" * 60)
+    
+    # for result in stage_results:
+    #     print(f"{result['stage']:<6} {result['request_rate']:<10.1f} {result['num_requests']:<10} "
+    #           f"{result['duration']:<12.2f} {result['request_throughput']:<15.2f} {result['completed']:<10}")
+    
+    # print("-" * 60)
+    # print(f"{'Total':<6} {'-':<10} {sum(r['num_requests'] for r in stage_results):<10} "
+    #       f"{total_duration:<12.2f} {total_completed/total_duration:<15.2f} {total_completed:<10}")
+    
+    # 返回总体结果
+    
+    return results
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -293,6 +528,8 @@ async def benchmark(
     input_requests: list[SampleRequest],
     logprobs: Optional[int],
     request_rate: float,
+    compact_kv_request_rate_list: list[float],
+    running_num_requests: list[int],
     burstiness: float,
     disable_tqdm: bool,
     profile: bool,
@@ -364,6 +601,43 @@ async def benchmark(
         if profile_output.success:
             print("Profiler started")
 
+    # 检查是否使用多阶段基准测试
+    print(f"compact list {compact_kv_request_rate_list}")
+    print(f"running requests number:{running_num_requests}")
+    if compact_kv_request_rate_list and running_num_requests:
+        assert len(compact_kv_request_rate_list) == len(running_num_requests), "request_rate_list and num_requests must have the same length"
+        for i, (rate, num_req) in enumerate(zip(compact_kv_request_rate_list, running_num_requests)):
+            print(f"  Stage {i+1}: {num_req} requests at {rate} req/s")
+        
+        # 执行多阶段基准测试
+        return await run_multi_stage_benchmark(
+            request_func=request_func,
+            input_requests=input_requests,
+            request_rate_list=compact_kv_request_rate_list,
+            running_num_requests=running_num_requests,
+            burstiness=burstiness,
+            disable_tqdm=disable_tqdm,
+            max_concurrency=max_concurrency,
+            lora_modules=lora_modules,
+            model_id=model_id,
+            model_name=model_name,
+            api_url=api_url,
+            logprobs=logprobs,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
+            profile=profile,
+            base_url=base_url,
+            test_prompt=test_prompt,
+            test_prompt_len=test_prompt_len,
+            test_output_len=test_output_len,
+            test_mm_content=test_mm_content,
+            tokenizer=tokenizer,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
+            goodput_config_dict=goodput_config_dict,
+        )
+    
+    # 原有的单阶段基准测试逻辑
     distribution = "Poisson process" if burstiness == 1.0 else "Gamma distribution"
 
     print(f"Traffic request rate: {request_rate}")
@@ -636,6 +910,13 @@ def main(args: argparse.Namespace):
         tokenizer_mode=tokenizer_mode,
         trust_remote_code=args.trust_remote_code,
     )
+        # 读取基准测试配置
+    if args.benchmark_config:
+        # 检查配置文件是否存在
+        if not os.path.exists(args.benchmark_config):
+            raise ValueError(f"Benchmark config file not found: {args.benchmark_config}")
+        with open(args.benchmark_config, 'r') as f:
+            benchmark_config = BenchCfg.model_validate(json.load(f))
 
     if args.dataset_name is None:
         raise ValueError(
@@ -729,20 +1010,15 @@ def main(args: argparse.Namespace):
         )
 
     elif args.dataset_name == "pattern":
-        BENCHMARK_CONFIG_PATH = os.environ.get("BENCHMARK_CONFIG_PATH")
-        assert BENCHMARK_CONFIG_PATH is not None, "BENCHMARK_CONFIG_PATH is not set"
-        config_data = json.load(open(BENCHMARK_CONFIG_PATH))
-        input_ouput_len_data = config_data["input_output_lens"]        
-        request_nums = config_data["request_nums"]        
         input_output_len: list[Tuple[int,int]] = []
-        assert isinstance(input_ouput_len_data,list)
-        for ele in input_ouput_len_data:
+        assert len(benchmark_config.input_output_lens) != 0
+        for ele in benchmark_config.input_output_lens:
             assert isinstance(ele,list)
             assert len(ele) == 2
             input_output_len.append((ele[0],ele[1]))
         input_requests =  PatternDataset(dataset_path=args.dataset_path).pattern_sample(
             tokenizer=tokenizer,
-            num_requests=request_nums,
+            num_requests=benchmark_config.data_num_requests,
             input_output_len=input_output_len,
             prefix_len=args.pattern_prefix_len,
             range_ratio=args.pattern_range_ratio,
@@ -801,6 +1077,7 @@ def main(args: argparse.Namespace):
     gc.collect()
     gc.freeze()
 
+
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -812,6 +1089,8 @@ def main(args: argparse.Namespace):
             input_requests=input_requests,
             logprobs=args.logprobs,
             request_rate=args.request_rate,
+            compact_kv_request_rate_list=benchmark_config.running_request_rates,
+            running_num_requests=benchmark_config.running_num_requests,
             burstiness=args.burstiness,
             disable_tqdm=args.disable_tqdm,
             profile=args.profile,
@@ -848,9 +1127,35 @@ def main(args: argparse.Namespace):
                         "Invalid metadata format. Please use KEY=VALUE format."
                     )
         # Traffic
-        result_json["request_rate"] = (
-            args.request_rate if args.request_rate < float("inf") else "inf"
-        )
+        if args.benchmark_config:
+            result_json["benchmark_config_file"] = args.benchmark_config
+            # 从配置文件中读取实际值用于显示
+            try:
+                with open(args.benchmark_config, 'r') as f:
+                    config_data = json.load(f)
+                request_rates = config_data.get("request_rates")
+                num_requests = config_data.get("num_requests")
+                
+                if request_rates is not None and num_requests is not None:
+                    result_json["multi_stage"] = True
+                    result_json["request_rate_list"] = request_rates
+                    result_json["num_requests"] = num_requests
+                    result_json["request_rate"] = "multi_stage"
+                else:
+                    result_json["multi_stage"] = False
+                    result_json["request_rate"] = (
+                        args.request_rate if args.request_rate < float("inf") else "inf"
+                    )
+            except:
+                result_json["multi_stage"] = False
+                result_json["request_rate"] = (
+                    args.request_rate if args.request_rate < float("inf") else "inf"
+                )
+        else:
+            result_json["multi_stage"] = False
+            result_json["request_rate"] = (
+                args.request_rate if args.request_rate < float("inf") else "inf"
+            )
         result_json["burstiness"] = args.burstiness
         result_json["max_concurrency"] = args.max_concurrency
 
@@ -877,7 +1182,28 @@ def main(args: argparse.Namespace):
             if args.max_concurrency is not None
             else ""
         )
-        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+        
+        if args.benchmark_config:
+            # 检查是否包含多阶段配置
+            try:
+                with open(args.benchmark_config, 'r') as f:
+                    config_data = json.load(f)
+                request_rates = config_data.get("request_rates", [])
+                
+                if request_rates:
+                    # 多阶段基准测试文件名
+                    rates_str = "_".join([f"{rate}qps" for rate in request_rates])
+                    file_name = f"{backend}-multi_stage-{rates_str}{max_concurrency_str}-{base_model_id}-{current_dt}.json"
+                else:
+                    # 单阶段基准测试文件名
+                    file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"
+            except:
+                # 如果读取配置文件失败，使用单阶段文件名
+                file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"
+        else:
+            # 单阶段基准测试文件名
+            file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"
+        
         if args.result_filename:
             file_name = args.result_filename
         if args.result_dir:
@@ -983,6 +1309,14 @@ if __name__ == "__main__":
         "then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process or gamma distribution "
         "to synthesize the request arrival times.",
+    )
+    parser.add_argument(
+        "--benchmark-config",
+        type=str,
+        default=None,
+        help="Path to JSON configuration file for benchmark. "
+        "For multi-stage benchmark, the file should contain 'request_rates' and 'num_requests' arrays. "
+        "Example: --benchmark-config config.json",
     )
     parser.add_argument(
         "--burstiness",
@@ -1261,5 +1595,40 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # 验证基准测试配置
+    if args.benchmark_config:
+        if not os.path.exists(args.benchmark_config):
+            raise ValueError(f"Benchmark config file not found: {args.benchmark_config}")
+        
+        try:
+            with open(args.benchmark_config, 'r') as f:
+                config_data = json.load(f)
+            
+            # 检查是否包含多阶段基准测试配置
+            request_rates = config_data.get("request_rates")
+            num_requests = config_data.get("num_requests")
+            
+            if request_rates is not None and num_requests is not None:
+                if len(request_rates) != len(num_requests):
+                    raise ValueError(
+                        f"Length of request_rates ({len(request_rates)}) must match "
+                        f"length of num_requests ({len(num_requests)})"
+                    )
+                
+                # 验证请求数量总和不超过总请求数
+                total_stage_requests = sum(num_requests)
+                if hasattr(args, 'num_prompts') and total_stage_requests > args.num_prompts:
+                    print(f"Warning: Total requests in stages ({total_stage_requests}) exceeds "
+                          f"total prompts ({args.num_prompts}). This may cause issues.")
+                
+                print(f"Multi-stage benchmark config validation passed: {len(request_rates)} stages configured")
+            else:
+                print("Benchmark config loaded (no multi-stage configuration found)")
+            
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in config file: {e}")
+        except Exception as e:
+            raise ValueError(f"Error reading config file: {e}")
 
     main(args)

@@ -14,13 +14,13 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import (get_distributed_init_method,
                         get_ip, get_open_port)
+from bitarray import bitarray
 if ray is not None:
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 else:
     ActorHandle = None
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
-
 logger = init_logger(__name__)
 
 class DynamicRayDistributedExecutor(RayDistributedExecutor):
@@ -326,3 +326,6 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
     def get_current_available_memory(self) -> List[int]:
         return self.collective_rpc("get_current_available_memory")
+    
+    def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
+        self.collective_rpc("compact_kv_cache", args=(compacted_length, bitmap))

@@ -55,6 +55,7 @@ class BlockPool:
         # if there is already an identical block in the cache. This is because
         # we want to make sure the allocated block IDs won't change so that
         # block tables are append-only.
+        # 这个在prefix caching enabled的时候需要更改，而且很简单
         self.cached_block_hash_to_block: dict[BlockHashType, dict[
             int, KVCacheBlock]] = defaultdict(dict)
 
