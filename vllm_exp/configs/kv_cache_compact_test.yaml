@@ -6,6 +6,8 @@ envs:
   RAY_CGRAPH_get_timeout: "10000"
   BENCHMARK_CONFIG_PATH: "/tmp/vllm_exp/benchmark_config.json"
   DEPLOYMENT_CONFIG_PATH: "/tmp/vllm_exp/vllm_config.json"
+  # Safety margin used when estimating memory for adding layers during dynamic migration
+  VLLM_DYNAMIC_MIGRATION_SAFETY_MARGIN: "0.10"
 projects:
   - project: "kv_cache_compact_test"
     type: "test_compact_kv"

@@ -3,7 +3,8 @@
 from regex import P
 from vllm.v1.core.dynamic_kv_cache_manager import DynamicKVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
-from typing import List, Tuple, Optional, TypeVar, Union
+from typing import List, Tuple, Optional, TypeVar, Union, Any
+from vllm.v1.core.sched.snapshot import KVCacheSnapshot, KVCacheSnapshotEntry
 from threading import Lock
 import vllm.envs as envs
 from enum import Enum
@@ -184,19 +185,26 @@ class DynamicScheduler(Scheduler):
         # self.cur_waiting = deque()
         # self.next_running = []
         # self.next_waiting = deque()
-
+        self.next_pp_layer_config = None # This is only used when switching fron old configuration to new configuration in the 
         # When scheduler executes schedule or migration operation, it needs
         # to acquire the lock.
         self.lock = Lock()
         self._migration_future: Optional[Future] = None
+        self.inject_sync_msg = False
 
+    def synchronize_kv_cache_and_change_configuration(self, pp_layer_config: List[Tuple[int,int]]):
+        self.inject_sync_msg = True
+        assert self.next_pp_layer_config is None
+        self.next_pp_layer_config = pp_layer_config
 
-    def start_migration(self, layer_config: List[Tuple[int,int]])->Future:
+    def v1_start_migration(self, layer_config: List[Tuple[int,int]])->Future:
         # Start the migration process
+        # This function will only be called when doing concurrent serving old and new requests in migration 
+        # In the latest style of migration, we don't use this function
         # 1. When doing migration, we maintain two sets of running 
-        #    and waiting requests.
+        #    and waiting requests. 
         # 2. cur_waiting and cur_running are the requests that are 
-        #    running when the migration starts.
+        #    running when the migration starts. 
         # 3. next_waiting and next_running are the new requests that 
         #    will be run when the migraion is in process. 
         assert self.migration_status == MigrationStatus.NOT_MIGRATING, \
@@ -258,22 +266,75 @@ class DynamicScheduler(Scheduler):
             self.waiting_controller.next = self.waiting
             self.running_controller.set_queue_by_id(id, self.running)
 
-        return DynamicSchedulerOutput(
-                    scheduled_new_reqs=scheduler_output.scheduled_new_reqs,
-                    scheduled_cached_reqs=scheduler_output.scheduled_cached_reqs,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
-                    scheduled_spec_decode_tokens=scheduler_output.scheduled_spec_decode_tokens,
-                    scheduled_encoder_inputs=scheduler_output.scheduled_encoder_inputs,
-                    num_common_prefix_blocks=scheduler_output.num_common_prefix_blocks,
-                    finished_req_ids=scheduler_output.finished_req_ids,
-                    free_encoder_input_ids=scheduler_output.free_encoder_input_ids,
-                    structured_output_request_ids=scheduler_output.structured_output_request_ids,
-                    grammar_bitmask=scheduler_output.grammar_bitmask,
-                    kv_connector_metadata=scheduler_output.kv_connector_metadata,
-                    pp_layer_config=pp_layer_config,
-                    request_queue_id=id
-                )
+        # When inject_sync_msg is True, it means we need to sync the kv cache between layers belongs to old and new configuration
+        # The logic here will result in a two step scheduling process
+        # 1. First step: use the old configuration to schedule the requests, but the is_sync_after_migration is True
+        # This will result in different rank to send sync msg to each other
+        # 2. Second step: use the new configuration to schedule the requests, but the is_sync_after_migration is False
+        #  Note when rank receive this sync msg, it is possible that the kv cache patch is not fully applied to the sync point,
+        #  Therefore we will let gpu worker to wait for all kv cache patch to be applied before using the new configuration
+        output = DynamicSchedulerOutput(
+                scheduled_new_reqs=scheduler_output.scheduled_new_reqs,
+                scheduled_cached_reqs=scheduler_output.scheduled_cached_reqs,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                scheduled_spec_decode_tokens=scheduler_output.scheduled_spec_decode_tokens,
+                scheduled_encoder_inputs=scheduler_output.scheduled_encoder_inputs,
+                num_common_prefix_blocks=scheduler_output.num_common_prefix_blocks,
+                finished_req_ids=scheduler_output.finished_req_ids,
+                free_encoder_input_ids=scheduler_output.free_encoder_input_ids,
+                structured_output_request_ids=scheduler_output.structured_output_request_ids,
+                grammar_bitmask=scheduler_output.grammar_bitmask,
+                kv_connector_metadata=scheduler_output.kv_connector_metadata,
+                pp_layer_config=pp_layer_config,
+                request_queue_id=id,
+                is_sync_after_migration=self.inject_sync_msg
+            )
+        if self.inject_sync_msg:
+            self.inject_sync_msg = False
+            assert self.next_pp_layer_config is not None
+            # In here, we update the layer configuration to the next configuration
+            # In the next scheduling step, we will use the next configuration
+            self.update_layer_config(self.next_pp_layer_config)
+            self.next_pp_layer_config = None
+        return output
+
+    def get_kv_cache_snapshot(self) -> KVCacheSnapshot:
+        """Capture a snapshot of current KV cache state per request.
+
+        Returns a mapping: request_id -> {"num_computed_tokens": int,
+                                           "block_ids": list[list[int]]}
+        It includes requests from both current/next running & waiting queues
+        when migration is ongoing; otherwise only the current queues.
+        """
+        entries: dict[str, KVCacheSnapshotEntry] = {}
+        with self.lock:
+            # Collect from both CUR and NEXT queues to be robust during migration
+            cur_run_id, cur_running = self.running_controller.get_cur()
+            cur_waiting = self.waiting_controller.get_cur()
+            next_run_id, next_running = self.running_controller.get_next()
+            next_waiting = self.waiting_controller.get_next()
+            # 此时我们并不涉及到next的迁移，所以next_running和next_waiting都为空
+            assert next_run_id is None and next_waiting is None
+
+            def _collect(reqs: list[Request]) -> None:
+                for req in reqs:
+                    req_id = req.request_id
+                    # Some waiting requests may have no allocated blocks yet
+                    if req_id in self.kv_cache_manager.single_type_manager.req_to_blocks:
+                        block_ids = self.kv_cache_manager.get_block_ids(req_id)
+                    else:
+                        block_ids = []
+                    entries[req_id] = KVCacheSnapshotEntry(
+                        request_id=req_id,
+                        num_computed_tokens=int(req.num_computed_tokens),
+                        block_ids=block_ids,
+                    )
+
+            _collect(cur_running)
+            _collect(list(cur_waiting))
+
+        return KVCacheSnapshot(entries_by_id=entries)
 
     def re_initialize_kv_cache_manager(self,  kv_cache_config: KVCacheConfig):
         # When doing naive stop and go layer migration, we free the old kv cache

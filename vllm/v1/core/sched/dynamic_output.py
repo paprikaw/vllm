@@ -71,3 +71,6 @@ class DynamicSchedulerOutput():
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    # Whether the scheduling output is from before the migration was started.  
+    is_sync_after_migration: bool = False

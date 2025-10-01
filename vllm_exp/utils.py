@@ -101,8 +101,9 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, log_dir: Path, log_file_name: 
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file_path = log_dir / log_file_name
     log_fd = open(log_file_path, "wb", buffering=0)
-    # Dump vvlm config to configuration files
+    # Dump vllm dynamic deployment config to configuration files
     config_file_path = cfg.envs["DEPLOYMENT_CONFIG_PATH"]
+    Path(config_file_path).parent.mkdir(parents=True, exist_ok=True)
     with open(config_file_path, "w") as f:
         json.dump({
             "alternative_configs": cfg.migration.alternative_configs
@@ -150,6 +151,7 @@ def start_benchmark(cfg: Config, spec: BenchmarkRunSpec, log_dir: Path, log_file
     bench_fd = open(log_dir / log_file_name, "wb", buffering=0)
     # Dump workload config to configuration files
     config_file_path = cfg.envs["BENCHMARK_CONFIG_PATH"]
+    Path(config_file_path).parent.mkdir(parents=True, exist_ok=True)
     with open(config_file_path, "w") as f:
         json.dump({
             "input_output_lens": cfg.benchmark.input_output_lens

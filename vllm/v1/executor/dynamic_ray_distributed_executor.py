@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
 import os
 from collections import defaultdict
@@ -21,34 +21,15 @@ else:
     ActorHandle = None
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
+from vllm.v1.executor.abstract import ModelRunnerOutput
+from vllm.v1.executor.abstract import Future
+from vllm.v1.executor.ray_distributed_executor import FutureWrapper
+from vllm.v1.utils import WorkerMemInfo
+from vllm.v1.worker.utils import KVBufferStatus
 logger = init_logger(__name__)
 
 class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
-    def initialize_kv_cache_for_layers(self, rank: int, 
-                                        kv_cache_specs: dict[str, KVCacheSpec], 
-                                        kv_cache_size: int, 
-                                        kv_cache_num_blocks: int,
-                                        layers: Tuple[int, int]) -> None:
-        self.collective_rpc("initialize_kv_cache_for_layers", args=(rank, kv_cache_specs, kv_cache_size, kv_cache_num_blocks, layers))
-
-    def get_kv_cache_spec_for_layers(self, rank: int, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
-        output = self.collective_rpc("get_kv_cache_spec_for_layers", args=(rank, layer_range))
-        return output[rank]
-
-    def add_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
-        self.collective_rpc("add_layers", args=(rank, layers_list))
-
-    def remove_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
-        self.collective_rpc("remove_layers", args=(rank, layers_list))
-
-    def release_kv_cache_for_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
-        self.collective_rpc("release_kv_cache_for_layers", args=(rank, layers_list))
-    def release_kv_cache(self) -> None:
-        self.collective_rpc("release_kv_cache")
-    def reinitialize_kv_cache(self, kv_cache_configs: list[KVCacheConfig]) -> None:
-        assert len(kv_cache_configs) == self.parallel_config.world_size, "kv_cache_configs must have the same length as world_size"
-        self.collective_rpc("reinitialize_kv_cache", args=(kv_cache_configs,))
 
     def _init_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
@@ -324,8 +305,184 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             else:
                 self.non_driver_workers.append(worker)
 
+
+    def _compiled_cpu_ray_dag(self, enable_asyncio: bool):
+        assert self.parallel_config.use_ray
+        self._check_ray_cgraph_installation()
+        from ray.dag import InputNode, MultiOutputNode
+
+
+        # Enlarge the default value of "RAY_CGRAPH_get_timeout" to 300 seconds
+        # (it is 10 seconds by default). This is a Ray environment variable to
+        # control the timeout of getting result from a compiled graph execution,
+        # i.e., the distributed execution that includes model forward runs and
+        # intermediate tensor communications, in the case of vllm.
+        os.environ.setdefault("RAY_CGRAPH_get_timeout", "300")  # noqa: SIM112
+        logger.info("debug start compile cpu ray dag")
+        logger.info("RAY_CGRAPH_get_timeout is set to %s",
+                    os.environ["RAY_CGRAPH_get_timeout"])  # noqa: SIM112
+
+        with InputNode() as input_data:
+            # Example DAG: PP=2, TP=4
+            #
+            # For V0:
+            # ExecuteModelRequest -> 0 -> (ExecuteModelReq, IntermediateTensors) -> 4 -> SamplerOutput   # noqa: E501
+            # ExecuteModelRequest -> 1 -> (ExecuteModelReq, IntermediateTensors) -> 5 -> SamplerOutput   # noqa: E501
+            # ExecuteModelRequest -> 2 -> (ExecuteModelReq, IntermediateTensors) -> 6 -> SamplerOutput   # noqa: E501
+            # ExecutaModelRequest -> 3 -> (ExecuteModelReq, IntermediateTensors) -> 7 -> SamplerOutput   # noqa: E501
+            #
+            # For V1:
+            # SchedulerOutput -> 0 -> (SchedulerOutput, IntermediateTensors) -> 4 -> ModelRunnerOutput   # noqa: E501
+            # SchedulerOutput -> 1 -> (SchedulerOutput, IntermediateTensors) -> 5 -> ModelRunnerOutput   # noqa: E501
+            # SchedulerOutput -> 2 -> (SchedulerOutput, IntermediateTensors) -> 6 -> ModelRunnerOutput   # noqa: E501
+            # SchedulerOutput -> 3 -> (SchedulerOutput, IntermediateTensors) -> 7 -> ModelRunnerOutput   # noqa: E501
+
+            # Build two branches in one DAG: default(SHM) and NCCL.
+            # Both branches share the same workers and execution steps,
+            # but only the NCCL branch specifies 'nccl' transport between PP stages.
+            outputs_shm = [input_data for _ in self.pp_tp_workers[0]]
+            outputs_nccl = [input_data for _ in self.pp_tp_workers[0]]
+
+            for pp_rank, tp_group in enumerate(self.pp_tp_workers):
+                # Advance SHM branch (explicitly use auto -> SHM/object-store on-node)
+                if self.use_v1:
+                    outputs_shm = [
+                        worker.execute_model_ray.bind(  # type: ignore[attr-defined]
+                            outputs_shm[i]) for i, worker in enumerate(tp_group)
+                    ]
+                else:
+                    outputs_shm = [
+                        worker.execute_model_spmd.bind(  # type: ignore[attr-defined]
+                            outputs_shm[i]) for i, worker in enumerate(tp_group)
+                    ]
+
+                # Advance NCCL branch (explicit 'nccl' transport between PP stages)
+                if self.use_v1:
+                    outputs_nccl = [
+                        worker.execute_model_ray.bind(  # type: ignore[attr-defined]
+                            outputs_nccl[i]) for i, worker in enumerate(tp_group)
+                    ]
+                else:
+                    outputs_nccl = [
+                        worker.execute_model_spmd.bind(  # type: ignore[attr-defined]
+                            outputs_nccl[i]) for i, worker in enumerate(tp_group)
+                    ]
+
+                last_pp_rank = len(self.pp_tp_workers) - 1
+                if pp_rank < last_pp_rank:
+                    outputs_shm = [
+                        output.with_tensor_transport(transport="auto")
+                        for output in outputs_shm
+                    ]
+                    outputs_nccl = [
+                        output.with_tensor_transport(transport="nccl")
+                        for output in outputs_nccl
+                    ]
+
+            # Combine branch outputs; we will pick one branch at runtime.
+            forward_dag = MultiOutputNode(outputs_shm + outputs_nccl)
+            # Record per-branch output size for selection later.
+            self._cpu_tp_group_size = len(self.pp_tp_workers[-1])
+
+        return forward_dag.experimental_compile(
+            enable_asyncio=enable_asyncio,
+            _overlap_gpu_communication=envs.
+            VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM)
+
+    def _init_executor(self) -> None:
+        super()._init_executor()
+        self.cpu_forward_dag = None
+
+    def execute_model(
+        self,
+        scheduler_output,
+    ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
+        # 在这里我们也事先构建cpu的dag，减少migratin期间切换到cpu dag的延迟
+        # if self.cpu_forward_dag is None:  # type: ignore
+        #     self.cpu_forward_dag = self._compiled_cpu_ray_dag(enable_asyncio=False)
+        return super().execute_model(scheduler_output)
+
+    def execute_cpu_model(
+        self,
+        scheduler_output,
+    ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
+        """
+        Copied from vllm.executor.ray_distributed_executor.RayDistributedExecutor.execute_model
+        The only difference is we also initialize the cpu_forward_dag
+        Execute the model on the Ray workers.
+
+        Args:
+            scheduler_output: The scheduler output to execute.
+
+        Returns:
+            The model runner output.
+        """
+        # Build the compiled DAG for the first time.
+        if self.cpu_forward_dag is None:
+            self.cpu_forward_dag = self._compiled_cpu_ray_dag(enable_asyncio=False)
+        refs = self.cpu_forward_dag.execute(scheduler_output)  # type: ignore
+        # Select branch at runtime: default(SHM) uses the first block; NCCL uses the second.
+        tp_group = getattr(self, "_cpu_tp_group_size", len(self.pp_tp_workers[-1]))
+        channel = os.environ.get("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "shm").lower()
+        start_idx = 0 if channel == "shm" else tp_group
+        # When PP is not used, we block here until the result is available.
+        if self.max_concurrent_batches == 1:
+            return refs[start_idx].get()
+
+        # When PP is used, we return a FutureWrapper immediately so that
+        # the scheduler can yield to the next batch.
+        return FutureWrapper(refs[start_idx])
+
+    def initialize_kv_cache_for_layers(self, rank: int, 
+                                        kv_cache_specs: dict[str, KVCacheSpec], 
+                                        kv_cache_size: int, 
+                                        kv_cache_num_blocks: int,
+                                        layers: Tuple[int, int]) -> None:
+        self.collective_rpc("initialize_kv_cache_for_layers", args=(rank, kv_cache_specs, kv_cache_size, kv_cache_num_blocks, layers))
+
+    def get_kv_cache_spec_for_layers(self, rank: int, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
+        output = self.collective_rpc("get_kv_cache_spec_for_layers", args=(rank, layer_range))
+        return output[rank]
+
+    def add_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
+        self.collective_rpc("add_layers", args=(rank, layers_list))
+    
+    def async_add_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
+        # fire-and-forget 异步发起，每个 worker 内部用线程执行
+        self.collective_rpc("async_add_layers", args=(rank, layers_list))
+    
+    def start_kv_cache_migration(self, rank, rank_to_layers_ids: dict[int, list[int]]):
+        # 调用 worker 侧的同名方法，仅在 source_rank 上发送，其余 rank 不做事
+        self.collective_rpc("start_kv_cache_migration", args=(rank, rank_to_layers_ids))
+
+    def get_kv_buffer_status(self) -> list[KVBufferStatus]:
+        output = self.collective_rpc("get_kv_buffer_status")
+        return output
+
+    def remove_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
+        self.collective_rpc("remove_layers", args=(rank, layers_list))
+
     def get_current_available_memory(self) -> List[int]:
         return self.collective_rpc("get_current_available_memory")
+
+    def get_workers_mem_info(self) -> List[WorkerMemInfo]:
+        """Return per worker (layer_size, free_memory, single_kv_tensor_size).
+
+        - layer_size: bytes of a single layer's weights (recorded by model).
+        - free_memory: current free GPU memory in bytes.
+        - single_kv_tensor_size: bytes of one layer's KV cache tensor.
+        """
+        return self.collective_rpc("get_mem_info")
     
     def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         self.collective_rpc("compact_kv_cache", args=(compacted_length, bitmap))
+
+    def release_kv_cache_for_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
+        self.collective_rpc("release_kv_cache_for_layers", args=(rank, layers_list))
+
+    def release_kv_cache(self) -> None:
+        self.collective_rpc("release_kv_cache")
+
+    def reinitialize_kv_cache(self, kv_cache_configs: list[KVCacheConfig]) -> None:
+        assert len(kv_cache_configs) == self.parallel_config.world_size, "kv_cache_configs must have the same length as world_size"
+        self.collective_rpc("reinitialize_kv_cache", args=(kv_cache_configs,))

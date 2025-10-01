@@ -98,6 +98,10 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
         extra_env["TEST_KV_COMPACT"] = "0"
 
     env = os.environ.copy()
+    # 传递 LayerKV 双向通道所需的 rank->ip 映射（JSON 字符串）
+    if cfg.network.rank_to_ip:
+        import json as _json
+        env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(cfg.network.rank_to_ip)
     env.update(extra_env)
 
     # 启动服务
@@ -123,20 +127,18 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
     path = get_path_with_log_type("server", "log", logm, vars)
     log_fd = open(path, "wb", buffering=0)
         
-    # Dump vvlm config to configuration files
-    if cfg.migration.is_migration or cfg.migration.is_compact_kv:
-        deployment_config_path = os.environ.get("DEPLOYMENT_CONFIG_PATH")
-        C.print(deployment_config_path)
-        assert deployment_config_path is not None
+    # Dump vllm dynamic deployment config to configuration files (always write if path is provided)
+    deployment_config_path = os.environ.get("DEPLOYMENT_CONFIG_PATH")
+    C.print(deployment_config_path)
+    if deployment_config_path is not None:
         config_file_path = Path(deployment_config_path)
         config_file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(config_file_path, "w") as f:
             json.dump({
-                "alternative_configs": {"pp_layer_configs":
-                                        cfg.migration.alternative_configs},
+                "alternative_configs": {"pp_layer_configs": cfg.migration.alternative_configs},
                 "migration_steps": cfg.migration.migration_steps,
                 "compact_steps": cfg.migration.compact_steps,
-                }, f)
+            }, f)
     proc = subprocess.Popen(
         serve_args,
         stdout=log_fd,
@@ -257,7 +259,7 @@ def partition_and_request_rate(cfg: Config, logm: LogManager):
         time.sleep(3)
         C.print(f"[bold cyan] Running is finished")
 
-def test_compact_kv(cfg: Config, logm: LogManager):
+def one_off_test(cfg: Config, logm: LogManager):
     cfg.path_policy = get_path_policy_from_var_keys([])
     logm.write_constants_meta()
     ok = False

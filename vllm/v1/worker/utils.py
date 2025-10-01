@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 import vllm.envs as envs
+from dataclasses import dataclass
 
 def sanity_check_mm_encoder_outputs(
     mm_embeddings: object,
@@ -79,3 +80,11 @@ def get_total_gpu_memory(rank: int) -> int:
     else:   
         _, total_gpu_memory = torch.cuda.mem_get_info()
     return total_gpu_memory
+
+@dataclass
+class KVBufferStatus:
+    used_tokens: list[int]
+    free_tokens: list[int]
+    capacity_tokens: list[int]
+    send_patch_ids: dict[int, int]
+    recv_patch_ids: dict[int, int]

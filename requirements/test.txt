@@ -517,7 +517,7 @@ pyyaml==6.0.2
     #   transformers
 rapidfuzz==3.12.1
     # via jiwer
-ray==2.43.0
+ray==2.49.0
     # via -r requirements/test.in
 redis==5.2.0
     # via tensorizer

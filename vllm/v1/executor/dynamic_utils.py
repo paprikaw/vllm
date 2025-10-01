@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import traceback
 from typing import TYPE_CHECKING, Dict, Tuple, Union
 
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.executor.ray_utils import RayWorkerWrapper
-from vllm.v1.worker.dynamic_gpu_worker import DynamicGPUWorker
+from vllm.v1.worker.dynamic_gpu_worker import DynamicGPUWorker, DynamicGPUModelRunner
+import torch
 from vllm.v1.core.sched.dynamic_scheduler import create_from_dynamic_scheduler_output
+from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 import time
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
     from vllm.v1.outputs import ModelRunnerOutput
 
 logger = init_logger(__name__)
@@ -43,27 +45,35 @@ try:
                                               "IntermediateTensors"]]:
             # This method is used by Ray Compiled Graph to execute the model,
             # and it needs a special logic of self.setup_device_if_necessary()
-            self.setup_device_if_necessary()
-            assert self.worker is not None, "Worker is not initialized"
-            assert isinstance(self.worker, DynamicGPUWorker), "Worker is not a DynamicGPUWorker"
-            if isinstance(scheduler_output, tuple):
-                scheduler_output, intermediate_tensors = scheduler_output
-            else:
-                scheduler_output, intermediate_tensors = scheduler_output, None
-
             try:
+                self.setup_device_if_necessary()
+                assert self.worker is not None, "Worker is not initialized"
+                assert isinstance(self.worker, DynamicGPUWorker), "Worker is not a DynamicGPUWorker"
+                assert isinstance(self.worker.model_runner, DynamicGPUModelRunner), "Model runner is not a DynamicGPUModelRunner"
+                if isinstance(scheduler_output, tuple):
+                    scheduler_output, intermediate_tensors = scheduler_output
+                else:
+                    scheduler_output, intermediate_tensors = scheduler_output, None
+
+                assert isinstance(scheduler_output, DynamicSchedulerOutput), f"Scheduler output is not a DynamicSchedulerOutput:{type(scheduler_output)}"
+
+                self.worker.kv_synchronize_before_execute_callback()
                 output = self.worker.model_runner.execute_model(
                 create_from_dynamic_scheduler_output(scheduler_output), 
-                scheduler_output.pp_layer_config[self.rpc_rank], 
+                scheduler_output.pp_layer_config[self.rpc_rank],
                 intermediate_tensors)
+                assert(len(self.worker.model_runner.input_batch.block_table.block_tables) == 1) # Only for consistent shape of attention
+                self.worker.kv_synchronize_after_execute_callback(scheduler_output.is_sync_after_migration)
+
+                if isinstance(output, IntermediateTensors):
+                    output = scheduler_output, output
+                # logger.info(f"finished the results:{output}")
+                return output
             except Exception as e:
-                logger.exception("Exception occurred during execute_model")
-                time.sleep(10)
+                print(traceback.format_exc())
+                print(f"error is raised within the compiled ray DAG graph, error: {e}")
+                time.sleep(1)
                 raise e
-            if isinstance(output, IntermediateTensors):
-                output = scheduler_output, output
-            # logger.info(f"finished the results:{output}")
-            return output
 
 except ImportError as e:
     ray = None  # type: ignore

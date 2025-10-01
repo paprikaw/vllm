@@ -34,7 +34,7 @@ from threading import Lock
 from vllm.v1.spec_decode.eagle import EagleProposer
 from bitarray import bitarray
 from vllm.v1.core.dynamic_kv_cache_utils import compact_cache
-from vllm.distributed.kv_transfer.kv_connector.dynamic_layer_kv_connector import DynamicLayerKVConnector
+from vllm.distributed.kv_transfer.kv_connector.dynamic_layer_kv_connector import DynamicKVSynchronizer
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -54,7 +54,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
     # def load_model(self)->float:
     #     super().load_model()
     #     return self.model_memory_usage
-
     def initialize_kv_cache_for_layers(self, 
             kv_cache_specs: dict[str, KVCacheSpec],
             kv_cache_size: int,
@@ -67,6 +66,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         kv_caches: dict[str, torch.Tensor] = {} 
         logger.info(f"kv_cache_specs: {kv_cache_specs}")
         for layer_name, kv_cache_spec in kv_cache_specs.items():
+                if extract_layer_index(layer_name) not in range(layers[0], layers[1]+1):
+                    continue
                 assert kv_cache_size % kv_cache_spec.page_size_bytes == 0
                 num_blocks = kv_cache_size // kv_cache_spec.page_size_bytes
                 assert num_blocks >= kv_cache_num_blocks
@@ -79,6 +80,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     kv_caches[layer_name] = torch.zeros(kv_cache_shape,
                                                         dtype=dtype,
                                                         device=self.device)
+                    self.bind_layer_kv_tensor(extract_layer_index(layer_name), kv_caches[layer_name])
                 else:
                     # TODO: add new branches when introducing more types of
                     # KV cache specs.
@@ -88,14 +90,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 self.kv_cache_config.kv_cache_groups[0].layer_names.append(layer_name)
         if self.speculative_config and self.speculative_config.use_eagle():
             raise NotImplementedError("Eagle is not supported for dynamic weights")
-        start_layer = self.model.model.start_layer
-        bind_kv_cache_for_layers(
-            start_layer,
-            kv_caches,
-            self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches,
-            layers)
 
+        self._update_start_layer()
         if has_kv_transfer_group():
             raise NotImplementedError("KV transfer group is not supported for dynamic weights")
 
@@ -114,7 +110,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
             if not isinstance(self.model, DynamicQwen3ForCausalLM):
                 raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
             self.model.set_sched_layers(layer_config[0], layer_config[1])
-            return super().execute_model(scheduler_output, intermediate_tensors)
+            result = super().execute_model(scheduler_output, intermediate_tensors)
+            return result
 
     def profile_run(self) -> None: 
         """
@@ -163,6 +160,52 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 raise ValueError(
                     f"Unknown attention type: {attn_module.attn_type}")
         return kv_cache_spec
+
+    def get_layer_name_for_index(self, layer_index: int) -> str:
+        """Return the layer name in forward_context for a given global layer index.
+
+        Raises KeyError if not found or ambiguous.
+        """
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        candidates = [name for name in forward_context.keys()
+                      if extract_layer_index(name) == layer_index]
+        if not candidates:
+            raise KeyError(f"No layer name found for index {layer_index} in forward_context")
+        if len(candidates) > 1:
+            raise KeyError(f"Multiple layer names found for index {layer_index}: {candidates}")
+        return candidates[0]
+
+    def bind_layer_kv_tensor(self, layer_index: int, kv_tensor: torch.Tensor) -> None:
+        """Bind a single layer's KV tensor to runner caches and forward context.
+
+        Thread-safe: acquires forward_lock internally.
+        """
+        # Ensure model type for type-checkers
+        if not isinstance(self.model, DynamicQwen3ForCausalLM):
+            raise AssertionError(
+                f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+        # Determine local index in runner kv cache list
+        start_layer: int = self.model.model.start_layer
+        end_layer: int = self.model.model.end_layer
+        if not (start_layer <= layer_index <= end_layer):
+            raise ValueError(f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]")
+
+        local_index = layer_index - start_layer
+        if local_index >= len(self.kv_caches):
+            pad_right = local_index + 1 - len(self.kv_caches)
+            self.kv_caches.extend([torch.tensor([])] * pad_right)
+
+        self.kv_caches[local_index] = kv_tensor
+
+        # Bind to forward context
+        layer_name: str = self.get_layer_name_for_index(layer_index)
+        forward_context: dict[str, "Attention"] = self.vllm_config.compilation_config.static_forward_context
+        forward_context[layer_name].kv_cache = [kv_tensor]
+
+    def has_layer(self, layer_index: int) -> bool:
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        return layer_index in range(self.model.model.start_layer, self.model.model.end_layer + 1)
+
     def add_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
             raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
@@ -203,18 +246,24 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 # different GPUs, and `kv_cache_config.num_blocks` is set to
                 # the min of all `num_blocks`. Verify it here.
                 assert num_blocks >= kv_cache_config.num_blocks
-                if isinstance(kv_cache_spec, AttentionSpec):
+                # Handle known KV cache spec types explicitly for clarity.
+                if isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
                     kv_cache_shape = self.attn_backends[i].get_kv_cache_shape(
                         num_blocks, kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                     dtype = kv_cache_spec.dtype
-                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
-                                                        dtype=dtype,
-                                                        device=self.device)
+                    kv_caches[layer_name] = torch.zeros(
+                        kv_cache_shape, dtype=dtype, device=self.device)
+                elif isinstance(kv_cache_spec, AttentionSpec):
+                    kv_cache_shape = self.attn_backends[i].get_kv_cache_shape(
+                        num_blocks, kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                    dtype = kv_cache_spec.dtype
+                    kv_caches[layer_name] = torch.zeros(
+                        kv_cache_shape, dtype=dtype, device=self.device)
                 else:
-                    # TODO: add new branches when introducing more types of
-                    # KV cache specs.
-                    raise ValueError("Unknown KV cache spec type.")
+                    raise ValueError(
+                        f"Unknown KV cache spec type: {type(kv_cache_spec).__name__}.")
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
@@ -228,6 +277,16 @@ class DynamicGPUModelRunner(GPUModelRunner):
             self.kv_caches)
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
+
+    def get_single_kv_tensor_size(self) -> int:
+        """Return the size in bytes of a single layer's KV cache tensor.
+
+        If KV caches are not initialized yet, returns 0.
+        """
+        assert hasattr(self, "kv_caches") and self.kv_caches and isinstance(self.kv_caches[0], torch.Tensor) 
+
+        t: torch.Tensor = self.kv_caches[0]
+        return int(t.numel() * t.element_size())
 
     def remove_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
@@ -244,7 +303,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
             layer_name: attn_module for layer_name, attn_module in self.vllm_config.compilation_config.static_forward_context.items()
             if extract_layer_index(layer_name) not in deleted_layers
         }
-        logger.info(f"forward context:{self.vllm_config.compilation_config.static_forward_context}")
         gc.collect()
         torch.cuda.empty_cache()
         logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
@@ -319,21 +377,24 @@ class DynamicGPUModelRunner(GPUModelRunner):
             idx = extract_layer_index(layer_name) - self.model.model.start_layer
             cache = self.kv_caches[idx]
 
-            tmp_cache = torch.zeros((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
+            tmp_cache = torch.empty((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
             tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...])
 
             self.kv_caches[idx] = tmp_cache
             attn_module.kv_cache = [tmp_cache]
         time_end = time.time()
         logger.info(f"resize kv cache in {time_end - time_start} seconds")
-        logger.info(f"before allocate a 5GB tensor, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
-        # Allocate a 5GB tensor
-        # 5GB 大小的 float32 tensor
-        num_elements = int(5 * 1024**3 / 4)   # 元素个数
-        big_tensor = torch.empty(num_elements, dtype=torch.float32, device=self.device)
-        logger.info(f"after allocate a 5GB tensor, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+        # logger.info(f"before allocate a 1GB tensor, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+        # # Allocate a 5GB tensor
+        # # 5GB 大小的 float32 tensor
+        # num_elements = int(1 * 1024**3 / 4)   # 元素个数
+        # big_tensor = torch.empty(num_elements, dtype=torch.float32, device=self.device)
+        # logger.info(f"after allocate a 1GB tensor, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+        torch.cuda.empty_cache()
         time_tensor_end = time.time()
-        logger.info(f"allocate a 5GB tensor in {time_tensor_end - time_end} seconds")
+        # logger.info(f"allocate a 1GB tensor in {time_tensor_end - time_end} seconds")
+        logger.info(f"after empty cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+        logger.info(f"empty cache in {time_tensor_end - time_end} seconds")
     def _migrate_block(self, new_block_id: int, old_block_id: int):
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
         assert len(self.kv_caches) != 0
@@ -342,41 +403,62 @@ class DynamicGPUModelRunner(GPUModelRunner):
             for i in range(2):
                 cache[i][new_block_id].copy_(cache[i][old_block_id])
                 # 这里我们只将旧的搬迁到新的，我们不对旧的block数据制0
+    def _update_start_layer(self) -> None:
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        forward_context: dict[str, "Attention"] = self.vllm_config.compilation_config.static_forward_context
+        new_start = min(extract_layer_index(layer_name) for layer_name in forward_context.keys())
+        start_layer = self.model.model.start_layer
 
-def bind_kv_cache_for_layers(
-    start_layer_index: int,
-    kv_caches: dict[str, torch.Tensor],
-    forward_context: dict[str, "Attention"],
-    runner_kv_caches: list[torch.Tensor],
-    layers: Tuple[int, int],
-) -> None:
-    """
-    Bind the allocated KV cache of layers to ModelRunner and forward context.
-    """
-    # Bind kv_caches to ModelRunner
-    assert len(runner_kv_caches) != 0
+        # Sync model start if left-padded
+        if new_start != start_layer:
+            self.model.model.start_layer = new_start
 
-    # Convert kv_caches dict to a list of tensors in the order of layer_index.
-    index2name = defaultdict(list)
-    for layer_name in kv_caches:
-        layer_index = extract_layer_index(layer_name)
-        assert layer_index in range(layers[0], layers[1]+1), f"layer_index: {layer_index} not in range({layers[0]}, {layers[1]+1})"
-        index2name[layer_index].append(layer_name)
+# def bind_kv_cache_for_layers(
+#     start_layer_index: int,
+#     kv_caches: dict[str, torch.Tensor],
+#     forward_context: dict[str, "Attention"],
+#     runner_kv_caches: list[torch.Tensor],
+# ) -> int:
+#     """
+#     Bind the allocated KV cache of layers to ModelRunner and forward context.
+#     """
+#     # Bind kv_caches to ModelRunner (support discrete additions with padding)
+#     # Convert kv_caches dict to a mapping indexed by global layer index.
+#     index2name = defaultdict(list)
+#     for layer_name in kv_caches:
+#         layer_index = extract_layer_index(layer_name)
+#         index2name[layer_index].append(layer_name)
 
-    for layer_index in sorted(index2name.keys()):
-        layer_names = index2name[layer_index]
-        if len(layer_names) > 1:
-            # One typical case is encoder-decoder model, e.g., bart.
-            # The cross attention and self attention in the same decoder layer
-            # has different layer_name but the same layer_index.
-            raise NotImplementedError
-        layer_name = layer_names[0]
-        runner_kv_caches.insert(layer_index - start_layer_index, kv_caches[layer_name])
+#     # Extend the current runner's kv cache list
+#     if index2name:
+#         min_index, max_index = min(index2name.keys()), max(index2name.keys())
+#         if min_index < start_layer_index:
+#             pad_left = start_layer_index - min_index
+#             runner_kv_caches[:0] = [torch.tensor([])] * pad_left
+#             start_layer_index = min_index
 
-    # Bind kv_caches to forward context
-    for layer_name, kv_cache in kv_caches.items():
-        # NOTE: Use list because of v0 PP virtual engine.
-        forward_context[layer_name].kv_cache = [kv_cache]
+#         max_local_index = max_index - start_layer_index
+#         if max_local_index >= len(runner_kv_caches):
+#             pad_right = max_local_index + 1 - len(runner_kv_caches)
+#             runner_kv_caches.extend([torch.tensor([])] * pad_right)
+
+#     for layer_index in sorted(index2name.keys()):
+#         layer_names = index2name[layer_index]
+#         if len(layer_names) > 1:
+#             # One typical case is encoder-decoder model, e.g., bart.
+#             # The cross attention and self attention in the same decoder layer
+#             # has different layer_name but the same layer_index.
+#             raise NotImplementedError
+#         layer_name = layer_names[0]
+#         local_index = layer_index - start_layer_index
+#         runner_kv_caches[local_index] = kv_caches[layer_name]
+
+#     # Bind kv_caches to forward context
+#     for layer_name, kv_cache in kv_caches.items():
+#         # NOTE: Use list because of v0 PP virtual engine.
+#         forward_context[layer_name].kv_cache = [kv_cache]
+#     # Return possibly updated start_layer_index (if left-padded)
+#     return start_layer_index
 
 def _debug_tensor_referrers(tensor, max_referrers=10):
     """打印引用该 tensor 的对象及可能的变量名或容器索引。"""

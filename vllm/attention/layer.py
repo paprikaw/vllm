@@ -367,7 +367,7 @@ def maybe_save_kv_layer_to_connector(
         return
 
     connector = get_kv_transfer_group()
-
+    logger.info(f"connector type: {type(connector)}")
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is None:

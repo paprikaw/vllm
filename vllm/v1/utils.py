@@ -8,6 +8,8 @@ from collections.abc import Sequence
 from multiprocessing import Process, connection
 from typing import (TYPE_CHECKING, Callable, Generic, Optional, TypeVar, Union,
                     overload)
+from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 
@@ -26,6 +28,126 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 T = TypeVar("T")
+
+
+# =========================
+# Time utilities
+# =========================
+
+def human_readable_duration(seconds: float) -> str:
+    """Return a concise human-readable duration string.
+
+    Examples:
+        0.532 -> "532ms"
+        12.3  -> "12.3s"
+        75.0  -> "1m 15.0s"
+        3720  -> "1h 2m 0.0s"
+    """
+    try:
+        if seconds < 0:
+            # Guard against negative inputs; show absolute value with prefix
+            return f"-{human_readable_duration(-seconds)}"
+        if seconds < 1e-3:
+            # microseconds
+            return f"{seconds * 1e6:.0f}µs"
+        if seconds < 1:
+            # milliseconds
+            return f"{seconds * 1e3:.0f}ms"
+
+        # For >= 1 second, format as h m s with a decimal on seconds
+        total_seconds = float(seconds)
+        td = timedelta(seconds=total_seconds)
+        # Extract hours, minutes, seconds
+        total_sec_int = int(td.total_seconds())
+        hours, rem = divmod(total_sec_int, 3600)
+        minutes, secs_int = divmod(rem, 60)
+        secs_rem = total_seconds - (hours * 3600 + minutes * 60)
+
+        parts: list[str] = []
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes or hours:
+            parts.append(f"{minutes}m")
+        parts.append(f"{secs_rem:.1f}s")
+        return " ".join(parts)
+    except Exception:
+        # Fallback to raw seconds if any unexpected error happens
+        return f"{seconds:.3f}s"
+
+
+def now_s() -> float:
+    """High-resolution monotonic time in seconds (for elapsed measurements)."""
+    return time.perf_counter()
+
+
+def elapsed_s(start_s: float, end_s: Optional[float] = None) -> float:
+    """Compute elapsed seconds from start to now or provided end."""
+    return (end_s if end_s is not None else now_s()) - start_s
+
+
+def elapsed_str(start_s: float, end_s: Optional[float] = None) -> str:
+    """Human-readable elapsed time string."""
+    return human_readable_duration(elapsed_s(start_s, end_s))
+
+
+class DurationTimer:
+    """Context manager + utility for timing code blocks.
+
+    Usage:
+        with DurationTimer() as t:
+            ...
+        logger.info("took %s", t.elapsed_str)
+    """
+
+    def __init__(self) -> None:
+        self._start_s: Optional[float] = None
+        self._end_s: Optional[float] = None
+
+    def __enter__(self):
+        self._start_s = now_s()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._end_s = now_s()
+
+    @property
+    def elapsed(self) -> float:
+        return elapsed_s(self._start_s or now_s(), self._end_s)
+
+    @property
+    def elapsed_str(self) -> str:
+        return human_readable_duration(self.elapsed)
+
+# Shared dataclasses for memory assessment
+@dataclass
+class WorkerMemInfo:
+    """Per-worker memory snapshot.
+
+    layer_size: bytes of a single layer's weights
+    free_mem: current free GPU memory reported by driver (bytes)
+    kv_tensor_size: bytes of a single layer's KV cache tensor
+    """
+    layer_size: int
+    free_mem: int
+    kv_tensor_size: int
+
+
+@dataclass
+class AssessResult:
+    """Assessment result for adding layers on a worker.
+
+    enough_without_compact: free_mem >= required_with_margin
+    can_fit_after_compact: free_mem + freed_estimate > required_with_margin
+    required_mem: bytes needed by new layers' weights + their KV cache
+                          (estimated) with safety margin
+    free_mem: current free GPU memory
+    freed_estimate: estimated bytes that could be freed by compacting KV (on existing layers)
+    """
+    enough_without_compact: bool
+    can_fit_after_compact: bool
+    required_mem: int
+    free_mem: int
+    freed_estimate: int
 
 
 class ConstantList(Generic[T], Sequence):

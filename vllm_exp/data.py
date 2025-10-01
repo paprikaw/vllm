@@ -84,10 +84,9 @@ class BenchCfg(BaseModel):
     @field_validator("running_request_rates")
     @classmethod
     def _check_running_request_rate_len(cls, v: List[float], info: ValidationInfo):
-        # 在 v2 里，用 info.data 获取已解析字段
         num_requests = info.data.get("running_num_requests") or []
         if v and not num_requests:
-            raise ValueError("当提供 request_rates_list_compact 时，必须同时提供 num_requests。")
+            raise ValueError("当提供 running_request_rates 时，必须同时提供 running_num_requests。")
         if v and num_requests and len(v) != len(num_requests):
             raise ValueError(
                 f"request_rates_list_compact 长度 {len(v)} 必须与 num_requests 长度 {len(num_requests)} 一致"
@@ -99,7 +98,7 @@ class BenchCfg(BaseModel):
     def _check_io_lens_len(cls, v: List[List[int]], info: ValidationInfo):
         num_requests = info.data.get("data_num_requests") or []
         if v and not num_requests:
-            raise ValueError("当提供 input_output_lens 时，必须同时提供 num_requests。")
+            raise ValueError("当提供 input_output_lens 时，必须同时提供 data_num_requests。")
         if v and num_requests and len(v) != len(num_requests):
             raise ValueError(
                 f"input_output_lens 长度 {len(v)} 必须与 num_requests 长度 {len(num_requests)} 一致"
@@ -109,6 +108,8 @@ class BenchCfg(BaseModel):
 
 class NetworkCfg(BaseModel):
     delays: List[float] = [0]
+    # 可选：pipeline 并行各 rank 的可达 IP，支持双向通道
+    rank_to_ip: Dict[int, str] = {}
 
 class PathPolicy(BaseModel):
     variables: List[str] = []                   # 本轮作为“变量”的键

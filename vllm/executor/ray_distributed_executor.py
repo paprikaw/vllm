@@ -575,6 +575,8 @@ class RayDistributedExecutor(DistributedExecutorBase):
         # i.e., the distributed execution that includes model forward runs and
         # intermediate tensor communications, in the case of vllm.
         os.environ.setdefault("RAY_CGRAPH_get_timeout", "300")  # noqa: SIM112
+        logger.info("debug start compile ray dag")
+        logger.info("Channel type is %s", channel_type)
         logger.info("RAY_CGRAPH_get_timeout is set to %s",
                     os.environ["RAY_CGRAPH_get_timeout"])  # noqa: SIM112
 

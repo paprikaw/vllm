@@ -111,7 +111,7 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
                     if first_layer_index == -1:
                         first_layer_index = layer_idx
                         self.layer_weight_size = 0  # 初始化为0，避免累加多次
-                    self.layer_weight_size += weight.numel() * weight.element_size()
+                        self.layer_weight_size = weight.numel() * weight.element_size()
                 yield name, weight
 
         loader = AutoWeightsLoader(

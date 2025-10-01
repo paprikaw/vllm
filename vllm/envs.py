@@ -837,6 +837,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALL2ALL_BACKEND":
     lambda: os.getenv("VLLM_ALL2ALL_BACKEND", "naive"),
 
+    # =============== LayerKVConnector 专属环境变量 ===============
+    # 通信 IP（默认 127.0.0.1）
+    "VLLM_LAYERKV_IP":
+    lambda: os.getenv("VLLM_LAYERKV_IP", None),
+
+    # 多节点场景下，每个 pipeline 并行 rank 对应的可达 IP（JSON 字符串）
+    # 例如: '{"0": "10.0.0.1", "1": "10.0.0.2"}'
+    "VLLM_LAYERKV_RANK_TO_IP":
+    lambda: os.getenv("VLLM_LAYERKV_RANK_TO_IP", None),
+
+    # 通信基础端口（默认 17579，避免与 KVTransferConfig 默认端口冲突）
+    "VLLM_LAYERKV_PORT":
+    lambda: (int(os.getenv("VLLM_LAYERKV_PORT"))
+             if os.getenv("VLLM_LAYERKV_PORT") is not None else None),
+
+    # TCPStore 超时（秒），默认 300
+    "VLLM_LAYERKV_STORE_TIMEOUT_S":
+    lambda: (int(os.getenv("VLLM_LAYERKV_STORE_TIMEOUT_S", None))
+             if os.getenv("VLLM_LAYERKV_STORE_TIMEOUT_S") is not None else None),
+
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
     # the blockscale tensor of activations NVFP4 Quantization.

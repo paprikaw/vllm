@@ -831,6 +831,9 @@ class EngineArgs:
                                 **vllm_kwargs["kv_transfer_config"])
         vllm_group.add_argument('--kv-events-config',
                                 **vllm_kwargs["kv_events_config"])
+        # 暴露 LayerKVConnector 配置（JSON）
+        vllm_group.add_argument("--layer-kv-connector-config",
+                                **vllm_kwargs["layer_kv_connector_config"]) 
         vllm_group.add_argument("--compilation-config", "-O",
                                 **vllm_kwargs["compilation_config"])
         vllm_group.add_argument("--additional-config",

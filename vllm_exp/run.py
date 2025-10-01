@@ -60,9 +60,9 @@ def sweep(
         elif cfg.type == "test_migration_with_different_pp":
             from .experiments import test_migration_with_different_pp
             test_migration_with_different_pp(cfg, logm)
-        elif cfg.type == "test_compact_kv":
-            from .experiments import test_compact_kv
-            test_compact_kv(cfg, logm)
+        elif cfg.type == "one_off_test":
+            from .experiments import one_off_test
+            one_off_test(cfg, logm)
         else:
             raise ValueError(f"Unknown project type: {cfg.type}")
 

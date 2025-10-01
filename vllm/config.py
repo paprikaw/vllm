@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ast
+import os
 import copy
 import enum
 import hashlib
@@ -3598,6 +3599,83 @@ class KVTransferConfig:
 
 @config
 @dataclass
+class LayerKVConnectorConfig:
+    """配置 DynamicLayerKVConnector 的网络与时序参数。
+
+    支持通过环境变量覆盖：
+    - VLLM_LAYERKV_IP: 覆盖 kv_ip
+    - VLLM_LAYERKV_PORT: 覆盖 kv_port
+    - VLLM_LAYERKV_STORE_TIMEOUT_S: 覆盖 store_timeout_s
+    """
+
+    """用于 LayerKVConnector 的通信 IP。"""
+
+    kv_port: int = 17579
+    """用于 LayerKVConnector 的基础端口（避免与 KVTransferConfig 默认 14579 冲突）。"""
+
+    store_timeout_s: int = 300
+    """StatelessProcessGroup(TCPStore) 的超时时间（秒）。"""
+
+    # 每个 rank 的可达 IP（可选，用于双向通道）。
+    # 若为空则回退到 `kv_ip`。
+    rank_to_ip: dict[int, str] = field(default_factory=dict)
+    """每个 pipeline 并行 rank 的可达 IP 映射。
+
+    - key: 全局 rank（int）
+    - value: 该 rank 所在节点的可达 IP 地址（字符串）
+
+    若未设置或映射为空，则在通信时回退使用 `kv_ip`。
+    用于 DynamicLayerKVConnector 的双向控制通道（每对 rank 各一条）。
+    """
+
+    def compute_hash(self) -> str:
+        # 不影响计算图
+        factors: list[Any] = []
+        hash_str = hashlib.md5(str(factors).encode(),
+                               usedforsecurity=False).hexdigest()
+        return hash_str
+
+    def __post_init__(self) -> None:
+
+        env_port = os.getenv("VLLM_LAYERKV_PORT")
+        if env_port:
+            try:
+                self.kv_port = int(env_port)
+            except ValueError:
+                raise ValueError("VLLM_LAYERKV_PORT 必须为整数")
+
+        env_timeout = os.getenv("VLLM_LAYERKV_STORE_TIMEOUT_S")
+        if env_timeout:
+            try:
+                self.store_timeout_s = int(env_timeout)
+            except ValueError:
+                raise ValueError("VLLM_LAYERKV_STORE_TIMEOUT_S 必须为整数（秒）")
+
+        # 可选：通过环境变量传入 rank->ip 映射（JSON 字符串）
+        env_rank_to_ip = os.getenv("VLLM_LAYERKV_RANK_TO_IP")
+        if env_rank_to_ip:
+            import json
+            try:
+                mapping = json.loads(env_rank_to_ip)
+                # 归一化 key 为 int，value 为 str
+                norm: dict[int, str] = {}
+                for k, v in mapping.items():
+                    try:
+                        ik = int(k)
+                    except Exception:
+                        continue
+                    if not isinstance(v, str):
+                        v = str(v)
+                    norm[ik] = v
+                if norm:
+                    self.rank_to_ip = norm
+            except Exception:
+                # 无法解析时忽略，沿用 kv_ip
+                pass
+
+
+@config
+@dataclass
 class KVEventsConfig:
     """Configuration for KV event publishing."""
 
@@ -4088,6 +4166,8 @@ class VllmConfig:
     """
     kv_transfer_config: Optional[KVTransferConfig] = None
     """The configurations for distributed KV cache transfer."""
+    layer_kv_connector_config: LayerKVConnectorConfig = field(default_factory=LayerKVConnectorConfig)
+    """DynamicLayerKVConnector 的配置。"""
     kv_events_config: Optional[KVEventsConfig] = None
     """The configurations for event publishing."""
     # some opaque config, only used to provide additional information

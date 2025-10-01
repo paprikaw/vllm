@@ -8,6 +8,18 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from typing import Dict, Optional, Union, TypedDict, List
+
+# Avoid circular import by defining metadata type locally instead of importing
+# from dynamic_layer_kv_connector
+class KVSynchronizerMetadata(TypedDict, total=False):
+    type: str
+    dtype: torch.dtype
+    shape: torch.Size
+    batch_id: int
+    layer_ids: List[int]
+    num_tokens: int
+    layer_id: Optional[int]
 
 logger = init_logger(__name__)
 
@@ -64,8 +76,15 @@ class model_aware_kv_ops_helper:
 
         model_config = model_executable.model.config
 
+        # Resolve layer module if an integer layer id is provided.
+        # layer can be either a module or a global layer index.
+        layer_module = layer
+        if isinstance(layer, int):
+            # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
+            layer_module = model_executable.model.layers[layer]
+
         if self.is_deepseek_mla and self.use_mla_opt:
-            layer.self_attn.attn = layer.self_attn.mla_attn
+            layer_module.self_attn.attn = layer_module.self_attn.mla_attn
             k_c_normed_k_pe = keys.squeeze(1)
             k_c_normed = k_c_normed_k_pe[:, :model_config.kv_lora_rank]
             k_pe = k_c_normed_k_pe[:, model_config.kv_lora_rank:]
@@ -74,8 +93,8 @@ class model_aware_kv_ops_helper:
                 k_pe.to(kv_cache.device),
                 kv_cache,
                 slot_mapping[start_pos:end_pos],
-                layer.self_attn.attn.kv_cache_dtype,
-                layer.self_attn.attn._k_scale,
+                layer_module.self_attn.attn.kv_cache_dtype,
+                layer_module.self_attn.attn._k_scale,
             )
         else:
             key_cache, value_cache = kv_cache[0], kv_cache[1]
@@ -85,7 +104,20 @@ class model_aware_kv_ops_helper:
                 key_cache,
                 value_cache,
                 slot_mapping[start_pos:end_pos],
-                layer.self_attn.attn.kv_cache_dtype,
-                layer.self_attn.attn._k_scale,
-                layer.self_attn.attn._v_scale,
+                layer_module.self_attn.attn.kv_cache_dtype,
+                layer_module.self_attn.attn._k_scale,
+                layer_module.self_attn.attn._v_scale,
             )
+
+class kv_synchronizer_helper:
+    @staticmethod
+    def make_metadata_for_layer_tensor(tensor: torch.Tensor,
+                       layer_id: Optional[int]) -> KVSynchronizerMetadata:
+        return {"dtype": tensor.dtype, "shape": tensor.shape, "layer_id": layer_id}
+
+    @staticmethod
+    def make_metadata_for_tensor(tensor: torch.Tensor) -> KVSynchronizerMetadata:
+        return {"dtype": tensor.dtype, "shape": tensor.shape}
+
+    def make_metadata_for_stage_batch(self, batch_id: int, layer_ids: list[int], num_tokens: int, tensor: torch.Tensor) -> KVSynchronizerMetadata:
+        return {"type": "kv_stage_batch", "dtype": tensor.dtype, "shape": tensor.shape, "batch_id": batch_id, "layer_ids": layer_ids, "num_tokens": num_tokens}

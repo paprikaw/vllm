@@ -52,6 +52,7 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
         # Build the compiled DAG for the first time.
         if self.forward_dag is None:  # type: ignore
             self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
+        # refs = self.forward_dag.execute(scheduler_output)  # type: ignore
         refs = self.forward_dag.execute(scheduler_output)  # type: ignore
         # When PP is not used, we block here until the result is available.
         if self.max_concurrent_batches == 1:
