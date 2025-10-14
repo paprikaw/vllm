@@ -32,7 +32,7 @@ from vllm.logger import init_logger
 # Reuse the lightweight 1:1 pipe for rendezvous + NCCL from the dynamic layer
 # connector implementation.
 from vllm.distributed.kv_transfer.kv_connector.dynamic_layer_kv_connector import (  # noqa: E501
-    _PairPipe)
+    PairPipe)
 
 
 logger = init_logger(__name__)
@@ -46,7 +46,7 @@ class DynamicStageKVConnector:
         self.config = config.layer_kv_connector_config
 
         # Map (min_rank, max_rank) -> _PairPipe
-        self._pair_pipes: Dict[Tuple[int, int], _PairPipe] = {}
+        self._pair_pipes: Dict[Tuple[int, int], PairPipe] = {}
 
     def _pair_key(self, peer_rank: int) -> Tuple[int, int]:
         me = self.rank
@@ -65,7 +65,7 @@ class DynamicStageKVConnector:
             ws = max(a, b) + 1
         return base + a * ws + b
 
-    def _ensure_pipe(self, peer_rank: int) -> _PairPipe:
+    def _ensure_pipe(self, peer_rank: int) -> PairPipe:
         key = self._pair_key(peer_rank)
         if key in self._pair_pipes:
             return self._pair_pipes[key]
@@ -74,7 +74,7 @@ class DynamicStageKVConnector:
         pair_rank = 0 if self.rank == a else 1
         port = self._pair_port(peer_rank)
 
-        pipe = _PairPipe(local_rank=self.local_rank,
+        pipe = PairPipe(local_rank=self.local_rank,
                          host=self.config.kv_ip,
                          port=port,
                          pair_rank=pair_rank,

@@ -70,6 +70,7 @@ class DynamicKVCacheManager(KVCacheManager):
             else:
                 assert block.block_hash is None
         return bitmap
+
     def compact_kv_cache(self, compacted_length: int) -> None:
         """Compact the KV cache by moving all used blocks to the leftmost
         `compact length` portion of the cache.
@@ -110,8 +111,7 @@ class DynamicKVCacheManager(KVCacheManager):
         return
     
     def extend_kv_cache(self, extended_length: int) -> None:
-        """Extend the KV cache by moving all used blocks to the leftmost
-        `extended_length` portion of the cache.
+        """ Extend the KV cache to a certain length
         """
         self.block_pool.extend_block_pool(extended_length)
         assert self.block_pool.num_gpu_blocks == extended_length

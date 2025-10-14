@@ -124,16 +124,19 @@ class WorkerMemInfo:
     """Per-worker memory snapshot.
 
     layer_size: bytes of a single layer's weights
+    block_size: bytes of a single block of a KV cache
     free_mem: current free GPU memory reported by driver (bytes)
     kv_tensor_size: bytes of a single layer's KV cache tensor
     """
     layer_size: int
-    free_mem: int
+    block_size: int
     kv_tensor_size: int
+    free_mem: int
+    total_gpu_memory: int
 
 
 @dataclass
-class AssessResult:
+class LayerAddingAssessResult:
     """Assessment result for adding layers on a worker.
 
     enough_without_compact: free_mem >= required_with_margin
@@ -142,12 +145,21 @@ class AssessResult:
                           (estimated) with safety margin
     free_mem: current free GPU memory
     freed_estimate: estimated bytes that could be freed by compacting KV (on existing layers)
+    max_blocks_per_layer: number of blocks after compacting KV, this will only be used when can_fit_after_compact is True and enough_without_compact is False
     """
     enough_without_compact: bool
     can_fit_after_compact: bool
     required_mem: int
     free_mem: int
     freed_estimate: int
+    max_blocks_per_layer: int
+
+@dataclass
+class LayerDeletionAssessResult:
+    """Assessment result for deleting layers on a worker.
+    This result shows the maximum number of blocks one layer can have after adding certain number of weights
+    """
+    max_blocks_per_layer: int
 
 
 class ConstantList(Generic[T], Sequence):

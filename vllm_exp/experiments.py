@@ -151,7 +151,7 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
 def start_benchmark(cfg: Config, spec: BenchmarkRunSpec, logm: LogManager, vars: Optional[dict[str, Any]] = None) -> bool:
     base_url = f"http://head:{cfg.vllm.port}"
     ok = False
-    if not wait_ready(base_url, 180):
+    if not wait_ready(base_url, 300):
         C.print("[red]ERROR[/] vLLM not ready in time")
         return False
 
@@ -172,6 +172,9 @@ def start_benchmark(cfg: Config, spec: BenchmarkRunSpec, logm: LogManager, vars:
         "--pattern-batch-size", str(cfg.benchmark.pattern_batch_size),
         "--benchmark-config", str(benchmark_config_path),
     ]
+
+    if cfg.benchmark.print_outputs:
+        bench_args.append("--print-outputs")
 
     if cfg.benchmark.profile:
         bench_args.append("--profile")

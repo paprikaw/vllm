@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from vllm.v1.request import Request, RequestStatus
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 
 def check_stop(request: Request, max_model_len: int) -> bool:
     if (request.num_tokens >= max_model_len

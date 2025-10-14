@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-
+import threading
 import copy
 import gc
 import time
@@ -34,7 +34,7 @@ from threading import Lock
 from vllm.v1.spec_decode.eagle import EagleProposer
 from bitarray import bitarray
 from vllm.v1.core.dynamic_kv_cache_utils import compact_cache
-from vllm.distributed.kv_transfer.kv_connector.dynamic_layer_kv_connector import DynamicKVSynchronizer
+from vllm.distributed.kv_transfer.kv_connector.dynamic_kv_synchronizer import DynamicKVSynchronizer
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -178,9 +178,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def bind_layer_kv_tensor(self, layer_index: int, kv_tensor: torch.Tensor) -> None:
         """Bind a single layer's KV tensor to runner caches and forward context.
 
-        Thread-safe: acquires forward_lock internally.
+        - 更新本 runner 的 `self.kv_caches`
+        - 将 forward context 中对应 Attention 的 `kv_cache[ve]` 指向该张量
+        - 如有必要，补齐 kv_cache_config 的 layer_names，确保后续 attn_metadata 构建覆盖到该层
+
+        线程安全：内部获取 forward_lock。
         """
-        # Ensure model type for type-checkers
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
             raise AssertionError(
                 f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
@@ -192,15 +195,37 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
         local_index = layer_index - start_layer
         if local_index >= len(self.kv_caches):
+            logger.info(f"pad the kv cache for {layer_index}, local_index={local_index}, kv_tensor length: {len(self.kv_caches)}")
             pad_right = local_index + 1 - len(self.kv_caches)
             self.kv_caches.extend([torch.tensor([])] * pad_right)
-
+        logger.info(f"bind kv tensor for {layer_index}, local_index={local_index}, kv_tensor length: {len(self.kv_caches)}")
         self.kv_caches[local_index] = kv_tensor
-
+        logger.info(f"difference between binded new kv tensor and old kv tensor: old_shape: {self.kv_caches[-1].shape}, new_shape: {self.kv_caches[local_index].shape}, element_number: {self.kv_caches[local_index].numel()}, thread_id: {threading.get_ident()}")
+        logger.info(f"shape of the kv cache after bind: {local_index}, {self.kv_caches[0].shape}, len: {len(self.kv_caches)}")
         # Bind to forward context
         layer_name: str = self.get_layer_name_for_index(layer_index)
-        forward_context: dict[str, "Attention"] = self.vllm_config.compilation_config.static_forward_context
-        forward_context[layer_name].kv_cache = [kv_tensor]
+        fctx: dict[str, "Attention"] = \
+            self.vllm_config.compilation_config.static_forward_context
+        if layer_name not in fctx:
+            raise KeyError(
+                f"No attention layer named {layer_name} in forward_context.")
+
+        attn_module = fctx[layer_name]
+
+        attn_module.kv_cache = [kv_tensor]
+
+        # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
+        group = self.kv_cache_config.kv_cache_groups[0]
+        if layer_name not in group.layer_names:
+            # 按 layer_index 位置插入，保持有序
+            insert_idx = len(group.layer_names)
+            target_idx = extract_layer_index(layer_name)
+            for i, name in enumerate(group.layer_names):
+                if extract_layer_index(name) > target_idx:
+                    insert_idx = i
+                    break
+            group.layer_names.insert(insert_idx, layer_name)
+
 
     def has_layer(self, layer_index: int) -> bool:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
@@ -368,17 +393,21 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def resize_kv_cache(self, new_length: int) -> None:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
 
+        logger.info(f"resizing kv cache from {len(self.kv_caches[0][0])} to {new_length}")
         logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         time_start = time.time()
         forward_context = self.vllm_config.compilation_config.static_forward_context
-        kv, _, T, H, Dh = self.kv_caches[0].shape
+        kv, kv_length, T, H, Dh = self.kv_caches[0].shape
 
         for layer_name, attn_module in forward_context.items():
             idx = extract_layer_index(layer_name) - self.model.model.start_layer
             cache = self.kv_caches[idx]
-
+            
             tmp_cache = torch.empty((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
-            tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...])
+            if new_length > kv_length:
+                tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...])
+            else:
+                tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...])
 
             self.kv_caches[idx] = tmp_cache
             attn_module.kv_cache = [tmp_cache]

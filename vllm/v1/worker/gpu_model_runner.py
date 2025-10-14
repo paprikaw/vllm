@@ -2042,6 +2042,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches)
+        logger.info(f"debug---------------- init kv cache done, kv block num: {len(self.kv_caches[0][0])}")
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 

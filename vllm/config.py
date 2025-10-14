@@ -3613,7 +3613,7 @@ class LayerKVConnectorConfig:
     kv_port: int = 17579
     """用于 LayerKVConnector 的基础端口（避免与 KVTransferConfig 默认 14579 冲突）。"""
 
-    store_timeout_s: int = 300
+    store_timeout_s: int = 30000
     """StatelessProcessGroup(TCPStore) 的超时时间（秒）。"""
 
     # 每个 rank 的可达 IP（可选，用于双向通道）。

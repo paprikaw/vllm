@@ -8,18 +8,6 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from typing import Dict, Optional, Union, TypedDict, List
-
-# Avoid circular import by defining metadata type locally instead of importing
-# from dynamic_layer_kv_connector
-class KVSynchronizerMetadata(TypedDict, total=False):
-    type: str
-    dtype: torch.dtype
-    shape: torch.Size
-    batch_id: int
-    layer_ids: List[int]
-    num_tokens: int
-    layer_id: Optional[int]
 
 logger = init_logger(__name__)
 
@@ -97,7 +85,29 @@ class model_aware_kv_ops_helper:
                 layer_module.self_attn.attn._k_scale,
             )
         else:
+            # When migrating KV cache between ranks, keys/values may already
+            # be in the storage dtype of the destination kv_cache (e.g. fp8 as
+            # uint8/float8). In such case, calling reshape_and_cache_flash()
+            # would re-quantize already-quantized values and corrupt data.
+            # To avoid this, if the input dtype matches the kv cache storage
+            # dtype, directly scatter-copy into the flattened cache.
             key_cache, value_cache = kv_cache[0], kv_cache[1]
+            # tgt_slot = slot_mapping[start_pos:end_pos]
+            # Fast path: direct copy when dtypes already match storage.
+            logger.info(f"debug: put_kv_to_cache---------------keys.dtype: {keys.dtype}, value_cache.dtype: {value_cache.dtype}")
+            # if keys.dtype == key_cache.dtype and values.dtype == value_cache.dtype:
+            #     # keys/values shape: [T, H, D]; flatten caches to [T_total, H, D]
+            #     H = key_cache.shape[-2]
+            #     D = key_cache.shape[-1]
+            #     flat_k = key_cache.reshape(-1, H, D)
+            #     flat_v = value_cache.reshape(-1, H, D)
+            #     # Ensure indices live on same device
+            #     if tgt_slot.device != flat_k.device:
+            #         tgt_slot = tgt_slot.to(flat_k.device, non_blocking=True)
+            #     flat_k.index_copy_(0, tgt_slot, keys)
+            #     flat_v.index_copy_(0, tgt_slot, values)
+            # else:
+                # Fallback: normal path (expects float{16,32} inputs).
             ops.reshape_and_cache_flash(
                 keys.to(key_cache.device),
                 values.to(value_cache.device),
@@ -108,16 +118,3 @@ class model_aware_kv_ops_helper:
                 layer_module.self_attn.attn._k_scale,
                 layer_module.self_attn.attn._v_scale,
             )
-
-class kv_synchronizer_helper:
-    @staticmethod
-    def make_metadata_for_layer_tensor(tensor: torch.Tensor,
-                       layer_id: Optional[int]) -> KVSynchronizerMetadata:
-        return {"dtype": tensor.dtype, "shape": tensor.shape, "layer_id": layer_id}
-
-    @staticmethod
-    def make_metadata_for_tensor(tensor: torch.Tensor) -> KVSynchronizerMetadata:
-        return {"dtype": tensor.dtype, "shape": tensor.shape}
-
-    def make_metadata_for_stage_batch(self, batch_id: int, layer_ids: list[int], num_tokens: int, tensor: torch.Tensor) -> KVSynchronizerMetadata:
-        return {"type": "kv_stage_batch", "dtype": tensor.dtype, "shape": tensor.shape, "batch_id": batch_id, "layer_ids": layer_ids, "num_tokens": num_tokens}

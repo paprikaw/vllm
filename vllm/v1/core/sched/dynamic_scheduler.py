@@ -191,11 +191,14 @@ class DynamicScheduler(Scheduler):
         self.lock = Lock()
         self._migration_future: Optional[Future] = None
         self.inject_sync_msg = False
+        self.next_new_kv_cache_block_num = 0
 
-    def synchronize_kv_cache_and_change_configuration(self, pp_layer_config: List[Tuple[int,int]]):
+    def synchronize_kv_cache_and_change_configuration(self, pp_layer_config: List[Tuple[int,int]], new_kv_cache_block_num: int):
         self.inject_sync_msg = True
+        assert self.next_new_kv_cache_block_num == 0 
         assert self.next_pp_layer_config is None
         self.next_pp_layer_config = pp_layer_config
+        self.next_new_kv_cache_block_num = new_kv_cache_block_num
 
     def v1_start_migration(self, layer_config: List[Tuple[int,int]])->Future:
         # Start the migration process
@@ -288,15 +291,20 @@ class DynamicScheduler(Scheduler):
                 kv_connector_metadata=scheduler_output.kv_connector_metadata,
                 pp_layer_config=pp_layer_config,
                 request_queue_id=id,
-                is_sync_after_migration=self.inject_sync_msg
+                is_sync_after_migration=self.inject_sync_msg,
+                new_kv_cache_block_num=self.next_new_kv_cache_block_num
             )
         if self.inject_sync_msg:
             self.inject_sync_msg = False
             assert self.next_pp_layer_config is not None
+            assert self.next_new_kv_cache_block_num != 0 
             # In here, we update the layer configuration to the next configuration
             # In the next scheduling step, we will use the next configuration
             self.update_layer_config(self.next_pp_layer_config)
+            if self.next_new_kv_cache_block_num > self.kv_cache_manager.num_gpu_blocks:
+                self.extend_kv_cache(self.next_new_kv_cache_block_num)
             self.next_pp_layer_config = None
+            self.next_new_kv_cache_block_num = 0
         return output
 
     def get_kv_cache_snapshot(self) -> KVCacheSnapshot:
@@ -490,7 +498,13 @@ class DynamicScheduler(Scheduler):
     
     def compact_kv_cache(self, compacted_length: int) -> None:
         assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
+        assert compacted_length < self.kv_cache_manager.num_gpu_blocks, "compacted_length should be smaller than current kv cache block num"
         self.kv_cache_manager.compact_kv_cache(compacted_length)
+
+    def extend_kv_cache(self, extended_length: int) -> None:
+        assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
+        assert extended_length > self.kv_cache_manager.num_gpu_blocks, "extended_length should be larger than current kv cache block num"
+        self.kv_cache_manager.extend_kv_cache(extended_length)
 
     def get_bitmap(self) -> bitarray:
         assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)

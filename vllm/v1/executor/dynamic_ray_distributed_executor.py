@@ -341,8 +341,6 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             # Both branches share the same workers and execution steps,
             # but only the NCCL branch specifies 'nccl' transport between PP stages.
             outputs_shm = [input_data for _ in self.pp_tp_workers[0]]
-            outputs_nccl = [input_data for _ in self.pp_tp_workers[0]]
-
             for pp_rank, tp_group in enumerate(self.pp_tp_workers):
                 # Advance SHM branch (explicitly use auto -> SHM/object-store on-node)
                 if self.use_v1:
@@ -355,32 +353,14 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                         worker.execute_model_spmd.bind(  # type: ignore[attr-defined]
                             outputs_shm[i]) for i, worker in enumerate(tp_group)
                     ]
-
-                # Advance NCCL branch (explicit 'nccl' transport between PP stages)
-                if self.use_v1:
-                    outputs_nccl = [
-                        worker.execute_model_ray.bind(  # type: ignore[attr-defined]
-                            outputs_nccl[i]) for i, worker in enumerate(tp_group)
-                    ]
-                else:
-                    outputs_nccl = [
-                        worker.execute_model_spmd.bind(  # type: ignore[attr-defined]
-                            outputs_nccl[i]) for i, worker in enumerate(tp_group)
-                    ]
-
                 last_pp_rank = len(self.pp_tp_workers) - 1
                 if pp_rank < last_pp_rank:
                     outputs_shm = [
-                        output.with_tensor_transport(transport="auto")
+                        output.with_tensor_transport(transport="shm")
                         for output in outputs_shm
                     ]
-                    outputs_nccl = [
-                        output.with_tensor_transport(transport="nccl")
-                        for output in outputs_nccl
-                    ]
-
             # Combine branch outputs; we will pick one branch at runtime.
-            forward_dag = MultiOutputNode(outputs_shm + outputs_nccl)
+            forward_dag = MultiOutputNode(outputs_shm)
             # Record per-branch output size for selection later.
             self._cpu_tp_group_size = len(self.pp_tp_workers[-1])
 
@@ -451,9 +431,9 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         # fire-and-forget 异步发起，每个 worker 内部用线程执行
         self.collective_rpc("async_add_layers", args=(rank, layers_list))
     
-    def start_kv_cache_migration(self, rank, rank_to_layers_ids: dict[int, list[int]]):
+    def start_kv_cache_migration(self, src_to_plan: dict[int, dict[int, list[int]]]):
         # 调用 worker 侧的同名方法，仅在 source_rank 上发送，其余 rank 不做事
-        self.collective_rpc("start_kv_cache_migration", args=(rank, rank_to_layers_ids))
+        self.collective_rpc("start_kv_cache_migration", args=(src_to_plan,))
 
     def get_kv_buffer_status(self) -> list[KVBufferStatus]:
         output = self.collective_rpc("get_kv_buffer_status")
@@ -476,6 +456,9 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
     
     def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         self.collective_rpc("compact_kv_cache", args=(compacted_length, bitmap))
+
+    def resize_kv_cache(self, new_length: int) -> None:
+        self.collective_rpc("resize_kv_cache", args=(new_length,))
 
     def release_kv_cache_for_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
         self.collective_rpc("release_kv_cache_for_layers", args=(rank, layers_list))

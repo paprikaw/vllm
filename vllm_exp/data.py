@@ -75,11 +75,13 @@ class MigrationCfg(BaseModel):
 class BenchCfg(BaseModel):
     running_num_requests: list[int] = []
     data_num_requests: list[int] = []
-    pattern_batch_size: int = 250
+    pattern_batch_size: int = 150
     sweep_request_rates: list[float] = []
     running_request_rates: list[float] = []
     profile: bool = False
     input_output_lens: list[list[int]]
+    # Whether to print each request's generated output in benchmark logs
+    print_outputs: bool = False
 
     @field_validator("running_request_rates")
     @classmethod

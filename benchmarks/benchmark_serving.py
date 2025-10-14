@@ -312,6 +312,7 @@ async def run_multi_stage_benchmark(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
+    print_outputs: bool,
 ):
     """
     执行多阶段基准测试，每个阶段使用不同的请求速率和请求数量
@@ -387,6 +388,28 @@ async def run_multi_stage_benchmark(
             )
         
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+    # Optionally print per-request outputs, grouped by stage
+    if print_outputs:
+        for s_idx, num_req in enumerate(running_num_requests):
+            s = start_indices[s_idx]
+            e = s + num_req
+            stage_total_output_tokens = 0
+            for i in range(s, e):
+                out = outputs[i]
+                rel_i = i - s
+                if out.success:
+                    print(f"[Stage {s_idx + 1}] Request {rel_i}: {out.generated_text}")
+                    # Accumulate output token count with tokenizer fallback
+                    output_len = out.output_tokens
+                    if not output_len:
+                        output_len = len(
+                            tokenizer(out.generated_text, add_special_tokens=False).input_ids
+                        )
+                    stage_total_output_tokens += output_len
+                else:
+                    print(f"[Stage {s_idx + 1}] Request {rel_i}: ERROR: {out.error}")
+            print(f"[Stage {s_idx + 1}] Total generated tokens: {stage_total_output_tokens}")
         
     if pbar is not None:
         pbar.close()
@@ -431,6 +454,37 @@ async def run_multi_stage_benchmark(
             "Total Token throughput (tok/s):", metrics.total_token_throughput
         )
     )
+    
+    # 打印延迟指标
+    def process_one_metric(
+        metric_attribute_name: str,
+        metric_name: str,
+        metric_header: str,
+    ):
+        """打印指定指标的统计信息"""
+        if metric_attribute_name not in selected_percentile_metrics:
+            return
+        print("{s:{c}^{n}}".format(s=metric_header, n=50, c="-"))
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Mean {metric_name} (ms):",
+                getattr(metrics, f"mean_{metric_attribute_name}_ms"),
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Median {metric_name} (ms):",
+                getattr(metrics, f"median_{metric_attribute_name}_ms"),
+            )
+        )
+        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}_ms"):
+            p_word = str(int(p)) if int(p) == p else str(p)
+            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
+    
+    process_one_metric("ttft", "TTFT", "Time to First Token")
+    process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
+    process_one_metric("itl", "ITL", "Inter-token Latency")
+    process_one_metric("e2el", "E2EL", "End-to-end Latency")
         
     # 保存当前阶段的结果
     result = {
@@ -540,6 +594,7 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
+    print_outputs: bool,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -635,6 +690,7 @@ async def benchmark(
             selected_percentile_metrics=selected_percentile_metrics,
             selected_percentiles=selected_percentiles,
             goodput_config_dict=goodput_config_dict,
+            print_outputs=print_outputs,
         )
     
     # 原有的单阶段基准测试逻辑
@@ -691,6 +747,23 @@ async def benchmark(
             )
         )
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+    # Optionally print per-request outputs
+    if print_outputs:
+        total_output_tokens = 0
+        for idx, out in enumerate(outputs):
+            if out.success:
+                print(f"Request {idx}: {out.generated_text}")
+                # Accumulate output token count with tokenizer fallback
+                output_len = out.output_tokens
+                if not output_len:
+                    output_len = len(
+                        tokenizer(out.generated_text, add_special_tokens=False).input_ids
+                    )
+                total_output_tokens += output_len
+            else:
+                print(f"Request {idx}: ERROR: {out.error}")
+        print(f"Total generated tokens: {total_output_tokens}")
 
     if profile:
         print("Stopping profiler...")
@@ -1101,6 +1174,7 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
+            print_outputs=args.print_outputs,
         )
     )
 
@@ -1357,6 +1431,11 @@ if __name__ == "__main__":
         action="store_true",
         help="When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc.",
+    )
+    parser.add_argument(
+        "--print-outputs",
+        action="store_true",
+        help="Print each request's generated output to benchmark stdout.",
     )
     parser.add_argument(
         "--append-result",

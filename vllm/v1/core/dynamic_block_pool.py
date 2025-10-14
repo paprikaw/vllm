@@ -82,6 +82,7 @@ class DynamicBlockPool(BlockPool):
         """
         根据当前最新的kv block大小，为free_block_queue新增从当前最大id到new_block_num-1的块
         """
+        logger.info(f"expand the block pool from {len(self.blocks)} to {new_block_num}")
         old_block_num = len(self.blocks)
         assert new_block_num > old_block_num, "new_block_num should be larger than current block num"
         self.blocks.extend([KVCacheBlock(idx) for idx in range(old_block_num, new_block_num)])

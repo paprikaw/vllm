@@ -83,8 +83,6 @@ def get_total_gpu_memory(rank: int) -> int:
 
 @dataclass
 class KVBufferStatus:
-    used_tokens: list[int]
-    free_tokens: list[int]
-    capacity_tokens: list[int]
-    send_patch_ids: dict[int, int]
-    recv_patch_ids: dict[int, int]
+    used_tokens: dict[int, int]
+    free_tokens: dict[int, int]
+    capacity_tokens: dict[int, int]

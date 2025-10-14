@@ -104,15 +104,27 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
                 return weights
 
             first_layer_index = -1
+            layer_weight_accumulator = 0
+            
             for name, weight in weights:
                 # 只记录第一个出现的 layer 的权重大小，假设所有 layer 权重大小一致
                 layer_idx = extract_layer_index(name) if "layers" in name else None
-                if layer_idx is not None and (first_layer_index == -1 or layer_idx == first_layer_index):
+                
+                if layer_idx is not None:
                     if first_layer_index == -1:
+                        # 发现第一个layer，开始记录
                         first_layer_index = layer_idx
-                        self.layer_weight_size = 0  # 初始化为0，避免累加多次
-                        self.layer_weight_size = weight.numel() * weight.element_size()
+                        layer_weight_accumulator = 0
+                    
+                    if layer_idx == first_layer_index:
+                        # 累加同一个layer的所有weight
+                        weight_size = weight.numel() * weight.element_size()
+                        layer_weight_accumulator += weight_size
+                
                 yield name, weight
+            self.layer_weight_size = layer_weight_accumulator
+            # 处理只有一个layer的情况（迭代结束时还没有保存）
+            assert first_layer_index != -1 and self.layer_weight_size != -1
 
         loader = AutoWeightsLoader(
             self,
@@ -247,6 +259,7 @@ class DynamicQwen3Model(Qwen3Model):
                 assert intermediate_tensors is not None
                 hidden_states = intermediate_tensors["hidden_states"]
                 residual = intermediate_tensors["residual"]
+            logger.info(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
             for layer in self.layers[self.sched_start_layer:self.sched_end_layer]:
                 try:
                     hidden_states, residual = layer(
