@@ -397,7 +397,7 @@ class DynamicEngineCore(EngineCore):
 
             return engine_core_outputs
 
-    def change_model_configuration_by_kv_transfer(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
+    def change_model_configuration_by_kv_transfer_async(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
         """
         Our fancy implementation of model configuration change
         """
@@ -510,7 +510,7 @@ class DynamicEngineCore(EngineCore):
             #         unique_sorted = sorted(set(layers))
             #         rank_to_layers_ids[dst_rank] = unique_sorted
             #     logger.info(f"rank {src_rank} start kv cache migration to rank {rank_to_layers_ids}")
-            self.model_executor.start_kv_cache_migration(src_to_plan)
+            self.model_executor.start_kv_cache_migration_async(src_to_plan)
             self.migration_in_process = True
             time_kv_migration_end = time.time()
             logger.info(f"time taken to start kv cache migration: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
@@ -536,12 +536,121 @@ class DynamicEngineCore(EngineCore):
 
                 if should_sync:
                     logger.info("all tokens to be sent is less than the threshold, start to synchronize the kv cache")
-                    self.scheduler.synchronize_kv_cache_and_change_configuration(pp_layer_config, after_compact_kv_block_num)
+                    self.scheduler.async_change_configuration(pp_layer_config, after_compact_kv_block_num)
                     break
 
         threading.Thread(target=check_patch_sending_process, daemon=True).start()
         return engine_core_outputs
 
+    def change_model_configuration_by_kv_transfer_sync(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
+        """
+        Our fancy implementation of model configuration change
+        """
+        logger.info(f"Start migrating to new configuration {pp_layer_config}")
+        assert isinstance(self.scheduler, DynamicScheduler)
+
+        engine_core_outputs = []
+        # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
+        # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
+        with self.engine_lock:
+            time_start = time.time()
+            # 先获取一次内存快照
+            assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+            mem_infos = self.model_executor.get_workers_mem_info()
+
+            # Adding/removing
+            need_compact = False
+            adding_per_rank: dict[int, list[Tuple[int, int]]] = {}
+            adding_layer_ranks_assesses: list[LayerAddingAssessResult] = []
+            adding_layer_kv_block_num_after_compact: list[int] = []
+            deleting_layer_kv_block_num_after_compact: list[int] = []
+            for rank, layers in enumerate(pp_layer_config):
+                start_layer, end_layer = self.cur_pp_layer_config[rank][0], self.cur_pp_layer_config[rank][1]
+                adding_layer_list = []
+                deleting_layer_list = []
+                if layers[0] < start_layer:
+                    adding_layer_list.append((layers[0], start_layer - 1))
+                if layers[1] > end_layer:
+                    adding_layer_list.append((end_layer + 1, layers[1]))
+
+                if layers[0] > start_layer:
+                    deleting_layer_list.append((start_layer, layers[0] - 1))
+                if layers[1] < end_layer:
+                    deleting_layer_list.append((layers[1] + 1, end_layer))
+
+                if len(adding_layer_list) == 0 and len(deleting_layer_list) == 0:
+                    continue
+                logger.info(f"rank {rank}:\n adding_layer_list: {adding_layer_list}\n deleting_layer_list: {deleting_layer_list}")
+                # 在 adding 之前，校验对应 GPU 是否有足够可用显存容纳“将要新增的层”的权重；
+                # 如果不足，尝试评估：压缩（compact）KV cache 后释放的显存，是否足以腾挪出空间。
+                # 同时，如果当前的GPU available memory已经足够，则需要评估是否需要resize kv cache
+                if len(adding_layer_list) > 0:
+                    adding_per_rank[rank] = adding_layer_list
+                    assess = self._assess_memory_for_add(rank, adding_layer_list, mem_infos[rank])
+                    adding_layer_ranks_assesses.append(assess)
+                    adding_layer_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
+                    if assess.required_mem > 0:
+                        if assess.enough_without_compact:
+                            pass
+                        elif assess.can_fit_after_compact:
+                            need_compact = True
+                        else:
+                            logger.warning(
+                                "Rank %s lacks memory even after KV compact estimate: free=%s, freed_est≈%s, required=%s",
+                                rank, assess.free_mem, assess.freed_estimate, assess.required_mem)
+                            return []
+                if len(deleting_layer_list) > 0:
+                    assess = self._get_max_blocks_per_layer_after_deletion(rank, deleting_layer_list, mem_infos[rank])
+                    deleting_layer_kv_block_num_after_compact.append(assess)
+
+            # TODO: 在这里实际上我们也需要加上expanding kv cache的逻辑，可以在后面再实现
+            if need_compact:
+                compacted_length = min(assess.max_blocks_per_layer for assess in adding_layer_ranks_assesses)
+                engine_core_outputs.extend(self._compact_kv_cache(compacted_length))
+                logger.info(f"debug -------------- KV cache compacted to {compacted_length} blocks before adding layers")
+            
+            # Resize the kv cache
+            after_compact_kv_block_num = min(adding_layer_kv_block_num_after_compact + deleting_layer_kv_block_num_after_compact)
+
+            if after_compact_kv_block_num < self.scheduler.kv_cache_manager.num_gpu_blocks:
+                logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
+                self.model_executor.resize_kv_cache(after_compact_kv_block_num)
+
+        # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
+        for r, add_list in adding_per_rank.items():
+            self.model_executor.async_add_layers(r, add_list)
+        time_kv_compact_end = time.time()
+
+        logger.info(f"time taken to compact and resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
+
+        with self.engine_lock:
+            # Ensure no in-flight work before snapshotting KV state
+            outputs = self._drain_out_running_queue()
+            engine_core_outputs.extend(outputs)
+            # 计算 src->dst 传输对
+            # 辅助函数：根据当前分片配置找到包含区间 [lo, hi] 的源 rank
+            def find_src_rank_for_range(lo: int, hi: int) -> int:
+                for src_rank, (cur_lo, cur_hi) in enumerate(self.cur_pp_layer_config):
+                    if lo >= cur_lo and hi <= cur_hi:
+                        return src_rank
+                raise AssertionError(f"No source rank found for range [{lo}, {hi}] in {self.cur_pp_layer_config}")
+
+            # 聚合为以 src_rank 为键的 rank_to_layers_ids 映射
+            sending_plan_for_ranks: dict[int, dict[int, list[Tuple[int, int]]]] = {}
+            for dst_rank, add_list in adding_per_rank.items():
+                for lo, hi in add_list:
+                    src_rank = find_src_rank_for_range(lo, hi)
+                    plan = sending_plan_for_ranks.setdefault(src_rank, {})
+                    layer_ranges = plan.setdefault(dst_rank, [])
+                    layer_ranges.extend([(lo, hi)])
+
+            self.model_executor.start_kv_cache_migration_sync(sending_plan_for_ranks, adding_per_rank)
+            self.migration_in_process = True
+            time_kv_migration_end = time.time()
+            logger.info(f"time taken to start kv cache migration: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
+            self.scheduler.sync_change_configuration(pp_layer_config, after_compact_kv_block_num)
+
+        return engine_core_outputs
     def migrate_layer_v1(self, rank_from: int, rank_to: int, num_layers: int) -> list[EngineCoreOutputs]:
         with self.engine_lock:
             logger.info(f"migrating layer from {rank_from} to {rank_to} with {num_layers} layers")
@@ -1040,7 +1149,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             logger.info("num_of_requests: " + str(num_of_requests))
             if num_of_requests in migration_steps:
                 logger.info("change model configuration")
-                outputs = self.change_model_configuration_by_kv_transfer(alternative_configs[1])
+                outputs = self.change_model_configuration_by_kv_transfer_sync(alternative_configs[1])
                 logger.info("debug-------- engineoutput when migration: " + str(outputs))
                 for output in outputs:
                     self.output_queue.put_nowait(output)

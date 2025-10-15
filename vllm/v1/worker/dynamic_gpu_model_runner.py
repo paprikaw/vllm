@@ -398,12 +398,13 @@ class DynamicGPUModelRunner(GPUModelRunner):
         time_start = time.time()
         forward_context = self.vllm_config.compilation_config.static_forward_context
         kv, kv_length, T, H, Dh = self.kv_caches[0].shape
-
+        logger.info(f"num of kv tensors{len(self.kv_caches)}")
         for layer_name, attn_module in forward_context.items():
+            logger.info(f"resizing kv cache for layer {layer_name}")
             idx = extract_layer_index(layer_name) - self.model.model.start_layer
             cache = self.kv_caches[idx]
-            
             tmp_cache = torch.empty((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
+            logger.info(f"tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}")
             if new_length > kv_length:
                 tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...])
             else:

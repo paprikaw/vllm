@@ -376,7 +376,51 @@ class DynamicKVSynchronizer():
         self._ensure_pipe_and_buffer(rank, 'send')
         return self._pair_pipes_send[rank]
 
-    def start_kv_tensor_transfer(self, rank_to_layers_ids: dict[int, list[int]], kv_caches: list[torch.Tensor],
+    def start_kv_tensor_transfer_sync(self, rank_to_layers_ids: dict[int, list[int]], kv_caches: list[torch.Tensor],
+                              start_layer_id: int) -> None:
+        """Send layers' KV cache to a peer rank.
+            In each of the migration process, this function should only be called once.
+        Args:
+            rank: peer global rank to send to.
+            kv_cache: tensor to send (GPU or CPU tensor; will be moved to local GPU).
+            start_layer_id: which layer this KV cache belongs to (for receiver to demux).
+            layer_ids: which layers this KV cache belongs to (for receiver to demux).
+        """
+        assert all(transfer_in_process == False for transfer_in_process in self.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
+        assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
+
+        for rank, layer_ids in rank_to_layers_ids.items():
+            for layer_id in layer_ids:
+                logger.info(f"rank {self.rank} send kv cache to rank {rank} for layer {layer_id}")
+                local_layer_id = layer_id - start_layer_id
+                kv_cache = kv_caches[local_layer_id]
+                # 第一次访问时默认置为 False，避免 KeyError
+                logger.info(f"rank {self.rank} send kv tensor meta to rank {rank} for layer {layer_id}")
+                self._send_meta_to_rank(rank, KVTensorMeta(
+                    type='kv_tensor',
+                    layer_to_be_received=set(layer_ids),
+                    layer_id=int(layer_id),
+                    num_tokens=int(kv_cache.size(0)),
+                    dtype=kv_cache.dtype,
+                    shape=kv_cache.shape))
+                logger.info(f"rank {self.rank} send kv tensor data to rank {rank} for layer {layer_id}")
+                self._send_data_to_rank(rank, kv_cache)
+                self.kv_cache_transfer_in_process[rank] = True
+            # Only to tell the receiver the kv patch have been
+            self._send_meta_to_rank(rank, KVPatchMeta(
+                type='kv_patch_meta',
+                id=0,
+                layer_ids=layer_ids,
+                num_tokens=int(kv_cache.size(0)),
+                slot_mapping_dtype=torch.int64,
+                slot_mapping_shape=torch.Size([]),
+                kv_payload_dtype=torch.int64,
+                kv_payload_shape=torch.Size([]))
+            )
+
+        return None
+        
+    def start_kv_tensor_transfer_async(self, rank_to_layers_ids: dict[int, list[int]], kv_caches: list[torch.Tensor],
                               start_layer_id: int) -> None:
         """Send layers' KV cache to a peer rank.
             In each of the migration process, this function should only be called once.

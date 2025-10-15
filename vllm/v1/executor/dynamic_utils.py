@@ -57,18 +57,26 @@ try:
                     scheduler_output, intermediate_tensors = scheduler_output, None
 
                 assert isinstance(scheduler_output, DynamicSchedulerOutput), f"Scheduler output is not a DynamicSchedulerOutput:{type(scheduler_output)}"
-                self.worker.kv_synchronize_before_execute_callback(
-                    scheduler_output.is_sync_after_migration)
 
+                # self.worker.kv_synchronize_before_execute_callback(
+                #     scheduler_output.is_sync_after_migration)
+                self.worker.sync_migration_before_execute_callback(scheduler_output.new_kv_cache_block_num)
                 time_after_before_execute_callback = time.time()
-                output = self.worker.model_runner.execute_model(
-                create_from_dynamic_scheduler_output(scheduler_output), 
-                scheduler_output.pp_layer_config[self.rpc_rank],
-                intermediate_tensors)
+                try:
+                    output = self.worker.model_runner.execute_model(
+                    create_from_dynamic_scheduler_output(scheduler_output), 
+                    scheduler_output.pp_layer_config[self.rpc_rank],
+                    intermediate_tensors)
+                except Exception as e:
+                    print(traceback.format_exc())
+                    print(f"scheduler_output: {scheduler_output}")
+                    print(f"error is raised within the compiled ray DAG graph, error: {e}")
+                    time.sleep(1)
+                    raise e
 
                 time_after_execute = time.time()
                 assert(len(self.worker.model_runner.input_batch.block_table.block_tables) == 1) # Only for consistent shape of attention
-                self.worker.kv_synchronize_after_execute_callback(scheduler_output.is_sync_after_migration, scheduler_output.new_kv_cache_block_num)
+                # self.worker.kv_synchronize_after_execute_callback(scheduler_output.is_sync_after_migration, scheduler_output.new_kv_cache_block_num)
 
                 time_after_execute_callback = time.time()
                 if isinstance(output, IntermediateTensors):

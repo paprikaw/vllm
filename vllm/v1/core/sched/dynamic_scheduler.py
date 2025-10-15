@@ -39,6 +39,10 @@ from vllm.v1.structured_output import StructuredOutputManager
 logger = init_logger(__name__)
 T = TypeVar("T")
 
+class ChangeConfigurationType(Enum):
+    NOT_CHANGING = 0
+    ASYNC_CHANGING = 1
+    SYNC_CHANGING = 2
 
 class DynamicScheduler(Scheduler):
     def __init__(
@@ -190,14 +194,31 @@ class DynamicScheduler(Scheduler):
         # to acquire the lock.
         self.lock = Lock()
         self._migration_future: Optional[Future] = None
-        self.inject_sync_msg = False
+
+        # These flags are used to indicate the type of configuration change
+        # Once the flag is set, the scheduler will schedule the according scheduleroutput
+        # on the next scheduling step
+        self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
         self.next_new_kv_cache_block_num = 0
 
-    def synchronize_kv_cache_and_change_configuration(self, pp_layer_config: List[Tuple[int,int]], new_kv_cache_block_num: int):
-        self.inject_sync_msg = True
+    def async_change_configuration(self, pp_layer_config: List[Tuple[int,int]], new_kv_cache_block_num: int):
+        self.change_configuration_status = ChangeConfigurationType.ASYNC_CHANGING
         assert self.next_new_kv_cache_block_num == 0 
         assert self.next_pp_layer_config is None
         self.next_pp_layer_config = pp_layer_config
+        self.next_new_kv_cache_block_num = new_kv_cache_block_num
+
+    def sync_change_configuration(self, pp_layer_config: List[Tuple[int,int]], new_kv_cache_block_num: int):
+        """
+        This function is used to synchronize the kv cache and change the configuration
+        Note that this function is only used when there is no running batch remain in the pipeline and the scheduling process is suspended.
+        Therefore it is common to firstly call _drain_out_running_queue to drain out the running queue, then call this function to change the scheduler configuration.
+        The actual configuration change will be done by invoking collective operation "start_kv_cache_migration_sync" in the model executor.
+        """
+        self.change_configuration_status = ChangeConfigurationType.SYNC_CHANGING
+        self.update_layer_config(pp_layer_config)
+        if new_kv_cache_block_num > self.kv_cache_manager.num_gpu_blocks:
+            self.extend_kv_cache(new_kv_cache_block_num)
         self.next_new_kv_cache_block_num = new_kv_cache_block_num
 
     def v1_start_migration(self, layer_config: List[Tuple[int,int]])->Future:
@@ -247,6 +268,22 @@ class DynamicScheduler(Scheduler):
         self._migration_future.set_result(True)
 
     def _schedule(self,is_old_request: bool) -> DynamicSchedulerOutput:
+        """
+        In this function, we control the behavior of scheduler during the migration process
+        There are three types of migration process at the moment:
+            1. sync migration with kv cache transfer 
+            2. async migration with kv cache transfer
+            3. drain-out style of migration (depreciated)
+
+        sync migration: 
+            Drain out the running batches and interupt the inference process.
+            Change the configuration of gpus and scheduler synchronously.
+            In the next scheduling step, the scheduler will schedule the requests using the new configuration. Also scheduled with the next kv cache block num to tell the gpu worker to resize the kv cache *before* the execution of inferenc of inferencee.
+        async migration:
+            Don't interupt the inference process, the kv tensor is transmitting asynchronously.
+            When the timing is right, we inject a sync msg to scheduleroutput to tell the gpu worker sending out all the kv patches. After this async msg, we change the configuration of the scheduler.
+            In the next scheduling step, the scheduler is scheduling with the new configuration.
+        """
         if is_old_request:
             id, cur_running = self.running_controller.get_cur()
             cur_waiting = self.waiting_controller.get_cur()
@@ -291,19 +328,25 @@ class DynamicScheduler(Scheduler):
                 kv_connector_metadata=scheduler_output.kv_connector_metadata,
                 pp_layer_config=pp_layer_config,
                 request_queue_id=id,
-                is_sync_after_migration=self.inject_sync_msg,
+                is_sync_after_migration=True if self.change_configuration_status == ChangeConfigurationType.ASYNC_CHANGING else False,
                 new_kv_cache_block_num=self.next_new_kv_cache_block_num
             )
-        if self.inject_sync_msg:
-            self.inject_sync_msg = False
+
+        if self.change_configuration_status == ChangeConfigurationType.ASYNC_CHANGING:
+            self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
             assert self.next_pp_layer_config is not None
-            assert self.next_new_kv_cache_block_num != 0 
+            assert self.next_new_kv_cache_block_num != 0
             # In here, we update the layer configuration to the next configuration
             # In the next scheduling step, we will use the next configuration
             self.update_layer_config(self.next_pp_layer_config)
             if self.next_new_kv_cache_block_num > self.kv_cache_manager.num_gpu_blocks:
                 self.extend_kv_cache(self.next_new_kv_cache_block_num)
             self.next_pp_layer_config = None
+            self.next_new_kv_cache_block_num = 0
+
+        if self.change_configuration_status == ChangeConfigurationType.SYNC_CHANGING:
+            assert self.next_new_kv_cache_block_num != 0
+            self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
             self.next_new_kv_cache_block_num = 0
         return output
 

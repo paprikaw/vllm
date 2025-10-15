@@ -104,6 +104,17 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
         env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(cfg.network.rank_to_ip)
     env.update(extra_env)
 
+    # Configure CSV metrics output path: logs/<project...>/{timestamp}_metrics.csv
+    # Use the constants-dir (project-level) to avoid nesting under varying vars.
+    try:
+        metrics_dir = logm.planner.constants_dir()
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        metrics_csv = metrics_dir / f"timestamp_metrics.csv"
+        env["VLLM_METRICS_CSV_PATH"] = str(metrics_csv)
+    except Exception:
+        # Best-effort; do not fail server launch on metrics path issues.
+        pass
+
     # 启动服务
     serve_args = [
         "vllm", "serve", cfg.model.path,

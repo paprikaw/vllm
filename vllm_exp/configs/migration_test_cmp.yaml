@@ -35,8 +35,8 @@ projects:
     benchmark:
       profile: false
       print_outputs: false
-      data_num_requests: [30, 30]
+      data_num_requests: [150, 150]
       input_output_lens: [[512, 64], [512, 256]]
-      running_request_rates: [2]
-      running_num_requests: [60]
+      running_num_requests: [150, 150]
+      running_request_rates: [2.2, 2]
 is_log_cover: false

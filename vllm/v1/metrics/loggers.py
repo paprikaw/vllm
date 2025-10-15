@@ -2,6 +2,8 @@
 
 import logging
 import time
+import os
+import csv
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
@@ -60,6 +62,9 @@ class LoggingStatLogger(StatLoggerBase):
         self.spec_decoding_logging = SpecDecodingLogging()
         self.last_prompt_throughput: float = 0.0
         self.last_generation_throughput: float = 0.0
+        # Optional CSV metrics output. Set path via env VLLM_METRICS_CSV_PATH.
+        # If set, on each log() we append a CSV row with timestamp and metrics.
+        self.csv_path: Optional[str] = os.getenv("VLLM_METRICS_CSV_PATH", None)
 
     def _reset(self, now):
         self.last_log_time = now
@@ -129,6 +134,46 @@ class LoggingStatLogger(StatLoggerBase):
             self.prefix_caching_metrics.hit_rate * 100,
         )
         self.spec_decoding_logging.log(log_fn=log_fn)
+
+        # Optionally append to CSV file for persistent logging.
+        if self.csv_path:
+            try:
+                # Ensure parent directory exists (if provided).
+                parent = os.path.dirname(self.csv_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                # Prepare header if file is new/empty.
+                need_header = (not os.path.exists(self.csv_path)
+                               or os.path.getsize(self.csv_path) == 0)
+                with open(self.csv_path, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    if need_header:
+                        writer.writerow([
+                            "timestamp",
+                            "engine_index",
+                            "prompt_throughput_tokens_per_s",
+                            "generation_throughput_tokens_per_s",
+                            "running_reqs",
+                            "waiting_reqs",
+                            "gpu_kv_cache_usage_percent",
+                            "prefix_cache_hit_rate_percent",
+                        ])
+                    # Use wall clock time for CSV timestamp.
+                    ts = time.time()
+                    writer.writerow([
+                        f"{ts:.3f}",
+                        self.engine_index,
+                        f"{prompt_throughput:.4f}",
+                        f"{generation_throughput:.4f}",
+                        scheduler_stats.num_running_reqs,
+                        scheduler_stats.num_waiting_reqs,
+                        f"{scheduler_stats.gpu_cache_usage * 100:.4f}",
+                        f"{self.prefix_caching_metrics.hit_rate * 100:.4f}",
+                    ])
+            except Exception:
+                # Do not disrupt normal logging if file write fails.
+                logger.exception("Failed to write CSV metrics to %s",
+                                 self.csv_path)
 
     def log_engine_initialized(self):
         logger.info(

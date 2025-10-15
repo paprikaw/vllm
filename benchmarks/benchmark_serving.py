@@ -399,13 +399,11 @@ async def run_multi_stage_benchmark(
                 out = outputs[i]
                 rel_i = i - s
                 if out.success:
-                    print(f"[Stage {s_idx + 1}] Request {rel_i}: {out.generated_text}")
                     # Accumulate output token count with tokenizer fallback
-                    output_len = out.output_tokens
-                    if not output_len:
-                        output_len = len(
-                            tokenizer(out.generated_text, add_special_tokens=False).input_ids
-                        )
+                    output_len = len(
+                        tokenizer(out.generated_text, add_special_tokens=False).input_ids
+                    )
+                    print(f"[Stage {s_idx + 1}] Request {rel_i}: output len: {output_len}, output text: {out.generated_text}")
                     stage_total_output_tokens += output_len
                 else:
                     print(f"[Stage {s_idx + 1}] Request {rel_i}: ERROR: {out.error}")
