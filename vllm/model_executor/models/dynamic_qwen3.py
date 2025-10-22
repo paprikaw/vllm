@@ -100,6 +100,7 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
         # 在weights读出的时候，记录layer 0的weight权重大小。
         # 只记录layer 0，因为我们假设所有weight的大小相同。
         def weight_size_record_generator(weights: Iterable[tuple[str, torch.Tensor]]):
+            # 如果已经记录过layer weight size，就不再记录，但仍需要yield所有weights
             if self.layer_weight_size != -1:
                 return weights
 
@@ -115,6 +116,7 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
                         # 发现第一个layer，开始记录
                         first_layer_index = layer_idx
                         layer_weight_accumulator = 0
+                        logger.info(f"开始记录layer {first_layer_index}的权重大小")
                     
                     if layer_idx == first_layer_index:
                         # 累加同一个layer的所有weight
@@ -170,14 +172,12 @@ class DynamicQwen3Model(Qwen3Model):
                                               prefix=prefix),
             prefix=f"{self.prefix}.layers",
             )
-
-        if layers[1] == self.start_layer-1:
-            self.start_layer = layers[0]
-        if layers[0] == self.end_layer:
-            self.end_layer = layers[1] + 1
-        self.sync_sched_layers()
         with self.model_lock:
             self.layers = new_module
+            if layers[1] == self.start_layer-1:
+                self.start_layer = layers[0]
+            if layers[0] == self.end_layer:
+                self.end_layer = layers[1] + 1
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -188,7 +188,6 @@ class DynamicQwen3Model(Qwen3Model):
         deleted_start_layer, deleted_end_layer = layers[0], layers[1] + 1
         old_start_layer, old_end_layer = self.start_layer, self.end_layer
         logger.info(f"deleted_start_layer: {deleted_start_layer}, deleted_end_layer: {deleted_end_layer}")
-        logger.info(f"old_start_layer: {old_start_layer}, old_end_layer: {old_end_layer}")
         assert deleted_start_layer < deleted_end_layer, "layers[0] must be less than layers[1]"
         assert deleted_start_layer >= old_start_layer and deleted_end_layer <= old_end_layer, f"layers must be in the range of start_layer and end_layer, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
         assert deleted_start_layer == old_start_layer or deleted_end_layer == old_end_layer, f"model layers must be continuous after delete layers, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"

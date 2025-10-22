@@ -58,9 +58,9 @@ try:
 
                 assert isinstance(scheduler_output, DynamicSchedulerOutput), f"Scheduler output is not a DynamicSchedulerOutput:{type(scheduler_output)}"
 
-                # self.worker.kv_synchronize_before_execute_callback(
-                #     scheduler_output.is_sync_after_migration)
-                self.worker.sync_migration_before_execute_callback(scheduler_output.new_kv_cache_block_num)
+                self.worker.kv_synchronize_before_execute_callback(
+                    scheduler_output.is_sync_after_migration)
+                # self.worker.sync_migration_before_execute_callback(scheduler_output.new_kv_cache_block_num)
                 time_after_before_execute_callback = time.time()
                 try:
                     output = self.worker.model_runner.execute_model(
@@ -76,18 +76,17 @@ try:
 
                 time_after_execute = time.time()
                 assert(len(self.worker.model_runner.input_batch.block_table.block_tables) == 1) # Only for consistent shape of attention
-                # self.worker.kv_synchronize_after_execute_callback(scheduler_output.is_sync_after_migration, scheduler_output.new_kv_cache_block_num)
+                self.worker.kv_synchronize_after_execute_callback(scheduler_output.is_sync_after_migration, scheduler_output.new_kv_cache_block_num)
 
                 time_after_execute_callback = time.time()
                 if isinstance(output, IntermediateTensors):
                     output = scheduler_output, output
-                # logger.info(f"finished the results:{output}")
-                # logger.info(f"""
-                # before execute callback time: {time_after_before_execute_callback - time_start:.2f} seconds,
-                # execute time: {time_after_execute - time_after_before_execute_callback:.2f} seconds,
-                # after execute callback time: {time_after_execute_callback - time_after_execute:.2f} seconds
-                # total time: {time_after_execute_callback - time_start:.2f} seconds
-                # """)
+                logger.info(f"""
+                [forward]: before execute callback time: {time_after_before_execute_callback - time_start:.2f} seconds,
+                [forward]: execute time: {time_after_execute - time_after_before_execute_callback:.2f} seconds,
+                [forward]: after execute callback time: {time_after_execute_callback - time_after_execute:.2f} seconds
+                [forward]: total time: {time_after_execute_callback - time_start:.2f} seconds
+                """)
                 return output
             except Exception as e:
                 print(traceback.format_exc())

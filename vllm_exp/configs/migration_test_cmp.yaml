@@ -11,8 +11,8 @@ envs:
     # Safety margin used when estimating memory for adding layers during dynamic migration
   VLLM_DYNAMIC_MIGRATION_SAFETY_MARGIN: "0.10"
 projects:
-  # - project: "migration_test_no_migration_8_56"
-  - project: "migration_test_no_migration_24_40"
+  - project: "migration_test_no_migration_8_56"
+  # - project: "migration_test_no_migration_24_40"
     type: "one_off_test"
     network:
       delays: [0]
@@ -24,8 +24,8 @@ projects:
       pipeline_parallel_size: 2
       gpu_memory_utilization: 0.8
       start_pp_layer_partitions:
-        - "24,40"
-        # - "8,56"
+        # - "24,40"
+        - "8,56"
     migration:
       is_migration: true 
       migration_steps: [500]
@@ -34,7 +34,7 @@ projects:
         "1": [8, 56]
     benchmark:
       profile: false
-      print_outputs: false
+      print_outputs: true
       data_num_requests: [150, 150]
       input_output_lens: [[512, 64], [512, 256]]
       running_num_requests: [150, 150]

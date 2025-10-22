@@ -190,18 +190,15 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # Determine local index in runner kv cache list
         start_layer: int = self.model.model.start_layer
         end_layer: int = self.model.model.end_layer
-        if not (start_layer <= layer_index <= end_layer):
-            raise ValueError(f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]")
+        assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
 
         local_index = layer_index - start_layer
-        if local_index >= len(self.kv_caches):
-            logger.info(f"pad the kv cache for {layer_index}, local_index={local_index}, kv_tensor length: {len(self.kv_caches)}")
-            pad_right = local_index + 1 - len(self.kv_caches)
-            self.kv_caches.extend([torch.tensor([])] * pad_right)
+        assert local_index < len(self.kv_caches), f"Local index {local_index} is out of range, kv_tensor length: {len(self.kv_caches)}"
         logger.info(f"bind kv tensor for {layer_index}, local_index={local_index}, kv_tensor length: {len(self.kv_caches)}")
+        # Basic sanity: non-empty tensor
+        assert isinstance(kv_tensor, torch.Tensor) and kv_tensor.numel() > 0, (
+            f"Binding empty KV tensor for layer {layer_index}")
         self.kv_caches[local_index] = kv_tensor
-        logger.info(f"difference between binded new kv tensor and old kv tensor: old_shape: {self.kv_caches[-1].shape}, new_shape: {self.kv_caches[local_index].shape}, element_number: {self.kv_caches[local_index].numel()}, thread_id: {threading.get_ident()}")
-        logger.info(f"shape of the kv cache after bind: {local_index}, {self.kv_caches[0].shape}, len: {len(self.kv_caches)}")
         # Bind to forward context
         layer_name: str = self.get_layer_name_for_index(layer_index)
         fctx: dict[str, "Attention"] = \
@@ -211,7 +208,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 f"No attention layer named {layer_name} in forward_context.")
 
         attn_module = fctx[layer_name]
-
         attn_module.kv_cache = [kv_tensor]
 
         # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
@@ -229,7 +225,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
     def has_layer(self, layer_index: int) -> bool:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
-        return layer_index in range(self.model.model.start_layer, self.model.model.end_layer + 1)
+        logger.info(f"debug: ---------------------has_layer: {layer_index} in range {self.model.model.start_layer} to {self.model.model.end_layer}")
+        return layer_index in range(self.model.model.start_layer, self.model.model.end_layer)
 
     def add_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
@@ -328,6 +325,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
             layer_name: attn_module for layer_name, attn_module in self.vllm_config.compilation_config.static_forward_context.items()
             if extract_layer_index(layer_name) not in deleted_layers
         }
+        logger.info(f"after delete_layers, the forward context is {self.vllm_config.compilation_config.static_forward_context}")
+        for i in range(len(self.kv_caches)):
+            logger.info(f"kv_caches[{i}] shape: {self.kv_caches[i].shape}")
         gc.collect()
         torch.cuda.empty_cache()
         logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
@@ -403,9 +403,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
             logger.info(f"resizing kv cache for layer {layer_name}")
             idx = extract_layer_index(layer_name) - self.model.model.start_layer
             cache = self.kv_caches[idx]
-            tmp_cache = torch.empty((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
+            # 使用 zeros 而不是 empty 来避免未初始化的数据导致错误生成EOS
+            tmp_cache = torch.zeros((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
             logger.info(f"tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}")
             if new_length > kv_length:
+                # 只复制旧的有效部分，新增的部分已经是0了
                 tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...])
             else:
                 tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...])
@@ -414,17 +416,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
             attn_module.kv_cache = [tmp_cache]
         time_end = time.time()
         logger.info(f"resize kv cache in {time_end - time_start} seconds")
-        # logger.info(f"before allocate a 1GB tensor, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
-        # # Allocate a 5GB tensor
-        # # 5GB 大小的 float32 tensor
-        # num_elements = int(1 * 1024**3 / 4)   # 元素个数
-        # big_tensor = torch.empty(num_elements, dtype=torch.float32, device=self.device)
-        # logger.info(f"after allocate a 1GB tensor, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
-        torch.cuda.empty_cache()
-        time_tensor_end = time.time()
-        # logger.info(f"allocate a 1GB tensor in {time_tensor_end - time_end} seconds")
-        logger.info(f"after empty cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
-        logger.info(f"empty cache in {time_tensor_end - time_end} seconds")
+        # torch.cuda.empty_cache()
+        # time_tensor_end = time.time()
+        # # logger.info(f"allocate a 1GB tensor in {time_tensor_end - time_end} seconds")
+        # logger.info(f"after empty cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+        # logger.info(f"empty cache in {time_tensor_end - time_end} seconds")
     def _migrate_block(self, new_block_id: int, old_block_id: int):
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
         assert len(self.kv_caches) != 0

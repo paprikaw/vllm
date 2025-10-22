@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Attention layer."""
 from typing import Any, Dict, List, Optional
+import os
 
 import torch
 import torch.nn as nn
@@ -221,6 +222,10 @@ class Attention(nn.Module):
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                # Debug assert: KV must be bound and non-empty
+                if os.environ.get("VLLM_DEBUG_ASSERT_KV", "1").lower() not in ("0", "", "false", "no"):
+                    assert isinstance(self_kv_cache, torch.Tensor) and self_kv_cache.numel() > 0, (
+                        f"Attention {self.layer_name} has empty KV cache bound")
                 self.impl.forward(self,
                                   query,
                                   key,
@@ -239,6 +244,9 @@ class Attention(nn.Module):
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                if os.environ.get("VLLM_DEBUG_ASSERT_KV", "1").lower() not in ("0", "", "false", "no"):
+                    assert isinstance(self_kv_cache, torch.Tensor) and self_kv_cache.numel() > 0, (
+                        f"Attention {self.layer_name} has empty KV cache bound")
                 return self.impl.forward(self, query, key, value,
                                          self_kv_cache, attn_metadata)
             else:

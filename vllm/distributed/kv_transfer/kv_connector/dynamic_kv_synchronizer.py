@@ -59,7 +59,7 @@ class KVPatchBuffer:
         with self._cv:
             # 当剩余容量不足时阻塞等待
             while self.size < token_num:
-                logger.info(f"the size of the buffer is {self.size}, the token num is {token_num}, wait for the buffer to be free")
+                logger.info(f"the size of the buffer is {self.size}, the token num is {token_num}, kv patch tensor size: {kv_payload.shape}, wait for the buffer to be free")
                 self._cv.wait()
 
             # 检查 meta id 顺序
@@ -521,9 +521,10 @@ class DynamicKVSynchronizer():
         time_start = time.time()
         kv_patch = self.kv_synchronizer_helper.extract_kv_patch_from_kv_cache(self.last_patch_ids[rank], kv_caches, layer_ids, start_layer_id, slot_mapping)
         time_after_extract_kv_patch = time.time()
-        # logger.info(f"debug: ---------------------extract kv patch time: {time_after_extract_kv_patch - time_start:.2f} seconds")
+        logger.info(f"debug: ---------------------extract kv patch time: {time_after_extract_kv_patch - time_start:.2f} seconds")
         assert kv_patch is not None
         self.last_patch_ids[rank] += 1
+
         self.buffers[rank].add_patch(kv_patch)
 
     def apply_one_patch(self, kv_caches: list[torch.Tensor], start_layer_id: int, meta: KVPatchMeta, kv_payload: torch.Tensor, slot_mapping: torch.Tensor) -> int:
@@ -532,6 +533,7 @@ class DynamicKVSynchronizer():
         logger.info(f"apply one patch with id {meta.id}, num_tokens: {meta.num_tokens}")
         # slot_mapping 已经被裁剪过，只包含有效的 token
         assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
+        logger.info(f"Apply one patch, keys.dtype: {keys.dtype}, values.dtype: {values.dtype}, kv_caches.dtype: {kv_caches[0].dtype}")
         for layer_id, key, value in zip(meta.layer_ids, keys, values):
             local_layer_id = layer_id - start_layer_id
             kv_cache = kv_caches[local_layer_id]

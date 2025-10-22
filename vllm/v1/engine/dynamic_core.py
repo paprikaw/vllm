@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from torch import jagged
 from .core import EngineCore
+import traceback
 import os
 import queue
 import signal
@@ -318,10 +319,10 @@ class DynamicEngineCore(EngineCore):
                 future, scheduler_output = self.batch_queue.get_nowait()
                 # Blocking until the first result is available.
                 model_output = future.result()
-                logger.info(f"debug: ---------------------get the result from the batch queue, time: {time.time() - time_start:.2f} seconds")
                 self.batch_queue.task_done()
                 engine_core_outputs = self.scheduler.update_from_output(
                     scheduler_output, model_output)
+            logger.info(f"[forward]: step with batch queue in {time.time() - time_start:.2f} seconds")
 
             return engine_core_outputs
 
@@ -457,12 +458,15 @@ class DynamicEngineCore(EngineCore):
                 if len(deleting_layer_list) > 0:
                     assess = self._get_max_blocks_per_layer_after_deletion(rank, deleting_layer_list, mem_infos[rank])
                     deleting_layer_kv_block_num_after_compact.append(assess)
-
+            outputs = self._drain_out_running_queue()
+            engine_core_outputs.extend(outputs)
+            logger.info(f"[timeline]: after drain out running queue, time taken: {human_readable_duration(time.time() - time_start)}")
             # TODO: 在这里实际上我们也需要加上expanding kv cache的逻辑，可以在后面再实现
             if need_compact:
                 compacted_length = min(assess.max_blocks_per_layer for assess in adding_layer_ranks_assesses)
                 engine_core_outputs.extend(self._compact_kv_cache(compacted_length))
                 logger.info(f"debug -------------- KV cache compacted to {compacted_length} blocks before adding layers")
+                logger.info(f"[timeline]: after compact kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
             
             # Resize the kv cache
             after_compact_kv_block_num = min(adding_layer_kv_block_num_after_compact + deleting_layer_kv_block_num_after_compact)
@@ -470,21 +474,19 @@ class DynamicEngineCore(EngineCore):
             if after_compact_kv_block_num < self.scheduler.kv_cache_manager.num_gpu_blocks:
                 logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
                 self.model_executor.resize_kv_cache(after_compact_kv_block_num)
+                logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
 
-        # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
-        for r, add_list in adding_per_rank.items():
-            self.model_executor.async_add_layers(r, add_list)
-        time_kv_compact_end = time.time()
+            # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
+            for r, add_list in adding_per_rank.items():
+                self.model_executor.async_add_layers(r, add_list)
+            time_kv_compact_end = time.time()
 
-        logger.info(f"time taken to compact and resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
+            logger.info(f"[timeline]: before start actual kv cache migration, time taken to add weights, compact, resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
 
-        # 在异步传输/扩容前，抓取 KV cache 的快照，记录各请求的已计算 token 与 block 映射
-        # 用于后续传输完成后对齐新增 token，实现两 GPU 之间 KV 同步
-
-        with self.engine_lock:
+            # 在异步传输/扩容前，抓取 KV cache 的快照，记录各请求的已计算 token 与 block 映射
+            # 用于后续传输完成后对齐新增 token，实现两 GPU 之间 KV 同步
             # Ensure no in-flight work before snapshotting KV state
-            outputs = self._drain_out_running_queue()
-            engine_core_outputs.extend(outputs)
+
             # 计算 src->dst 传输对
             # 辅助函数：根据当前分片配置找到包含区间 [lo, hi] 的源 rank
             def find_src_rank_for_range(lo: int, hi: int) -> int:
@@ -511,16 +513,16 @@ class DynamicEngineCore(EngineCore):
             #         rank_to_layers_ids[dst_rank] = unique_sorted
             #     logger.info(f"rank {src_rank} start kv cache migration to rank {rank_to_layers_ids}")
             self.model_executor.start_kv_cache_migration_async(src_to_plan)
-            self.migration_in_process = True
             time_kv_migration_end = time.time()
-            logger.info(f"time taken to start kv cache migration: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
+            logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
         
         def check_patch_sending_process():
             assert isinstance(self.scheduler, DynamicScheduler)
             token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 1024))
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+            time_start = time.time()
             while True:
-                time.sleep(1)
+                time.sleep(0.3)
                 should_sync = True
                 buffer_status_list = self.model_executor.get_kv_buffer_status()
                 logger.info(f"buffer_status_list: {buffer_status_list}")
@@ -538,6 +540,7 @@ class DynamicEngineCore(EngineCore):
                     logger.info("all tokens to be sent is less than the threshold, start to synchronize the kv cache")
                     self.scheduler.async_change_configuration(pp_layer_config, after_compact_kv_block_num)
                     break
+            logger.info(f"[timeline]: after check patch sending process, time taken: {human_readable_duration(time.time() - time_start)}")
 
         threading.Thread(target=check_patch_sending_process, daemon=True).start()
         return engine_core_outputs
@@ -603,6 +606,9 @@ class DynamicEngineCore(EngineCore):
                     assess = self._get_max_blocks_per_layer_after_deletion(rank, deleting_layer_list, mem_infos[rank])
                     deleting_layer_kv_block_num_after_compact.append(assess)
 
+            outputs = self._drain_out_running_queue()
+            engine_core_outputs.extend(outputs)
+
             # TODO: 在这里实际上我们也需要加上expanding kv cache的逻辑，可以在后面再实现
             if need_compact:
                 compacted_length = min(assess.max_blocks_per_layer for assess in adding_layer_ranks_assesses)
@@ -616,17 +622,10 @@ class DynamicEngineCore(EngineCore):
                 logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
                 self.model_executor.resize_kv_cache(after_compact_kv_block_num)
 
-        # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
-        for r, add_list in adding_per_rank.items():
-            self.model_executor.async_add_layers(r, add_list)
-        time_kv_compact_end = time.time()
 
-        logger.info(f"time taken to compact and resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
-
-        with self.engine_lock:
-            # Ensure no in-flight work before snapshotting KV state
-            outputs = self._drain_out_running_queue()
-            engine_core_outputs.extend(outputs)
+            # # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
+            for r, add_list in adding_per_rank.items():
+                self.model_executor.async_add_layers(r, add_list)
             # 计算 src->dst 传输对
             # 辅助函数：根据当前分片配置找到包含区间 [lo, hi] 的源 rank
             def find_src_rank_for_range(lo: int, hi: int) -> int:
@@ -645,9 +644,9 @@ class DynamicEngineCore(EngineCore):
                     layer_ranges.extend([(lo, hi)])
 
             self.model_executor.start_kv_cache_migration_sync(sending_plan_for_ranks, adding_per_rank)
-            self.migration_in_process = True
+
             time_kv_migration_end = time.time()
-            logger.info(f"time taken to start kv cache migration: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
+            logger.info(f"time taken to start kv cache migration: {human_readable_duration(time_kv_migration_end - time_start)}")
             self.scheduler.sync_change_configuration(pp_layer_config, after_compact_kv_block_num)
 
         return engine_core_outputs
@@ -949,10 +948,12 @@ class DynamicEngineCoreProc(DynamicEngineCore):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
+            time_start = time.time()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
             self._process_engine_step()
+            logger.info(f"debug: ---------------------process the engine step, time: {time.time() - time_start:.2f} seconds")
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
@@ -1149,7 +1150,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             logger.info("num_of_requests: " + str(num_of_requests))
             if num_of_requests in migration_steps:
                 logger.info("change model configuration")
-                outputs = self.change_model_configuration_by_kv_transfer_sync(alternative_configs[1])
+                outputs = self.change_model_configuration_by_kv_transfer_async(alternative_configs[1])
                 logger.info("debug-------- engineoutput when migration: " + str(outputs))
                 for output in outputs:
                     self.output_queue.put_nowait(output)

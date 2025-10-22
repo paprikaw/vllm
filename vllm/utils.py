@@ -2842,3 +2842,80 @@ def is_torch_equal_or_newer(target: str) -> bool:
     except Exception:
         # Fallback to PKG-INFO to load the package info, needed by the doc gen.
         return Version(importlib.metadata.version('torch')) >= Version(target)
+
+
+def dump_all_thread_stacks(signum=None, frame=None):
+    """打印所有线程的栈追踪信息，用于死锁调试
+    
+    使用方法：
+    1. 当程序运行时，如果怀疑死锁，发送信号：kill -SIGUSR1 <pid>
+    2. 或者在代码中直接调用：dump_all_thread_stacks()
+    """
+    logger.error("=" * 80)
+    logger.error("🔍 DUMPING ALL THREAD STACKS (for deadlock debugging)")
+    logger.error("=" * 80)
+    
+    # 获取所有线程
+    thread_names = {}
+    for thread in threading.enumerate():
+        thread_names[thread.ident] = thread.name
+    
+    # 打印每个线程的栈
+    for thread_id, stack in sys._current_frames().items():
+        thread_name = thread_names.get(thread_id, f"Unknown-{thread_id}")
+        logger.error(f"\n📌 Thread: {thread_name} (ID: {thread_id})")
+        logger.error("-" * 60)
+        for filename, lineno, name, line in traceback.extract_stack(stack):
+            logger.error(f"  File: {filename}:{lineno}")
+            logger.error(f"    in {name}")
+            if line:
+                logger.error(f"    {line}")
+        logger.error("-" * 60)
+    
+    logger.error("=" * 80)
+    logger.error("🔍 END OF THREAD STACKS DUMP")
+    logger.error("=" * 80)
+
+
+class DeadlockTimeoutContext:
+    """带超时检测的锁上下文管理器，用于检测潜在的死锁"""
+    
+    def __init__(self, lock, lock_name: str, timeout: float = 30.0):
+        """
+        Args:
+            lock: threading.Lock 或 threading.Condition 对象
+            lock_name: 锁的名称（用于日志）
+            timeout: 超时时间（秒），默认30秒
+        """
+        self.lock = lock
+        self.lock_name = lock_name
+        self.timeout = timeout
+        self.acquired = False
+    
+    def __enter__(self):
+        start_time = time.time()
+        logger.info(f"🔒 Attempting to acquire lock: {self.lock_name}")
+        
+        if isinstance(self.lock, threading.Condition):
+            self.acquired = self.lock.acquire(timeout=self.timeout)
+        else:
+            self.acquired = self.lock.acquire(timeout=self.timeout)
+        
+        if self.acquired:
+            elapsed = time.time() - start_time
+            if elapsed > 1.0:  # 如果获取锁超过1秒，记录警告
+                logger.warning(f"⚠️  Slow lock acquisition: {self.lock_name} took {elapsed:.2f}s")
+            else:
+                logger.info(f"✅ Acquired lock: {self.lock_name} in {elapsed:.3f}s")
+            return self.lock
+        else:
+            logger.error(f"❌ DEADLOCK DETECTED! Failed to acquire lock: {self.lock_name} within {self.timeout}s")
+            logger.error(f"💥 Dumping all thread stacks for debugging...")
+            dump_all_thread_stacks()
+            raise TimeoutError(f"Failed to acquire lock '{self.lock_name}' within {self.timeout} seconds - possible deadlock!")
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.acquired:
+            logger.info(f"🔓 Releasing lock: {self.lock_name}")
+            self.lock.release()
+        return False

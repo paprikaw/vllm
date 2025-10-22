@@ -5,6 +5,7 @@ import queue
 import signal
 import sys
 import threading
+import traceback
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -514,10 +515,13 @@ class EngineCoreProc(EngineCore):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
+            time_start = time.time()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
+            logger.info(f"debug: ---------------------process the input queue, time: {time.time() - time_start:.2f} seconds")
             # 2) Step the engine core and return the outputs.
             self._process_engine_step()
+            logger.info(f"debug: ---------------------process the engine step, time: {time.time() - time_start:.2f} seconds")
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
@@ -540,7 +544,7 @@ class EngineCoreProc(EngineCore):
 
     def _process_engine_step(self):
         """Called only when there are unfinished local requests."""
-
+        # Print call stack here:
         # Step the engine core.
         outputs = self.step_fn()
         # Put EngineCoreOutputs into the output queue.

@@ -94,7 +94,6 @@ class model_aware_kv_ops_helper:
             key_cache, value_cache = kv_cache[0], kv_cache[1]
             # tgt_slot = slot_mapping[start_pos:end_pos]
             # Fast path: direct copy when dtypes already match storage.
-            logger.info(f"debug: put_kv_to_cache---------------keys.dtype: {keys.dtype}, value_cache.dtype: {value_cache.dtype}")
             # if keys.dtype == key_cache.dtype and values.dtype == value_cache.dtype:
             #     # keys/values shape: [T, H, D]; flatten caches to [T_total, H, D]
             #     H = key_cache.shape[-2]
