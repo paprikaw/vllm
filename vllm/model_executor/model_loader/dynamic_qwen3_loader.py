@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.attention import Attention
+from vllm.v1.utils import human_readable_duration
 logger = init_logger(__name__)
 
 class CustomModelLoader(DefaultModelLoader):
@@ -83,21 +84,25 @@ class CustomModelLoader(DefaultModelLoader):
         assert isinstance(model, DynamicQwen3ForCausalLM), "model must be a DynamicQwen3ForCausalLM instance"
         device_config = vllm_config.device_config
         target_device = torch.device(device_config.device)
+        time_start = time.time()
+        logger.info(f"[timeline]: start to load layers {layers}")
         with set_default_torch_dtype(model_config.dtype): 
             logger.info(f"before weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
             # 只收集属于指定层范围的参数名，更易读
             model.add_layers(layers)
-            logger.info(f"Loading weights for layers {layers}")
+            logger.info(f"[timeline]: after add layers but not weigths, time taken: {human_readable_duration(time.time() - time_start)}")
+            logger.info(f"[debug]: Loading weights for layers {layers}")
             weights_to_load = {
                 name
                 for name, _ in model.named_parameters()
                 if "layers" in name and extract_layer_index(name) in range(layers[0], layers[1]+1)
             }
-            logger.info(f"Weights to load: {weights_to_load}")
+            logger.info(f"[debug]: Weights to load: {weights_to_load}")
             loaded_weights = model.load_weights(
                 self.get_layer_weights(model_config, model, layers)) 
             model.to(target_device)
-            logger.info(f"after weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+            logger.info(f"[debug]: after weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+            logger.info(f"[timeline]: after weight loading, time taken: {human_readable_duration(time.time() - time_start)}")
             if model_config.quantization is None and loaded_weights is not None:
                 weights_not_loaded = weights_to_load - loaded_weights
                 if weights_not_loaded:
@@ -105,6 +110,7 @@ class CustomModelLoader(DefaultModelLoader):
                         "Following weights were not initialized from "
                         f"checkpoint: {weights_not_loaded}")
             process_layer_weights_after_loading(model, model_config, target_device, layers)
+            logger.info(f"[timeline]: after process layer weights after loading, time taken: {human_readable_duration(time.time() - time_start)}")
         return
 
 ########################################################

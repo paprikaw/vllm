@@ -178,8 +178,8 @@ class DynamicQwen3Model(Qwen3Model):
                 self.start_layer = layers[0]
             if layers[0] == self.end_layer:
                 self.end_layer = layers[1] + 1
-        gc.collect()
-        torch.cuda.empty_cache()
+        # gc.collect()
+        # torch.cuda.empty_cache()
 
     def delete_layers(self, layers: Tuple[int, int]):
         """Delete the layer module and its parameters at the given index."""
@@ -212,8 +212,8 @@ class DynamicQwen3Model(Qwen3Model):
                 # keys_to_delete = (k for k in self._modules if k.startswith(prefix))
                 # for key in keys_to_delete:
                 #     self._modules.pop(key)
-            gc.collect()
-            torch.cuda.empty_cache()
+            # gc.collect()
+            # torch.cuda.empty_cache()
 
         # Update the start_layer and end_layer
         if deleted_start_layer == old_start_layer:

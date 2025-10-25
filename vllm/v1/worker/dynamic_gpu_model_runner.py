@@ -325,12 +325,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
             layer_name: attn_module for layer_name, attn_module in self.vllm_config.compilation_config.static_forward_context.items()
             if extract_layer_index(layer_name) not in deleted_layers
         }
-        logger.info(f"after delete_layers, the forward context is {self.vllm_config.compilation_config.static_forward_context}")
         for i in range(len(self.kv_caches)):
             logger.info(f"kv_caches[{i}] shape: {self.kv_caches[i].shape}")
-        gc.collect()
-        torch.cuda.empty_cache()
-        logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+        # gc.collect()
+        # torch.cuda.empty_cache()
 
     
     def release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
@@ -356,9 +354,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             if extract_layer_index(name) not in deleted_layers
         ]
 
-        gc.collect()
-        torch.cuda.empty_cache()
-        logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+        # logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
     def release_kv_cache(self) -> None:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)

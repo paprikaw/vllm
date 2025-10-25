@@ -55,11 +55,10 @@ class KVPatchBuffer:
             assert kv_payload.size(2) == slot_mapping.size(0), "The number of tokens in the kv_payload and slot_mapping must be the same"
 
             token_num = int(slot_mapping.size(0))
-
         with self._cv:
+            logger.info(f"[operation]: add kv patch to buffer, the size of the buffer is {self.size}, the token num is {token_num}, kv patch tensor size: {kv_payload.shape}")
             # 当剩余容量不足时阻塞等待
             while self.size < token_num:
-                logger.info(f"the size of the buffer is {self.size}, the token num is {token_num}, kv patch tensor size: {kv_payload.shape}, wait for the buffer to be free")
                 self._cv.wait()
 
             # 检查 meta id 顺序
@@ -121,8 +120,11 @@ class PairPipe:
         if self.is_use_nccl:
         # NCCL data-plane communicator
             self._nccl = PyNcclCommunicator(group=self.meta_group, device=local_rank)
+            # 创建专用的 CUDA stream 用于 KV 传输，避免与模型计算的 stream 冲突
+            self._kv_transfer_stream = torch.cuda.Stream(device=self.device)
         else:
             self._nccl = None
+            self._kv_transfer_stream = None
 
     def _prepare_recv_buffer(self, dtype: torch.dtype, shape: torch.Size) -> torch.Tensor:
         assert dtype is not None and shape is not None
@@ -136,11 +138,18 @@ class PairPipe:
         assert isinstance(obj, (KVTensorMeta, KVPatchMeta)), "The object should be a KVTensorMeta or KVPatchMeta"
         return obj
 
-    def send_data(self, tensor: torch.Tensor) -> None:
+    def send_data(self, tensor: torch.Tensor, stream=None) -> None:
+        """发送数据，可以指定使用的 CUDA stream
+        
+        Args:
+            tensor: 要发送的 tensor
+            stream: 可选的 CUDA stream，如果为 None 则使用默认行为
+        """
         if self.is_use_nccl:
             assert self._nccl is not None, "The nccl communicator should be initialized"
             dev_tensor = tensor.to(self.device)
-            self._nccl.send(dev_tensor, dst=self.peer_rank)
+            # 如果指定了 stream，使用指定的 stream；否则使用默认 stream
+            self._nccl.send(dev_tensor, dst=self.peer_rank, stream=stream)
         else:
             self.data_group.send_obj(tensor, dst=self.peer_rank)
 
@@ -337,10 +346,30 @@ class DynamicKVSynchronizer():
         pipe = self._pair_pipes_send[rank]
         pipe.send_obj(meta)
 
-    def _send_data_to_rank(self, rank: int, kv_cache: torch.Tensor) -> None:
+    def _send_data_to_rank(self, rank: int, kv_cache: torch.Tensor, synchronize: bool = False) -> None:
+        """发送 KV 数据到指定 rank
+        
+        Args:
+            rank: 目标 rank
+            kv_cache: 要发送的 KV cache tensor
+            synchronize: 是否同步等待发送完成（默认 False，异步发送）
+        """
         pipe = self._ensure_pipe_and_buffer(rank, 'send')
         pipe = self._pair_pipes_send[rank]
-        pipe.send_data(kv_cache)
+        
+        # 使用专用的 KV 传输 stream（如果有），避免与模型计算 stream 冲突
+        if pipe.is_use_nccl and pipe._kv_transfer_stream is not None:
+            # 使用专用 stream 发送
+            logger.info(f"[debug]: send kv tensor data to rank {rank} using dedicated stream")
+            pipe.send_data(kv_cache, stream=pipe._kv_transfer_stream)
+            # 如果需要同步，只等待这个专用 stream
+            if synchronize:
+                pipe._kv_transfer_stream.synchronize()
+        else:
+            pipe.send_data(kv_cache)
+            # 如果需要同步但没有专用 stream，等待整个设备
+            if synchronize:
+                torch.cuda.synchronize(device=kv_cache.device)
 
 
     def _recv_metadata_from_rank(self, rank: int) -> Union[KVTensorMeta, KVPatchMeta]:
@@ -435,11 +464,10 @@ class DynamicKVSynchronizer():
 
         for rank, layer_ids in rank_to_layers_ids.items():
             for layer_id in layer_ids:
-                logger.info(f"rank {self.rank} send kv cache to rank {rank} for layer {layer_id}")
+                time_start = time.time()
                 local_layer_id = layer_id - start_layer_id
                 kv_cache = kv_caches[local_layer_id]
                 # 第一次访问时默认置为 False，避免 KeyError
-                logger.info(f"rank {self.rank} send kv tensor meta to rank {rank} for layer {layer_id}")
                 self._send_meta_to_rank(rank, KVTensorMeta(
                     type='kv_tensor',
                     layer_to_be_received=set(layer_ids),
@@ -447,26 +475,28 @@ class DynamicKVSynchronizer():
                     num_tokens=int(kv_cache.size(0)),
                     dtype=kv_cache.dtype,
                     shape=kv_cache.shape))
-                logger.info(f"rank {self.rank} send kv tensor data to rank {rank} for layer {layer_id}")
-                self._send_data_to_rank(rank, kv_cache)
+
+                logger.info(f"[timeline]: send kv tensor meta to rank {rank} for layer {layer_id}, time taken: {time.time() - time_start}")
+                # 使用同步发送，确保数据传输完成后再继续
+                self._send_data_to_rank(rank, kv_cache, synchronize=True)
+                logger.info(f"[timeline]: send kv tensor payload to rank {rank} for layer {layer_id}, time taken: {time.time() - time_start}, data_size: {kv_cache.numel() * kv_cache.element_size() / 1024 ** 2:.2f}MB")
                 self.kv_cache_transfer_in_process[rank] = True
-            
         # 在发送完kv tensor之后开始发送kv patch
-        def patch_sending_thread(rank: int):
-            while True:
-                kv_patch = self.buffers[rank].pop_patch()
-                self.kv_patch_sending = True
-                self._send_meta_to_rank(rank, kv_patch.meta)
-                self._send_data_to_rank(rank, kv_patch.slot_mapping)
-                self._send_data_to_rank(rank, kv_patch.kv_payload)
-                if kv_patch.meta.type == "kv_patch_finished":
-                    self.kv_patch_sending = False
-                    self.kv_cache_transfer_in_process[rank] = False
-                    break
-
-        for rank in rank_to_layers_ids:
-            threading.Thread(target=patch_sending_thread, args=(rank,), daemon=True).start()
-
+        while True:
+            time_start = time.time()
+            kv_patch = self.buffers[rank].pop_patch()
+            self._send_meta_to_rank(rank, kv_patch.meta)
+            self._send_data_to_rank(rank, kv_patch.slot_mapping, synchronize=True)
+            self._send_data_to_rank(rank, kv_patch.kv_payload, synchronize=True)
+            self.kv_patch_sending = True
+            patch_payload_size = kv_patch.kv_payload.numel() * kv_patch.kv_payload.element_size()
+            patch_slot_mapping_size = kv_patch.slot_mapping.numel() * kv_patch.slot_mapping.element_size()
+            logger.info(f"[timeline]: send kv patch to rank {rank}, time taken: {time.time() - time_start}, data_size: {patch_slot_mapping_size / 1024 ** 2:.2f}MB + {patch_payload_size / 1024 ** 2:.2f}MB")
+            if kv_patch.meta.type == "kv_patch_finished":
+                logger.info(f"[operation]: rank {self.rank} finish the kv patch sending to rank {rank}")
+                self.kv_cache_transfer_in_process[rank] = False
+                self.kv_patch_sending = False
+                break
 
     def add_patch_to_send_buffer(self, rank: int, kv_patch: KVPatch) -> None:
         self.buffers[rank].add_patch(kv_patch)
@@ -533,7 +563,6 @@ class DynamicKVSynchronizer():
         logger.info(f"apply one patch with id {meta.id}, num_tokens: {meta.num_tokens}")
         # slot_mapping 已经被裁剪过，只包含有效的 token
         assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
-        logger.info(f"Apply one patch, keys.dtype: {keys.dtype}, values.dtype: {values.dtype}, kv_caches.dtype: {kv_caches[0].dtype}")
         for layer_id, key, value in zip(meta.layer_ids, keys, values):
             local_layer_id = layer_id - start_layer_id
             kv_cache = kv_caches[local_layer_id]

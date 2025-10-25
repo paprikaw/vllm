@@ -49,7 +49,7 @@ class TcRunSpec():
 
 class MultiConfig(BaseModel):
     projects: List[Config]
-## Utils ##
+## Utils 
 def load_config(path: str) -> MultiConfig:
     with open(path, "r") as f:
         return MultiConfig.model_validate(yaml.safe_load(f))

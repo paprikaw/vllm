@@ -140,7 +140,6 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
             "KV_all must have shape [2, L, T, H, D]")
         _, L2, T2, H, D = KV_all.shape
         assert int(L2) == len(layer_ids) and int(T2) == T_valid
-
         meta = KVPatchMeta(
             type='kv_patch_meta',
             id=int(patch_id),

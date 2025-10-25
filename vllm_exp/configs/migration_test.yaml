@@ -7,9 +7,9 @@ envs:
   BENCHMARK_CONFIG_PATH: "/tmp/vllm_exp/benchmark_config.json"
   DEPLOYMENT_CONFIG_PATH: "/tmp/vllm_exp/vllm_config.json"
   KV_SYNC_USE_CPU: "0"
-  VLLM_USE_CPU_MODEL: "1"
+  VLLM_USE_CPU_MODEL: "0"
 projects:
-  - project: "migration_test_async"
+  - project: "migration_test_async_applied_patch"
     type: "one_off_test"
     network:
       delays: [0]
@@ -24,15 +24,15 @@ projects:
         - "8,56"
     migration:
       is_migration: true
-      migration_steps: [50]
+      migration_steps: [150]
       alternative_configs:
         "0": [8, 56]
         "1": [24, 40]
     benchmark:
       profile: false
       print_outputs: true
-      data_num_requests: [50, 50]
+      data_num_requests: [150, 150]
       input_output_lens: [ [512, 64], [512, 256]]
-      running_num_requests: [50, 50]
+      running_num_requests: [150, 150]
       running_request_rates: [2.2, 2]
 is_log_cover: true
