@@ -209,7 +209,7 @@ class DynamicGPUWorker(Worker):
         for rank in range(self.vllm_config.parallel_config.pipeline_parallel_size):
             if rank != self.rank:
                 # threading.Thread(target=self.listen_to_kv_cache_tensor_and_patches, args=(rank,), daemon=True).start()
-                threading.Thread(target=self.listen_to_kv_cache_tensor_and_patches, args=(rank,), daemon=True).start()
+                threading.Thread(target=self.listen_to_kv_cache_tensor, args=(rank,), daemon=True).start()
 
     @torch.inference_mode()
     def execute_model(
@@ -275,19 +275,21 @@ class DynamicGPUWorker(Worker):
             logger.info(f"Worker {self.rank} is not the target rank {rank}, skip adding model layers")
             return None
         logger.info(f"[operation]: Async Add Model Layers: {layer_list}")
-        def _do_add():
-            self._add_layers(layer_list)
-        threading.Thread(target=_do_add, daemon=False).start()
+        time_start = time.time()
+        # def _do_add():
+        #     self._add_layers(layer_list)
+        # threading.Thread(target=_do_add, daemon=False).start()
         # # t.start()
         # # t.join()
-        # s: Stream = torch.cuda.Stream(device=self.device)
-        # event = torch.cuda.Event()
+        s = torch.cuda.Stream(device=self.device)
+        event = torch.cuda.Event()
 
-        # with torch.cuda.stream(s): 
-        #     self._add_layers(layer_list)
-        #     event.record(s)
+        with torch.cuda.stream(s): 
+            self._add_layers(layer_list)
+            event.record(s)
 
-        # torch.cuda.current_stream().wait_event(event)
+        torch.cuda.current_stream().wait_event(event)
+        logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
 
     def remove_layers(self, rank: int, layer_list: list[Tuple[int, int]]) -> None:
         if self.rank != rank:
@@ -454,9 +456,9 @@ class DynamicGPUWorker(Worker):
             # Asynchronize with cuda stream
             torch.cuda.synchronize()
 
-            for _, layer_ranges in sending_layers_plans.items():
-                self.release_kv_cache_for_layers(self.rank, layer_ranges)
-                self.remove_layers(self.rank, layer_ranges)
+            # for _, layer_ranges in sending_layers_plans.items():
+            #     self.release_kv_cache_for_layers(self.rank, layer_ranges)
+            #     self.remove_layers(self.rank, layer_ranges)
             self.sending_kv_cache_in_process = False
 
         logger.info(f"-------------启动 KV cache 迁移所用时间: {time.time() - time_start:.2f} 秒")
@@ -536,8 +538,8 @@ class DynamicGPUWorker(Worker):
                         logger.info(f"debug: ------------ Worker {self.rank} received kv patch meta from rank {from_rank}")
                         pipe = self.dynamic_kv_synchronizer._ensure_pipe_and_buffer(from_rank, 'recv')
                         pipe = self.dynamic_kv_synchronizer._pair_pipes_recv[from_rank]
-                        slot_mapping = pipe.recv_data(meta.slot_mapping_dtype, meta.slot_mapping_shape)
-                        kv_payload = pipe.recv_data(meta.kv_payload_dtype, meta.kv_payload_shape)
+                        slot_mapping = pipe.recv_data(meta.slot_mapping_dtype, meta.slot_mapping_shape, send_ack=True)
+                        kv_payload = pipe.recv_data(meta.kv_payload_dtype, meta.kv_payload_shape, send_ack=True)
                         assert kv_payload.dim() == 5 and kv_payload.size(0) == 2
                         self.dynamic_kv_synchronizer.apply_one_patch(self.model_runner.kv_caches, self.model_runner.model.model.start_layer, meta, kv_payload, slot_mapping)
                     elif meta.type == "kv_patch_finished":
@@ -609,7 +611,7 @@ class DynamicGPUWorker(Worker):
     def all_patch_applied(self) -> bool:
         return all(self.is_all_patch_applied.values())
 
-    def kv_synchronize_before_execute_callback(self,
+    def async_migration_before_execute_callback(self,
                                                is_sync_after_migration: bool
                                                ) -> None:
         # 处于迁移中时，或这是同步批（用于发送 finished 信号），直接放行。
@@ -642,10 +644,10 @@ class DynamicGPUWorker(Worker):
                 logger.info(f"debug: ---------------------rank {self.rank} waiting for migration to be finished")
                 self._sync_migration_cv.wait()
             logger.info(f"debug: ---------------------rank {self.rank} is good for forwarding")
-        if new_kv_cache_block_num != 0:
-            self.resize_kv_cache(new_kv_cache_block_num)
+        # if new_kv_cache_block_num != 0:
+        #     self.resize_kv_cache(new_kv_cache_block_num)
 
-    def kv_synchronize_after_execute_callback(self, is_sync: bool, new_kv_cache_block_num: int):
+    def async_migration_after_execute_callback(self, is_sync: bool, new_kv_cache_block_num: int):
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
 
         # target_device = self.device  # set in init_device to cuda:self.local_rank
@@ -672,7 +674,6 @@ class DynamicGPUWorker(Worker):
             time_start = time.time()
             logger.info(f"[operation]: before finish kv cache transfer start to finish kv cache tansfer, delete layers, release kv cache, reinitialize kv cache")
             # Sender finishes transfer and cleans up; receiver no-ops.
-            assert new_kv_cache_block_num != 0, "The new kv cache block num should not be 0"
             if self.sending_kv_cache_in_process:
                 logger.info(f"debug: finish kv cache transfer for rank {self.rank}")
                 self.dynamic_kv_synchronizer.finish_kv_cache_transfer()

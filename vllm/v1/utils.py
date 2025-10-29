@@ -73,6 +73,17 @@ def human_readable_duration(seconds: float) -> str:
     except Exception:
         # Fallback to raw seconds if any unexpected error happens
         return f"{seconds:.3f}s"
+def human_readable_size(size: int) -> str:
+    """Return a concise human-readable size string.
+    """
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 ** 2:
+        return f"{size / 1024:.2f}KB"
+    if size < 1024 ** 3:
+        return f"{size / 1024 ** 2:.2f}MB"
+
+    return f"{size / 1024 ** 3:.2f}GB"
 
 
 def now_s() -> float:
@@ -143,15 +154,10 @@ class LayerAddingAssessResult:
     can_fit_after_compact: free_mem + freed_estimate > required_with_margin
     required_mem: bytes needed by new layers' weights + their KV cache
                           (estimated) with safety margin
-    free_mem: current free GPU memory
-    freed_estimate: estimated bytes that could be freed by compacting KV (on existing layers)
     max_blocks_per_layer: number of blocks after compacting KV, this will only be used when can_fit_after_compact is True and enough_without_compact is False
     """
     enough_without_compact: bool
     can_fit_after_compact: bool
-    required_mem: int
-    free_mem: int
-    freed_estimate: int
     max_blocks_per_layer: int
 
 @dataclass

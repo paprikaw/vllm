@@ -1191,20 +1191,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True)
-
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens):
             self.maybe_setup_kv_connector(scheduler_output)
-
-            model_output = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-            )
+            try:
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                )
+            except Exception as e:
+                logger.info(f"[debug]: attention_metadata: {attn_metadata}")
+                time.sleep(2)
+                raise e
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
@@ -1985,6 +1988,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             block_table_i = self.input_batch.block_table[i]
             attn_metadata_builder_i = attn_backend_i.get_builder_cls()(
                 weakref.proxy(self), kv_cache_spec, block_table_i)
+            logger.info(f"[debug]: attn_metadata_builder_i: {attn_metadata_builder_i}")
             self.attn_backends.append(attn_backend_i)
             self.attn_metadata_builders.append(attn_metadata_builder_i)
 

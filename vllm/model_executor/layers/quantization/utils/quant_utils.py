@@ -7,10 +7,12 @@ from typing import Optional
 import numpy
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.qqq import (
     MARLIN_QQQ_SUPPORTED_NUM_BITS)
 from vllm.scalar_type import ScalarType, scalar_types
 
+logger = init_logger(__name__)
 SUPPORTED_GPTQ_QUANT_TYPES = [scalar_types.uint4b8, scalar_types.uint8b128]
 SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 
@@ -526,17 +528,24 @@ def unpack_cols(
 
     orig_device = packed_q_w.device
 
+    # logger.info(f"[debug]: get from cpu")
     packed_q_w_cpu = packed_q_w.cpu().numpy().astype(numpy.uint32)
+    # logger.info(f" get q res")
     q_res = numpy.zeros((size_k, size_n), dtype=numpy.uint32)
 
     mask = (1 << num_bits) - 1
+    # logger.info(f"[debug]: start loop")
     for i in range(pack_factor):
         vals = packed_q_w_cpu & mask
         packed_q_w_cpu >>= num_bits
         q_res[:, i::pack_factor] = vals
-
+    # logger.info(f"[debug]: get q_res from gpu")
+    # logger.info(f"available memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+    # logger.info(f"q_res shape: {q_res.shape}")
     q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
+    # logger.info(f"[debug]: make it contiguous")
     q_res = q_res.contiguous()
+    # logger.info(f"[debug]: done unpack_cols")
 
     return q_res
 

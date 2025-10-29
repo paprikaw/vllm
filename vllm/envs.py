@@ -331,6 +331,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "CUDA_VISIBLE_DEVICES":
     lambda: os.environ.get("CUDA_VISIBLE_DEVICES", None),
 
+    "CUDA_LAUNCH_BLOCKING":
+    lambda: os.environ.get("CUDA_LAUNCH_BLOCKING", "0"),
+
+    "NCCL_DEBUG":
+    lambda: os.environ.get("NCCL_DEBUG", None),
     # timeout for each iteration in the engine
     "VLLM_ENGINE_ITERATION_TIMEOUT_S":
     lambda: int(os.environ.get("VLLM_ENGINE_ITERATION_TIMEOUT_S", "60")),

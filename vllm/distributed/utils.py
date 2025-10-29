@@ -183,6 +183,7 @@ class StatelessProcessGroup:
         while self.entries:
             # check the oldest entry
             key, timestamp = self.entries[0]
+            logger.info(f"[debug]: expire data {key} {timestamp}")
             if time.time() - timestamp > self.data_expiration_seconds:
                 self.store.delete_key(key)
                 self.entries.popleft()

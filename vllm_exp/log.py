@@ -81,11 +81,11 @@ class PathPlanner:
             path = self.base_dir / f"project-{self.cfg.project}" / "-".join(f"{self._k(k)}={self._encode_val(v)}" for k, v in self.const_dir_vars.items())
         return path
 
-    def write_constants_meta(self, where: Path):
+    def write_constants_meta(self, path: Path):
         meta = {
             "constants": self.const_items,
         }
-        (where / "constants.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     # ---------- 迭代式变量维护 ----------
     def extend_path_with_vars(self, vars_mapping: Dict[str, Any], *, move_to_end: bool = True) -> None:
@@ -206,13 +206,14 @@ class LogManager:
 
         # atexit.register(self._atexit_try_archive_failed)
 
-    def write_constants_meta(self):
+    def write_constants_meta(self, vars: Optional[Dict[str, Any]] = None):
         const_dir = self.planner.constants_dir()
         C.print(f"[bold cyan] Writing constants meta to {const_dir}")
         const_dir.mkdir(parents=True, exist_ok=True)
-        const_meta = const_dir / "constants.json"
-        if not const_meta.exists() or self.cfg:
-            self.planner.write_constants_meta(const_dir)
+        const_path = self.get_path_with_log_type("constants", "json", vars)
+        if const_path.exists():
+            os.remove(const_path)
+        self.planner.write_constants_meta(const_path)
     # # ---- 日志流 ----
     # def open_stream_with_combo(self, vars_mapping: Optional[Dict[str, Any]] = None, prefix: Optional[str] = None, suffix: Optional[str] = None) -> FileIO:
     #     # 关闭句柄
@@ -286,3 +287,16 @@ class LogManager:
         self.planner.extend_base_dir_with_vars(vars_mapping, move_to_end=move_to_end)
     def pop_vars_from_path(self, keys: Iterable[str]) -> None:
         self.planner.remove_vars(keys)
+
+
+    def get_path_with_log_type(self, basename: str, type: str, vars: Optional[Dict[str, Any]] = None) -> Path:
+        log_dir = self.get_dir()
+        log_file_name_var_part: str = self.get_filename_with_vars(vars)
+        filename = ""
+        if log_file_name_var_part is None or log_file_name_var_part == "":
+            filename = f"{basename}.{type}"
+        else:
+            filename = f"{basename}-{log_file_name_var_part}.{type}"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        return log_dir / filename

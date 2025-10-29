@@ -138,12 +138,13 @@ class PairPipe:
         assert isinstance(obj, (KVTensorMeta, KVPatchMeta)), "The object should be a KVTensorMeta or KVPatchMeta"
         return obj
 
-    def send_data(self, tensor: torch.Tensor, stream=None) -> None:
-        """发送数据，可以指定使用的 CUDA stream
+    def send_data(self, tensor: torch.Tensor, stream=None, wait_for_ack: bool = False) -> None:
+        """发送数据，可以指定使用的 CUDA stream，并可选择等待接收方确认
         
         Args:
             tensor: 要发送的 tensor
             stream: 可选的 CUDA stream，如果为 None 则使用默认行为
+            wait_for_ack: 如果为 True，发送后等待接收方的 ACK 确认
         """
         if self.is_use_nccl:
             assert self._nccl is not None, "The nccl communicator should be initialized"
@@ -152,12 +153,19 @@ class PairPipe:
             self._nccl.send(dev_tensor, dst=self.peer_rank, stream=stream)
         else:
             self.data_group.send_obj(tensor, dst=self.peer_rank)
+        
+        # 如果需要等待确认，接收对方的 ACK
+        if wait_for_ack:
+            ack = self.meta_group.recv_obj(src=self.peer_rank)
+            assert ack == "ACK", f"Expected ACK, got {ack}"
 
-    def recv_data(self, dtype: torch.dtype, shape: torch.Size) -> torch.Tensor:
+    def recv_data(self, dtype: torch.dtype, shape: torch.Size, send_ack: bool = False) -> torch.Tensor:
         """Data-plane receive: allocate buffer and perform NCCL recv.
 
         Args:
-            metadata: dict with dtype/shape (from recv_metadata_once).
+            dtype: 数据类型
+            shape: 数据形状
+            send_ack: 如果为 True，接收完成后向发送方发送 ACK 确认
         Returns:
             Received tensor on local GPU.
         """
@@ -168,6 +176,10 @@ class PairPipe:
         else:
             buf = self.data_group.recv_obj(src=self.peer_rank)
             assert isinstance(buf, torch.Tensor), "The object should be a torch.Tensor"
+        
+        # 如果需要发送确认，向发送方发送 ACK
+        if send_ack:
+            self.meta_group.send_obj("ACK", dst=self.peer_rank)
 
         return buf
 
@@ -346,13 +358,14 @@ class DynamicKVSynchronizer():
         pipe = self._pair_pipes_send[rank]
         pipe.send_obj(meta)
 
-    def _send_data_to_rank(self, rank: int, kv_cache: torch.Tensor, synchronize: bool = False) -> None:
+    def _send_data_to_rank(self, rank: int, kv_cache: torch.Tensor, synchronize: bool = False, wait_for_ack: bool = False) -> None:
         """发送 KV 数据到指定 rank
         
         Args:
             rank: 目标 rank
             kv_cache: 要发送的 KV cache tensor
-            synchronize: 是否同步等待发送完成（默认 False，异步发送）
+            synchronize: 是否等待 CUDA 操作完成（本地同步）
+            wait_for_ack: 是否等待接收方确认（远程同步）
         """
         pipe = self._ensure_pipe_and_buffer(rank, 'send')
         pipe = self._pair_pipes_send[rank]
@@ -361,12 +374,12 @@ class DynamicKVSynchronizer():
         if pipe.is_use_nccl and pipe._kv_transfer_stream is not None:
             # 使用专用 stream 发送
             logger.info(f"[debug]: send kv tensor data to rank {rank} using dedicated stream")
-            pipe.send_data(kv_cache, stream=pipe._kv_transfer_stream)
+            pipe.send_data(kv_cache, stream=pipe._kv_transfer_stream, wait_for_ack=wait_for_ack)
             # 如果需要同步，只等待这个专用 stream
             if synchronize:
                 pipe._kv_transfer_stream.synchronize()
         else:
-            pipe.send_data(kv_cache)
+            pipe.send_data(kv_cache, wait_for_ack=wait_for_ack)
             # 如果需要同步但没有专用 stream，等待整个设备
             if synchronize:
                 torch.cuda.synchronize(device=kv_cache.device)
@@ -384,18 +397,20 @@ class DynamicKVSynchronizer():
     def _recv_data_from_rank(self, rank: int,
                                dtype: torch.dtype,
                                shape: torch.Size,
-                               ) -> torch.Tensor:
+                               send_ack: bool = False) -> torch.Tensor:
         """Given previously received metadata, receive tensor payload via NCCL.
 
         Args:
-            rank: peer global rank.
-            metadata: dict returned by recv_kv_metadata_from_rank.
+            rank: peer global rank
+            dtype: tensor 数据类型
+            shape: tensor 形状
+            send_ack: 是否在接收完成后发送 ACK 确认
         Returns:
             Received tensor on local GPU.
         """
         pipe = self._ensure_pipe_and_buffer(rank, 'recv')
         pipe = self._pair_pipes_recv[rank]
-        return pipe.recv_data(dtype, shape)
+        return pipe.recv_data(dtype, shape, send_ack=send_ack)
 
     def get_recv_pipe(self, rank: int) -> PairPipe:
         self._ensure_pipe_and_buffer(rank, 'recv')
@@ -486,8 +501,8 @@ class DynamicKVSynchronizer():
             time_start = time.time()
             kv_patch = self.buffers[rank].pop_patch()
             self._send_meta_to_rank(rank, kv_patch.meta)
-            self._send_data_to_rank(rank, kv_patch.slot_mapping, synchronize=True)
-            self._send_data_to_rank(rank, kv_patch.kv_payload, synchronize=True)
+            self._send_data_to_rank(rank, kv_patch.slot_mapping, synchronize=True, wait_for_ack=True)
+            self._send_data_to_rank(rank, kv_patch.kv_payload, synchronize=True, wait_for_ack=True)
             self.kv_patch_sending = True
             patch_payload_size = kv_patch.kv_payload.numel() * kv_patch.kv_payload.element_size()
             patch_slot_mapping_size = kv_patch.slot_mapping.numel() * kv_patch.slot_mapping.element_size()

@@ -5,7 +5,7 @@ from collections import defaultdict
 from vllm.v1.core.single_type_kv_cache_manager import (
     get_manager_for_kv_cache_spec)
 from vllm.v1.core.dynamic_single_type_kv_cache_manager import DynamicFullAttentionManager
-from .dynamic_kv_cache_utils import compact_cache
+from .dynamic_kv_cache_utils import compact_cache_with_record
 from bitarray import bitarray
 from vllm.logger import init_logger
 logger = init_logger(__name__)
@@ -57,9 +57,10 @@ class DynamicKVCacheManager(KVCacheManager):
         self.req_to_block_hashes: defaultdict[
             str, list[BlockHashType]] = defaultdict(list)
     
-    def _migrate_block(self, block_id: int, to_block_id: int) -> None:
+    def _migrate_block(self, block_id: int, to_block_id: int, migrate_record: dict[int, int]) -> None:
         self.single_type_manager.update_requests_to_new_block_id(block_id, to_block_id)
         self.block_pool.migrate_block(block_id, to_block_id)
+        migrate_record[block_id] = to_block_id
 
     def get_bitmap(self) -> bitarray:
         bitmap = bitarray(self.block_pool.num_gpu_blocks)
@@ -86,11 +87,14 @@ class DynamicKVCacheManager(KVCacheManager):
 
         def is_used(idx):
             return self.block_pool.blocks[idx].ref_cnt != 0
-        compact_cache(
+        migrate_record: dict[int, int] = {}
+        compact_cache_with_record(
             self._migrate_block, 
             is_used,
             compacted_length, 
-            total)
+            total,
+            migrate_record)
+        logger.info(f"[debug]: scheduler migrate_record: {migrate_record}")
         logger.info(f"before kv cache shrinking, the kv cache utilization is {self.block_pool.get_usage()}")
         # left, right = 0, len(self.block_pool.blocks) - 1
         # while left < right:
@@ -106,6 +110,7 @@ class DynamicKVCacheManager(KVCacheManager):
         #         break
         
         self.block_pool.shrink_block_pool(compacted_length)
+        self.num_gpu_blocks = compacted_length
         logger.info(f"after kv cache shrinking, the kv cache utilization is {self.block_pool.get_usage()}")
         assert self.block_pool.num_gpu_blocks == compacted_length
         return

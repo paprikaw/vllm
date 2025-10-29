@@ -50,7 +50,7 @@ def sweep(
         base_dir = Path(log_dir)
         base_dir.mkdir(parents=True, exist_ok=True)
         logm = LogManager(base_dir, cfg)
-        clean_metrics_directory(logm.get_dir())
+        # clean_metrics_directory(logm.get_dir())
 
         os.environ.update(cfg.envs)
 

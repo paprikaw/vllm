@@ -217,9 +217,8 @@ class DynamicScheduler(Scheduler):
         """
         self.change_configuration_status = ChangeConfigurationType.SYNC_CHANGING
         self.update_layer_config(pp_layer_config)
-        if new_kv_cache_block_num > self.kv_cache_manager.num_gpu_blocks:
-            self.extend_kv_cache(new_kv_cache_block_num)
-        self.next_new_kv_cache_block_num = new_kv_cache_block_num
+        # if new_kv_cache_block_num > self.kv_cache_manager.num_gpu_blocks:
+        #     self.extend_kv_cache(new_kv_cache_block_num)
 
     def v1_start_migration(self, layer_config: List[Tuple[int,int]])->Future:
         # Start the migration process
@@ -335,7 +334,8 @@ class DynamicScheduler(Scheduler):
         if self.change_configuration_status == ChangeConfigurationType.ASYNC_CHANGING:
             self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
             assert self.next_pp_layer_config is not None
-            assert self.next_new_kv_cache_block_num != 0
+            # 在最后的阶段，只有可能是expand，不可能shrink
+            assert self.next_new_kv_cache_block_num == 0 or self.next_new_kv_cache_block_num > self.kv_cache_manager.num_gpu_blocks, f"next_new_kv_cache_block_num: {self.next_new_kv_cache_block_num} is less than the current kv cache size: {self.kv_cache_manager.num_gpu_blocks}"
             # In here, we update the layer configuration to the next configuration
             # In the next scheduling step, we will use the next configuration
             self.update_layer_config(self.next_pp_layer_config)
@@ -345,9 +345,8 @@ class DynamicScheduler(Scheduler):
             self.next_new_kv_cache_block_num = 0
 
         if self.change_configuration_status == ChangeConfigurationType.SYNC_CHANGING:
-            assert self.next_new_kv_cache_block_num != 0
+            assert self.next_new_kv_cache_block_num == 0
             self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
-            self.next_new_kv_cache_block_num = 0
         return output
 
     def get_kv_cache_snapshot(self) -> KVCacheSnapshot:

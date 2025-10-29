@@ -66,17 +66,6 @@ def wait_ready(base_url: str, timeout_s: int = 180) -> bool:
         time.sleep(2)
     return False
 
-def get_path_with_log_type(basename: str, type: str, logm: LogManager, vars: Optional[Dict[str, Any]] = None) -> Path:
-    log_dir = logm.get_dir()
-    log_file_name_var_part: str = logm.get_filename_with_vars(vars)
-    filename = ""
-    if log_file_name_var_part is None or log_file_name_var_part == "":
-        filename = f"{basename}.{type}"
-    else:
-        filename = f"{basename}-{log_file_name_var_part}.{type}"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    return log_dir / filename
 
 def get_path_policy_from_var_keys(var_keys: list[str]) -> PathPolicy:
     return PathPolicy(variables=var_keys)
@@ -104,17 +93,6 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
         env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(cfg.network.rank_to_ip)
     env.update(extra_env)
 
-    # Configure CSV metrics output path: logs/<project...>/{timestamp}_metrics.csv
-    # Use the constants-dir (project-level) to avoid nesting under varying vars.
-    try:
-        metrics_dir = logm.planner.constants_dir()
-        metrics_dir.mkdir(parents=True, exist_ok=True)
-        metrics_csv = metrics_dir / f"timestamp_metrics.csv"
-        env["VLLM_METRICS_CSV_PATH"] = str(metrics_csv)
-    except Exception:
-        # Best-effort; do not fail server launch on metrics path issues.
-        pass
-
     # 启动服务
     serve_args = [
         "vllm", "serve", cfg.model.path,
@@ -135,9 +113,17 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
     if cfg.vllm.enable_nsight:
         serve_args.append("--ray-workers-use-nsight")
 
-    path = get_path_with_log_type("server", "log", logm, vars)
+    metrics_path = logm.get_path_with_log_type("timestamp_metrics", "csv", vars)
+    if metrics_path.exists():
+        os.remove(metrics_path)
+    env["VLLM_METRICS_CSV_PATH"] = str(metrics_path)
+
+    path = logm.get_path_with_log_type("server", "log", vars)
+    # 如果file存在的话
+    if path.exists():
+        os.remove(path)
     log_fd = open(path, "wb", buffering=0)
-        
+
     # Dump vllm dynamic deployment config to configuration files (always write if path is provided)
     deployment_config_path = os.environ.get("DEPLOYMENT_CONFIG_PATH")
     C.print(deployment_config_path)
@@ -195,11 +181,17 @@ def start_benchmark(cfg: Config, spec: BenchmarkRunSpec, logm: LogManager, vars:
     config_file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(config_file_path, "w", encoding="utf-8") as f:
         json.dump(cfg.benchmark.model_dump(), f, indent=2, ensure_ascii=False)
-    metrics_file_name = get_path_with_log_type("metrics", "csv", logm, vars)
+    
+    # 规定metrics文件的命名方式
+    metrics_file_name = logm.get_path_with_log_type("request_metrics", "csv", vars)
+    if metrics_file_name.exists():
+        os.remove(metrics_file_name)
     envs = os.environ.copy()
     envs.update({"METRICS_FILE_NAME": str(metrics_file_name)})
 
-    log_path = get_path_with_log_type("benchmark", "log", logm, vars)
+    log_path = logm.get_path_with_log_type("benchmark", "log", vars)
+    if log_path.exists():
+        os.remove(log_path)
     bench_fd = open(log_path, "wb", buffering=0)
     C.print(f"[bold cyan] log_path: {log_path}")
     ret = subprocess.run(
@@ -275,7 +267,6 @@ def partition_and_request_rate(cfg: Config, logm: LogManager):
 
 def one_off_test(cfg: Config, logm: LogManager):
     cfg.path_policy = get_path_policy_from_var_keys([])
-    logm.write_constants_meta()
     ok = False
     proc = None
     # benchmark每发送num_requests次请求，都对应一个request_rate_list_compact中的request_rate
@@ -284,6 +275,7 @@ def one_off_test(cfg: Config, logm: LogManager):
         # Start vllm
         spec = ServerRunSpec(cfg.vllm.start_pp_layer_partitions[0], cfg.migration.is_migration)
         vars_mapping = {"start_pp_layer_partition": spec.start_pp_layer_partition}
+        logm.write_constants_meta(vars_mapping)
         proc = start_vllm(cfg=cfg, spec=spec, logm=logm, vars=vars_mapping)
         bench_spec = BenchmarkRunSpec(input_output_len=cfg.benchmark.input_output_lens, running_request_rate_list=cfg.benchmark.running_request_rates)
 

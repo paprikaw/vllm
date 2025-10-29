@@ -266,38 +266,43 @@ class AWQMarlinLinearMethod(LinearMethodBase):
                                           requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data,
                                           requires_grad=False)
-
+        # torch.cuda.empty_cache()
         # Allocate marlin workspace
         layer.workspace = marlin_make_workspace_new(device)
-
+        # logger.info(f"[debug]: start operation: awq_marlin_repack")
         # Repack weights from AWQ format to marlin format.
         marlin_qweight = ops.awq_marlin_repack(
             layer.qweight,
             size_k=layer.input_size_per_partition,
             size_n=layer.output_size_per_partition,
             num_bits=self.quant_config.quant_type.size_bits)
+        # logger.info(f"[debug]: replace parameter: qweight")
         replace_parameter(layer, "qweight", marlin_qweight)
 
+        # logger.info(f"[debug]: start operation: marlin_permute_scales")
         # Permute scales from AWQ format to marlin format.
         marlin_scales = marlin_permute_scales(
             layer.scales,
             size_k=layer.input_size_per_partition,
             size_n=layer.output_size_per_partition,
             group_size=self.quant_config.group_size)
+        # logger.info(f"[debug]: end operation: marlin_permute_scales")
         replace_parameter(layer, "scales", marlin_scales)
 
+        # logger.info(f"[debug]: start operation: awq_to_marlin_zero_points")
         # Permute zero-points from AWQ format to marlin format.
         marlin_zp = awq_to_marlin_zero_points(
             layer.qzeros,
             size_k=layer.num_groups,
             size_n=layer.output_size_per_partition,
             num_bits=self.quant_config.quant_type.size_bits)
+        # logger.info(f"[debug]: end operation: awq_to_marlin_zero_points")
         replace_parameter(layer, "qzeros", marlin_zp)
 
+        # logger.info(f"[debug]: start operation: marlin_make_empty_g_idx")
         # Not-used
         layer.g_idx = marlin_make_empty_g_idx(device)
         layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
-
     def apply(
         self,
         layer: torch.nn.Module,

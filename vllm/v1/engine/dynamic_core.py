@@ -31,6 +31,7 @@ from vllm.utils import make_zmq_socket, resolve_obj_by_qualname, zmq_socket_ctx
 from vllm.v1.core.kv_cache_utils import (get_kv_cache_config,
                                          unify_kv_cache_configs)
 from vllm.v1.core.sched.interface import SchedulerInterface
+from vllm.v1.core.dynamic_kv_cache_manager import DynamicKVCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as V1Scheduler
 from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
@@ -51,6 +52,7 @@ from .utils import get_new_layer_config_with_migration_action
 from vllm.v1.utils import WorkerMemInfo, LayerAddingAssessResult, human_readable_duration
 from dataclasses import dataclass
 from vllm.dynamic_config import DynamicConfig
+from copy import deepcopy
 
 
 logger = init_logger(__name__)
@@ -85,11 +87,12 @@ class DynamicEngineCore(EngineCore):
         return math.floor(memory_after_adding_weight / (num_layers_on_rank * block_size))
 
 
-    def _assess_memory_for_add(
+    def _assess_memory_for_layer_reconfiguration(
         self,
         rank: int,
-        adding_layer_list: list[Tuple[int, int]],
+        num_changed_layers: int,
         mem_info: WorkerMemInfo,
+        current_pp_layer_config: list[Tuple[int, int]],
     ) -> LayerAddingAssessResult:
         """Assess whether the target rank has enough memory to add layers.
 
@@ -98,101 +101,118 @@ class DynamicEngineCore(EngineCore):
           - can_fit_after_compact: free_mem + freed_estimate > required_mem
           - required_mem: bytes needed by new layers' weights + their KV
             cache (estimated) with safety margin
-          - free_mem: current free GPU memory (driver)
-          - freed_estimate: estimated bytes that could be freed by compacting KV
         注意，这里的所有memory都是对于整体的memory而言，而不是对于单个kv cache tensor而言的。
         """
-        logger.info(f"rank {rank}: assessing memory for adding layers: {adding_layer_list}")
         assert isinstance(self.scheduler, DynamicScheduler)
-        current_blocks_per_layer = self.scheduler.kv_cache_manager.num_gpu_blocks
-        assert len(adding_layer_list) != 0, f"adding_layer_list is empty for rank {rank}"
+        # assert len(adding_layer_list) != 0 or len(deleting_layer_list) != 0, f"adding_layer_list and deleting_layer_list are empty for rank {rank}"
 
-        # 汇总 rank 上要新增的层数
-        num_added_layers = sum((hi - lo + 1) for lo, hi in adding_layer_list)
-        layer_size = int(mem_info.layer_size)
-        free_mem = int(mem_info.free_mem)
+        # if len(deleting_layer_list) > 0:
+        #     for layers in deleting_layer_list:
+        #         assert layers[0] <= layers[1], f"deleting layers {layers} is not valid"
+        #         assert layers[0] >= current_pp_layer_config[rank][0] and layers[1] <= current_pp_layer_config[rank][1], f"deleting layers {layers} is not in the current pp layer config {current_pp_layer_config[rank]}"
+
+        # if len(adding_layer_list) > 0:
+        #     for layers in adding_layer_list:
+        #         assert layers[0] <= layers[1], f"deleting layers {layers} is not valid"
+        #         assert layers[1] < current_pp_layer_config[rank][0] or layers[0] > current_pp_layer_config[rank][1], f"adding layers {layers} is already in the current pp layer config {current_pp_layer_config[rank]}"
+
         total_gpu_memory = int(mem_info.total_gpu_memory)
-        kv_tensor_size = int(mem_info.kv_tensor_size)
-        num_layers_on_rank = self.cur_pp_layer_config[rank][1] - self.cur_pp_layer_config[rank][0] + 1 # 当前 rank 上的层数（用于估算该 rank 的 KV 总占用）
-        assert num_layers_on_rank > 0 
-        total_kv_cache_size = num_layers_on_rank * kv_tensor_size
-        # 估算新增层的需求（按压缩后的长度 u）
-        # 在这里，我们按照当前kv cache有可能的最小值来估算新增层对于kv cache的需求
-        # 安全余量从环境变量 VLLM_DYNAMIC_MIGRATION_SAFETY_MARGIN 读取，默认 10%
-        weight_required = num_added_layers * max(layer_size, 0)
-        u = float(self.scheduler.get_kv_cache_utilization())
-        minimal_kv_needed_for_added = int(num_added_layers * kv_tensor_size * u)
-        minimal_total_needed = weight_required + minimal_kv_needed_for_added
-        margin_pct = float(os.getenv("VLLM_DYNAMIC_MIGRATION_SAFETY_MARGIN", "0.10"))
-        required = int(math.ceil(minimal_total_needed * (1.0 + margin_pct)))
-        assert kv_tensor_size > 0 and required > 0 and margin_pct >= 0.0 and u >= 0.0
+        total_usable_memory = total_gpu_memory * self.vllm_config.cache_config.gpu_memory_utilization
+        weight_size_per_layer = mem_info.layer_size
+        block_num =  self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
+        free_blocks = self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+        used_blocks =  block_num - free_blocks
+        block_size = mem_info.block_size
+        num_layers_on_rank = current_pp_layer_config[rank][1] - current_pp_layer_config[rank][0] + 1
+        logger.info(f"[debug]: rank {rank}: num_changed_layers: {num_changed_layers}, num_layers_on_rank: {num_layers_on_rank}")
 
-        # 直接可用（包含余量）
-        if free_mem > required:
-            # 估算此时的max_block_per_layer
-            maximum_mem_for_kv_cache = free_mem + total_kv_cache_size - weight_required
-            max_blocks_per_layer = self._estimate_max_blocks_per_layer(
-                total_gpu_memory,
-                maximum_mem_for_kv_cache, 
-                num_layers_on_rank + num_added_layers, 
-                mem_info.block_size)
-            logger.info(f"rank {rank}: max_blocks_per_layer: {max_blocks_per_layer}")
-            return LayerAddingAssessResult(True, True, required, free_mem, 0, max_blocks_per_layer)
+        # 计算在加入当前layer之后，kv cache的最大block数量
+        total_layer_num = num_changed_layers + num_layers_on_rank
+        total_weight_size = weight_size_per_layer * total_layer_num
+        total_kv_cache = total_usable_memory - total_weight_size
+        max_blocks_per_layer = math.floor(total_kv_cache / (total_layer_num * block_size))
 
-        # TODO: 测试这种情况
-        # 首先需要估算在释放最多的KV cache的情况下，是否能够装下weight
-        # 释放KV cache的时候需要保存当前KV cache中活跃的block
-        # 由于当前的KV cache正在被使用，所以我们能腾出的最大空间maximum_mem_after_compact是 \
-        # GPU的free memory加上可被释放的KV cache.
-        compacted_kv_size_estimate = math.floor(int((1.0 - u) * kv_tensor_size * num_layers_on_rank))
-        assert compacted_kv_size_estimate >= 0
-        maximum_mem_after_compact = free_mem + compacted_kv_size_estimate
+        logger.info(f"[debug]: rank {rank}: total_layer_num: {total_layer_num}, total_weight_size: {total_weight_size}, total_kv_cache: {total_kv_cache}, max_blocks_per_layer: {max_blocks_per_layer}")
 
-        # 只有当compact后的最大空间能够装下需要添加的weight和其最小KV cache（由当前活跃的KV cache大小定义）时，我们判断此时通过compact kv来腾出空间是可行的
-        can_fit_after = (maximum_mem_after_compact > required)
+        # 计算当前GPU的可用内存
+        current_used_memory = (weight_size_per_layer + block_size * block_num) * num_layers_on_rank
+        free_gpu_memory = total_usable_memory - current_used_memory
+        
+        if num_changed_layers <= 0:
+            return LayerAddingAssessResult(True, True, max_blocks_per_layer)
 
-        if can_fit_after:
-            # 估算此时的max_block_per_layer
-            maximum_mem_for_kv_cache = free_mem + total_kv_cache_size - weight_required
-            max_blocks_per_layer = self._estimate_max_blocks_per_layer(
-                total_gpu_memory,
-                maximum_mem_for_kv_cache, 
-                num_layers_on_rank + num_added_layers, 
-                mem_info.block_size)
-        else:
-            max_blocks_per_layer = current_blocks_per_layer
-        logger.info(f"rank {rank}: after adding layers, can_fit_after: {can_fit_after}, max_blocks_per_layer: {max_blocks_per_layer}")
-        return LayerAddingAssessResult(False, can_fit_after, required, free_mem, compacted_kv_size_estimate, max_blocks_per_layer)
+        # 如果当前GPU的可用内存大于需要添加的layer的内存，则直接可用（包含余量）
+        if (weight_size_per_layer + block_size * block_num)  * num_changed_layers <= free_gpu_memory:
+            logger.info(f"[operation]: assessed memory for adding layers: {num_changed_layers}, memory can directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
+            return LayerAddingAssessResult(True, True, max_blocks_per_layer)
 
-    def _get_max_blocks_per_layer_after_deletion(self, rank: int, deleting_layer_list: list[Tuple[int, int]], mem_info: WorkerMemInfo) -> int:
-        """Assess after deleting certain number of layers, how many blocks one layer can have
+        # 或许需要compact, 此时我们计算在加入当前layer之后，kv cache的最大block数量
+        if max_blocks_per_layer > used_blocks:
+            logger.info(f"[operation]: assessed memory for adding layers: {num_changed_layers}, memory can fit after compact, max_blocks_per_layer: {max_blocks_per_layer}")
+            return LayerAddingAssessResult(False, True, max_blocks_per_layer)
+
+        logger.info(f"[operation]: assessed memory for adding layers: {num_changed_layers}, memory can not directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
+        return LayerAddingAssessResult(False, False, max_blocks_per_layer)
+
+    def _assess_memory_for_delete(
+        self,
+        rank: int,
+        deleting_layer_list: list[Tuple[int, int]],
+        mem_info: WorkerMemInfo,
+        current_pp_layer_config: list[Tuple[int, int]],
+    ) -> int:
+        """Assess whether the target rank has enough memory to add layers.
+        Returns the maximum number of blocks one layer can have after deleting certain number of layers
         """
-
+        logger.info(f"rank {rank}: assessing memory for deleting layers: {deleting_layer_list}")
         assert isinstance(self.scheduler, DynamicScheduler)
-        assert len(deleting_layer_list) != 0
+        assert len(deleting_layer_list) != 0, f"deleting_layer_list is empty for rank {rank}"
 
-        num_layers_on_rank = self.cur_pp_layer_config[rank][1] - self.cur_pp_layer_config[rank][0] + 1
-        assert num_layers_on_rank > 0
-        num_deleted_layers = sum((hi - lo + 1) for lo, hi in deleting_layer_list)
-        layer_size = int(mem_info.layer_size)
-        free_mem = int(mem_info.free_mem)
-        kv_tensor_size = int(mem_info.kv_tensor_size)
+        for layers in deleting_layer_list:
+            assert layers[0] in current_pp_layer_config[rank] and layers[1] in current_pp_layer_config[rank], f"deleting layers {layers} is not in the current pp layer config {current_pp_layer_config[rank]}"
         total_gpu_memory = int(mem_info.total_gpu_memory)
+        total_usable_memory = total_gpu_memory * (1 - self.vllm_config.cache_config.gpu_memory_utilization)
+        weight_size_per_layer = mem_info.layer_size
+        block_size = mem_info.block_size
+        num_deleted_layers = sum((hi - lo + 1) for lo, hi in deleting_layer_list)
+        num_layers_on_rank = current_pp_layer_config[rank][1] - current_pp_layer_config[rank][0] + 1
 
-        # Calculate the new space for kv cache after the deletion of layers
-        freed_memory_from_delete_weight = layer_size * num_deleted_layers 
-        freed_memory_from_free_kv_cache = kv_tensor_size * num_layers_on_rank
-        maximum_mem_for_kv_cache = free_mem + freed_memory_from_delete_weight + freed_memory_from_free_kv_cache
+        # 计算在加入当前layer之后，kv cache的最大block数量
+        total_layer_num = num_layers_on_rank - num_deleted_layers
+        total_weight_size = weight_size_per_layer * total_layer_num
+        total_kv_cache = total_usable_memory - total_weight_size
+        max_blocks_per_layer = math.floor(total_kv_cache / (total_layer_num * block_size))
+        return max_blocks_per_layer
 
-        logger.info(f"rank {rank}: layer_size{layer_size}, num_of_deleted_layers: {num_deleted_layers}, freed memory from delete weight: {freed_memory_from_delete_weight / 1024 ** 3:.2f} GB, freed memory from free kv cache: {freed_memory_from_free_kv_cache / 1024 ** 3:.2f} GB, maximum memory for kv cache: {maximum_mem_for_kv_cache / 1024 ** 3:.2f} GB, total gpu memory: {total_gpu_memory / 1024 ** 3:.2f} GB, num layers on rank: {num_layers_on_rank}, block size: {mem_info.block_size}")
+    # def _get_max_blocks_per_layer_after_deletion(self, rank: int, deleting_layer_list: list[Tuple[int, int]], mem_info: WorkerMemInfo) -> int:
+    #     """Assess after deleting certain number of layers, how many blocks one layer can have
+    #     """
 
-        max_blocks_per_layer = self._estimate_max_blocks_per_layer(
-            total_gpu_memory,
-            maximum_mem_for_kv_cache, 
-            num_layers_on_rank - num_deleted_layers, 
-            mem_info.block_size)
-        logger.info(f"rank {rank}: after deleting layers, maximum blocks per layer: {max_blocks_per_layer}")
-        return int(max_blocks_per_layer)
+    #     assert isinstance(self.scheduler, DynamicScheduler)
+    #     assert len(deleting_layer_list) != 0
+
+    #     num_layers_on_rank = self.cur_pp_layer_config[rank][1] - self.cur_pp_layer_config[rank][0] + 1
+    #     assert num_layers_on_rank > 0
+    #     num_deleted_layers = sum((hi - lo + 1) for lo, hi in deleting_layer_list)
+    #     layer_size = int(mem_info.layer_size)
+    #     free_mem = int(mem_info.free_mem)
+    #     kv_tensor_size = int(mem_info.kv_tensor_size)
+    #     total_gpu_memory = int(mem_info.total_gpu_memory)
+
+    #     # Calculate the new space for kv cache after the deletion of layers
+    #     freed_memory_from_delete_weight = layer_size * num_deleted_layers 
+    #     freed_memory_from_free_kv_cache = kv_tensor_size * num_layers_on_rank
+    #     maximum_mem_for_kv_cache = free_mem + freed_memory_from_delete_weight + freed_memory_from_free_kv_cache
+
+    #     logger.info(f"rank {rank}: layer_size{layer_size}, num_of_deleted_layers: {num_deleted_layers}, freed memory from delete weight: {freed_memory_from_delete_weight / 1024 ** 3:.2f} GB, freed memory from free kv cache: {freed_memory_from_free_kv_cache / 1024 ** 3:.2f} GB, maximum memory for kv cache: {maximum_mem_for_kv_cache / 1024 ** 3:.2f} GB, total gpu memory: {total_gpu_memory / 1024 ** 3:.2f} GB, num layers on rank: {num_layers_on_rank}, block size: {mem_info.block_size}")
+
+    #     max_blocks_per_layer = self._estimate_max_blocks_per_layer(
+    #         total_gpu_memory,
+    #         maximum_mem_for_kv_cache, 
+    #         num_layers_on_rank - num_deleted_layers, 
+    #         mem_info.block_size)
+    #     logger.info(f"rank {rank}: after deleting layers, maximum blocks per layer: {max_blocks_per_layer}")
+    #     return int(max_blocks_per_layer)
 
     def _reinitialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -417,65 +437,57 @@ class DynamicEngineCore(EngineCore):
             # Adding/removing
             need_compact = False
             adding_per_rank: dict[int, list[Tuple[int, int]]] = {}
-            adding_layer_ranks_assesses: list[LayerAddingAssessResult] = []
-            adding_layer_kv_block_num_after_compact: list[int] = []
-            deleting_layer_kv_block_num_after_compact: list[int] = []
+            maximum_kv_block_num_after_compact: list[int] = []
+
+            # 记录当前gpu上的layer configuration
+            # 除了migration前的config和migration后的config之外，在migration的过程中
+            # 还有可能出现一些中间状态的migration config
+            tmp_pp_layer_config = deepcopy(self.cur_pp_layer_config)
             for rank, layers in enumerate(pp_layer_config):
-                start_layer, end_layer = self.cur_pp_layer_config[rank][0], self.cur_pp_layer_config[rank][1]
+                start_layer, end_layer = tmp_pp_layer_config[rank][0], tmp_pp_layer_config[rank][1]
                 adding_layer_list = []
-                deleting_layer_list = []
                 if layers[0] < start_layer:
                     adding_layer_list.append((layers[0], start_layer - 1))
+                    tmp_pp_layer_config[rank] = (layers[0], tmp_pp_layer_config[rank][1])
                 if layers[1] > end_layer:
                     adding_layer_list.append((end_layer + 1, layers[1]))
-
-                if layers[0] > start_layer:
-                    deleting_layer_list.append((start_layer, layers[0] - 1))
-                if layers[1] < end_layer:
-                    deleting_layer_list.append((layers[1] + 1, end_layer))
-
-                if len(adding_layer_list) == 0 and len(deleting_layer_list) == 0:
-                    continue
-                logger.info(f"rank {rank}:\n adding_layer_list: {adding_layer_list}\n deleting_layer_list: {deleting_layer_list}")
+                    tmp_pp_layer_config[rank] = (tmp_pp_layer_config[rank][0], layers[1])
+                logger.info(f"rank {rank}:\n adding_layer_list: {adding_layer_list}")
                 # 在 adding 之前，校验对应 GPU 是否有足够可用显存容纳“将要新增的层”的权重；
                 # 如果不足，尝试评估：压缩（compact）KV cache 后释放的显存，是否足以腾挪出空间。
                 # 同时，如果当前的GPU available memory已经足够，则需要评估是否需要resize kv cache
+                adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
+                assess = self._assess_memory_for_layer_reconfiguration(rank, adding_layer_num, mem_infos[rank], self.cur_pp_layer_config)
+                maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
                 if len(adding_layer_list) > 0:
                     adding_per_rank[rank] = adding_layer_list
-                    assess = self._assess_memory_for_add(rank, adding_layer_list, mem_infos[rank])
-                    adding_layer_ranks_assesses.append(assess)
-                    adding_layer_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
-                    if assess.required_mem > 0:
-                        if assess.enough_without_compact:
-                            pass
-                        elif assess.can_fit_after_compact:
-                            need_compact = True
-                        else:
-                            logger.warning(
-                                "Rank %s lacks memory even after KV compact estimate: free=%s, freed_est≈%s, required=%s",
-                                rank, assess.free_mem, assess.freed_estimate, assess.required_mem)
-                            return []
-                if len(deleting_layer_list) > 0:
-                    assess = self._get_max_blocks_per_layer_after_deletion(rank, deleting_layer_list, mem_infos[rank])
-                    deleting_layer_kv_block_num_after_compact.append(assess)
+                    if assess.enough_without_compact:
+                        pass
+                    elif assess.can_fit_after_compact:
+                        need_compact = True
+                    else:
+                        logger.info(
+                            "Rank %s lacks memory even after KV compact estimate: max_blocks_per_layer: %s, current_used_blocks: %s",
+                            rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
+                        return []
+
+
             outputs = self._drain_out_running_queue()
             engine_core_outputs.extend(outputs)
             logger.info(f"[timeline]: after drain out running queue, time taken: {human_readable_duration(time.time() - time_start)}")
-            # TODO: 在这里实际上我们也需要加上expanding kv cache的逻辑，可以在后面再实现
+
+            assert isinstance(self.scheduler, DynamicScheduler)
+            assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
+            compacted_length = min(maximum_kv_block_num_after_compact)
             if need_compact:
-                compacted_length = min(assess.max_blocks_per_layer for assess in adding_layer_ranks_assesses)
+                logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
                 engine_core_outputs.extend(self._compact_kv_cache(compacted_length))
                 logger.info(f"debug -------------- KV cache compacted to {compacted_length} blocks before adding layers")
                 logger.info(f"[timeline]: after compact kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
-            
-            # Resize the kv cache
-            after_compact_kv_block_num = min(adding_layer_kv_block_num_after_compact + deleting_layer_kv_block_num_after_compact)
 
-            if after_compact_kv_block_num < self.scheduler.kv_cache_manager.num_gpu_blocks:
                 logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
-                self.model_executor.resize_kv_cache(after_compact_kv_block_num)
+                self.model_executor.resize_kv_cache(compacted_length)
                 logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
-
             # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
             for r, add_list in adding_per_rank.items():
                 self.model_executor.async_add_layers(r, add_list)
@@ -505,13 +517,6 @@ class DynamicEngineCore(EngineCore):
                     layer_ids = plan.setdefault(dst_rank, [])
                     layer_ids.extend(range(lo, hi + 1))
 
-            # 去重并排序每个 dst_rank 的 layer 列表，然后按 src 发起迁移
-            # for src_rank, rank_to_layers_ids in src_to_plan.items():
-            #     for dst_rank, layers in rank_to_layers_ids.items():
-            #         # 去重且保持有序
-            #         unique_sorted = sorted(set(layers))
-            #         rank_to_layers_ids[dst_rank] = unique_sorted
-            #     logger.info(f"rank {src_rank} start kv cache migration to rank {rank_to_layers_ids}")
             self.model_executor.start_kv_cache_migration_async(src_to_plan)
             time_kv_migration_end = time.time()
             logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
@@ -535,11 +540,40 @@ class DynamicEngineCore(EngineCore):
                             break
                     if not should_sync:
                         break
-
+                
+                final_pp_layer_config = deepcopy(tmp_pp_layer_config)
                 if should_sync:
-                    logger.info("all tokens to be sent is less than the threshold, start to synchronize the kv cache")
-                    self.scheduler.async_change_configuration(pp_layer_config, after_compact_kv_block_num)
+                    deleting_layer_assesses: list[int] = []
+                    for rank, layers in enumerate(pp_layer_config):
+                        # 计算对于每一个rank而言，需要删除哪一些layers
+                        start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
+                        deleting_layer_list = []
+                        if layers[0] > start_layer:
+                            deleting_layer_list.append((start_layer, layers[0] - 1))
+                            final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
+                        if layers[1] < end_layer:
+                            deleting_layer_list.append((layers[1] + 1, end_layer))
+                            final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
+                        deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
+                        assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
+                        deleting_layer_assesses.append(assess.max_blocks_per_layer)
+
+                    for rank, layers in enumerate(final_pp_layer_config):
+                        assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
+
+                    resized_block_num = min(deleting_layer_assesses)
+                    logger.info("all tokens to be sent is less than the threshold, start to synchronize the kv cache, resized_block_num: {resized_block_num}")
+                    if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
+                        assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
+                        logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
+
+                    # 如果resized_block_num和当前kv cache size相同，则不需要进行resize
+                    if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
+                        resized_block_num = 0
+
+                    self.scheduler.async_change_configuration(pp_layer_config, resized_block_num)
                     break
+
             logger.info(f"[timeline]: after check patch sending process, time taken: {human_readable_duration(time.time() - time_start)}")
 
         threading.Thread(target=check_patch_sending_process, daemon=True).start()
@@ -547,7 +581,7 @@ class DynamicEngineCore(EngineCore):
 
     def change_model_configuration_by_kv_transfer_sync(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
         """
-        Our fancy implementation of model configuration change
+        Our fancy implementation of model synchronized configuration change
         """
         logger.info(f"Start migrating to new configuration {pp_layer_config}")
         assert isinstance(self.scheduler, DynamicScheduler)
@@ -564,68 +598,72 @@ class DynamicEngineCore(EngineCore):
             # Adding/removing
             need_compact = False
             adding_per_rank: dict[int, list[Tuple[int, int]]] = {}
-            adding_layer_ranks_assesses: list[LayerAddingAssessResult] = []
-            adding_layer_kv_block_num_after_compact: list[int] = []
-            deleting_layer_kv_block_num_after_compact: list[int] = []
+            maximum_kv_block_num_after_compact: list[int] = []
+
+            # 记录当前gpu上的layer configuration
+            # 除了migration前的config和migration后的config之外，在migration的过程中
+            # 还有可能出现一些中间状态的migration config
+            tmp_pp_layer_config = deepcopy(self.cur_pp_layer_config)
             for rank, layers in enumerate(pp_layer_config):
-                start_layer, end_layer = self.cur_pp_layer_config[rank][0], self.cur_pp_layer_config[rank][1]
+                start_layer, end_layer = tmp_pp_layer_config[rank][0], tmp_pp_layer_config[rank][1]
                 adding_layer_list = []
-                deleting_layer_list = []
                 if layers[0] < start_layer:
                     adding_layer_list.append((layers[0], start_layer - 1))
+                    tmp_pp_layer_config[rank] = (layers[0], tmp_pp_layer_config[rank][1])
                 if layers[1] > end_layer:
                     adding_layer_list.append((end_layer + 1, layers[1]))
-
-                if layers[0] > start_layer:
-                    deleting_layer_list.append((start_layer, layers[0] - 1))
-                if layers[1] < end_layer:
-                    deleting_layer_list.append((layers[1] + 1, end_layer))
-
-                if len(adding_layer_list) == 0 and len(deleting_layer_list) == 0:
-                    continue
-                logger.info(f"rank {rank}:\n adding_layer_list: {adding_layer_list}\n deleting_layer_list: {deleting_layer_list}")
+                    tmp_pp_layer_config[rank] = (tmp_pp_layer_config[rank][0], layers[1])
+                logger.info(f"rank {rank}:\n adding_layer_list: {adding_layer_list}")
                 # 在 adding 之前，校验对应 GPU 是否有足够可用显存容纳“将要新增的层”的权重；
                 # 如果不足，尝试评估：压缩（compact）KV cache 后释放的显存，是否足以腾挪出空间。
                 # 同时，如果当前的GPU available memory已经足够，则需要评估是否需要resize kv cache
+                adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
+                assess = self._assess_memory_for_layer_reconfiguration(rank, adding_layer_num, mem_infos[rank], self.cur_pp_layer_config)
+                maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
                 if len(adding_layer_list) > 0:
                     adding_per_rank[rank] = adding_layer_list
-                    assess = self._assess_memory_for_add(rank, adding_layer_list, mem_infos[rank])
-                    adding_layer_ranks_assesses.append(assess)
-                    adding_layer_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
-                    if assess.required_mem > 0:
-                        if assess.enough_without_compact:
-                            pass
-                        elif assess.can_fit_after_compact:
-                            need_compact = True
-                        else:
-                            logger.warning(
-                                "Rank %s lacks memory even after KV compact estimate: free=%s, freed_est≈%s, required=%s",
-                                rank, assess.free_mem, assess.freed_estimate, assess.required_mem)
-                            return []
-                if len(deleting_layer_list) > 0:
-                    assess = self._get_max_blocks_per_layer_after_deletion(rank, deleting_layer_list, mem_infos[rank])
-                    deleting_layer_kv_block_num_after_compact.append(assess)
+                    if assess.enough_without_compact:
+                        pass
+                    elif assess.can_fit_after_compact:
+                        need_compact = True
+                    else:
+                        logger.info(
+                            "Rank %s lacks memory even after KV compact estimate: max_blocks_per_layer: %s, current_used_blocks: %s",
+                            rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
+                        return []
+
 
             outputs = self._drain_out_running_queue()
             engine_core_outputs.extend(outputs)
+            logger.info(f"[timeline]: after drain out running queue, time taken: {human_readable_duration(time.time() - time_start)}")
+            logger.info(f"[debug]: tmp pp layer config: {tmp_pp_layer_config}")
 
-            # TODO: 在这里实际上我们也需要加上expanding kv cache的逻辑，可以在后面再实现
+            assert isinstance(self.scheduler, DynamicScheduler)
+            assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
+            compacted_length = min(maximum_kv_block_num_after_compact)
             if need_compact:
-                compacted_length = min(assess.max_blocks_per_layer for assess in adding_layer_ranks_assesses)
+                logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
                 engine_core_outputs.extend(self._compact_kv_cache(compacted_length))
                 logger.info(f"debug -------------- KV cache compacted to {compacted_length} blocks before adding layers")
-            
-            # Resize the kv cache
-            after_compact_kv_block_num = min(adding_layer_kv_block_num_after_compact + deleting_layer_kv_block_num_after_compact)
+                logger.info(f"[timeline]: after compact kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
 
-            if after_compact_kv_block_num < self.scheduler.kv_cache_manager.num_gpu_blocks:
                 logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
-                self.model_executor.resize_kv_cache(after_compact_kv_block_num)
-
-
-            # # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
+                self.model_executor.resize_kv_cache(compacted_length)
+                logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
+            else:
+                logger.info(f"[debug]: no need to compact kv cache")
+            # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
             for r, add_list in adding_per_rank.items():
                 self.model_executor.async_add_layers(r, add_list)
+            time_kv_compact_end = time.time()
+
+            logger.info(f"[timeline]: before start actual kv cache migration, time taken to add weights, compact, resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
+
+
+            # 在异步传输/扩容前，抓取 KV cache 的快照，记录各请求的已计算 token 与 block 映射
+            # 用于后续传输完成后对齐新增 token，实现两 GPU 之间 KV 同步
+            # Ensure no in-flight work before snapshotting KV state
+
             # 计算 src->dst 传输对
             # 辅助函数：根据当前分片配置找到包含区间 [lo, hi] 的源 rank
             def find_src_rank_for_range(lo: int, hi: int) -> int:
@@ -644,12 +682,39 @@ class DynamicEngineCore(EngineCore):
                     layer_ranges.extend([(lo, hi)])
 
             self.model_executor.start_kv_cache_migration_sync(sending_plan_for_ranks, adding_per_rank)
-
+            time_kv_migration_end = time.time()
+            logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
             time_kv_migration_end = time.time()
             logger.info(f"time taken to start kv cache migration: {human_readable_duration(time_kv_migration_end - time_start)}")
-            self.scheduler.sync_change_configuration(pp_layer_config, after_compact_kv_block_num)
+            logger.info(f"[cur]compact length: {compacted_length}")
 
-        return engine_core_outputs
+            final_pp_layer_config = deepcopy(tmp_pp_layer_config)
+            deleting_layer_assesses: list[int] = []
+            for rank, layers in enumerate(pp_layer_config):
+                # 计算对于每一个rank而言，需要删除哪一些layers
+                start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
+                deleting_layer_list = []
+                if layers[0] > start_layer:
+                    deleting_layer_list.append((start_layer, layers[0] - 1))
+                    final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
+                if layers[1] < end_layer:
+                    deleting_layer_list.append((layers[1] + 1, end_layer))
+                    final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
+                deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
+                assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
+                deleting_layer_assesses.append(assess.max_blocks_per_layer)
+
+            for rank, layers in enumerate(final_pp_layer_config):
+                assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
+
+            resized_block_num = min(deleting_layer_assesses)
+            if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
+                assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
+                logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
+                self.scheduler.sync_change_configuration(pp_layer_config, resized_block_num)
+                # self.model_executor.resize_kv_cache(resized_block_num)
+
+            return engine_core_outputs
     def migrate_layer_v1(self, rank_from: int, rank_to: int, num_layers: int) -> list[EngineCoreOutputs]:
         with self.engine_lock:
             logger.info(f"migrating layer from {rank_from} to {rank_to} with {num_layers} layers")
@@ -1150,7 +1215,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             logger.info("num_of_requests: " + str(num_of_requests))
             if num_of_requests in migration_steps:
                 logger.info("change model configuration")
-                outputs = self.change_model_configuration_by_kv_transfer_async(alternative_configs[1])
+                outputs = self.change_model_configuration_by_kv_transfer_sync(alternative_configs[1])
                 logger.info("debug-------- engineoutput when migration: " + str(outputs))
                 for output in outputs:
                     self.output_queue.put_nowait(output)

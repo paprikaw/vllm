@@ -69,9 +69,10 @@ try:
 
                 # 计算通信时间（如果有上游数据）
 
-                self.worker.kv_synchronize_before_execute_callback(
-                    scheduler_output.is_sync_after_migration)
+                # self.worker.kv_synchronize_before_execute_callback(
+                #     scheduler_output.is_sync_after_migration)
                 time_after_before_execute_callback = time.time()
+                self.worker.sync_migration_before_execute_callback(scheduler_output.new_kv_cache_block_num)
                 
                 try:
                     output = self.worker.model_runner.execute_model(
@@ -87,7 +88,7 @@ try:
 
                 time_after_execute = time.time()
                 assert(len(self.worker.model_runner.input_batch.block_table.block_tables) == 1) # Only for consistent shape of attention
-                self.worker.kv_synchronize_after_execute_callback(scheduler_output.is_sync_after_migration, scheduler_output.new_kv_cache_block_num)
+                # self.worker.kv_synchronize_after_execute_callback(scheduler_output.is_sync_after_migration, scheduler_output.new_kv_cache_block_num)
 
                 time_after_execute_callback = time.time()
                 

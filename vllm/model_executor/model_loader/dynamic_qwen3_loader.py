@@ -143,13 +143,16 @@ def process_layer_weights_after_loading(model: nn.Module, model_config: ModelCon
     for name, module in model.named_modules():
         if name == "model.layers" or "layers" not in name or extract_layer_index(name) not in range(layers[0], layers[1]+1):
             continue
+        logger.info(f"[debug]: processing weights after loading for module: {name}")
         if isinstance(module, QKVCrossParallelLinear):
+            logger.info(f"[debug]: processing weights after loading for QKVCrossParallelLinear: {module}")
             # NOTE(Isotr0py): special case for cross QKV layer because
             # q and kv proj aren't registered as submodules intentionally
             module.process_weights_after_loading()
             continue
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
+            logger.info(f"[debug]: processing weights after loading for quant method: {quant_method}")
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
@@ -164,6 +167,7 @@ def process_layer_weights_after_loading(model: nn.Module, model_config: ModelCon
     for _, module in model.named_modules():
         if isinstance(module, Attention) and \
             hasattr(module, "process_weights_after_loading"):
+            logger.info(f"[debug]: processing weights after loading for Attention: {module}")
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
             module.process_weights_after_loading(model_config.dtype)
