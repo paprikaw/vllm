@@ -4,6 +4,7 @@ from typing import Optional
 
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.config import LoadConfig, LoadFormat, ModelConfig, VllmConfig
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.bitsandbytes_loader import (
@@ -19,7 +20,7 @@ from vllm.model_executor.model_loader.tensorizer_loader import TensorizerLoader
 from vllm.model_executor.model_loader.utils import (
     get_architecture_class_name, get_model_architecture)
 
-
+logger = init_logger(__name__)
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     if isinstance(load_config.load_format, type):
@@ -53,6 +54,7 @@ def get_model(*,
               vllm_config: VllmConfig,
               model_config: Optional[ModelConfig] = None) -> nn.Module:
     loader = get_model_loader(vllm_config.load_config)
+    logger.info(f"loader: {loader}")
     if model_config is None:
         model_config = vllm_config.model_config
     return loader.load_model(vllm_config=vllm_config,

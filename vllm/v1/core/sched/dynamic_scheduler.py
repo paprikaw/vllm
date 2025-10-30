@@ -208,7 +208,7 @@ class DynamicScheduler(Scheduler):
         self.next_pp_layer_config = pp_layer_config
         self.next_new_kv_cache_block_num = new_kv_cache_block_num
 
-    def sync_change_configuration(self, pp_layer_config: List[Tuple[int,int]], new_kv_cache_block_num: int):
+    def sync_change_configuration(self, pp_layer_config: List[Tuple[int,int]]):
         """
         This function is used to synchronize the kv cache and change the configuration
         Note that this function is only used when there is no running batch remain in the pipeline and the scheduling process is suspended.
@@ -407,7 +407,7 @@ class DynamicScheduler(Scheduler):
         while self.running:
             preempt_request = self.running.pop()
             # Mabe not free preempt request, because we will reconstruct it anyway
-            # self.kv_cache_manager.free(preempt_request)
+            self.kv_cache_manager.free(preempt_request)
             preempt_request.status = RequestStatus.PREEMPTED
             preempt_request.num_computed_tokens = 0
             self.waiting.appendleft(preempt_request)

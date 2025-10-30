@@ -432,14 +432,15 @@ class DynamicKVSynchronizer():
         """
         assert all(transfer_in_process == False for transfer_in_process in self.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
         assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
-
+        logger.info(f"[debug]: rank_to_layers_ids: {rank_to_layers_ids}")
         for rank, layer_ids in rank_to_layers_ids.items():
             for layer_id in layer_ids:
-                logger.info(f"rank {self.rank} send kv cache to rank {rank} for layer {layer_id}")
+                logger.info(f"[debug]: rank {self.rank} send kv cache to rank {rank} for layer {layer_id}")
                 local_layer_id = layer_id - start_layer_id
+                logger.info(f"[debug]:rank {self.rank} local_layer_id: {local_layer_id}")
                 kv_cache = kv_caches[local_layer_id]
                 # 第一次访问时默认置为 False，避免 KeyError
-                logger.info(f"rank {self.rank} send kv tensor meta to rank {rank} for layer {layer_id}")
+                logger.info(f"[debug]: rank {self.rank} send kv tensor meta to rank {rank} for layer {layer_id}")
                 self._send_meta_to_rank(rank, KVTensorMeta(
                     type='kv_tensor',
                     layer_to_be_received=set(layer_ids),
@@ -447,8 +448,9 @@ class DynamicKVSynchronizer():
                     num_tokens=int(kv_cache.size(0)),
                     dtype=kv_cache.dtype,
                     shape=kv_cache.shape))
-                logger.info(f"rank {self.rank} send kv tensor data to rank {rank} for layer {layer_id}")
-                self._send_data_to_rank(rank, kv_cache)
+                logger.info(f"[debug]: rank {self.rank} send kv tensor data to rank {rank} for layer {layer_id}")
+                kv_cache_copy = kv_cache.clone()
+                self._send_data_to_rank(rank, kv_cache_copy, synchronize=True, wait_for_ack=True)
                 self.kv_cache_transfer_in_process[rank] = True
             # Only to tell the receiver the kv patch have been
             self._send_meta_to_rank(rank, KVPatchMeta(

@@ -11,7 +11,7 @@ envs:
   CUDA_LAUNCH_BLOCKING: "1"
   NCCL_DEBUG: "INFO"
 projects:
-  - project: "migration_test_sync"
+  - project: "migration_test_sync_32_32"
     type: "one_off_test"
     network:
       delays: [0]
@@ -26,7 +26,7 @@ projects:
         - "8,56"
     migration:
       is_migration: true
-      migration_steps: [30]
+      migration_steps: [1]
       alternative_configs:
         "0": [32, 32]
         "1": [32, 32]

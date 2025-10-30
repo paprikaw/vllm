@@ -272,7 +272,7 @@ class DefaultModelLoader(BaseModelLoader):
             with target_device:
                 model = initialize_model(vllm_config=vllm_config,
                                          model_config=model_config)
-
+            logger.info(f"initialize model weights: {model}")
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
                 self.get_all_weights(model_config, model))

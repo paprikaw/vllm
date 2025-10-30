@@ -101,8 +101,12 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
         # 只记录layer 0，因为我们假设所有weight的大小相同。
         def weight_size_record_generator(weights: Iterable[tuple[str, torch.Tensor]]):
             # 如果已经记录过layer weight size，就不再记录，但仍需要yield所有weights
+            # 🔴 修复：在generator中使用return会导致generator立即结束，不yield任何值！
+            # 正确做法：无论是否已记录，都要yield所有权重
             if self.layer_weight_size != -1:
-                return weights
+                # 已经记录过，直接yield所有权重，不再记录大小
+                yield from weights
+                return
 
             first_layer_index = -1
             layer_weight_accumulator = 0
@@ -148,7 +152,7 @@ class DynamicQwen3Model(Qwen3Model):
         self.sched_end_layer = self.end_layer
         self.model_lock = Lock()
         self.cache_config = vllm_config.cache_config
-        # self.vllm_config = vllm_config
+        self.vllm_config = vllm_config  # 保存vllm_config用于后续add_layers
         # self.layer_module = vllm_config.compilation_config.static_forward_context
         # logger.info(f"Initlized Dyanmic Qwen3 Model, layers: {self.layers}")
         # logger.info(f"Initlized Dyanmic Qwen3 Model, vllm_config: {self.vllm_config.compilation_config.static_forward_context}")
@@ -161,23 +165,35 @@ class DynamicQwen3Model(Qwen3Model):
         # First update model's layers
         assert layers[0] <= layers[1], "layers[0] must be less than layers[1]"
         assert layers[1] == self.start_layer - 1 or layers[0] == self.end_layer, f"layers must be adjacent to old_layers, layers: {layers}, start_layer: {self.start_layer}, end_layer: {self.end_layer}"
-        # with set_current_vllm_config(self.vllm_config):
-        new_module = add_layers(
-            self.layers, 
-            layers,
-            (self.start_layer, self.end_layer-1),
-            lambda prefix: decoder_layer_type(config=self.config,
-                                              cache_config=self.cache_config,
-                                              quant_config=self.quant_config,
-                                              prefix=prefix),
-            prefix=f"{self.prefix}.layers",
-            )
+        # 使用set_current_vllm_config上下文管理器，确保新层初始化时能访问到正确的vllm_config
+        # 这与initialize_model中的逻辑保持一致
+        with set_current_vllm_config(self.vllm_config):
+            new_module = add_layers(
+                self.layers, 
+                layers,
+                (self.start_layer, self.end_layer-1),
+                lambda prefix: decoder_layer_type(config=self.config,
+                                                  cache_config=self.cache_config,
+                                                  quant_config=self.quant_config,
+                                                  prefix=prefix),
+                prefix=f"{self.prefix}.layers",
+                )
         with self.model_lock:
             self.layers = new_module
             if layers[1] == self.start_layer-1:
                 self.start_layer = layers[0]
             if layers[0] == self.end_layer:
                 self.end_layer = layers[1] + 1
+        
+        # 🔴 关键修复：清除get_pp_missing_layer_names的缓存
+        # add_layers后，原来的PPMissingLayer变成了真实的层，但缓存仍保存旧的missing列表
+        # 必须清除缓存，否则is_pp_missing_parameter会错误地跳过新增层的权重加载
+        from vllm.model_executor.models.utils import _model_to_pp_missing_layer_names
+        # 清除当前模型（DynamicQwen3Model/Qwen2Model）的缓存
+        # 这是Qwen2Model.load_weights()中is_pp_missing_parameter检查的对象
+        _model_to_pp_missing_layer_names.pop(id(self), None)
+        logger.info(f"[DEBUG] Cleared PP missing layer cache after add_layers for model id={id(self)}")
+        
         # gc.collect()
         # torch.cuda.empty_cache()
 

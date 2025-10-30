@@ -29,6 +29,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.forward_context import get_forward_context
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
 from vllm.model_executor.model_loader.dynamic_qwen3_loader import CustomModelLoader
@@ -233,7 +234,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     insert_idx = i
                     break
             group.layer_names.insert(insert_idx, layer_name)
-
 
     def has_layer(self, layer_index: int) -> bool:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)

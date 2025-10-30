@@ -1205,7 +1205,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     inputs_embeds=inputs_embeds,
                 )
             except Exception as e:
-                logger.info(f"[debug]: attention_metadata: {attn_metadata}")
                 time.sleep(2)
                 raise e
 
@@ -1539,8 +1538,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         logger.info("Starting to load model %s...", self.model_config.model)
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             time_before_load = time.perf_counter()
+            logger.info(f"start to load model, vllm_config: {self.vllm_config}")
             self.model = get_model(vllm_config=self.vllm_config)
             if self.lora_config:
+                logger.info(f"applied lora config")
                 self.model = self.load_lora_model(self.model,
                                                   self.model_config,
                                                   self.scheduler_config,

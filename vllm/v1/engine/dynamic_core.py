@@ -656,7 +656,7 @@ class DynamicEngineCore(EngineCore):
             for r, add_list in adding_per_rank.items():
                 self.model_executor.async_add_layers(r, add_list)
             time_kv_compact_end = time.time()
-
+            time.sleep(10)
             logger.info(f"[timeline]: before start actual kv cache migration, time taken to add weights, compact, resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
 
 
@@ -687,7 +687,6 @@ class DynamicEngineCore(EngineCore):
             time_kv_migration_end = time.time()
             logger.info(f"time taken to start kv cache migration: {human_readable_duration(time_kv_migration_end - time_start)}")
             logger.info(f"[cur]compact length: {compacted_length}")
-
             final_pp_layer_config = deepcopy(tmp_pp_layer_config)
             deleting_layer_assesses: list[int] = []
             for rank, layers in enumerate(pp_layer_config):
@@ -706,12 +705,12 @@ class DynamicEngineCore(EngineCore):
 
             for rank, layers in enumerate(final_pp_layer_config):
                 assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
-
             resized_block_num = min(deleting_layer_assesses)
             if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
                 assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
                 logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
-                self.scheduler.sync_change_configuration(pp_layer_config, resized_block_num)
+                # self.scheduler.sync_change_configuration(pp_layer_config, resized_block_num)
+                self.scheduler.update_layer_config([(0, 23), (24, 63)])
                 # self.model_executor.resize_kv_cache(resized_block_num)
 
             return engine_core_outputs
@@ -746,7 +745,7 @@ class DynamicEngineCore(EngineCore):
                     self.scheduler.pp_layer_config_status.get_cur_pp_layer_config()
                     )
             
-            self.model_executor.add_layers(rank_to, [layers])
+            self.model_executor.async_add_layers(rank_to, [layers])
             self.model_executor.remove_layers(rank_from, [layers])
             self.scheduler.update_layer_config(next_layer_config)
             weight_migration_time = time.time()
@@ -1216,6 +1215,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             if num_of_requests in migration_steps:
                 logger.info("change model configuration")
                 outputs = self.change_model_configuration_by_kv_transfer_sync(alternative_configs[1])
+                # outputs = self.migrate_layer_v1(1, 0, 24)
                 logger.info("debug-------- engineoutput when migration: " + str(outputs))
                 for output in outputs:
                     self.output_queue.put_nowait(output)

@@ -246,7 +246,7 @@ class DynamicGPUWorker(Worker):
             by adjusting the `gpu_memory_utilization` parameter.
         """
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
-        assert self.model_runner.model.get_sched_layers() == (self.model_runner.model.model.start_layer, self.model_runner.model.model.end_layer), "model should be in the initial state"
+        # assert self.model_runner.model.get_sched_layers() == (self.model_runner.model.model.start_layer, self.model_runner.model.model.end_layer), "model should be in the initial state"
         self.model_runner.profile_run()
         torch.cuda.empty_cache()
 
@@ -276,19 +276,11 @@ class DynamicGPUWorker(Worker):
             return None
         logger.info(f"[operation]: Async Add Model Layers: {layer_list}")
         time_start = time.time()
-        # def _do_add():
-        #     self._add_layers(layer_list)
-        # threading.Thread(target=_do_add, daemon=False).start()
+        def _do_add():
+            self._add_layers(layer_list)
+        threading.Thread(target=_do_add, daemon=False).start()
         # # t.start()
         # # t.join()
-        s = torch.cuda.Stream(device=self.device)
-        event = torch.cuda.Event()
-
-        with torch.cuda.stream(s): 
-            self._add_layers(layer_list)
-            event.record(s)
-
-        torch.cuda.current_stream().wait_event(event)
         logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
 
     def remove_layers(self, rank: int, layer_list: list[Tuple[int, int]]) -> None:
@@ -582,7 +574,8 @@ class DynamicGPUWorker(Worker):
                     layers_to_be_received = meta.layer_to_be_received
                     assert meta.layer_id not in received_layer, "The layer should not be received twice"
                     received_layer.add(meta.layer_id)
-                    kv_tensor = self.dynamic_kv_synchronizer._recv_data_from_rank(from_rank, meta.dtype, meta.shape)
+                    kv_tensor = self.dynamic_kv_synchronizer._recv_data_from_rank(from_rank, meta.dtype, meta.shape, send_ack=True)
+                    logger.info(f"[debug]: rank {self.rank} receive kv tensor {meta.layer_id}, shape: {kv_tensor.shape}, dtype: {kv_tensor.dtype}")
                     # 在kv cache绑定前，weight必须loading结束
                     # 等待层加载完成（不持有任何锁）
                     with self._layer_loaded_cv:

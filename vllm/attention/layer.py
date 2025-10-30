@@ -244,6 +244,7 @@ class Attention(nn.Module):
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                logger.info(f"[debug]: rank {self.rank} self_kv_cache shape: {self_kv_cache.shape}, dtype: {self_kv_cache.dtype}")
                 if os.environ.get("VLLM_DEBUG_ASSERT_KV", "1").lower() not in ("0", "", "false", "no"):
                     assert isinstance(self_kv_cache, torch.Tensor) and self_kv_cache.numel() > 0, (
                         f"Attention {self.layer_name} has empty KV cache bound")
@@ -271,7 +272,9 @@ class Attention(nn.Module):
         return s
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
+        logger.info(f"[debug]: enter process weights after loading")
         if hasattr(self.impl, "process_weights_after_loading"):
+            logger.info(f"[debug]: process weights after loading for {self.layer_name}")
             self.impl.process_weights_after_loading(act_dtype)
 
 
@@ -422,7 +425,6 @@ direct_register_custom_op(
     fake_impl=unified_attention_fake,
     dispatch_key=current_platform.dispatch_key,
 )
-
 
 def unified_attention_with_output(
     query: torch.Tensor,

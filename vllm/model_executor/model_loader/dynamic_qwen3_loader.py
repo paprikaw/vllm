@@ -87,30 +87,31 @@ class CustomModelLoader(DefaultModelLoader):
         time_start = time.time()
         logger.info(f"[timeline]: start to load layers {layers}")
         with set_default_torch_dtype(model_config.dtype): 
-            logger.info(f"before weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-            # 只收集属于指定层范围的参数名，更易读
-            model.add_layers(layers)
-            logger.info(f"[timeline]: after add layers but not weigths, time taken: {human_readable_duration(time.time() - time_start)}")
-            logger.info(f"[debug]: Loading weights for layers {layers}")
-            weights_to_load = {
-                name
-                for name, _ in model.named_parameters()
-                if "layers" in name and extract_layer_index(name) in range(layers[0], layers[1]+1)
-            }
-            logger.info(f"[debug]: Weights to load: {weights_to_load}")
-            loaded_weights = model.load_weights(
-                self.get_layer_weights(model_config, model, layers)) 
-            model.to(target_device)
-            logger.info(f"[debug]: after weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-            logger.info(f"[timeline]: after weight loading, time taken: {human_readable_duration(time.time() - time_start)}")
-            if model_config.quantization is None and loaded_weights is not None:
-                weights_not_loaded = weights_to_load - loaded_weights
-                if weights_not_loaded:
-                    raise ValueError(
-                        "Following weights were not initialized from "
-                        f"checkpoint: {weights_not_loaded}")
-            process_layer_weights_after_loading(model, model_config, target_device, layers)
-            logger.info(f"[timeline]: after process layer weights after loading, time taken: {human_readable_duration(time.time() - time_start)}")
+            # 添加设备上下文管理器，与 vllm 正常初始化逻辑保持一致
+            with target_device:
+                logger.info(f"before weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+                # 只收集属于指定层范围的参数名，更易读
+                model.add_layers(layers)
+                logger.info(f"[timeline]: after add layers but not weigths, time taken: {human_readable_duration(time.time() - time_start)}")
+                logger.info(f"[debug]: Loading weights for layers {layers}")
+                weights_to_load = {
+                    name
+                    for name, _ in model.named_parameters()
+                    if "layers" in name and extract_layer_index(name) in range(layers[0], layers[1]+1)
+                }
+                logger.info(f"[debug]: Weights to load: {weights_to_load}")
+                loaded_weights = model.load_weights(
+                    self.get_layer_weights(model_config, model, layers)) 
+                logger.info(f"[debug]: after weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+                logger.info(f"[timeline]: after weight loading, time taken: {human_readable_duration(time.time() - time_start)}")
+                if model_config.quantization is None and loaded_weights is not None:
+                    weights_not_loaded = weights_to_load - loaded_weights
+                    if weights_not_loaded:
+                        raise ValueError(
+                            "Following weights were not initialized from "
+                            f"checkpoint: {weights_not_loaded}")
+                process_layer_weights_after_loading(model, model_config, target_device, layers)
+                logger.info(f"[timeline]: after process layer weights after loading, time taken: {human_readable_duration(time.time() - time_start)}")
         return
 
 ########################################################
@@ -164,7 +165,9 @@ def process_layer_weights_after_loading(model: nn.Module, model_config: ModelCon
     # Currently only used by MLA.
     # NOTE: This intentionally happens after other modules so we can easily
     # decompress the weights for MLA.
-    for _, module in model.named_modules():
+    for name, module in model.named_modules():
+        if name == "model.layers" or "layers" not in name or extract_layer_index(name) not in range(layers[0], layers[1]+1):
+            continue
         if isinstance(module, Attention) and \
             hasattr(module, "process_weights_after_loading"):
             logger.info(f"[debug]: processing weights after loading for Attention: {module}")
