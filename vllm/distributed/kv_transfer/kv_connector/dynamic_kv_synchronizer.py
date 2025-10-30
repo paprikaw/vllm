@@ -449,8 +449,7 @@ class DynamicKVSynchronizer():
                     dtype=kv_cache.dtype,
                     shape=kv_cache.shape))
                 logger.info(f"[debug]: rank {self.rank} send kv tensor data to rank {rank} for layer {layer_id}")
-                kv_cache_copy = kv_cache.clone()
-                self._send_data_to_rank(rank, kv_cache_copy, synchronize=True, wait_for_ack=True)
+                self._send_data_to_rank(rank, kv_cache, synchronize=True, wait_for_ack=True)
                 self.kv_cache_transfer_in_process[rank] = True
             # Only to tell the receiver the kv patch have been
             self._send_meta_to_rank(rank, KVPatchMeta(

@@ -448,9 +448,9 @@ class DynamicGPUWorker(Worker):
             # Asynchronize with cuda stream
             torch.cuda.synchronize()
 
-            # for _, layer_ranges in sending_layers_plans.items():
-            #     self.release_kv_cache_for_layers(self.rank, layer_ranges)
-            #     self.remove_layers(self.rank, layer_ranges)
+            for _, layer_ranges in sending_layers_plans.items():
+                self.release_kv_cache_for_layers(self.rank, layer_ranges)
+                self.remove_layers(self.rank, layer_ranges)
             self.sending_kv_cache_in_process = False
 
         logger.info(f"-------------启动 KV cache 迁移所用时间: {time.time() - time_start:.2f} 秒")

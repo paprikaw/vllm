@@ -385,7 +385,6 @@ class Qwen2Model(nn.Module):
         # 这里的fuse操作有可能导致GPU显存不足。
         # 我们不能假设模型加载的最小显存开支就等于模型权重大小。
         for name, loaded_weight in weights:
-            logger.info(f"[debug]: start to load parameter: {name}")
             if "rotary_emb.inv_freq" in name:
                 continue
             if (self.quant_config is not None and
@@ -407,7 +406,6 @@ class Qwen2Model(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if is_pp_missing_parameter(name, self):
-                    logger.info(f"[debug]: skip loading missing parameter: {name}")
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -422,14 +420,12 @@ class Qwen2Model(nn.Module):
                 if name is None:
                     continue
                 if is_pp_missing_parameter(name, self):
-                    logger.info(f"[debug]: skip loading missing parameter: {name}")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
-            logger.info(f"[debug]: loaded parameter: {name}")
         return loaded_params
 
     

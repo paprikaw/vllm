@@ -709,9 +709,9 @@ class DynamicEngineCore(EngineCore):
             if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
                 assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
                 logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
-                # self.scheduler.sync_change_configuration(pp_layer_config, resized_block_num)
-                self.scheduler.update_layer_config([(0, 23), (24, 63)])
-                # self.model_executor.resize_kv_cache(resized_block_num)
+                self.scheduler.sync_change_configuration(pp_layer_config)
+                # self.scheduler.update_layer_config([(0, 23), (24, 63)])
+                self.model_executor.resize_kv_cache(resized_block_num)
 
             return engine_core_outputs
     def migrate_layer_v1(self, rank_from: int, rank_to: int, num_layers: int) -> list[EngineCoreOutputs]:
