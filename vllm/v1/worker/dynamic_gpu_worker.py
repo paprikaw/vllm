@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu_worker import init_worker_distributed_environment, _chec
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.utils import DeadlockTimeoutContext
 from vllm.v1.utils import human_readable_duration
+from vllm.device_allocator.cumem import CuMemAllocator
 
 
 
@@ -209,7 +210,18 @@ class DynamicGPUWorker(Worker):
         for rank in range(self.vllm_config.parallel_config.pipeline_parallel_size):
             if rank != self.rank:
                 # threading.Thread(target=self.listen_to_kv_cache_tensor_and_patches, args=(rank,), daemon=True).start()
-                threading.Thread(target=self.listen_to_kv_cache_tensor, args=(rank,), daemon=True).start()
+                threading.Thread(target=self.listen_to_kv_cache_tensor_and_patches, args=(rank,), daemon=True).start()
+
+    def dynamic_initialize_from_config(self, kv_cache_config: KVCacheConfig, num_blocks: int) -> None:
+        """Allocate GPU KV cache with the specified kv_cache_config."""
+        if self.vllm_config.model_config.enable_sleep_mode:
+            allocator = CuMemAllocator.get_instance()
+            context = allocator.use_memory_pool(tag="kv_cache")
+        else:
+            from contextlib import nullcontext
+            context = nullcontext()
+        with context:
+            self.model_runner.dynamic_initialize_kv_cache(kv_cache_config, num_blocks)
 
     @torch.inference_mode()
     def execute_model(
@@ -279,8 +291,6 @@ class DynamicGPUWorker(Worker):
         def _do_add():
             self._add_layers(layer_list)
         threading.Thread(target=_do_add, daemon=False).start()
-        # # t.start()
-        # # t.join()
         logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
 
     def remove_layers(self, rank: int, layer_list: list[Tuple[int, int]]) -> None:
@@ -316,8 +326,9 @@ class DynamicGPUWorker(Worker):
         # Layer weight size (may raise if not recorded yet)
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
         layer_size = int(self.model_runner.model.get_layer_weight_size())
-        k_block = self.model_runner.kv_caches[0][0][0]
-        block_size = int(k_block.numel() * k_block.element_size() * 2)  # 乘以2包含V
+
+        is_kv_cache_initialized = len(self.model_runner.kv_caches) != 0 and self.model_runner.kv_caches[0].numel() != 0
+
 
 
         # Free memory from driver
@@ -325,13 +336,14 @@ class DynamicGPUWorker(Worker):
 
         # Size of a single KV cache tensor (for one layer) from model runner
         kv_tensor_size = 0
-        if isinstance(self.model_runner, DynamicGPUModelRunner):
+        assert isinstance(self.model_runner, DynamicGPUModelRunner)
+        if is_kv_cache_initialized:
             kv_tensor_size = int(self.model_runner.get_single_kv_tensor_size())
 
         # get the size of total gpu memory
         total_gpu_memory = get_total_gpu_memory(self.rank)
 
-        return WorkerMemInfo(layer_size, block_size, kv_tensor_size, int(free_memory), int(total_gpu_memory))
+        return WorkerMemInfo(layer_size, kv_tensor_size, int(free_memory), int(total_gpu_memory))
 
     def get_kv_buffer_status(self) -> KVBufferStatus:
         """Return KV patch buffer status per rank.

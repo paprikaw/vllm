@@ -343,7 +343,54 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # gc.collect()
         # torch.cuda.empty_cache()
 
-    
+    def dynamic_initialize_kv_cache(self, kv_cache_config: KVCacheConfig, num_blocks: int) -> None:
+        """
+        Initialize KV cache based on `kv_cache_config`.
+        Args:
+            kv_cache_config: Configuration for the KV cache, including the KV
+            cache size of each layer
+        """
+        if len(kv_cache_config.kv_cache_groups) > 1:
+            raise NotImplementedError(
+                "Hybrid models with more than one KV cache type are not "
+                "supported yet.")
+        self.kv_cache_config = kv_cache_config
+        self.initialize_attn_backend(kv_cache_config)
+
+        kv_caches: dict[str, torch.Tensor] = {}
+
+        for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            for layer_name in kv_cache_group.layer_names:
+                assert num_blocks >= kv_cache_config.num_blocks
+                if isinstance(kv_cache_spec, AttentionSpec):
+                    kv_cache_shape = self.attn_backends[i].get_kv_cache_shape(
+                        num_blocks, kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                    dtype = kv_cache_spec.dtype
+                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
+                                                        dtype=dtype,
+                                                        device=self.device)
+                else:
+                    # TODO: add new branches when introducing more types of
+                    # KV cache specs.
+                    raise ValueError("Unknown KV cache spec type.")
+                logger.info(f"kv_caches shape: {kv_cache_shape}")
+
+        if self.speculative_config and self.speculative_config.use_eagle():
+            assert isinstance(self.drafter, EagleProposer)
+            # validate all draft model layers belong to the same kv cache
+            # group
+            self.drafter.validate_same_kv_cache_group(kv_cache_config)
+
+        bind_kv_cache(
+            kv_caches,
+            self.vllm_config.compilation_config.static_forward_context,
+            self.kv_caches)
+        logger.info(f"debug---------------- init kv cache done, kv block num: {len(self.kv_caches[0][0])}")
+        if has_kv_transfer_group():
+            get_kv_transfer_group().register_kv_caches(kv_caches) 
+
     def release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         '''
         目前release_kv_cache依赖于model.start_layers来进行kv cache list的删除。
@@ -408,13 +455,13 @@ class DynamicGPUModelRunner(GPUModelRunner):
         migrate_record: dict[int, int] = {}
         compact_cache_with_record(self._migrate_block, is_used, compacted_length, num_blocks, migrate_record)
         logger.info(f"[debug]: migrate_record: {migrate_record}")
+
         # 遍历CachedRequestState更新block_ids
         for req_state in self.requests.values():
             for i, block_ids in enumerate(req_state.block_ids):
                 for j, block_id in enumerate(block_ids):
                     if block_id in migrate_record:
                         req_state.block_ids[i][j] = migrate_record[block_id]
-        
         # 遍历InputBatch中的block_table更新block_ids
         for block_table in self.input_batch.block_table:
             for row in block_table.block_table_np:

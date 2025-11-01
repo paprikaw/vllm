@@ -64,21 +64,92 @@ _R = TypeVar('_R')  # Return type for collective_rpc
 
 class DynamicEngineCore(EngineCore):
 
-    def __init__(self, *args, 
-                        dynamic_config: DynamicConfig, 
-                        **kwargs):
+    def __init__(self,
+                 vllm_config: VllmConfig,
+                 executor_class: type[Executor],
+                 log_stats: bool,
+                 dynamic_config: DynamicConfig,
+                 executor_fail_callback: Optional[Callable] = None
+                 ):
 
-        super().__init__(*args, **kwargs)
+        # plugins need to be loaded at the engine/scheduler level too
+        from vllm.plugins import load_general_plugins
+        load_general_plugins()
+
+        self.vllm_config = vllm_config
+        logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
+                    VLLM_VERSION, vllm_config)
+
+        self.log_stats = log_stats
+
+        # Setup Model.
+        self.model_executor = executor_class(vllm_config)
+        if executor_fail_callback is not None:
+            self.model_executor.register_failure_callback(
+                executor_fail_callback)
+
+        # TODO: Load initial configurations properly
+        self.dynamic_config = dynamic_config
+        self.cur_pp_layer_config = self.dynamic_config.alternative_configs.pp_layer_configs["0"]
+        self.migration_in_process = False
+
+        # Setup KV Caches and update CacheConfig after profiling.
+        num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
+            self._initialize_kv_caches(vllm_config)
+
+        vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
+        vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+
+        self.structured_output_manager = StructuredOutputManager(vllm_config)
+
+        # Setup scheduler.
+        if isinstance(vllm_config.scheduler_config.scheduler_cls, str):
+            Scheduler = resolve_obj_by_qualname(
+                vllm_config.scheduler_config.scheduler_cls)
+        else:
+            Scheduler = vllm_config.scheduler_config.scheduler_cls
+
+        # This warning can be removed once the V1 Scheduler interface is
+        # finalized and we can maintain support for scheduler classes that
+        # implement it
+        if Scheduler is not V1Scheduler:
+            logger.warning(
+                "Using configured V1 scheduler class %s. "
+                "This scheduler interface is not public and "
+                "compatibility may not be maintained.",
+                vllm_config.scheduler_config.scheduler_cls)
+
+        assert Scheduler is DynamicScheduler
+        self.scheduler = DynamicScheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=self.structured_output_manager,
+            include_finished_set=vllm_config.parallel_config.data_parallel_size
+            > 1,
+            log_stats=self.log_stats,
+        )
+
+        # Setup MM Input Mapper.
+        self.mm_input_cache_server = MirroredProcessingCache(
+            vllm_config.model_config)
+
+        # Setup batch queue for pipeline parallelism.
+        # Batch queue for scheduled batches. This enables us to asynchronously
+        # schedule and execute batches, and is required by pipeline parallelism
+        # to eliminate pipeline bubbles.
+        self.batch_queue_size = self.model_executor.max_concurrent_batches
+        self.batch_queue: Optional[queue.Queue[tuple[Future[ModelRunnerOutput],
+                                                     SchedulerOutput]]] = None
+        if self.batch_queue_size > 1:
+            logger.info("Batch queue is enabled with size %d",
+                        self.batch_queue_size)
+            self.batch_queue = queue.Queue(self.batch_queue_size)
+        self.vllm_config = vllm_config
         assert isinstance(self.scheduler, DynamicScheduler)
 
         # Make sure dynamic_config is not in the kwargs, but pulling out from it.
-        assert "dynamic_config" not in kwargs
         self.migration_status = MigrationStatus.NOT_MIGRATING
         self.engine_lock = threading.Lock()
-        self.dynamic_config = dynamic_config
-        # TODO: Load initial configurations properly
-        self.cur_pp_layer_config = self.scheduler.pp_layer_config_status.get_cur_pp_layer_config()
-        self.migration_in_process = False
 
     def _estimate_max_blocks_per_layer(self, gpu_total_memory: int, memory_after_adding_weight: int, num_layers_on_rank: int, block_size: int) -> int:
         safe_margin = (1 - self.vllm_config.cache_config.gpu_memory_utilization) * gpu_total_memory
@@ -104,36 +175,18 @@ class DynamicEngineCore(EngineCore):
         注意，这里的所有memory都是对于整体的memory而言，而不是对于单个kv cache tensor而言的。
         """
         assert isinstance(self.scheduler, DynamicScheduler)
-        # assert len(adding_layer_list) != 0 or len(deleting_layer_list) != 0, f"adding_layer_list and deleting_layer_list are empty for rank {rank}"
 
-        # if len(deleting_layer_list) > 0:
-        #     for layers in deleting_layer_list:
-        #         assert layers[0] <= layers[1], f"deleting layers {layers} is not valid"
-        #         assert layers[0] >= current_pp_layer_config[rank][0] and layers[1] <= current_pp_layer_config[rank][1], f"deleting layers {layers} is not in the current pp layer config {current_pp_layer_config[rank]}"
+        num_layers_on_rank = current_pp_layer_config[rank][1] - current_pp_layer_config[rank][0] + 1
+        # 计算在加入当前layer之后，kv cache的最大block数量
+        total_layer_num = num_changed_layers + num_layers_on_rank
+        max_blocks_per_layer = self._get_max_num_blocks(mem_info, total_layer_num)
 
-        # if len(adding_layer_list) > 0:
-        #     for layers in adding_layer_list:
-        #         assert layers[0] <= layers[1], f"deleting layers {layers} is not valid"
-        #         assert layers[1] < current_pp_layer_config[rank][0] or layers[0] > current_pp_layer_config[rank][1], f"adding layers {layers} is already in the current pp layer config {current_pp_layer_config[rank]}"
 
         total_gpu_memory = int(mem_info.total_gpu_memory)
         total_usable_memory = total_gpu_memory * self.vllm_config.cache_config.gpu_memory_utilization
         weight_size_per_layer = mem_info.layer_size
         block_num =  self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
-        free_blocks = self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
-        used_blocks =  block_num - free_blocks
-        block_size = mem_info.block_size
-        num_layers_on_rank = current_pp_layer_config[rank][1] - current_pp_layer_config[rank][0] + 1
-        logger.info(f"[debug]: rank {rank}: num_changed_layers: {num_changed_layers}, num_layers_on_rank: {num_layers_on_rank}")
-
-        # 计算在加入当前layer之后，kv cache的最大block数量
-        total_layer_num = num_changed_layers + num_layers_on_rank
-        total_weight_size = weight_size_per_layer * total_layer_num
-        total_kv_cache = total_usable_memory - total_weight_size
-        max_blocks_per_layer = math.floor(total_kv_cache / (total_layer_num * block_size))
-
-        logger.info(f"[debug]: rank {rank}: total_layer_num: {total_layer_num}, total_weight_size: {total_weight_size}, total_kv_cache: {total_kv_cache}, max_blocks_per_layer: {max_blocks_per_layer}")
-
+        block_size = self.vllm_config.cache_config.block_size
         # 计算当前GPU的可用内存
         current_used_memory = (weight_size_per_layer + block_size * block_num) * num_layers_on_rank
         free_gpu_memory = total_usable_memory - current_used_memory
@@ -146,6 +199,9 @@ class DynamicEngineCore(EngineCore):
             logger.info(f"[operation]: assessed memory for adding layers: {num_changed_layers}, memory can directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
             return LayerAddingAssessResult(True, True, max_blocks_per_layer)
 
+        free_blocks = self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+        used_blocks =  block_num - free_blocks
+
         # 或许需要compact, 此时我们计算在加入当前layer之后，kv cache的最大block数量
         if max_blocks_per_layer > used_blocks:
             logger.info(f"[operation]: assessed memory for adding layers: {num_changed_layers}, memory can fit after compact, max_blocks_per_layer: {max_blocks_per_layer}")
@@ -153,6 +209,17 @@ class DynamicEngineCore(EngineCore):
 
         logger.info(f"[operation]: assessed memory for adding layers: {num_changed_layers}, memory can not directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
         return LayerAddingAssessResult(False, False, max_blocks_per_layer)
+
+    def _get_max_num_blocks(self, mem_info: WorkerMemInfo, num_layers: int) -> int:
+        total_gpu_memory = int(mem_info.total_gpu_memory)
+        total_usable_memory = total_gpu_memory * self.vllm_config.cache_config.gpu_memory_utilization
+        weight_size_per_layer = mem_info.layer_size
+        block_size = self.vllm_config.cache_config.block_size
+        total_weight_size = weight_size_per_layer * num_layers
+        total_kv_cache = total_usable_memory - total_weight_size
+        logger.info(f"debug ------- get max num blocks: {total_kv_cache / 1024 ** 3:.2f} GB, num_layers: {num_layers}, block_size: {block_size} , total_gpu_memory: {total_gpu_memory / 1024 ** 3:.2f} GB, total_usable_memory: {total_usable_memory / 1024 ** 3:.2f} GB, weight_size_per_layer: {weight_size_per_layer / 1024 ** 3:.2f} GB, total_weight_size: {total_weight_size / 1024 ** 3:.2f} GB")
+        max_blocks_per_layer = math.floor(total_kv_cache / (num_layers * block_size))
+        return max_blocks_per_layer
 
     def _assess_memory_for_delete(
         self,
@@ -173,7 +240,7 @@ class DynamicEngineCore(EngineCore):
         total_gpu_memory = int(mem_info.total_gpu_memory)
         total_usable_memory = total_gpu_memory * (1 - self.vllm_config.cache_config.gpu_memory_utilization)
         weight_size_per_layer = mem_info.layer_size
-        block_size = mem_info.block_size
+        block_size = self.vllm_config.cache_config.block_size
         num_deleted_layers = sum((hi - lo + 1) for lo, hi in deleting_layer_list)
         num_layers_on_rank = current_pp_layer_config[rank][1] - current_pp_layer_config[rank][0] + 1
 
@@ -213,7 +280,62 @@ class DynamicEngineCore(EngineCore):
     #         mem_info.block_size)
     #     logger.info(f"rank {rank}: after deleting layers, maximum blocks per layer: {max_blocks_per_layer}")
     #     return int(max_blocks_per_layer)
+    def _initialize_kv_caches(
+            self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
+        start = time.time()
 
+        kv_cache_specs = self.model_executor.get_kv_cache_specs()
+
+        # Here we are not using kv_cache_config to initialize the kv cache
+        # We keep these logic just for compatibility with the parent class
+        # Also we want to invoke the profile run within determine_available_memory()
+        available_gpu_memory = self.model_executor.determine_available_memory()
+
+        assert len(kv_cache_specs) == len(available_gpu_memory)
+        # Get the kv cache tensor size
+        kv_cache_configs = [
+            get_kv_cache_config(vllm_config, kv_cache_spec_one_worker,
+                                available_gpu_memory_one_worker)
+            for kv_cache_spec_one_worker, available_gpu_memory_one_worker in
+            zip(kv_cache_specs, available_gpu_memory)
+        ]
+
+        # Since we use a shared centralized controller, we need the
+        # `kv_cache_config` to be consistent across all workers to make sure
+        # all the memory operators can be applied to all workers.
+        unify_kv_cache_configs(kv_cache_configs)
+
+        # All workers have the same kv_cache_config except layer names, so use
+        # an arbitrary one to initialize the scheduler.
+        assert all([
+            cfg.num_blocks == kv_cache_configs[0].num_blocks
+            for cfg in kv_cache_configs
+        ])
+        num_cpu_blocks = 0
+        scheduler_kv_cache_config = kv_cache_configs[0]
+
+        # rather than initialize from kv config, we invoke our own logic 
+        assert len(kv_cache_configs) == 2 # We are not considering the different kv config case
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        mem_infos = self.model_executor.get_workers_mem_info()
+        max_blocks_per_layer = 6666666666
+        for rank, mem_info in enumerate(mem_infos):
+            num_layers_on_rank = self.cur_pp_layer_config[rank][1] - self.cur_pp_layer_config[rank][0] + 1
+            max_blocks_per_layer = min(max_blocks_per_layer, self._get_max_num_blocks(mem_info, num_layers_on_rank))
+        logger.info(f"[operation]: initialize kv cache with max blocks per layer: {max_blocks_per_layer}")
+        self.model_executor.dynamic_initialize_from_config(kv_cache_configs[0], max_blocks_per_layer)
+
+
+        # Override num_gpus in the kv cache
+        scheduler_kv_cache_config.num_blocks = max_blocks_per_layer
+        self.vllm_config.cache_config.num_gpu_blocks = max_blocks_per_layer
+        # self.model_executor.initialize_from_config(kv_cache_configs)
+
+
+        elapsed = time.time() - start
+        logger.info(("init engine (profile, create kv cache, "
+                     "warmup model) took %.2f seconds"), elapsed)
+        return max_blocks_per_layer, num_cpu_blocks, scheduler_kv_cache_config
     def _reinitialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
@@ -882,8 +1004,8 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             super().__init__(vllm_config, 
                             executor_class, 
                             log_stats, 
+                            dynamic_config,
                             executor_fail_callback,
-                            dynamic_config=dynamic_config
                             )
 
             self.step_fn = (self.step if self.batch_queue is None else
@@ -1214,7 +1336,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             logger.info("num_of_requests: " + str(num_of_requests))
             if num_of_requests in migration_steps:
                 logger.info("change model configuration")
-                outputs = self.change_model_configuration_by_kv_transfer_sync(alternative_configs[1])
+                outputs = self.change_model_configuration_by_kv_transfer_async(alternative_configs[1])
                 # outputs = self.migrate_layer_v1(1, 0, 24)
                 logger.info("debug-------- engineoutput when migration: " + str(outputs))
                 for output in outputs:

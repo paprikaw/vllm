@@ -55,7 +55,7 @@ class DynamicScheduler(Scheduler):
         log_stats: bool = False,
     ) -> None:
         """
-        Completely copied from parent class, we need to initialize new dynamic kv cache manager in __init_
+        Completely copied from parent class, we need to initialize new dynamic kv cache manager in __init_, including the pp layer config status
         """
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config

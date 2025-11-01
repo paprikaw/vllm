@@ -140,7 +140,6 @@ class WorkerMemInfo:
     kv_tensor_size: bytes of a single layer's KV cache tensor
     """
     layer_size: int
-    block_size: int
     kv_tensor_size: int
     free_mem: int
     total_gpu_memory: int
