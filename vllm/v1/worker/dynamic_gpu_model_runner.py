@@ -340,8 +340,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
         }
         for i in range(len(self.kv_caches)):
             logger.info(f"kv_caches[{i}] shape: {self.kv_caches[i].shape}")
-        # gc.collect()
-        # torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
     def dynamic_initialize_kv_cache(self, kv_cache_config: KVCacheConfig, num_blocks: int) -> None:
         """
@@ -376,7 +377,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     # KV cache specs.
                     raise ValueError("Unknown KV cache spec type.")
                 logger.info(f"kv_caches shape: {kv_cache_shape}")
-
+        
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
             # validate all draft model layers belong to the same kv cache
@@ -387,8 +388,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches)
+        del kv_caches
         logger.info(f"debug---------------- init kv cache done, kv block num: {len(self.kv_caches[0][0])}")
         if has_kv_transfer_group():
+            assert False
             get_kv_transfer_group().register_kv_caches(kv_caches) 
 
     def release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
@@ -398,6 +401,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         '''
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
         logger.info(f"before release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+        old_tensor_A = self.kv_caches[0]
+        old_tensor_B = self.kv_caches[16]
 
         # Delete the kv cache from kv_cache list
         start_layer = self.model.model.start_layer
@@ -413,18 +418,19 @@ class DynamicGPUModelRunner(GPUModelRunner):
             name for name in group.layer_names
             if extract_layer_index(name) not in deleted_layers
         ]
-
         forward_context = self.vllm_config.compilation_config.static_forward_context
-        logger.info(f"[debug]: before release kv cache for layers, forward context: {forward_context}")
         deleted_layer_names = []
-        for layer_name, _ in forward_context.items():
+        for layer_name, attn_module in forward_context.items():
             if extract_layer_index(layer_name) in deleted_layers:
                 deleted_layer_names.append(layer_name)
+                attn_module.kv_cache = [torch.tensor([])]
+
         for layer_name in deleted_layer_names:
             del forward_context[layer_name]
-        logger.info(f"[debug]: deleted layer names: {deleted_layer_names}")
-        logger.info(f"[debug]: after release kv cache for layers, forward context: {forward_context}")
-        # logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.kv_caches)}")
 
     def release_kv_cache(self) -> None:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)

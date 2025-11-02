@@ -497,6 +497,8 @@ class DynamicKVSynchronizer():
                 self._send_data_to_rank(rank, kv_cache, synchronize=True)
                 logger.info(f"[timeline]: send kv tensor payload to rank {rank} for layer {layer_id}, time taken: {time.time() - time_start}, data_size: {kv_cache.numel() * kv_cache.element_size() / 1024 ** 2:.2f}MB")
                 self.kv_cache_transfer_in_process[rank] = True
+                del kv_cache
+        del kv_caches
         # 在发送完kv tensor之后开始发送kv patch
         while True:
             time_start = time.time()

@@ -212,7 +212,7 @@ class DynamicGPUWorker(Worker):
                 # threading.Thread(target=self.listen_to_kv_cache_tensor_and_patches, args=(rank,), daemon=True).start()
                 threading.Thread(target=self.listen_to_kv_cache_tensor_and_patches, args=(rank,), daemon=True).start()
 
-    def dynamic_initialize_from_config(self, kv_cache_config: KVCacheConfig, num_blocks: int) -> None:
+    def dynamic_initialize_from_config(self, kv_cache_configs: list[KVCacheConfig], num_blocks: int) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CuMemAllocator.get_instance()
@@ -221,7 +221,7 @@ class DynamicGPUWorker(Worker):
             from contextlib import nullcontext
             context = nullcontext()
         with context:
-            self.model_runner.dynamic_initialize_kv_cache(kv_cache_config, num_blocks)
+            self.model_runner.dynamic_initialize_kv_cache(kv_cache_configs[self.rank], num_blocks)
 
     @torch.inference_mode()
     def execute_model(
@@ -304,6 +304,7 @@ class DynamicGPUWorker(Worker):
         if self.rank != rank:
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip releasing kv cache for layers")
             return None
+        # self.model_runner.release_kv_cache_for_layers(layers_list)
         self.model_runner.release_kv_cache_for_layers(layers_list)
 
     def release_kv_cache(self) -> None:

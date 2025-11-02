@@ -272,9 +272,7 @@ class Attention(nn.Module):
         return s
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
-        logger.info(f"[debug]: enter process weights after loading")
         if hasattr(self.impl, "process_weights_after_loading"):
-            logger.info(f"[debug]: process weights after loading for {self.layer_name}")
             self.impl.process_weights_after_loading(act_dtype)
 
 

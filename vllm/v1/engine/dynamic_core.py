@@ -151,6 +151,8 @@ class DynamicEngineCore(EngineCore):
         self.migration_status = MigrationStatus.NOT_MIGRATING
         self.engine_lock = threading.Lock()
 
+        self.scheduler_kv_cache_config: Optional[KVCacheConfig]
+
     def _estimate_max_blocks_per_layer(self, gpu_total_memory: int, memory_after_adding_weight: int, num_layers_on_rank: int, block_size: int) -> int:
         safe_margin = (1 - self.vllm_config.cache_config.gpu_memory_utilization) * gpu_total_memory
         memory_after_adding_weight -=  math.ceil(safe_margin)
@@ -175,11 +177,12 @@ class DynamicEngineCore(EngineCore):
         注意，这里的所有memory都是对于整体的memory而言，而不是对于单个kv cache tensor而言的。
         """
         assert isinstance(self.scheduler, DynamicScheduler)
+        assert self.scheduler_kv_cache_config is not None
 
         num_layers_on_rank = current_pp_layer_config[rank][1] - current_pp_layer_config[rank][0] + 1
         # 计算在加入当前layer之后，kv cache的最大block数量
         total_layer_num = num_changed_layers + num_layers_on_rank
-        max_blocks_per_layer = self._get_max_num_blocks(mem_info, total_layer_num)
+        max_blocks_per_layer = self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes, total_layer_num)
 
 
         total_gpu_memory = int(mem_info.total_gpu_memory)
@@ -210,15 +213,12 @@ class DynamicEngineCore(EngineCore):
         logger.info(f"[operation]: assessed memory for adding layers: {num_changed_layers}, memory can not directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
         return LayerAddingAssessResult(False, False, max_blocks_per_layer)
 
-    def _get_max_num_blocks(self, mem_info: WorkerMemInfo, num_layers: int) -> int:
-        total_gpu_memory = int(mem_info.total_gpu_memory)
+    def _get_max_num_blocks(self, total_gpu_memory: int, weight_size_per_layer: int, page_size: int, num_layers: int) -> int:
         total_usable_memory = total_gpu_memory * self.vllm_config.cache_config.gpu_memory_utilization
-        weight_size_per_layer = mem_info.layer_size
-        block_size = self.vllm_config.cache_config.block_size
         total_weight_size = weight_size_per_layer * num_layers
         total_kv_cache = total_usable_memory - total_weight_size
-        logger.info(f"debug ------- get max num blocks: {total_kv_cache / 1024 ** 3:.2f} GB, num_layers: {num_layers}, block_size: {block_size} , total_gpu_memory: {total_gpu_memory / 1024 ** 3:.2f} GB, total_usable_memory: {total_usable_memory / 1024 ** 3:.2f} GB, weight_size_per_layer: {weight_size_per_layer / 1024 ** 3:.2f} GB, total_weight_size: {total_weight_size / 1024 ** 3:.2f} GB")
-        max_blocks_per_layer = math.floor(total_kv_cache / (num_layers * block_size))
+        logger.info(f"debug ------- get max num blocks: {total_kv_cache / 1024 ** 3:.2f} GB, num_layers: {num_layers}, block_size: {page_size} , total_gpu_memory: {total_gpu_memory / 1024 ** 3:.2f} GB, total_usable_memory: {total_usable_memory / 1024 ** 3:.2f} GB, weight_size_per_layer: {weight_size_per_layer / 1024 ** 3:.2f} GB, total_weight_size: {total_weight_size / 1024 ** 3:.2f} GB")
+        max_blocks_per_layer = math.floor(total_kv_cache / (num_layers * page_size))
         return max_blocks_per_layer
 
     def _assess_memory_for_delete(
@@ -312,7 +312,7 @@ class DynamicEngineCore(EngineCore):
             for cfg in kv_cache_configs
         ])
         num_cpu_blocks = 0
-        scheduler_kv_cache_config = kv_cache_configs[0]
+        self.scheduler_kv_cache_config = kv_cache_configs[0]
 
         # rather than initialize from kv config, we invoke our own logic 
         assert len(kv_cache_configs) == 2 # We are not considering the different kv config case
@@ -321,13 +321,13 @@ class DynamicEngineCore(EngineCore):
         max_blocks_per_layer = 6666666666
         for rank, mem_info in enumerate(mem_infos):
             num_layers_on_rank = self.cur_pp_layer_config[rank][1] - self.cur_pp_layer_config[rank][0] + 1
-            max_blocks_per_layer = min(max_blocks_per_layer, self._get_max_num_blocks(mem_info, num_layers_on_rank))
+            max_blocks_per_layer = min(max_blocks_per_layer, self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes, num_layers_on_rank))
         logger.info(f"[operation]: initialize kv cache with max blocks per layer: {max_blocks_per_layer}")
-        self.model_executor.dynamic_initialize_from_config(kv_cache_configs[0], max_blocks_per_layer)
+        self.model_executor.dynamic_initialize_from_config(kv_cache_configs, max_blocks_per_layer)
 
 
         # Override num_gpus in the kv cache
-        scheduler_kv_cache_config.num_blocks = max_blocks_per_layer
+        self.scheduler_kv_cache_config.num_blocks = max_blocks_per_layer
         self.vllm_config.cache_config.num_gpu_blocks = max_blocks_per_layer
         # self.model_executor.initialize_from_config(kv_cache_configs)
 
@@ -335,7 +335,7 @@ class DynamicEngineCore(EngineCore):
         elapsed = time.time() - start
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
-        return max_blocks_per_layer, num_cpu_blocks, scheduler_kv_cache_config
+        return max_blocks_per_layer, num_cpu_blocks, self.scheduler_kv_cache_config
     def _reinitialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()

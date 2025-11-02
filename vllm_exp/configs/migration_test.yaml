@@ -21,7 +21,7 @@ projects:
         1: "worker1"
     vllm:
       pipeline_parallel_size: 2
-      gpu_memory_utilization: 0.75
+      gpu_memory_utilization: 0.8
       start_pp_layer_partitions:
         - "8,56"
     migration:

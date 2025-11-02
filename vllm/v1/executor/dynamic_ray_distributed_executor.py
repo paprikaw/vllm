@@ -474,5 +474,5 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         assert len(kv_cache_configs) == self.parallel_config.world_size, "kv_cache_configs must have the same length as world_size"
         self.collective_rpc("reinitialize_kv_cache", args=(kv_cache_configs,))
 
-    def dynamic_initialize_from_config(self, kv_cache_config: KVCacheConfig, num_blocks: int) -> None:
-        self.collective_rpc("dynamic_initialize_from_config", args=(kv_cache_config, num_blocks))
+    def dynamic_initialize_from_config(self, kv_cache_configs: list[KVCacheConfig], num_blocks: int) -> None:
+        self.collective_rpc("dynamic_initialize_from_config", args=(kv_cache_configs, num_blocks))
