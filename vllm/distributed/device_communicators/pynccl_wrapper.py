@@ -23,6 +23,7 @@
 
 import ctypes
 import platform
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 

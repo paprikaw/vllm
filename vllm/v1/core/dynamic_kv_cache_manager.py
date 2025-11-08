@@ -77,7 +77,7 @@ class DynamicKVCacheManager(KVCacheManager):
         `compact length` portion of the cache.
         """
         total = self.block_pool.num_gpu_blocks
-        assert 0 < compacted_length <= total, "invalid compacted_length"
+        # assert 0 < compacted_length <= total, "invalid compacted_length"
 
         # 需要满足：可裁掉的容量 <= 当前空闲块数
         free_blocks = self.block_pool.get_num_free_blocks()

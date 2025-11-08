@@ -438,13 +438,20 @@ def unified_attention_with_output(
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
-    self.impl.forward(self,
+    try:
+        self.impl.forward(self,
                       query,
                       key,
                       value,
                       kv_cache,
                       attn_metadata,
                       output=output)
+    except Exception as e:
+        logger.info(f"error is happeining during forward, current kv_cache shape: {kv_cache.shape}, dtype: {kv_cache.dtype}")
+        logger.info(f"kv cache: {kv_cache}")
+        logger.info(f"attention metadata: {attn_metadata.slot_mapping}")
+        time.sleep(1)
+        raise e
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 

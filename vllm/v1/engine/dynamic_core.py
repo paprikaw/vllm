@@ -182,14 +182,14 @@ class DynamicEngineCore(EngineCore):
         num_layers_on_rank = current_pp_layer_config[rank][1] - current_pp_layer_config[rank][0] + 1
         # 计算在加入当前layer之后，kv cache的最大block数量
         total_layer_num = num_changed_layers + num_layers_on_rank
-        max_blocks_per_layer = self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes, total_layer_num)
+        block_size = self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        max_blocks_per_layer = self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, block_size, total_layer_num)
 
 
         total_gpu_memory = int(mem_info.total_gpu_memory)
         total_usable_memory = total_gpu_memory * self.vllm_config.cache_config.gpu_memory_utilization
         weight_size_per_layer = mem_info.layer_size
         block_num =  self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
-        block_size = self.vllm_config.cache_config.block_size
         # 计算当前GPU的可用内存
         current_used_memory = (weight_size_per_layer + block_size * block_num) * num_layers_on_rank
         free_gpu_memory = total_usable_memory - current_used_memory
@@ -603,13 +603,22 @@ class DynamicEngineCore(EngineCore):
             compacted_length = min(maximum_kv_block_num_after_compact)
             if need_compact:
                 logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
-                engine_core_outputs.extend(self._compact_kv_cache(compacted_length))
+                self._compact_kv_cache(compacted_length)
                 logger.info(f"debug -------------- KV cache compacted to {compacted_length} blocks before adding layers")
                 logger.info(f"[timeline]: after compact kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
 
                 logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
+
+            # 需要resize kv cache来进行migration
+            if compacted_length != self.scheduler.kv_cache_manager.num_gpu_blocks:
+                assert compacted_length < self.scheduler.kv_cache_manager.num_gpu_blocks, f"compacted_length: {compacted_length} is greater than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
                 self.model_executor.resize_kv_cache(compacted_length)
+                self.scheduler.shrink_block_pool(compacted_length)
                 logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
+            
+            # self._compact_kv_cache(1700)
+            # self.model_executor.resize_kv_cache(1700)
+            # self.scheduler.shrink_block_pool(1700)
             # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
             for r, add_list in adding_per_rank.items():
                 self.model_executor.async_add_layers(r, add_list)
@@ -948,15 +957,12 @@ class DynamicEngineCore(EngineCore):
         self.layers_to_be_removed = None
         self.rank_from = None
 
-    def _compact_kv_cache(self, compacted_length: int) -> list[EngineCoreOutputs]:
+    def _compact_kv_cache(self, compacted_length: int):
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
         assert isinstance(self.scheduler, DynamicScheduler)
-        engine_outputs = self._drain_out_running_queue()
 
         bitmap = self.scheduler.get_bitmap()
         self.model_executor.compact_kv_cache(compacted_length, bitmap)
-        self.scheduler.compact_kv_cache(compacted_length)
-        return engine_outputs
 
 class DynamicEngineCoreProc(DynamicEngineCore):
     """ZMQ-wrapper for running EngineCore in background process.

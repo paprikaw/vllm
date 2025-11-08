@@ -340,7 +340,7 @@ class DynamicScheduler(Scheduler):
             # In the next scheduling step, we will use the next configuration
             self.update_layer_config(self.next_pp_layer_config)
             if self.next_new_kv_cache_block_num > self.kv_cache_manager.num_gpu_blocks:
-                self.extend_kv_cache(self.next_new_kv_cache_block_num)
+                self.extend_block_pool(self.next_new_kv_cache_block_num)
             self.next_pp_layer_config = None
             self.next_new_kv_cache_block_num = 0
 
@@ -538,12 +538,12 @@ class DynamicScheduler(Scheduler):
     def get_kv_cache_utilization(self) -> float:
         return self.kv_cache_manager.usage
     
-    def compact_kv_cache(self, compacted_length: int) -> None:
+    def shrink_block_pool(self, compacted_length: int) -> None:
         assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
         assert compacted_length < self.kv_cache_manager.num_gpu_blocks, "compacted_length should be smaller than current kv cache block num"
         self.kv_cache_manager.compact_kv_cache(compacted_length)
 
-    def extend_kv_cache(self, extended_length: int) -> None:
+    def extend_block_pool(self, extended_length: int) -> None:
         assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
         assert extended_length > self.kv_cache_manager.num_gpu_blocks, "extended_length should be larger than current kv cache block num"
         self.kv_cache_manager.extend_kv_cache(extended_length)

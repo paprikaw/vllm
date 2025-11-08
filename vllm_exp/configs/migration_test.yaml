@@ -6,10 +6,13 @@ envs:
   RAY_CGRAPH_get_timeout: "10000"
   BENCHMARK_CONFIG_PATH: "/tmp/vllm_exp/benchmark_config.json"
   DEPLOYMENT_CONFIG_PATH: "/tmp/vllm_exp/vllm_config.json"
-  KV_SYNC_USE_CPU: "0"
+  KV_SYNC_USE_CPU: "1"
   VLLM_USE_CPU_MODEL: "0"
-  # CUDA_LAUNCH_BLOCKING: "1"
+  CUDA_LAUNCH_BLOCKING: "1"
   NCCL_DEBUG: "INFO"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
+  PYTORCH_USE_CUDA_DSA: "1"
+  PYTORCH_NO_CUDA_MEMORY_CACHING: "1"
 projects:
   - project: "migration_test_async"
     type: "one_off_test"
@@ -21,20 +24,20 @@ projects:
         1: "worker1"
     vllm:
       pipeline_parallel_size: 2
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.75
       start_pp_layer_partitions:
-        - "8,56"
+        - "32,32"
     migration:
       is_migration: true
-      migration_steps: [10]
+      migration_steps: [80]
       alternative_configs:
-        "0": [8, 56]
-        "1": [24, 40]
+        "0": [32, 32]
+        "1": [12, 52]
     benchmark:
       profile: false
       print_outputs: true
-      data_num_requests: [10, 10]
-      input_output_lens: [[512, 64], [512, 256]]
-      running_num_requests: [10, 10]
-      running_request_rates: [2.2, 2]
+      data_num_requests: [50, 40]
+      input_output_lens: [[512, 64], [256, 32]]
+      running_num_requests: [50, 40]
+      running_request_rates: [2.2, 1.5]
 is_log_cover: true

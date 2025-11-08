@@ -122,6 +122,10 @@ if TYPE_CHECKING:
     NCCL_DEBUG: str = "INFO"
     VLLM_PIPELINE_MEMORY_LIMIT: Optional[list[int]] = None
     MIGRATION_INTERVAL: int = 60
+    PYTORCH_CUDA_ALLOC_CONF: Optional[str] = None
+    PYTORCH_NO_CUDA_MEMORY_CACHING: Optional[str] = None
+    PYTORCH_USE_CUDA_DSA: Optional[str] = None
+    KV_SYNC_USE_CPU: Optional[str] = None
 
 
 def get_default_cache_root():
@@ -194,6 +198,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "NCCL_DEBUG":
     lambda: os.getenv("NCCL_DEBUG", "INFO"),
 
+    "PYTORCH_CUDA_ALLOC_CONF":
+    lambda: os.getenv("PYTORCH_CUDA_ALLOC_CONF", None),
+
+    "KV_SYNC_USE_CPU":
+    lambda: os.getenv("KV_SYNC_USE_CPU", None),
+
     "VLLM_PIPELINE_MEMORY_LIMIT":
     lambda: (
         None if os.getenv("VLLM_PIPELINE_MEMORY_LIMIT", "") == "" else [
@@ -202,6 +212,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
             for m in os.getenv("VLLM_PIPELINE_MEMORY_LIMIT").split(",")
         ]
     ),
+    "PYTORCH_USE_CUDA_DSA": 
+    lambda: os.getenv("PYTORCH_USE_CUDA_DSA", None),
+    "PYTORCH_NO_CUDA_MEMORY_CACHING":
+    lambda: os.getenv("PYTORCH_NO_CUDA_MEMORY_CACHING", None),
+
     "MIGRATION_INTERVAL":
     lambda: int(os.getenv("MIGRATION_INTERVAL", "60")),
 

@@ -243,7 +243,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def add_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
             raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
-        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         available_memory = torch.cuda.mem_get_info()[0]
         num_added_layers = sum([layer[1] - layer[0] + 1 for layer in layers_list])
         assert available_memory > num_added_layers * self.model.get_layer_weight_size(), \
@@ -340,8 +340,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
         }
         for i in range(len(self.kv_caches)):
             logger.info(f"kv_caches[{i}] shape: {self.kv_caches[i].shape}")
-        gc.collect()
-        torch.cuda.empty_cache()
         logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
     def dynamic_initialize_kv_cache(self, kv_cache_config: KVCacheConfig, num_blocks: int) -> None:
@@ -392,7 +390,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         logger.info(f"debug---------------- init kv cache done, kv block num: {len(self.kv_caches[0][0])}")
         if has_kv_transfer_group():
             assert False
-            get_kv_transfer_group().register_kv_caches(kv_caches) 
+            get_kv_transfer_group().register_kv_caches(kv_caches)
 
     def release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         '''
@@ -401,8 +399,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
         '''
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
         logger.info(f"before release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-        old_tensor_A = self.kv_caches[0]
-        old_tensor_B = self.kv_caches[16]
 
         # Delete the kv cache from kv_cache list
         start_layer = self.model.model.start_layer
@@ -427,9 +423,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
         for layer_name in deleted_layer_names:
             del forward_context[layer_name]
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
         logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.kv_caches)}")
 
     def release_kv_cache(self) -> None:
@@ -505,12 +498,15 @@ class DynamicGPUModelRunner(GPUModelRunner):
             logger.info(f"tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}")
             if new_length > kv_length:
                 # 只复制旧的有效部分，新增的部分已经是0了
-                tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...])
+                tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...], non_blocking=False)
             else:
-                tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...])
+                tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...], non_blocking=False)
             self.kv_caches[idx] = tmp_cache
             attn_module.kv_cache = [tmp_cache]
+            logger.info(f"after resize kv cache, kv_cache[{idx}] shape: {tmp_cache.shape}, kv_cache_content: {tmp_cache[0][0]}")
         time_end = time.time()
+        torch.cuda.synchronize()
+        gc.collect()
         torch.cuda.empty_cache()
         logger.info(f"resize kv cache in {time_end - time_start} seconds")
         # time_tensor_end = time.time()

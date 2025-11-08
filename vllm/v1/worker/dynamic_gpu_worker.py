@@ -21,6 +21,7 @@ from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.utils import DeadlockTimeoutContext
 from vllm.v1.utils import human_readable_duration
 from vllm.device_allocator.cumem import CuMemAllocator
+import gc
 
 
 
@@ -78,6 +79,7 @@ class DynamicGPUWorker(Worker):
             self.is_all_patch_applied[rank] = True
 
         self.new_kv_cache_block_num = 0 # 用于记录新配置的kv cache block数量，用于后续的kv cache resize
+        logger.info(torch.__config__.show())
         
     def _assert_layers_kv_bound(self, layer_ids: set[int]) -> None:
         if not self._debug_assert_kv:
@@ -148,6 +150,8 @@ class DynamicGPUWorker(Worker):
                 pad_right = right_added_layer_num
                 self.model_runner.kv_caches.extend([torch.tensor([])] * pad_right)
             logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
+            for i in range(len(self.model_runner.kv_caches)):
+                logger.info(f"kv cache {i}: {self.model_runner.kv_caches[i].shape}")
         
             # 唤醒等待层加载的线程（kv tensor的绑定线程和kv patch 应用线程）。
             self._layer_loaded_cv.notify_all()
@@ -290,7 +294,8 @@ class DynamicGPUWorker(Worker):
         time_start = time.time()
         def _do_add():
             self._add_layers(layer_list)
-        threading.Thread(target=_do_add, daemon=False).start()
+        _do_add()
+        # threading.Thread(target=_do_add, daemon=False).start()
         logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
 
     def remove_layers(self, rank: int, layer_list: list[Tuple[int, int]]) -> None:
@@ -507,16 +512,21 @@ class DynamicGPUWorker(Worker):
                     logger.info(f"[debug]: rank {self.rank} receive kv tensor meta {meta}")
                     kv_tensor = self.dynamic_kv_synchronizer._recv_data_from_rank(from_rank, meta.dtype, meta.shape)
                     tmp_kv_tensors_dict[meta.layer_id] = kv_tensor
-                    logger.info(f"[debug]: rank {self.rank} receive kv tensor {kv_tensor.shape}")
+                    logger.info(f"[debug]: rank {self.rank} received kv tensor {kv_tensor.shape}")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    logger.info(f"available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
 
+                logger.info(f"[debug]: receive kv tensor finished, start to bind kv cache")
                 # 在kv cache绑定前，weight必须loading结束
                 for layer_id, kv_tensor in tmp_kv_tensors_dict.items():
                     with self._layer_loaded_cv:
                         while not self.model_runner.has_layer(layer_id):
                             logger.info(f"[debug]: rank {self.rank} waiting for layer {layer_id} to be loaded")
                             self._layer_loaded_cv.wait()
-                    # with self.model_runner.forward_lock:
-                    self.model_runner.bind_layer_kv_tensor(layer_id, kv_tensor)
+                    with self.model_runner.forward_lock:
+                        logger.info(f"[debug]: rank {self.rank} bind layer {layer_id}'s kv cache and weight")
+                        self.model_runner.bind_layer_kv_tensor(layer_id, kv_tensor)
                     logger.info(f"[operation]: rank {self.rank} layer {layer_id}'s kv cache and weight is loaded")
                 # 在同步迁移中，断言：所有接收层的 KV 已完成绑定且形状一致
                 try:
