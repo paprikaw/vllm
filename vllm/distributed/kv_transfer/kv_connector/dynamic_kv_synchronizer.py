@@ -374,7 +374,6 @@ class DynamicKVSynchronizer():
         # 使用专用的 KV 传输 stream（如果有），避免与模型计算 stream 冲突
         if pipe.is_use_nccl and pipe._kv_transfer_stream is not None:
             # 使用专用 stream 发送
-            logger.info(f"[debug]: send kv tensor data to rank {rank} using dedicated stream")
             pipe.send_data(kv_cache, stream=pipe._kv_transfer_stream, wait_for_ack=wait_for_ack)
             # 如果需要同步，只等待这个专用 stream
             if synchronize:

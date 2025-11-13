@@ -613,8 +613,9 @@ class DynamicEngineCore(EngineCore):
             if compacted_length != self.scheduler.kv_cache_manager.num_gpu_blocks:
                 assert compacted_length < self.scheduler.kv_cache_manager.num_gpu_blocks, f"compacted_length: {compacted_length} is greater than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
                 self.model_executor.resize_kv_cache(compacted_length)
-                self.scheduler.shrink_block_pool(compacted_length)
                 logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
+                self.scheduler.shrink_block_pool(compacted_length)
+                logger.info(f"[timeline]: after shrink block pool, time taken: {human_readable_duration(time.time() - time_start)}")
             
             # self._compact_kv_cache(1700)
             # self.model_executor.resize_kv_cache(1700)

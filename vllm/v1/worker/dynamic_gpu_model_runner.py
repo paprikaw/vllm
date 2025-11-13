@@ -17,7 +17,7 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.sampling_params import SamplingType
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-from vllm.v1.utils import human_readable_size
+from vllm.v1.utils import human_readable_size, human_readable_duration
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (LazyLoader)
@@ -244,8 +244,18 @@ class DynamicGPUModelRunner(GPUModelRunner):
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
             raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
         torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
         available_memory = torch.cuda.mem_get_info()[0]
         num_added_layers = sum([layer[1] - layer[0] + 1 for layer in layers_list])
+        time_wait = 0
+        while available_memory < num_added_layers * self.model.get_layer_weight_size() and time_wait < 10:
+            time_wait += 1
+            time.sleep(0.1)
+            gc.collect()
+            torch.cuda.empty_cache()
+            available_memory = torch.cuda.mem_get_info()[0]
+            logger.info(f"waiting for available memory to be enough, time_wait: {time_wait}, available_memory: {available_memory}")
         assert available_memory > num_added_layers * self.model.get_layer_weight_size(), \
             f"Available memory: {human_readable_size(available_memory)} is not enough for {num_added_layers} layers"
 
@@ -498,21 +508,14 @@ class DynamicGPUModelRunner(GPUModelRunner):
             logger.info(f"tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}")
             if new_length > kv_length:
                 # 只复制旧的有效部分，新增的部分已经是0了
-                tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...], non_blocking=False)
+                tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...], non_blocking=True)
             else:
-                tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...], non_blocking=False)
+                tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...], non_blocking=True)
             self.kv_caches[idx] = tmp_cache
             attn_module.kv_cache = [tmp_cache]
-            logger.info(f"after resize kv cache, kv_cache[{idx}] shape: {tmp_cache.shape}, kv_cache_content: {tmp_cache[0][0]}")
         time_end = time.time()
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        logger.info(f"resize kv cache in {time_end - time_start} seconds")
-        # time_tensor_end = time.time()
-        # # logger.info(f"allocate a 1GB tensor in {time_tensor_end - time_end} seconds")
-        logger.info(f"after empty cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
-        # logger.info(f"empty cache in {time_tensor_end - time_end} seconds")
+        logger.info(f"resized kv cache in {human_readable_duration(time_end - time_start)} seconds")
+        logger.info(f"resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
 
     def _migrate_block(self, old_block_id: int, new_block_id: int, migrate_record: dict[int, int]):
         assert isinstance(self.model, DynamicQwen3ForCausalLM)

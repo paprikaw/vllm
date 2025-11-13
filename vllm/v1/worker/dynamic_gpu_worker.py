@@ -294,8 +294,7 @@ class DynamicGPUWorker(Worker):
         time_start = time.time()
         def _do_add():
             self._add_layers(layer_list)
-        _do_add()
-        # threading.Thread(target=_do_add, daemon=False).start()
+        threading.Thread(target=_do_add, daemon=False).start()
         logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
 
     def remove_layers(self, rank: int, layer_list: list[Tuple[int, int]]) -> None:
@@ -513,9 +512,7 @@ class DynamicGPUWorker(Worker):
                     kv_tensor = self.dynamic_kv_synchronizer._recv_data_from_rank(from_rank, meta.dtype, meta.shape)
                     tmp_kv_tensors_dict[meta.layer_id] = kv_tensor
                     logger.info(f"[debug]: rank {self.rank} received kv tensor {kv_tensor.shape}")
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    logger.info(f"available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+                    # logger.info(f"available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
 
                 logger.info(f"[debug]: receive kv tensor finished, start to bind kv cache")
                 # 在kv cache绑定前，weight必须loading结束
