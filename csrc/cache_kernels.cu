@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -306,6 +307,64 @@ __global__ void reshape_and_cache_flash_kernel(
 }
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+__global__ void flexi_reshape_and_cache_flash_kernel(
+    const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
+    const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size]
+    // Array of pointers passed as int64_t for easier PyTorch binding
+    // Each element is a pointer to a block: [block_size, num_heads, head_size]
+    const int64_t cached_k_ptrs_addr,  // Address of cache_t** (pointer array)
+    const int64_t cached_v_ptrs_addr,  // Address of cache_t** (pointer array)
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int64_t page_stride,    // stride within a block to move to next token
+    const int64_t head_stride,    // stride within a token to move to next head
+    const int64_t key_stride,     // stride in input key tensor
+    const int64_t value_stride,   // stride in input value tensor
+    const int num_heads, const int head_size,
+    const int block_size, const float* k_scale, const float* v_scale) {
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  // NOTE: slot_idx can be -1 if the token is padded
+  if (slot_idx < 0) {
+    return;
+  }
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  
+  // Convert int64_t addresses back to pointer arrays
+  cache_t** cached_k_ptrs = reinterpret_cast<cache_t**>(cached_k_ptrs_addr);
+  cache_t** cached_v_ptrs = reinterpret_cast<cache_t**>(cached_v_ptrs_addr);
+  
+  // Get the base pointer for this block
+  cache_t* k_block = cached_k_ptrs[block_idx];
+  cache_t* v_block = cached_v_ptrs[block_idx];
+  
+  const int n = num_heads * head_size;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const int64_t src_key_idx = token_idx * key_stride + i;
+    const int64_t src_value_idx = token_idx * value_stride + i;
+    const int head_idx = i / head_size;
+    const int head_offset = i % head_size;
+    
+    // Offset within the block (no block_stride needed since we already have block pointer)
+    const int64_t tgt_key_value_idx = block_offset * page_stride +
+                                      head_idx * head_stride + head_offset;
+    
+    scalar_t tgt_key = key[src_key_idx];
+    scalar_t tgt_value = value[src_value_idx];
+    
+    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+      k_block[tgt_key_value_idx] = tgt_key;
+      v_block[tgt_key_value_idx] = tgt_value;
+    } else {
+      k_block[tgt_key_value_idx] =
+          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_key, *k_scale);
+      v_block[tgt_key_value_idx] =
+          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_value, *v_scale);
+    }
+  }
+}
+
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_kernel(
     const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
     const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]
@@ -447,6 +506,53 @@ void reshape_and_cache_flash(
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);
+}
+
+// KV_T is the data type of key and value tensors.
+// CACHE_T is the stored data type of kv-cache.
+// KV_DTYPE is the real data type of kv-cache.
+#define CALL_FLEXI_RESHAPE_AND_CACHE_FLASCALL_FLEXI_RESHAPE_AND_CACHE_FLASHH(KV_T, CACHE_T, KV_DTYPE)      \
+  vllm::flexi_reshape_and_cache_flash_kernel<KV_T, CACHE_T, KV_DTYPE>    \
+      <<<grid, block, 0, stream>>>(                                       \
+          reinterpret_cast<KV_T*>(key.data_ptr()),                        \
+          reinterpret_cast<KV_T*>(value.data_ptr()),                      \
+          cached_k_ptrs_addr, cached_v_ptrs_addr,                         \
+          slot_mapping.data_ptr<int64_t>(), page_stride,                  \
+          head_stride, key_stride, value_stride, num_heads, head_size,    \
+          block_size, reinterpret_cast<const float*>(k_scale.data_ptr()), \
+          reinterpret_cast<const float*>(v_scale.data_ptr()));
+
+// Flexible version that accepts pointer arrays for non-contiguous blocks
+void flexi_reshape_and_cache_flash(
+    torch::Tensor& key,        // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,      // [num_tokens, num_heads, head_size]
+    int64_t cached_k_ptrs_addr,  // Address of cache_t** (pointer array on device)
+    int64_t cached_v_ptrs_addr,  // Address of cache_t** (pointer array on device)
+    const torch::tensor& key_cache_meta,         // stride to move to next token in a block
+    const torch::tensor& value_cache_meta,         // stride to move to next token in a block
+    torch::Tensor& slot_mapping, // [num_tokens] or [num_actual_tokens]
+    const std::string& kv_cache_dtype, 
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale) {
+
+  int num_tokens = slot_mapping.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(0);
+
+  int64_t key_stride = key.stride(0);
+  int64_t value_stride = value.stride(0);
+  int64_t page_stride = key_cache.stride(0);
+  int64_t head_stride = key_cache.stride(1);
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(num_heads * head_size, 512));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
+                             CALL_FLEXI_RESHAPE_AND_CACHE_FLASH);
 }
 
 // KV_T is the data type of key and value tensors.
@@ -732,3 +838,4 @@ void gather_cache(
     TORCH_CHECK(false, "Unsupported data type width: ", dtype_bits);
   }
 }
+

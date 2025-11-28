@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <optional>
+
 #include <torch/all.h>
 
 #include <map>
@@ -30,6 +33,16 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
                              torch::Tensor& slot_mapping,
                              const std::string& kv_cache_dtype,
                              torch::Tensor& k_scale, torch::Tensor& v_scale);
+
+void flexi_reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
+                                   int64_t cached_k_ptrs_addr,
+                                   int64_t cached_v_ptrs_addr,
+                                   const torch::Tensor& key_cache_meta,
+                                   const torch::Tensor& value_cache_meta,
+                                   torch::Tensor& slot_mapping,
+                                   const std::string& kv_cache_dtype,
+                                   torch::Tensor& k_scale,
+                                   torch::Tensor& v_scale);
 
 void concat_and_cache_mla(torch::Tensor& kv_c, torch::Tensor& k_pe,
                           torch::Tensor& kv_cache, torch::Tensor& slot_mapping,

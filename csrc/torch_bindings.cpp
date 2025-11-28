@@ -641,6 +641,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("reshape_and_cache_flash", torch::kCUDA,
                  &reshape_and_cache_flash);
 
+  // Flexible version with pointer arrays for non-contiguous blocks
+  cache_ops.def(
+      "flexi_reshape_and_cache_flash(Tensor key, Tensor value,"
+      "                               int cached_k_ptrs_addr,"
+      "                               int cached_v_ptrs_addr,"
+      "                               Tensor! key_cache_meta,"
+      "                               Tensor! value_cache_meta,"
+      "                               Tensor slot_mapping,"
+      "                               str kv_cache_dtype,"
+      "                               Tensor k_scale, Tensor v_scale) -> ()");
+  cache_ops.impl("flexi_reshape_and_cache_flash", torch::kCUDA,
+                 &flexi_reshape_and_cache_flash);
+
   // Concat kv_c and k_pe and cache them.
   cache_ops.def(
       "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"

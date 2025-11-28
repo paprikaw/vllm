@@ -1566,6 +1566,22 @@ def reshape_and_cache_flash(
                                                    kv_cache_dtype, k_scale,
                                                    v_scale)
 
+def flexi_reshape_and_cache_flash(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache_ptr: int,
+    value_cache_ptr: int,
+    key_cache_meta: torch.Tensor,
+    value_cache_meta: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    torch.ops._C_cache_ops.flexi_reshape_and_cache_flash(key, value, key_cache_ptr,
+                                                   value_cache_ptr, slot_mapping,
+                                                   kv_cache_dtype, k_scale,
+                                                   v_scale)
 
 def concat_and_cache_mla(
     kv_c: torch.Tensor,
