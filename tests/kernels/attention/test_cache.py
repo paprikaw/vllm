@@ -454,6 +454,10 @@ def test_flexi_reshape_and_cache_flash(
             cond=(head_size == HEAD_SIZES[0]))
     ops.flexi_reshape_and_cache_flash(key, value, k_ptrs, v_ptrs,
                                 k_pages[0], v_pages[0], slot_mapping, kv_cache_dtype, k_scale, v_scale)
+    
+    # After kernel execution, read back the results
+    key_cache_compact = permute_and_compact(key_cache)
+    value_cache_compact = permute_and_compact(value_cache)
 
     if kv_cache_dtype == "fp8":
         result_key_cache = torch.empty_like(key_cache_compact,

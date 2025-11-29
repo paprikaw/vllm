@@ -1579,7 +1579,7 @@ def flexi_reshape_and_cache_flash(
     v_scale: torch.Tensor,
 ) -> None:
     torch.ops._C_cache_ops.flexi_reshape_and_cache_flash(key, value, key_cache_ptr,
-                                                   value_cache_ptr, slot_mapping,
+                                                   value_cache_ptr, key_cache_meta, value_cache_meta, slot_mapping,
                                                    kv_cache_dtype, k_scale,
                                                    v_scale)
 

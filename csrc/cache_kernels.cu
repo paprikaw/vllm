@@ -511,7 +511,7 @@ void reshape_and_cache_flash(
 // KV_T is the data type of key and value tensors.
 // CACHE_T is the stored data type of kv-cache.
 // KV_DTYPE is the real data type of kv-cache.
-#define CALL_FLEXI_RESHAPE_AND_CACHE_FLASCALL_FLEXI_RESHAPE_AND_CACHE_FLASHH(KV_T, CACHE_T, KV_DTYPE)      \
+#define CALL_FLEXI_RESHAPE_AND_CACHE_FLASH(KV_T, CACHE_T, KV_DTYPE)      \
   vllm::flexi_reshape_and_cache_flash_kernel<KV_T, CACHE_T, KV_DTYPE>    \
       <<<grid, block, 0, stream>>>(                                       \
           reinterpret_cast<KV_T*>(key.data_ptr()),                        \
@@ -528,8 +528,8 @@ void flexi_reshape_and_cache_flash(
     torch::Tensor& value,      // [num_tokens, num_heads, head_size]
     int64_t cached_k_ptrs_addr,  // Address of cache_t** (pointer array on device)
     int64_t cached_v_ptrs_addr,  // Address of cache_t** (pointer array on device)
-    const torch::tensor& key_cache_meta,         // stride to move to next token in a block
-    const torch::tensor& value_cache_meta,         // stride to move to next token in a block
+    const torch::Tensor& key_cache_meta,         // stride to move to next token in a block
+    const torch::Tensor& value_cache_meta,         // stride to move to next token in a block
     torch::Tensor& slot_mapping, // [num_tokens] or [num_actual_tokens]
     const std::string& kv_cache_dtype, 
     torch::Tensor& k_scale,
@@ -538,13 +538,13 @@ void flexi_reshape_and_cache_flash(
   int num_tokens = slot_mapping.size(0);
   int num_heads = key.size(1);
   int head_size = key.size(2);
-  int block_size = key_cache.size(0);
+  int block_size = key_cache_meta.size(0);
 
   int64_t key_stride = key.stride(0);
   int64_t value_stride = value.stride(0);
-  int64_t page_stride = key_cache.stride(0);
-  int64_t head_stride = key_cache.stride(1);
-  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+  int64_t page_stride = key_cache_meta.stride(0);
+  int64_t head_stride = key_cache_meta.stride(1);
+  TORCH_CHECK(key_cache_meta.stride(0) == value_cache_meta.stride(0));
 
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 512));
