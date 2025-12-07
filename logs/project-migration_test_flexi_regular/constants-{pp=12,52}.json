@@ -1,0 +1,41 @@
+{
+  "constants": {
+    "delay": [
+      0.0
+    ],
+    "request_rate": [],
+    "start_pp_layer_partition": [
+      "12,52"
+    ],
+    "max_model_len": 4096,
+    "pipeline_parallel_size": 2,
+    "gpu_memory_utilization": 0.8,
+    "chunked_prefill": true,
+    "enable_cuda_graph": false,
+    "enable_nsight": false,
+    "enable_flexi_flash_attn": false,
+    "model_name": "Qwen3-32B-AWQ",
+    "model_path": "/root/.cache/huggingface/Qwen3-32B-AWQ",
+    "is_migration": true,
+    "alternative_configs": {
+      "0": [
+        12,
+        52
+      ],
+      "1": [
+        32,
+        32
+      ]
+    },
+    "input_output_lens": [
+      [
+        512,
+        64
+      ],
+      [
+        512,
+        8
+      ]
+    ]
+  }
+}

@@ -203,6 +203,14 @@ class DynamicGPUWorker(Worker):
     def load_model(self) -> None:
         super().load_model()
 
+        # Wait for all ranks to finish loading model before initializing KV synchronizer
+        # This prevents deadlock where faster ranks (fewer layers) enter barrier
+        # while slower ranks (more layers) are still loading
+        if torch.distributed.is_initialized():
+            logger.info(f"Rank {self.rank}: waiting for all ranks to finish model loading before KV synchronizer init")
+            torch.distributed.barrier()
+            logger.info(f"Rank {self.rank}: all ranks ready, initializing KV synchronizer")
+
         # Initialize KV synchronizer AFTER model is ready (needs model for args)
         self.dynamic_kv_synchronizer = DynamicKVSynchronizer(
             rank=self.rank,
@@ -225,7 +233,12 @@ class DynamicGPUWorker(Worker):
             from contextlib import nullcontext
             context = nullcontext()
         with context:
-            self.model_runner.dynamic_initialize_kv_cache(kv_cache_configs[self.rank], num_blocks)
+            if self.vllm_config.dynamic_config.enable_flexi_flash_attn:
+                logger.info("Using flexi flash attention dynamic initialize kv cache")
+                self.model_runner.dynamic_initialize_kv_cache_flexi(kv_cache_configs[self.rank], num_blocks)
+            else:
+                logger.info("Using standard flash attention dynamic initialize kv cache")
+                self.model_runner.dynamic_initialize_kv_cache(kv_cache_configs[self.rank], num_blocks)
 
     @torch.inference_mode()
     def execute_model(
@@ -263,7 +276,7 @@ class DynamicGPUWorker(Worker):
         """
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
         # assert self.model_runner.model.get_sched_layers() == (self.model_runner.model.model.start_layer, self.model_runner.model.model.end_layer), "model should be in the initial state"
-        self.model_runner.profile_run()
+        self.model_runner.initialize_intermediate_states()
         torch.cuda.empty_cache()
 
         # torch.cuda.reset_peak_memory_stats()
@@ -309,7 +322,13 @@ class DynamicGPUWorker(Worker):
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip releasing kv cache for layers")
             return None
         # self.model_runner.release_kv_cache_for_layers(layers_list)
-        self.model_runner.release_kv_cache_for_layers(layers_list)
+        from vllm.config import get_current_vllm_config
+        vllm_config = get_current_vllm_config()
+        is_flexi = vllm_config.dynamic_config.enable_flexi_flash_attn
+        if is_flexi:
+            self.model_runner.flexi_release_kv_cache_for_layers(layers_list)
+        else:
+            self.model_runner.release_kv_cache_for_layers(layers_list)
 
     def release_kv_cache(self) -> None:
         self.model_runner.release_kv_cache()

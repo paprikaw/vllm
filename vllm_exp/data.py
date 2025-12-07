@@ -30,6 +30,7 @@ def collect_variables(cfg: Config) -> Dict[str, Any]:
         "chunked_prefill": cfg.vllm.chunked_prefill,
         "enable_cuda_graph": cfg.vllm.enable_cuda_graph,
         "enable_nsight": cfg.vllm.enable_nsight,
+        "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
         "model_name": cfg.model.name,
         "model_path": cfg.model.path,
 
@@ -61,6 +62,7 @@ class VllmCfg(BaseModel):
     chunked_prefill: bool = True
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
+    enable_flexi_flash_attn: bool = False
     port: int = 8000
     ray_port: int = 6379
     start_pp_layer_partitions: list[str] = ["8,56"]

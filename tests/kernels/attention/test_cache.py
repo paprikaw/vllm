@@ -448,9 +448,9 @@ def test_flexi_reshape_and_cache_flash(
         cloned_key_cache = key_cache_compact.clone()
         cloned_value_cache = value_cache_compact.clone()
     # Call the reshape_and_cache kernel.
-    opcheck(torch.ops._C_cache_ops.reshape_and_cache_flash,
-            (key, value, key_cache, value_cache, slot_mapping, kv_cache_dtype,
-             k_scale, v_scale),
+    opcheck(torch.ops._C_cache_ops.flexi_reshape_and_cache_flash,
+            (key, value, k_ptrs, v_ptrs,
+                                k_pages[0], v_pages[0], slot_mapping, kv_cache_dtype, k_scale, v_scale),
             cond=(head_size == HEAD_SIZES[0]))
     ops.flexi_reshape_and_cache_flash(key, value, k_ptrs, v_ptrs,
                                 k_pages[0], v_pages[0], slot_mapping, kv_cache_dtype, k_scale, v_scale)

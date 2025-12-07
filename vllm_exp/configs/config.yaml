@@ -29,11 +29,12 @@ projects:
   #       - [512, 256]
   #     request_rates: [2.5]
   #     profile: false
-  - project: "extream-constant"
+  - project: "flexi_test"
     type: "test_migration_with_different_pp"
     vllm:
       pipeline_parallel_size: 2
       gpu_memory_utilization: 0.9
+      enable_flexi_flash_attn: true  # Set to true to enable Flexi Flash Attention
       start_pp_layer_partitions:
         - "8,56"
         - "16,48"

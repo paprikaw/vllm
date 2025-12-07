@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import vllm.envs as envs
@@ -80,6 +80,10 @@ def get_total_gpu_memory(rank: int) -> int:
     else:   
         _, total_gpu_memory = torch.cuda.mem_get_info()
     return total_gpu_memory
+
+def get_flexi_kv_cache(size: int, block_shape: Tuple[int, int, int], kv_cache_dtype: torch.dtype, device: torch.device) -> Tuple[list[torch.Tensor], list[torch.Tensor]]:
+    return [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)], \
+        [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
 
 @dataclass
 class KVBufferStatus:

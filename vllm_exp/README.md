@@ -9,7 +9,7 @@
 
 ```bash
 python3 -m vllm_exp.run --config /root/vllm_workbench/vllm/vllm_exp/configs/migration_test.yaml \
-  --log-dir /root/vllm_workbench/logs
+  --log-dir /root/vllm_workbench/vllm/logs
 ```
 
 注意：

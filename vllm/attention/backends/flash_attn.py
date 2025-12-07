@@ -779,6 +779,7 @@ class FlashAttentionImpl(AttentionImpl):
             # Prompt run.
             if (kv_cache.numel() == 0 or prefill_meta.block_tables is None
                     or prefill_meta.block_tables.numel() == 0):
+
                 # normal attention
                 # When block_tables are not filled, it means q and k are the
                 # prompt, and they have the same length.

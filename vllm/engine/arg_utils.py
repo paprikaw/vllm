@@ -20,7 +20,8 @@ import vllm.envs as envs
 from vllm.config import (BlockSize, CacheConfig, CacheDType, CompilationConfig,
                          ConfigFormat, ConfigType, DecodingConfig,
                          DetailedTraceModules, Device, DeviceConfig,
-                         DistributedExecutorBackend, GuidedDecodingBackend,
+                         DistributedExecutorBackend, DynamicConfig,
+                         GuidedDecodingBackend,
                          GuidedDecodingBackendV1, HfOverrides, KVEventsConfig,
                          KVTransferConfig, LoadConfig, LoadFormat, LoRAConfig,
                          ModelConfig, ModelDType, ModelImpl, MultiModalConfig,
@@ -399,6 +400,7 @@ class EngineArgs:
     override_pooler_config: Optional[Union[dict, PoolerConfig]] = \
         ModelConfig.override_pooler_config
     compilation_config: Optional[CompilationConfig] = None
+    dynamic_config: Optional[DynamicConfig] = None
     worker_cls: str = ParallelConfig.worker_cls
     worker_extension_cls: str = ParallelConfig.worker_extension_cls
 
@@ -427,6 +429,9 @@ class EngineArgs:
         if isinstance(self.compilation_config, (int, dict)):
             self.compilation_config = CompilationConfig.from_cli(
                 str(self.compilation_config))
+        # support `EngineArgs(dynamic_config={...})`
+        if isinstance(self.dynamic_config, dict):
+            self.dynamic_config = DynamicConfig(**self.dynamic_config)
         if self.qlora_adapter_name_or_path is not None:
             warnings.warn(
                 "The `qlora_adapter_name_or_path` is deprecated "
@@ -836,6 +841,8 @@ class EngineArgs:
                                 **vllm_kwargs["layer_kv_connector_config"]) 
         vllm_group.add_argument("--compilation-config", "-O",
                                 **vllm_kwargs["compilation_config"])
+        vllm_group.add_argument("--dynamic-config", "-D",
+                                **vllm_kwargs["dynamic_config"])
         vllm_group.add_argument("--additional-config",
                                 **vllm_kwargs["additional_config"])
 
@@ -1185,6 +1192,7 @@ class EngineArgs:
             observability_config=observability_config,
             prompt_adapter_config=prompt_adapter_config,
             compilation_config=self.compilation_config,
+            dynamic_config=self.dynamic_config or DynamicConfig(),
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,

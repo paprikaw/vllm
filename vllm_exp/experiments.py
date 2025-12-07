@@ -106,6 +106,11 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
         "--scheduler-cls", "vllm.v1.core.sched.dynamic_scheduler.DynamicScheduler",
         "--worker-cls", "vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker",
     ]
+    # Add dynamic config for flexi flash attention
+    if cfg.vllm.enable_flexi_flash_attn:
+        dynamic_cfg = json.dumps({"enable_flexi_flash_attn": True})
+        serve_args.extend(["-D", dynamic_cfg])
+    
     if cfg.vllm.chunked_prefill:
         serve_args.append("--enable-chunked-prefill")
     if not cfg.vllm.enable_cuda_graph:

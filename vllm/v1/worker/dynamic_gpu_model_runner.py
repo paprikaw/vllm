@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+from hmac import new
 import threading
 import copy
 import gc
@@ -6,18 +7,22 @@ import time
 import weakref
 from typing import TYPE_CHECKING, Optional, Union, Tuple
 import sys
+import humanize
+from matplotlib.pylab import dtype
 import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+from vllm.attention.dynamic_layer import FlexiAttention
 from vllm.attention.layer import Attention
 from vllm.attention import AttentionType
 from vllm.config import (get_layers_from_vllm_config)
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.sampling_params import SamplingType
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-from vllm.v1.utils import human_readable_size, human_readable_duration
+from vllm.v1.utils import flexi_bind_kv_cache, human_readable_size, human_readable_duration
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (LazyLoader)
@@ -40,6 +45,8 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from bitarray import bitarray
 from vllm.v1.core.dynamic_kv_cache_utils import compact_cache_with_record
 from vllm.distributed.kv_transfer.kv_connector.dynamic_kv_synchronizer import DynamicKVSynchronizer
+from vllm.v1.worker.utils import get_flexi_kv_cache
+from vllm.vllm_flash_attn.flash_attn_interface import prepare_flexi_kv_ptrs, free_flexi_kv_ptrs
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -56,6 +63,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.forward_lock = Lock()
+        self.key_caches: list[list[torch.Tensor]] = []
+        self.value_caches: list[list[torch.Tensor]] = []
+        self.key_cache_ptrs: list[int] = []
+        self.value_cache_ptrs: list[int] = []
     # def load_model(self)->float:
     #     super().load_model()
     #     return self.model_memory_usage
@@ -133,6 +144,31 @@ class DynamicGPUModelRunner(GPUModelRunner):
         """
         with self.forward_lock:
             super().profile_run()
+
+    @torch.inference_mode()
+    def initialize_intermediate_states(
+        self,
+    ) -> None:
+
+        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+        # for dummy run with LoRA so that the num_reqs collectively
+        # has num_tokens in total.
+        num_tokens = self.max_num_tokens
+        assert num_tokens <= self.scheduler_config.max_num_batched_tokens
+        max_num_reqs = self.scheduler_config.max_num_seqs
+        num_reqs = max_num_reqs if num_tokens >= max_num_reqs else num_tokens
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+        assert sum(num_scheduled_tokens_list) == num_tokens
+        assert len(num_scheduled_tokens_list) == num_reqs
+        if not get_pp_group().is_first_rank:
+            if self.intermediate_tensors is None:
+                self.intermediate_tensors = (
+                    self.model.make_empty_intermediate_tensors(
+                        batch_size=self.max_num_tokens,
+                        dtype=self.model_config.dtype,
+                        device=self.device))
 
     def get_kv_cache_spec_for_layers(self, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
         """
@@ -402,6 +438,110 @@ class DynamicGPUModelRunner(GPUModelRunner):
             assert False
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
+    def dynamic_initialize_kv_cache_flexi(self, kv_cache_config: KVCacheConfig, num_blocks: int) -> None:
+        """
+        Initialize KV cache based on `kv_cache_config`.
+        Args:
+            kv_cache_config: Configuration for the KV cache, including the KV
+            cache size of each layer
+        """
+        if len(kv_cache_config.kv_cache_groups) > 1:
+            raise NotImplementedError(
+                "Hybrid models with more than one KV cache type are not "
+                "supported yet.")
+        self.kv_cache_config = kv_cache_config
+        self.initialize_attn_backend(kv_cache_config)
+
+        kv_caches: dict[str, torch.Tensor] = {} 
+        key_cache_ptrs: dict[str, int] = {}
+        value_cache_ptrs: dict[str, int] = {}
+        key_caches: dict[str, list[torch.Tensor]] = {}
+        value_caches: dict[str, list[torch.Tensor]] = {}
+        assert len(kv_cache_config.kv_cache_groups) == 1, "Only one KV cache group is supported."
+        assert len(self.attn_backends) == 1, "Only one attention backend is supported."
+
+        kv_cache_group = kv_cache_config.kv_cache_groups[0]
+        kv_cache_spec = kv_cache_group.kv_cache_spec
+        assert isinstance(kv_cache_spec, AttentionSpec), "KV cache spec must be an AttentionSpec."
+        self.kv_cache_dtype = kv_cache_spec.dtype
+        kv_cache_shape = self.attn_backends[0].get_kv_cache_shape(
+            num_blocks, kv_cache_spec.block_size,
+            kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+        self.kv_cache_shape = kv_cache_shape
+        assert num_blocks >= kv_cache_config.num_blocks
+        assert len(kv_cache_shape) == 5 # (2, nkvblocks, blockdim, n_head, headdim)
+        block_shape = kv_cache_shape[2:]
+
+        start_time = time.time()
+        for layer_name in kv_cache_group.layer_names:
+            key_caches[layer_name], value_caches[layer_name] = get_flexi_kv_cache(
+                kv_cache_shape[1], block_shape, self.kv_cache_dtype, self.device)
+            key_cache_ptrs[layer_name], value_cache_ptrs[layer_name] = prepare_flexi_kv_ptrs(key_caches[layer_name], value_caches[layer_name])
+        
+        logger.info(f"time to intialize kv blocks:{human_readable_duration(time.time() - start_time)}")
+        logger.info(f"key cache shape: {key_caches[kv_cache_group.layer_names[0]][0].shape}, value cache shape:{value_caches[kv_cache_group.layer_names[0]][0].shape}")
+        if self.speculative_config and self.speculative_config.use_eagle():
+            assert isinstance(self.drafter, EagleProposer)
+            # validate all draft model layers belong to the same kv cache
+            # group
+            self.drafter.validate_same_kv_cache_group(kv_cache_config)
+        
+        flexi_bind_kv_cache(
+            key_caches,
+            value_caches,
+            key_cache_ptrs,
+            value_cache_ptrs,
+            self.vllm_config.compilation_config.static_forward_context,
+            self.key_caches,
+            self.value_caches,
+            self.key_cache_ptrs,
+            self.value_cache_ptrs)
+        del kv_caches
+        if has_kv_transfer_group():
+            assert False
+            get_kv_transfer_group().register_kv_caches(kv_caches)
+
+    def flexi_release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
+        '''
+        目前release_kv_cache依赖于model.start_layers来进行kv cache list的删除。
+        因此只能先release kv cache再删除layers
+        '''
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        logger.info(f"before release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+
+        # Delete the kv cache from kv_cache list
+        start_layer = self.model.model.start_layer
+        self.key_caches = [
+            key_cache for idx, key_cache in enumerate(self.key_caches) 
+            if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+        ]
+        self.value_caches = [
+            value_cache for idx, value_cache in enumerate(self.value_caches)
+            if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+        ]
+        self.key_cache_ptrs = [
+            ptr for idx, ptr in enumerate(self.key_cache_ptrs)
+            if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+        ]
+        self.value_cache_ptrs = [
+            ptr for idx, ptr in enumerate(self.value_cache_ptrs)
+            if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+        ]
+
+        # Delete layer name from kv_cache_config
+        deleted_layers = set(layer for layers in layers_list for layer in range(layers[0], layers[1]+1))
+        group = self.kv_cache_config.kv_cache_groups[0]
+        group.layer_names = [
+            name for name in group.layer_names
+            if extract_layer_index(name) not in deleted_layers
+        ]
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        deleted_layer_names = [name for name in forward_context.keys() if extract_layer_index(name) in deleted_layers]
+
+        for layer_name in deleted_layer_names:
+            del forward_context[layer_name]
+        logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.kv_caches)}")
+
     def release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         '''
         目前release_kv_cache依赖于model.start_layers来进行kv cache list的删除。
@@ -462,7 +602,25 @@ class DynamicGPUModelRunner(GPUModelRunner):
         def is_used(idx):
             return bitmap[idx]
         migrate_record: dict[int, int] = {}
-        compact_cache_with_record(self._migrate_block, is_used, compacted_length, num_blocks, migrate_record)
+        if self.vllm_config.dynamic_config.enable_flexi_flash_attn:
+            compact_cache_with_record(self._migrate_block_by_swapping_ptrs, is_used, compacted_length, num_blocks, migrate_record)
+            # After swapping tensor references in Python lists, we must update the GPU pointer arrays
+            # because prepare_flexi_kv_ptrs caches the data_ptr() of each tensor on GPU
+            forward_context = self.vllm_config.compilation_config.static_forward_context
+            for layer_name, attn_module in forward_context.items():
+                idx = extract_layer_index(layer_name) - self.model.model.start_layer
+                # Free old GPU pointer arrays to avoid memory leak
+                old_k_ptrs, old_v_ptrs = self.key_cache_ptrs[idx], self.value_cache_ptrs[idx]
+                free_flexi_kv_ptrs(old_k_ptrs, old_v_ptrs)
+                # Allocate new GPU pointer arrays with updated tensor addresses
+                self.key_cache_ptrs[idx], self.value_cache_ptrs[idx] = prepare_flexi_kv_ptrs(
+                    self.key_caches[idx], self.value_caches[idx])
+                assert isinstance(attn_module, FlexiAttention)
+                attn_module.key_dev_ptr = self.key_cache_ptrs[idx]
+                attn_module.value_dev_ptr = self.value_cache_ptrs[idx]
+            logger.info(f"Updated GPU pointer arrays after compact")
+        else:
+            compact_cache_with_record(self._migrate_block_by_copy_data, is_used, compacted_length, num_blocks, migrate_record)
         logger.info(f"[debug]: migrate_record: {migrate_record}")
 
         # 遍历CachedRequestState更新block_ids
@@ -517,7 +675,58 @@ class DynamicGPUModelRunner(GPUModelRunner):
         logger.info(f"resized kv cache in {human_readable_duration(time_end - time_start)} seconds")
         logger.info(f"resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
 
-    def _migrate_block(self, old_block_id: int, new_block_id: int, migrate_record: dict[int, int]):
+    def flexi_resize_kv_cache(self, new_length: int) -> None:
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        logger.info(f"resizing kv cache from {len(self.kv_caches[0][0])} to {new_length}")
+        logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+        time_start = time.time()
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        T, H, Dh = self.key_caches[0][0].shape
+        cache_length = len(self.key_caches[0])
+        logger.info(f"num of kv tensors{cache_length}")
+
+        if new_length < cache_length:
+            for layer_name, attn_module in forward_context.items():
+                logger.info(f"resizing kv cache for layer {layer_name}")
+                idx = extract_layer_index(layer_name) - self.model.model.start_layer
+                key_cache = self.key_caches[idx][:new_length]
+                value_cache = self.value_caches[idx][:new_length]
+                self.key_caches[idx] = key_cache
+                self.value_caches[idx] = value_cache
+                # Free old GPU pointer arrays before allocating new ones
+                old_k_ptrs, old_v_ptrs = self.key_cache_ptrs[idx], self.value_cache_ptrs[idx]
+                free_flexi_kv_ptrs(old_k_ptrs, old_v_ptrs)
+                self.key_cache_ptrs[idx], self.value_cache_ptrs[idx] = prepare_flexi_kv_ptrs(key_cache, value_cache)
+                assert isinstance(attn_module, FlexiAttention)
+                attn_module.key_cache = key_cache
+                attn_module.value_cache = value_cache
+                attn_module.key_dev_ptr = self.key_cache_ptrs[idx]
+                attn_module.value_dev_ptr = self.value_cache_ptrs[idx]
+        elif new_length > cache_length:
+            extended_kv_cache_shape = (T, H, Dh)
+            for layer_name, attn_module in forward_context.items():
+                new_allocated_block_num = new_length - cache_length
+                new_allocated_key_cache, new_allocated_value_cache = get_flexi_kv_cache( new_allocated_block_num, extended_kv_cache_shape, self.kv_cache_dtype, self.device)
+                idx = extract_layer_index(layer_name) - self.model.model.start_layer
+                key_cache = self.key_caches[idx]
+                value_cache = self.value_caches[idx]
+                key_cache.extend(new_allocated_key_cache)
+                value_cache.extend(new_allocated_value_cache)
+                # Free old GPU pointer arrays before allocating new ones
+                old_k_ptrs, old_v_ptrs = self.key_cache_ptrs[idx], self.value_cache_ptrs[idx]
+                free_flexi_kv_ptrs(old_k_ptrs, old_v_ptrs)
+                self.key_cache_ptrs[idx], self.value_cache_ptrs[idx] = prepare_flexi_kv_ptrs(key_cache, value_cache)
+                assert isinstance(attn_module, FlexiAttention)
+                attn_module.key_cache = key_cache
+                attn_module.value_cache = value_cache
+                attn_module.key_dev_ptr = self.key_cache_ptrs[idx]
+                attn_module.value_dev_ptr = self.value_cache_ptrs[idx]
+            
+        time_end = time.time()
+        logger.info(f"resized kv cache in {human_readable_duration(time_end - time_start)} seconds")
+        logger.info(f"resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+
+    def _migrate_block_by_copy_data(self, old_block_id: int, new_block_id: int, migrate_record: dict[int, int]):
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
         assert len(self.kv_caches) != 0
         for cache in self.kv_caches:
@@ -526,6 +735,16 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 cache[i][new_block_id].copy_(cache[i][old_block_id])
                 # 这里我们只将旧的搬迁到新的，我们不对旧的block数据制0
         migrate_record[old_block_id] = new_block_id
+
+    def _migrate_block_by_swapping_ptrs(self, old_block_id: int, new_block_id: int, migrate_record: dict[int, int]):
+        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert len(self.kv_caches) != 0
+        for key_cache in self.key_caches:
+            key_cache[ new_block_id], key_cache[ old_block_id] = key_cache[ old_block_id], key_cache[ new_block_id]
+        for value_cache in self.value_caches:
+            value_cache[ new_block_id], value_cache[ old_block_id] = value_cache[ old_block_id], value_cache[ new_block_id]
+        migrate_record[old_block_id] = new_block_id
+
     def _update_start_layer(self) -> None:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
         forward_context: dict[str, "Attention"] = self.vllm_config.compilation_config.static_forward_context

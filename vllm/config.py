@@ -4116,6 +4116,25 @@ class CompilationConfig:
 
 @config
 @dataclass
+class DynamicConfig:
+    """Configuration for custom dynamic parameters used in vLLM experiments.
+    This config holds all custom experimental flags and parameters that are
+    not part of the standard vLLM configuration.
+    """
+    enable_flexi_flash_attn: bool = False
+    """Whether to enable Flexi Flash Attention implementation. When enabled,
+    uses the FlexiFlashAttentionImpl for attention computations which may
+    provide performance benefits for certain workloads."""
+
+    def compute_hash(self) -> str:
+        """Compute hash for dynamic config."""
+        factors: list[Any] = []
+        factors.append(self.enable_flexi_flash_attn)
+        return hashlib.sha256(str(factors).encode()).hexdigest()
+
+
+@config
+@dataclass
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
@@ -4164,6 +4183,8 @@ class VllmConfig:
     You can specify the full compilation config like so:
     `{"level": 3, "cudagraph_capture_sizes": [1, 2, 4, 8]}`
     """
+    dynamic_config: DynamicConfig = field(default_factory=DynamicConfig)
+    """Dynamic configuration for custom experimental parameters."""
     kv_transfer_config: Optional[KVTransferConfig] = None
     """The configurations for distributed KV cache transfer."""
     layer_kv_connector_config: LayerKVConnectorConfig = field(default_factory=LayerKVConnectorConfig)

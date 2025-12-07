@@ -22,6 +22,7 @@
 # limitations under the License.
 """Inference-only Qwen3 model compatible with HuggingFace weights."""
 from collections.abc import Iterable
+import os
 from typing import Optional, Union
 
 import torch
@@ -29,8 +30,9 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm.attention import Attention, AttentionType
+from vllm.attention.dynamic_layer import FlexiAttention
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -114,14 +116,28 @@ class Qwen3Attention(nn.Module):
             base=self.rope_theta,
             rope_scaling=rope_scaling,
         )
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config,
-                              prefix=f"{prefix}.attn",
-                              attn_type=attn_type)
+        vllm_config = get_current_vllm_config()
+        is_flexi = vllm_config.dynamic_config.enable_flexi_flash_attn
+        if is_flexi:
+            logger.info("Using FlexiAttention in Qwen3Attention")
+            self.attn = FlexiAttention(self.num_heads,
+                                            self.head_dim,
+                                            self.scaling,
+                                            num_kv_heads=self.num_kv_heads,
+                                            cache_config=cache_config,
+                                            quant_config=quant_config,
+                                            prefix=f"{prefix}.attn",
+                                            attn_type=attn_type)
+        else:
+            logger.info("Using Attention in Qwen3Attention")
+            self.attn = Attention(self.num_heads,
+                                       self.head_dim,
+                                       self.scaling,
+                                       num_kv_heads=self.num_kv_heads,
+                                       cache_config=cache_config,
+                                       quant_config=quant_config,
+                                       prefix=f"{prefix}.attn",
+                                       attn_type=attn_type)
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 

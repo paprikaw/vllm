@@ -264,33 +264,34 @@ class DynamicQwen3Model(Qwen3Model):
         assert self.sched_start_layer != -1 and self.sched_end_layer != -1, "Please set sched_layers first"
 
         with self.model_lock:
-            if get_pp_group().is_first_rank:
-                if inputs_embeds is not None:
-                    hidden_states = inputs_embeds
+            with set_current_vllm_config(self.vllm_config):
+                if get_pp_group().is_first_rank:
+                    if inputs_embeds is not None:
+                        hidden_states = inputs_embeds
+                    else:
+                        hidden_states = self.get_input_embeddings(input_ids)
+                    residual = None
                 else:
-                    hidden_states = self.get_input_embeddings(input_ids)
-                residual = None
-            else:
-                assert intermediate_tensors is not None
-                hidden_states = intermediate_tensors["hidden_states"]
-                residual = intermediate_tensors["residual"]
-            logger.info(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
-            for layer in self.layers[self.sched_start_layer:self.sched_end_layer]:
-                try:
-                    hidden_states, residual = layer(
-                    positions,
-                        hidden_states,
-                        residual,
-                    )
-                except Exception as e:
-                    print(f"error is raised, layer: {layer}")
-                    raise e
-            if not get_pp_group().is_last_rank:
-                return IntermediateTensors({
-                    "hidden_states": hidden_states,
-                    "residual": residual
-                })
-            hidden_states, _ = self.norm(hidden_states, residual)
+                    assert intermediate_tensors is not None
+                    hidden_states = intermediate_tensors["hidden_states"]
+                    residual = intermediate_tensors["residual"]
+                logger.info(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
+                for layer in self.layers[self.sched_start_layer:self.sched_end_layer]:
+                    try:
+                        hidden_states, residual = layer(
+                        positions,
+                            hidden_states,
+                            residual,
+                        )
+                    except Exception as e:
+                        print(f"error is raised, layer: {layer}")
+                        raise e
+                if not get_pp_group().is_last_rank:
+                    return IntermediateTensors({
+                        "hidden_states": hidden_states,
+                        "residual": residual
+                    })
+                hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
     # def load_layer_weights(self, weights: Iterable[tuple[str, torch.Tensor]], layers: Tuple[int, int])->set[str]:

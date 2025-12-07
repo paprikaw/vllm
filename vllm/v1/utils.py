@@ -13,6 +13,7 @@ from datetime import timedelta
 
 import torch
 
+from vllm.attention.dynamic_layer import FlexiAttention
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
@@ -377,6 +378,66 @@ def bind_kv_cache(
     for layer_name, kv_cache in kv_caches.items():
         # NOTE: Use list because of v0 PP virtual engine.
         forward_context[layer_name].kv_cache = [kv_cache]
+def flexi_bind_kv_cache(
+    key_cache: dict[str, list[torch.Tensor]],
+    value_cache: dict[str, list[torch.Tensor]],
+    key_dev_ptr: dict[str, int],
+    value_dev_ptr: dict[str, int],
+    forward_context: dict[str, "Attention"],
+    runner_key_caches: list[list[torch.Tensor]],
+    runner_value_caches: list[list[torch.Tensor]],
+    runner_key_dev_ptrs: list[int],
+    runner_value_dev_ptrs: list[int],
+) -> None:
+    """
+    Bind the allocated KV cache to both ModelRunner and forward context so
+    that the KV cache can be used in the forward pass.
+
+    This function:
+      1) Fills the ModelRunner's kv cache list (`runner_kv_caches`) with
+         kv_caches.
+      2) Associates each attention layer in the `forward_context` with its 
+         corresponding KV cache in kv_caches.
+
+    Args:
+        key_cache: The allocated key caches with layer names as keys.
+        value_cache: The allocated value caches with layer names as keys.
+        forward_context: The global forward context containing all Attention 
+        layers with layer names as keys.
+        runner_key_caches: The key_cache declared by ModelRunner.
+        runner_value_caches: The value_cache declared by ModelRunner.
+    """
+    # Bind kv_caches to ModelRunner
+    assert len(runner_key_caches) == 0
+    assert len(runner_value_caches) == 0
+
+    # Convert kv_caches dict to a list of tensors in the order of layer_index.
+    index2name = defaultdict(list)
+    for layer_name in key_cache:
+        index2name[extract_layer_index(layer_name)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        if len(layer_names) > 1:
+            # One typical case is encoder-decoder model, e.g., bart.
+            # The cross attention and self attention in the same decoder layer
+            # has different layer_name but the same layer_index.
+            raise NotImplementedError
+        layer_name = layer_names[0]
+        runner_key_caches.append(key_cache[layer_name])
+        runner_value_caches.append(value_cache[layer_name])
+        runner_key_dev_ptrs.append(key_dev_ptr[layer_name])
+        runner_value_dev_ptrs.append(value_dev_ptr[layer_name])
+    
+    # Bind kv_caches to forward context
+    for layer_name, attn in forward_context.items():
+        # NOTE: Use list because of v0 PP virtual engine.
+        assert isinstance(attn, FlexiAttention)
+        attn.key_cache = key_cache[layer_name]
+        attn.value_cache = value_cache[layer_name]
+        attn.key_dev_ptr = key_dev_ptr[layer_name]
+        attn.value_dev_ptr = value_dev_ptr[layer_name]
+
 
 
 def copy_slice(from_tensor: torch.Tensor, to_tensor: torch.Tensor,

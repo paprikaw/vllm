@@ -226,7 +226,7 @@ class Attention(nn.Module):
                 if os.environ.get("VLLM_DEBUG_ASSERT_KV", "1").lower() not in ("0", "", "false", "no"):
                     assert isinstance(self_kv_cache, torch.Tensor) and self_kv_cache.numel() > 0, (
                         f"Attention {self.layer_name} has empty KV cache bound")
-                self.impl.forward(self,
+                    self.impl.forward(self,
                                   query,
                                   key,
                                   value,
@@ -431,29 +431,19 @@ def unified_attention_with_output(
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
-    wait_for_kv_layer_from_connector(layer_name)
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
-    kv_cache = self.kv_cache[forward_context.virtual_engine]
-    try:
-        self.impl.forward(self,
-                      query,
-                      key,
-                      value,
-                      kv_cache,
-                      attn_metadata,
-                      output=output)
-    except Exception as e:
-        logger.info(f"error is happeining during forward, current kv_cache shape: {kv_cache.shape}, dtype: {kv_cache.dtype}")
-        logger.info(f"kv cache: {kv_cache}")
-        logger.info(f"attention metadata: {attn_metadata.slot_mapping}")
-        time.sleep(1)
-        raise e
-
-    maybe_save_kv_layer_to_connector(layer_name, kv_cache)
+    self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+    self.impl.forward(self,
+                  query,
+                  key,
+                  value,
+                  self_kv_cache,
+                  attn_metadata,
+                  output=output)
 
 
 def unified_attention_with_output_fake(
