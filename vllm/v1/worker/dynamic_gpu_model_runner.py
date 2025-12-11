@@ -836,7 +836,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         key_cache_list_ptr, value_cache_list_ptr = prepare_flexi_kv_ptrs(key_cache, value_cache) 
 
         dummy_scale = torch.tensor(1.0, device=self.device, dtype=torch.float32)
-        assert gathered_kv_tensor.shape[2:] == kv_cache_shape[2:]
+        assert gathered_kv_tensor.shape[-2:] == kv_cache_shape[-2:], f"gathered_kv_tensor shape {gathered_kv_tensor.shape} mismatch kv_cache_shape {kv_cache_shape}"
 
         flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_list_ptr,value_cache_list_ptr,  key_cache[0], value_cache[0], slot_mapping,"auto", dummy_scale, dummy_scale)
 

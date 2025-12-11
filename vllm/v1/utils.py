@@ -24,7 +24,6 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
 from vllm.utils import get_mp_context, kill_process_tree
 from vllm.v1.executor.abstract import Executor
 from vllm.dynamic_config import DynamicConfig
-from vllm.v1.worker.dynamic_gpu_model_runner import DynamicGPUModelRunner
 from vllm.v1.worker.utils import get_flexi_kv_cache
 
 if TYPE_CHECKING:
@@ -501,7 +500,7 @@ def dynamic_bind_single_kv_tensor(
         end_layer: int,
         forward_context: dict[str, "Attention"],
         kv_synchronizer: "DynamicKVSynchronizer",
-        runner: "DynamicGPUModelRunner",
+        runner,
         kv_tensor: torch.Tensor,
         ) -> None:
     """Bind a single layer's KV tensor to runner caches and forward context.
@@ -552,7 +551,7 @@ def dynamic_flexi_bind_single_kv_tensor(
     kv_tensor: torch.Tensor,
     forward_context: dict[str, "Attention"],
     kv_synchronizer: "DynamicKVSynchronizer",
-    runner: "DynamicGPUModelRunner") -> None:
+    runner) -> None:
     """Bind a single layer's KV tensor to runner caches and forward context.
 
     - 更新本 runner 的 `self.kv_caches`

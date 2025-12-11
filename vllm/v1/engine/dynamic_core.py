@@ -653,11 +653,11 @@ class DynamicEngineCore(EngineCore):
                     plan = src_to_plan.setdefault(src_rank, {})
                     layer_ids = plan.setdefault(dst_rank, [])
                     layer_ids.extend(range(lo, hi + 1))
-            with self.engine_lock:
-                time_before_slot_mapping_calculation = time.time() 
-                slot_mapping = self.scheduler.start_sending_slot_mapping()
-                logger.info(f"time taken to generate slot mapping:{human_readable_duration(time.time() - time_before_slot_mapping_calculation)}")
-                self.model_executor.start_kv_cache_migration_async(src_to_plan, slot_mapping)
+
+            time_before_slot_mapping_calculation = time.time() 
+            slot_mapping = self.scheduler.start_sending_slot_mapping()
+            logger.info(f"time taken to generate slot mapping:{human_readable_duration(time.time() - time_before_slot_mapping_calculation)}")
+            self.model_executor.start_kv_cache_migration_async(src_to_plan, slot_mapping)
             time_kv_migration_end = time.time()
 
             logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")

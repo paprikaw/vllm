@@ -5,12 +5,10 @@ from pdb import run
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 import threading
 import math
-from regex import A
-from sklearn import dummy
+from regex import F
 import torch
 import torch.distributed
 from torch.cuda import Stream
-from traitlets import default
 from vllm._custom_ops import flexi_reshape_and_cache_flash
 from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import FlexiKVTensorMeta
 from vllm.logger import init_logger
@@ -95,6 +93,8 @@ class DynamicGPUWorker(Worker):
 
         # 用于记录在migration过程中，receiver已经applied的token数量
         self.receiver_num_applied_token_dict = defaultdict(int)
+
+        self.block_size = 0
         
     def _assert_layers_kv_bound(self, layer_ids: set[int]) -> None:
         if not self._debug_assert_kv:
@@ -141,6 +141,7 @@ class DynamicGPUWorker(Worker):
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
         logger.info(f"[operation]: Add Model Layers: {layer_list}")
         time_start = time.time()
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         with DeadlockTimeoutContext(self._layer_loaded_cv, "_layer_loaded_cv", timeout=2):
             logger.info(f"start to load layers, inside forward lock")
             # 记录扩容前的起始 layer，便于在 start_layer 左移时重排本地 kv 索引基准
@@ -154,8 +155,6 @@ class DynamicGPUWorker(Worker):
             logger.info(f"debug: ---------------------add layers, old_start_layer: {old_start_layer}, new_start_layer: {new_start_layer}, old_end_layer: {old_end_layer}, new_end_layer: {new_end_layer}")
 
             # 在这里更新kv_cache_group
-
-            is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
             if is_flexi:
                 # 如果 start_layer 向更小的下标移动，需要对现有 self.kv_caches 做前置填充，
                 # 使其索引基准与新的 start_layer 对齐
@@ -170,6 +169,16 @@ class DynamicGPUWorker(Worker):
                                                     self.model_runner.key_cache_ptrs
                     self.model_runner.value_cache_ptrs = [0] * left_added_layer_num + \
                                                     self.model_runner.value_cache_ptrs
+                    
+                    self.dynamic_kv_synchronizer.key_cache_list = [[] for _ in range(left_added_layer_num)] + \
+                                                    self.dynamic_kv_synchronizer.key_cache_list
+                    self.dynamic_kv_synchronizer.value_cache_list = [[] for _ in range(left_added_layer_num)] + \
+                                                    self.dynamic_kv_synchronizer.value_cache_list
+                    self.dynamic_kv_synchronizer.key_cache_ptrs = [0] * left_added_layer_num + \
+                                                    self.dynamic_kv_synchronizer.key_cache_ptrs
+                    self.dynamic_kv_synchronizer.value_cache_ptrs = [0] * left_added_layer_num + \
+                                                    self.dynamic_kv_synchronizer.value_cache_ptrs
+
                 if right_added_layer_num > 0:
                     logger.info(f"pad the kv cache for {right_added_layer_num}")
                     pad_right = right_added_layer_num
@@ -177,6 +186,11 @@ class DynamicGPUWorker(Worker):
                     self.model_runner.value_caches.extend([[] for _ in range(pad_right)])
                     self.model_runner.key_cache_ptrs.extend([0] * pad_right)
                     self.model_runner.value_cache_ptrs.extend([0] * pad_right)
+
+                    self.dynamic_kv_synchronizer.key_cache_list.extend([[] for _ in range(pad_right)])
+                    self.dynamic_kv_synchronizer.value_cache_list.extend([[] for _ in range(pad_right)])
+                    self.dynamic_kv_synchronizer.key_cache_ptrs.extend([0] * pad_right)
+                    self.dynamic_kv_synchronizer.value_cache_ptrs.extend([0] * pad_right)
                 logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
                 for i in range(len(self.model_runner.key_caches)):
                     logger.info(f"key cache len: {len(self.model_runner.key_caches)}")
@@ -188,16 +202,20 @@ class DynamicGPUWorker(Worker):
                 if left_added_layer_num > 0:
                     self.model_runner.kv_caches = [torch.tensor([])] * left_added_layer_num + \
                                                   self.model_runner.kv_caches
+                    self.dynamic_kv_synchronizer.kv_caches = [torch.tensor([])] * left_added_layer_num + \
+                                                  self.dynamic_kv_synchronizer.kv_caches
                 if right_added_layer_num > 0:
                     logger.info(f"pad the kv cache for {right_added_layer_num}")
                     pad_right = right_added_layer_num
                     self.model_runner.kv_caches.extend([torch.tensor([])] * pad_right)
+                    self.dynamic_kv_synchronizer.kv_caches.extend([torch.tensor([])] * pad_right)
                 logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
                 for i in range(len(self.model_runner.kv_caches)):
                     logger.info(f"kv cache {i}: {self.model_runner.kv_caches[i].shape}")
         
             # 唤醒等待层加载的线程（kv tensor的绑定线程和kv patch 应用线程）。
             self._layer_loaded_cv.notify_all()
+            logger.info(f"[debug]: notified all layer loaded cv waiters")
 
 
     def init_device(self):
@@ -259,7 +277,7 @@ class DynamicGPUWorker(Worker):
             rank=self.rank,
             local_rank=self.local_rank,
             config=self.vllm_config,
-            model_executable=self.model_runner.model,
+            model_executable=self.model_runner.model
         )
         # 启动所有监听其它rank的发送过来的kv cache的线程
         for rank in range(self.vllm_config.parallel_config.pipeline_parallel_size):
@@ -269,6 +287,7 @@ class DynamicGPUWorker(Worker):
 
     def dynamic_initialize_from_config(self, kv_cache_configs: list[KVCacheConfig], num_blocks: int) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        self.block_size = kv_cache_configs[self.rank].kv_cache_groups[0].kv_cache_spec.block_size
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CuMemAllocator.get_instance()
             context = allocator.use_memory_pool(tag="kv_cache")
@@ -282,6 +301,7 @@ class DynamicGPUWorker(Worker):
             else:
                 logger.info("Using standard flash attention dynamic initialize kv cache")
                 self.model_runner.dynamic_initialize_kv_cache(kv_cache_configs[self.rank], self.dynamic_kv_synchronizer, num_blocks)
+            self.dynamic_kv_synchronizer.create_slot_mappings(num_blocks * self.block_size)
 
     @torch.inference_mode()
     def execute_model(
@@ -294,7 +314,7 @@ class DynamicGPUWorker(Worker):
         assert(isinstance(self.model_runner.model, DynamicQwen3ForCausalLM))
         logger.info(f"start to execute_model in gpu worker")
         result = self.model_runner.execute_model(scheduler_output, layer_config, intermediate_tensors=intermediate_tensors)
-        assert(len self.model_runner.input_batch.block_table.block_tables) == 0) 
+        assert(len(self.model_runner.input_batch.block_table.block_tables) == 0) 
         slot_mapping = self.model_runner.input_batch.block_table[0].slot_mapping
         assert slot_mapping.device == torch.device("cuda")
         if self.model_runner.migration_in_process:
@@ -368,10 +388,35 @@ class DynamicGPUWorker(Worker):
         from vllm.config import get_current_vllm_config
         vllm_config = get_current_vllm_config()
         is_flexi = vllm_config.dynamic_config.enable_flexi_flash_attn
+        
+        start_layer = self.model_runner.model.model.start_layer
+
         if is_flexi:
             self.model_runner.flexi_release_kv_cache_for_layers(layers_list)
+            
+            self.dynamic_kv_synchronizer.key_cache_list = [
+                key_cache for idx, key_cache in enumerate(self.dynamic_kv_synchronizer.key_cache_list) 
+                if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+            ]
+            self.dynamic_kv_synchronizer.value_cache_list = [
+                value_cache for idx, value_cache in enumerate(self.dynamic_kv_synchronizer.value_cache_list)
+                if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+            ]
+            self.dynamic_kv_synchronizer.key_cache_ptrs = [
+                ptr for idx, ptr in enumerate(self.dynamic_kv_synchronizer.key_cache_ptrs)
+                if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+            ]
+            self.dynamic_kv_synchronizer.value_cache_ptrs = [
+                ptr for idx, ptr in enumerate(self.dynamic_kv_synchronizer.value_cache_ptrs)
+                if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+            ]
         else:
             self.model_runner.release_kv_cache_for_layers(layers_list)
+            
+            self.dynamic_kv_synchronizer.kv_caches = [
+                kv_cache for idx, kv_cache in enumerate(self.dynamic_kv_synchronizer.kv_caches) 
+                if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+            ]
 
     def release_kv_cache(self) -> None:
         self.model_runner.release_kv_cache()
@@ -463,10 +508,11 @@ class DynamicGPUWorker(Worker):
 
     def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         self.model_runner.compact_kv_cache(compacted_length, bitmap)
+        self.dynamic_kv_synchronizer.create_slot_mappings(compacted_length * self.block_size)
 
     def resize_kv_cache(self, new_length: int) -> None:
         self.model_runner.resize_kv_cache(new_length)
-
+        self.dynamic_kv_synchronizer.create_slot_mappings(new_length * self.block_size)
     # ####################################### #
     # Sender side of KV migration functions   #
     # ####################################### #
@@ -479,7 +525,6 @@ class DynamicGPUWorker(Worker):
         """
         assert self.migration_in_process == False, "The migration should not be in process"
         assert self.sending_kv_cache_in_process == False, "The sending kv cache should not be in process"
-
         logger.info(f"[operation]: Start KV Cache Migration: {src_to_plan}")
         with self.model_runner.forward_lock:
             self.migration_in_process = True
@@ -496,7 +541,7 @@ class DynamicGPUWorker(Worker):
             assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
             time_start = time.time()
             # self.dynamic_kv_synchronizer.start_kv_tensor_transfer_async(rank_to_layers_ids, self.model_runner.kv_caches, self.model_runner.model.model.start_layer)
-            self._kv_migration_sender_loop(rank, layer_ids, self.model_runner.kv_caches[0], slot_mapping)
+            self._kv_migration_sender_loop(rank, layer_ids,slot_mapping)
             logger.info(f"[timeline]: after start kv cache tensor, time taken: {human_readable_duration(time.time() - time_start)}")
 
         for rank, layer_ids in rank_to_layers_ids.items():
@@ -506,7 +551,6 @@ class DynamicGPUWorker(Worker):
     def _kv_migration_sender_loop(self, 
                                 rank: int,
                                 layer_ids: list[int],
-                                kv_cache_meta: torch.Tensor, 
                                 slot_mapping: Optional[list[int]] = None
                                 ) -> None:
         """Send layers' KV cache to a peer rank.
@@ -524,13 +568,15 @@ class DynamicGPUWorker(Worker):
         """
         assert all(transfer_in_process == False for transfer_in_process in self.dynamic_kv_synchronizer.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
         assert all(patch_id == 0 for patch_id in self.dynamic_kv_synchronizer.last_patch_ids.values()), "The patch id of the rank should be 0."
-        slot_mapping_dev = torch.tensor(slot_mapping)
+        slot_mapping_dev = torch.tensor(slot_mapping, device=self.device) if slot_mapping is not None else None
         start_layer_id = self.model_runner.model.model.start_layer        # Firstly send the kv tensor to remote rank
         for layer_id in layer_ids:
+            time_start = time.time()
             kv_tensor_meta, kv_tensor_data = self.dynamic_kv_synchronizer.get_kv_tensor_from_cache(layer_ids, layer_id, start_layer_id, slot_mapping_dev)
+            logger.info(f"start to send kv tensor for layer {layer_id} to rank {rank}, kv_tensor_meta: {kv_tensor_meta}, kv_tensor_data shape: {kv_tensor_data.shape}, time taken to get kv tensor: {human_readable_duration(time.time() - time_start)} seconds")
 
-            logger.info(f"[debug]: start to send kv tensor meta to rank {rank} for layer {layer_id}, kv_cache block shape: {kv_cache_meta[0].shape}")
-            self.dynamic_kv_synchronizer.send_kv_tensor_to_rank(rank, kv_tensor_meta, kv_tensor_data)
+            self.dynamic_kv_synchronizer.send_kv_tensor_to_rank(rank, kv_tensor_meta, kv_tensor_data, slot_mapping_dev)
+            logger.info(f"[debug]: sent kv tensor for layer {layer_id} to rank {rank}")
 
         logger.info(f"[debug]: finished sending kv tensor, start to send kv patch")
 
@@ -542,6 +588,8 @@ class DynamicGPUWorker(Worker):
             patch_payload_size = kv_patch.kv_payload.numel() * kv_patch.kv_payload.element_size()
             patch_slot_mapping_size = kv_patch.slot_mapping.numel() * kv_patch.slot_mapping.element_size()
             logger.info(f"[timeline]: send kv patch to rank {rank}, time taken: {time.time() - time_start}, data_size: {patch_slot_mapping_size / 1024 ** 2:.2f}MB + {patch_payload_size / 1024 ** 2:.2f}MB")
+        # 最后发送一个 finished 的控制消息，表示本次kv cache的发送完成
+
 
     def start_kv_cache_migration_sync(self, src_to_sending_layers: dict[int, dict[int, list[Tuple[int, int]]]], rank_to_layer_ids: dict[int, list[Tuple[int, int]]]) -> None:
         """Collective-RPC entry used by executor.
@@ -619,10 +667,10 @@ class DynamicGPUWorker(Worker):
             while True:
                 # 1) Firstly wait for all tensor the be received
                 meta = self.dynamic_kv_synchronizer.recv_controller(from_rank)
+                logger.info("received kv tensor meta")
                 if first_time:
-                    assert isinstance(meta, KVTensorMeta)
+                    assert isinstance(meta, KVTensorMeta) or isinstance(meta, FlexiKVTensorMeta)
                     layers_to_be_received = set(meta.layer_to_be_received)
-                    # 第一次接受到kv tensor时，需要进行kv cache数据结构的扩展
                     time_start = time.time()
                     first_time = False
                     self.is_all_patch_applied[from_rank] = False # 第一次接受到kv tensor时，需要将is_all_patch_applied设置为False，表示需要等待所有patch都应用完毕后才能进行配置的转换
@@ -638,11 +686,12 @@ class DynamicGPUWorker(Worker):
                     assert isinstance(meta, FlexiKVTensorMeta)
                     slot_mapping, kv_tensor = self.dynamic_kv_synchronizer.recv_kv_tensor(from_rank, meta)
                     tmp_slot_mapping_dict[meta.layer_id] = slot_mapping 
-                    tmp_slot_token_num[meta.layer_id] = slot_mapping.numel()
                 else:
                     assert isinstance(meta, KVTensorMeta)
                     kv_tensor = self.dynamic_kv_synchronizer.recv_kv_tensor(from_rank, meta)
                     assert isinstance(kv_tensor, torch.Tensor)
+
+                tmp_slot_token_num[meta.layer_id] = meta.num_tokens
                 tmp_kv_tensors_dict[meta.layer_id] = kv_tensor
 
                 # logger.info(f"available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
@@ -660,7 +709,7 @@ class DynamicGPUWorker(Worker):
                         slot_mapping = tmp_slot_mapping_dict[layer_id]
                         dynamic_flexi_bind_single_kv_tensor(
                             self.model_runner.model.model.start_layer,
-                            self.model_runner.model.model.start_layer,
+                            self.model_runner.model.model.end_layer,
                             layer_id,
                             slot_mapping,
                             kv_tensor,
@@ -668,7 +717,6 @@ class DynamicGPUWorker(Worker):
                             self.dynamic_kv_synchronizer,
                             self.model_runner
                         )
-                        self.receiver_num_applied_token_dict[from_rank] += tmp_slot_token_num[layer_id]
                     else:
                         dynamic_bind_single_kv_tensor(
                             layer_id,
@@ -679,6 +727,7 @@ class DynamicGPUWorker(Worker):
                             runner=self.model_runner,
                             kv_tensor=kv_tensor
                         )
+                    self.receiver_num_applied_token_dict[from_rank] += tmp_slot_token_num[layer_id]
                 logger.info(f"[operation]: rank {self.rank} layer {layer_id}'s kv cache and weight is loaded")
           
                     
@@ -707,10 +756,10 @@ class DynamicGPUWorker(Worker):
                 assert meta.id == cur_patch_id, "The patch id should be the next id of the last patch"
                 cur_patch_id += 1
 
+                slot_mapping, kv_payload = self.dynamic_kv_synchronizer.recv_kv_patch(from_rank, meta)
+                self.dynamic_kv_synchronizer.apply_one_patch_to_kv_cache(self.model_runner.model.model.start_layer, meta, kv_payload, slot_mapping)
                 if meta.type == "kv_patch_meta":
                     logger.info(f"debug: ------------ Worker {self.rank} received kv patch meta from rank {from_rank}")
-                    slot_mapping, kv_payload = self.dynamic_kv_synchronizer.recv_kv_patch(from_rank, meta)
-                    self.dynamic_kv_synchronizer.apply_one_patch_to_kv_cache(self.model_runner.model.model.start_layer, meta, kv_payload, slot_mapping)
                     self.receiver_num_applied_token_dict[from_rank] += meta.num_tokens
                 elif meta.type == "kv_patch_finished":
                     logger.info(f"Worker {self.rank} received kv patch finished message from rank {from_rank}")
@@ -718,7 +767,7 @@ class DynamicGPUWorker(Worker):
                     with self._all_patch_applied_cv:
                         self.is_all_patch_applied[from_rank] = True
                         self._all_patch_applied_cv.notify_all()
-                    break
+                    break # Exit point from current migration listening loop
                 else:
                     assert False, f"Unexpected message type: {meta.type}"
                 meta = self.dynamic_kv_synchronizer.recv_controller(from_rank)
@@ -788,15 +837,14 @@ class DynamicGPUWorker(Worker):
                     self.rank_to_layers_ids[rank],
                     self.model_runner.model.model.start_layer,
                     slot_mapping,
+                    is_sync
                 )
 
-        if is_sync:
-            time_start = time.time()
-            logger.info(f"[operation]: before finish kv cache transfer start to finish kv cache tansfer, delete layers, release kv cache, reinitialize kv cache")
-            # Sender finishes transfer and cleans up; receiver no-ops.
-            if self.sending_kv_cache_in_process:
+            if is_sync:
+                time_start = time.time()
+                logger.info(f"[operation]: before finish kv cache transfer start to finish kv cache tansfer, delete layers, release kv cache, reinitialize kv cache")
+                # Sender finishes transfer and cleans up; receiver no-ops.
                 logger.info(f"debug: finish kv cache transfer for rank {self.rank}")
-                self.dynamic_kv_synchronizer.finish_kv_cache_transfer()
                 logger.info(f"[timeline]: after finish all kv cache transfer, time taken: {human_readable_duration(time.time() - time_start)}")
                 # 在这个节点，我们可以free旧的layer weights和kv cache
                 layer_ranges = []
@@ -808,9 +856,10 @@ class DynamicGPUWorker(Worker):
                 logger.info(f"[timeline]: after release kv cache for layers, time taken: {human_readable_duration(time.time() - time_start)}")
                 self.remove_layers(self.rank, layer_ranges)
                 logger.info(f"[timeline]: after remove layers, time taken: {human_readable_duration(time.time() - time_start)}")
-            self.new_kv_cache_block_num = new_kv_cache_block_num
-
-            self.finish_migration()
+                self.new_kv_cache_block_num = new_kv_cache_block_num
+                self.finish_migration()
+        else:
+            assert not is_sync, "If not sending kv cache, it should not be sync migration"
 
     def finish_migration(self):
         self.migration_in_process = False

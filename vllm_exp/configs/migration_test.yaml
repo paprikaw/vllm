@@ -30,15 +30,15 @@ projects:
         - "12,52"
     migration:
       is_migration: true
-      migration_steps: [70]
+      migration_steps: [10]
       alternative_configs:
         "0": [12, 52]
         "1": [32, 32]
     benchmark:
       profile: false
       print_outputs: true
-      data_num_requests: [50, 50]
+      data_num_requests: [10, 50]
       input_output_lens: [[512, 64], [512, 8]]
-      running_num_requests: [50, 50]
+      running_num_requests: [10, 50]
       running_request_rates: [3.0, 1.8]
 is_log_cover: true

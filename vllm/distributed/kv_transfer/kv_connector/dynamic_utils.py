@@ -80,8 +80,8 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
     def make_metadata_for_stage_batch(self, batch_id: int, layer_ids: list[int], num_tokens: int, tensor: torch.Tensor) -> KVSynchronizerMetadata:
         return {"type": "kv_stage_batch", "dtype": tensor.dtype, "shape": tensor.shape, "batch_id": batch_id, "layer_ids": layer_ids, "num_tokens": num_tokens}
 
-    def extract_kv_patch_from_kv_cache(self, patch_id: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor) -> KVPatch:
-        """Aggregate multiple layers' KV for this stage and send in one shot.
+    def extract_kv_patch_from_kv_cache(self, patch_id: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor, is_finished: bool) -> KVPatch:
+        """Aggregate multiple layers' KV for this stage and send in one shot.. . 
 
         Prefer passing `kv_caches` and `dest_slot_mapping` only; this method
         will extract per-layer K/V slices from the kv caches. `K_all`/`V_all`
@@ -155,7 +155,7 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
         _, L2, T2, H, D = KV_all.shape
         assert int(L2) == len(layer_ids) and int(T2) == T_valid
         meta = KVPatchMeta(
-            type='kv_patch_meta',
+            type='kv_patch_meta' if not is_finished else 'kv_patch_finished',
             id=int(patch_id),
             layer_ids=list(map(int, layer_ids)),
             num_tokens=int(T_valid),
