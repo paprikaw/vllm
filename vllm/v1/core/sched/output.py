@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 @dataclass
 class NewRequestData:
 
-    req_id: str
+    request_id: str
     prompt_token_ids: list[int]
     mm_inputs: list[MultiModalKwargs]
     mm_hashes: list[str]
@@ -37,7 +37,7 @@ class NewRequestData:
         block_ids: list[list[int]],
     ) -> NewRequestData:
         return cls(
-            req_id=request.request_id,
+            request_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
             mm_inputs=request.mm_inputs,
             mm_hashes=request.mm_hashes,
@@ -50,7 +50,7 @@ class NewRequestData:
 
     def __repr__(self):
         return (f"NewRequestData("
-                f"req_id={self.req_id},"
+                f"req_id={self.request_id},"
                 f"prompt_token_ids={self.prompt_token_ids},"
                 f"mm_inputs={self.mm_inputs},"
                 f"mm_hashes={self.mm_hashes},"
@@ -64,7 +64,7 @@ class NewRequestData:
     # Version of __repr__ with the prompt data obfuscated
     def anon_repr(self):
         return (f"NewRequestData("
-                f"req_id={self.req_id},"
+                f"req_id={self.request_id},"
                 f"prompt_token_ids_len={len(self.prompt_token_ids)},"
                 f"mm_inputs={self.mm_inputs},"
                 f"mm_hashes={self.mm_hashes},"

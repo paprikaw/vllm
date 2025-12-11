@@ -72,6 +72,7 @@ class model_aware_kv_ops_helper:
             layer_module = model_executable.model.layers[layer]
 
         if self.is_deepseek_mla and self.use_mla_opt:
+            assert False
             layer_module.self_attn.attn = layer_module.self_attn.mla_attn
             k_c_normed_k_pe = keys.squeeze(1)
             k_c_normed = k_c_normed_k_pe[:, :model_config.kv_lora_rank]
@@ -116,4 +117,48 @@ class model_aware_kv_ops_helper:
                 layer_module.self_attn.attn.kv_cache_dtype,
                 layer_module.self_attn.attn._k_scale,
                 layer_module.self_attn.attn._v_scale,
+            )
+    def flexi_put_kv_to_cache(self, model_executable: torch.nn.Module, keys, values,
+                         key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, layer, slot_mapping):
+        # Resolve layer module if an integer layer id is provided.
+        # layer can be either a module or a global layer index.
+        layer_module = layer
+        if isinstance(layer, int):
+            # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
+            layer_module = model_executable.model.layers[layer]
+
+        if self.is_deepseek_mla and self.use_mla_opt:
+            assert False
+        else:
+            # When migrating KV cache between ranks, keys/values may already
+            # be in the storage dtype of the destination kv_cache (e.g. fp8 as
+            # uint8/float8). In such case, calling reshape_and_cache_flash()
+            # would re-quantize already-quantized values and corrupt data.
+            # To avoid this, if the input dtype matches the kv cache storage
+            # dtype, directly scatter-copy into the flattened cache.
+            # tgt_slot = slot_mapping[start_pos:end_pos]
+            # Fast path: direct copy when dtypes already match storage.
+            # if keys.dtype == key_cache.dtype and values.dtype == value_cache.dtype:
+            #     # keys/values shape: [T, H, D]; flatten caches to [T_total, H, D]
+            #     H = key_cache.shape[-2]
+            #     D = key_cache.shape[-1]
+            #     flat_k = key_cache.reshape(-1, H, D)
+            #     flat_v = value_cache.reshape(-1, H, D)
+            #     # Ensure indices live on same device
+            #     if tgt_slot.device != flat_k.device:
+            #         tgt_slot = tgt_slot.to(flat_k.device, non_blocking=True)
+            #     flat_k.index_copy_(0, tgt_slot, keys)
+            #     flat_v.index_copy_(0, tgt_slot, values)
+            # else:
+                # Fallback: normal path (expects float{16,32} inputs).
+            ops.flexi_reshape_and_cache_flash(key=keys,
+                                              value=values,
+                                              key_cache_ptr=key_cache_ptr,
+                                              value_cache_ptr=value_cache_ptr,
+                                              key_cache_meta=key_cache_list[0],
+                                              value_cache_meta=value_cache_list[0],
+                                              slot_mapping=slot_mapping,
+                                              kv_cache_dtype=layer_module.self_attn.attn.kv_cache_dtype,
+                                              k_scale=layer_module.self_attn.attn._k_scale,
+                                              v_scale=layer_module.self_attn.attn._v_scale,
             )

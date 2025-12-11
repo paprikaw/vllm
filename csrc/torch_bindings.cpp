@@ -653,6 +653,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                               Tensor k_scale, Tensor v_scale) -> ()");
   cache_ops.impl("flexi_reshape_and_cache_flash", torch::kCUDA,
                  &flexi_reshape_and_cache_flash);
+  
+  // Flexible version with pointer arrays for non-contiguous blocks
+  cache_ops.def(
+      "flexi_gather_pages(int key_page_ptrs, int value_page_ptrs, "
+      "Tensor slot_mapping, Tensor! key_out, Tensor! value_out, "
+      "int block_size) -> ()");
+  cache_ops.impl("flexi_gather_pages", torch::kCUDA, &flexi_gather_pages);
 
   // Concat kv_c and k_pe and cache them.
   cache_ops.def(

@@ -44,6 +44,12 @@ void flexi_reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
                                    torch::Tensor& k_scale,
                                    torch::Tensor& v_scale);
 
+void flexi_gather_pages(const int64_t key_page_ptrs,
+                        const int64_t value_page_ptrs,
+                        const torch::Tensor& slot_mapping,
+                        const torch::Tensor& key_out,
+                        const torch::Tensor& value_out, int64_t block_size);
+
 void concat_and_cache_mla(torch::Tensor& kv_c, torch::Tensor& k_pe,
                           torch::Tensor& kv_cache, torch::Tensor& slot_mapping,
                           const std::string& kv_cache_dtype,

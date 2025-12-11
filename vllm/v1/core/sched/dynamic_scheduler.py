@@ -3,7 +3,7 @@
 from regex import P
 from vllm.v1.core.dynamic_kv_cache_manager import DynamicKVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
-from typing import List, Tuple, Optional, TypeVar, Union, Any
+from typing import List, Tuple, Optional, TypeVar, Union, Any, Dict
 from vllm.v1.core.sched.snapshot import KVCacheSnapshot, KVCacheSnapshotEntry
 from threading import Lock
 import vllm.envs as envs
@@ -25,7 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager, compute_encoder_budget)
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.sched.output import (CachedRequestData, SchedulerOutput)
+from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData, SchedulerOutput)
 from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs
@@ -201,12 +201,46 @@ class DynamicScheduler(Scheduler):
         self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
         self.next_new_kv_cache_block_num = 0
 
+        self.sending_slot_mapping = False # 控制在每一次scheduler schedule的时候是否需要同时发送slot_mapping
+        self.num_tokens_for_migration = 0 # 记录已经发送的slot数量，用来和worker端已处理的slot数量进行对比
+
     def async_change_configuration(self, pp_layer_config: List[Tuple[int,int]], new_kv_cache_block_num: int):
         self.change_configuration_status = ChangeConfigurationType.ASYNC_CHANGING
         assert self.next_new_kv_cache_block_num == 0 
         assert self.next_pp_layer_config is None
         self.next_pp_layer_config = pp_layer_config
         self.next_new_kv_cache_block_num = new_kv_cache_block_num
+
+    def start_sending_slot_mapping(self) -> List[int]:
+        slot_mapping = self.get_slot_mapping_from_reqs(self.running)
+        self.sending_slot_mapping = True
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        if is_flexi:
+            self.num_tokens_for_migration = len(slot_mapping) 
+        return slot_mapping
+
+
+    def get_slot_mapping_from_reqs(self, reqs: Union[list[Request], list[NewRequestData]]):
+        slot_mapping = []
+        block_size = self.block_size
+        for req in reqs:
+            req_id = req.request_id
+            if req_id in self.kv_cache_manager.single_type_manager.req_to_blocks:
+                # get_block_ids returns list[list[int]], we want the first list
+                block_ids = self.kv_cache_manager.get_block_ids(req_id)[0]
+            else:
+                block_ids = []
+            
+            num_computed_tokens = int(req.num_computed_tokens)
+            
+            for i, block_id in enumerate(block_ids):
+                start_token_idx = i * block_size
+                assert start_token_idx <= num_computed_tokens
+                
+                valid_tokens = min(block_size, num_computed_tokens - start_token_idx)
+                base_slot = block_id * block_size
+                slot_mapping.extend(range(base_slot, base_slot + valid_tokens))
+        return slot_mapping
 
     def sync_change_configuration(self, pp_layer_config: List[Tuple[int,int]]):
         """
@@ -328,8 +362,12 @@ class DynamicScheduler(Scheduler):
                 pp_layer_config=pp_layer_config,
                 request_queue_id=id,
                 is_sync_after_migration=True if self.change_configuration_status == ChangeConfigurationType.ASYNC_CHANGING else False,
-                new_kv_cache_block_num=self.next_new_kv_cache_block_num
+                new_kv_cache_block_num=self.next_new_kv_cache_block_num,
+                # slot_mapping = self.get_slot_mapping_from_reqs(scheduler_output.scheduled_new_reqs) if self.sending_slot_mapping else None,
             )
+
+        if self.sending_slot_mapping:
+            self.num_tokens_for_migration += output.total_num_scheduled_tokens
 
         if self.change_configuration_status == ChangeConfigurationType.ASYNC_CHANGING:
             self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
@@ -343,6 +381,8 @@ class DynamicScheduler(Scheduler):
                 self.extend_block_pool(self.next_new_kv_cache_block_num)
             self.next_pp_layer_config = None
             self.next_new_kv_cache_block_num = 0
+            self.sending_slot_mapping = False
+            self.num_tokens_for_migration = 0
 
         if self.change_configuration_status == ChangeConfigurationType.SYNC_CHANGING:
             assert self.next_new_kv_cache_block_num == 0

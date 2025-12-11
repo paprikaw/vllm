@@ -994,3 +994,59 @@ def test_concat_and_cache_mla_cpu(
     ops.concat_and_cache_mla(kv_c, k_pe, kv_cache, slot_mapping,
                              kv_cache_dtype, scale)
     torch.testing.assert_close(kv_cache, ref_kv_cache)
+
+@pytest.mark.parametrize("num_tokens", [1, 83, 100])
+@pytest.mark.parametrize("num_heads", [16])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("num_blocks", [1000])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_flexi_gather_pages(
+    num_tokens: int,
+    num_heads: int,
+    head_size: int,
+    block_size: int,
+    num_blocks: int,
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    torch.set_default_device(device)
+    
+    # Create random pages
+    # Each page: [block_size, num_heads, head_size]
+    key_pages = [torch.randn(block_size, num_heads, head_size, dtype=dtype, device=device) for _ in range(num_blocks)]
+    value_pages = [torch.randn(block_size, num_heads, head_size, dtype=dtype, device=device) for _ in range(num_blocks)]
+    
+    # Prepare pointers
+    key_page_ptrs, value_page_ptrs = prepare_flexi_kv_ptrs(key_pages, value_pages)
+    
+    # Create slot mapping
+    # Map each token to a random slot in the available blocks
+    total_token = num_blocks * block_size
+    slot_mapping = torch.randint(0, total_token, (num_tokens,), dtype=torch.int64, device=device)
+    
+    # Output tensors
+    key_out = torch.empty(num_tokens, num_heads, head_size, dtype=dtype, device=device)
+    value_out = torch.empty(num_tokens, num_heads, head_size, dtype=dtype, device=device)
+    
+    # Run kernel
+    ops.flexi_gather_pages(key_page_ptrs, value_page_ptrs, slot_mapping, key_out, value_out, block_size)
+    
+    # Verification
+    expected_key_out = torch.empty_like(key_out)
+    expected_value_out = torch.empty_like(value_out)
+    for i in range(num_tokens):
+        slot = slot_mapping[i].item()
+        page_idx = slot // block_size
+        page_offset = slot % block_size
+        
+        expected_key_out[i] = key_pages[page_idx][page_offset]
+        expected_value_out[i] = value_pages[page_idx][page_offset]
+        
+    assert torch.allclose(key_out, expected_key_out, atol=1e-3, rtol=1e-3)
+    assert torch.allclose(value_out, expected_value_out, atol=1e-3, rtol=1e-3)
+    
+    # Cleanup
+    free_flexi_kv_ptrs(key_page_ptrs, value_page_ptrs)
+

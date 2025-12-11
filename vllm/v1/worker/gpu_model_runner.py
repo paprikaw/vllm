@@ -357,7 +357,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_ids_to_add: list[str] = []
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
-            req_id = new_req_data.req_id
+            req_id = new_req_data.request_id
             sampling_params = new_req_data.sampling_params
             if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
                 generator = torch.Generator(device=self.device)

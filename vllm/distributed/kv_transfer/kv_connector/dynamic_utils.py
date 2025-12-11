@@ -26,6 +26,9 @@ class KVSynchronizerMetadata(TypedDict, total=False):
 logger = init_logger(__name__)
 
 class KVPatchMeta(BaseModel):
+    # 注意，这里的num_tokens和slot_mapping_shape[0]可能不一样，
+    # 因为slot_mapping使用dirty标记无效位置，而num_tokens中有可能包括duplicate的位置。
+    # 我们需要num_tokens来知道实际有效的token数量，以便正确统计当前receiver已经apply的token数目。
     model_config = ConfigDict(arbitrary_types_allowed=True)
     type: Literal['kv_patch_meta', 'kv_patch_finished']
     id: int
@@ -44,6 +47,17 @@ class KVTensorMeta(BaseModel):
     num_tokens: int
     dtype: torch.dtype
     shape: torch.Size
+
+class FlexiKVTensorMeta(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    type: Literal['kv_tensor']
+    layer_to_be_received: set[int]
+    layer_id: int
+    num_tokens: int
+    slot_mapping_dtype: torch.dtype
+    slot_mapping_shape: torch.Size
+    kv_payload_dtype: torch.dtype
+    kv_payload_shape: torch.Size
 
 class KVPatch:
     def __init__(self, meta: KVPatchMeta, kv_payload: torch.Tensor, slot_mapping: torch.Tensor):

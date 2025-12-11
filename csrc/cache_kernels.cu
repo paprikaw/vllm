@@ -315,7 +315,7 @@ __global__ void flexi_reshape_and_cache_flash_kernel(
     const int64_t cached_k_ptrs_addr,  // Address of cache_t** (pointer array)
     const int64_t cached_v_ptrs_addr,  // Address of cache_t** (pointer array)
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
-    const int64_t page_stride,    // stride within a block to move to next token
+    const int64_t token_stride,    // stride within a block to move to next token
     const int64_t head_stride,    // stride within a token to move to next head
     const int64_t key_stride,     // stride in input key tensor
     const int64_t value_stride,   // stride in input value tensor
@@ -346,7 +346,7 @@ __global__ void flexi_reshape_and_cache_flash_kernel(
     const int head_offset = i % head_size;
     
     // Offset within the block (no block_stride needed since we already have block pointer)
-    const int64_t tgt_key_value_idx = block_offset * page_stride +
+    const int64_t tgt_key_value_idx = block_offset * token_stride +
                                       head_idx * head_stride + head_offset;
     
     scalar_t tgt_key = key[src_key_idx];
@@ -361,6 +361,56 @@ __global__ void flexi_reshape_and_cache_flash_kernel(
       v_block[tgt_key_value_idx] =
           fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_value, *v_scale);
     }
+  }
+}
+
+template <typename scalar_t>
+__global__ void flexi_gather_pages_kernel(
+    // Array of pointers passed as int64_t for easier PyTorch binding
+    // Each element is a pointer to a block: [block_size, num_heads, head_size]
+    const int64_t key_page_cache_ptr,  // List of blocks, for each block: [block_size,
+                             // num_heads, head_size]
+    const int64_t value_page_cache_ptr,  // List of blocks, for each block: [block_size,
+                             // num_heads, head_size]
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    scalar_t* __restrict__ key_out, // [num_tokens, num_heads, head_size]
+    scalar_t* __restrict__ value_out, // [num_tokens, num_heads, head_size]
+    const int64_t token_stride,    // stride within a block to move to next token
+    const int64_t head_stride,    // stride within a token to move to next head
+    const int num_heads, const int head_size,
+    const int page_size) {
+
+  // Block Level Variables
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  // NOTE: slot_idx can be -1 if the token is padded
+  if (slot_idx < 0) {
+    return;
+  }
+  const int64_t page_idx = slot_idx / page_size;
+  const int64_t page_offset = slot_idx % page_size;
+  
+  // Convert int64_t addresses back to pointer arrays
+  scalar_t** key_page_ptrs = reinterpret_cast<scalar_t**>(key_page_cache_ptr);
+  scalar_t** value_page_ptrs = reinterpret_cast<scalar_t**>(value_page_cache_ptr);
+  
+  // Get the base pointer for this block
+  scalar_t* key_page_ptr = key_page_ptrs[page_idx];
+  scalar_t* value_page_ptr = value_page_ptrs[page_idx];
+  
+  // Thread Level Iteration
+  const int n = num_heads * head_size;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const int64_t output_index = token_idx * token_stride + i;
+
+    const int head_idx = i / head_size;
+    const int head_offset = i % head_size;
+    // Offset within the block (no block_stride needed since we already have block pointer)
+    const int64_t src_idx = page_offset * token_stride +
+                                      head_idx * head_stride + head_offset;
+    
+    key_out[output_index] = key_page_ptr[src_idx];
+    value_out[output_index] = value_page_ptr[src_idx];
   }
 }
 
@@ -555,6 +605,52 @@ void flexi_reshape_and_cache_flash(
                              CALL_FLEXI_RESHAPE_AND_CACHE_FLASH);
 }
 
+// KV_T is the data type of key and value tensors.
+// CACHE_T is the stored data type of kv-cache.
+// KV_DTYPE is the real data type of kv-cache.
+#define CALL_FLEXI_GATHER_PAGES(KV_T)      \
+  vllm::flexi_gather_pages_kernel<KV_T>    \
+      <<<grid, block, 0, stream>>>(                 \
+          key_page_ptrs, value_page_ptrs,           \
+          slot_mapping.data_ptr<int64_t>(),         \
+          reinterpret_cast<KV_T*>(key_out.data_ptr()), \
+          reinterpret_cast<KV_T*>(value_out.data_ptr()), \
+          token_stride, head_stride, num_heads, head_size, block_size);
+
+
+// Flexible version that accepts pointer arrays for non-contiguous blocks
+void flexi_gather_pages(
+    // Array of pointers passed as int64_t for easier PyTorch binding
+    // Each element is a pointer to a block: [block_size, num_heads, head_size]
+    const int64_t key_page_ptrs,  // List of blocks, for each block: [block_size,
+                             // num_heads, head_size]
+    const int64_t value_page_ptrs,  // List of blocks, for each block: [block_size,
+                             // num_heads, head_size]
+    const torch::Tensor& slot_mapping,  // [num_tokens]
+    const torch::Tensor& key_out, // [num_tokens, num_heads, head_size]
+    const torch::Tensor& value_out, // [num_tokens, num_heads, head_size]
+    int64_t block_size) {
+
+  int num_tokens = slot_mapping.size(0);
+  int num_heads = key_out.size(1);
+  int head_size = key_out.size(2);
+
+  // Assuming standard layout in the cache blocks: [block_size, num_heads, head_size]
+  int64_t head_stride = head_size;
+  int64_t token_stride = num_heads * head_size;
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(num_heads * head_size, 512));
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key_out));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // Dispatch. Assuming cache type matches output type for now as no dtype arg.
+  VLLM_DISPATCH_FLOATING_AND_BYTE_TYPES(
+    key_out.scalar_type(), "flexi_gather_pages_kernel", ([&] {
+      CALL_FLEXI_GATHER_PAGES(scalar_t);
+    }));
+}
 // KV_T is the data type of key and value tensors.
 // CACHE_T is the stored data type of kv-cache.
 // KV_DTYPE is the real data type of kv-cache.

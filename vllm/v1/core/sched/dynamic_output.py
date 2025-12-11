@@ -65,7 +65,8 @@ class DynamicSchedulerOutput():
     
     # Whether the scheduling output is from before the migration was started.  
     request_queue_id: int
-
+    
+#     slot_mapping: Optional[list[int]] = None
     # the bitmask for the whole batch
     grammar_bitmask: Optional[npt.NDArray[np.int32]]
 

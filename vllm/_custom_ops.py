@@ -1583,6 +1583,18 @@ def flexi_reshape_and_cache_flash(
                                                    kv_cache_dtype, k_scale,
                                                    v_scale)
 
+def flexi_gather_pages(
+    key_page_ptrs: int,
+    value_page_ptrs: int,
+    slot_mapping: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    block_size: int,
+) -> None:
+    torch.ops._C_cache_ops.flexi_gather_pages(key_page_ptrs, value_page_ptrs,
+                                              slot_mapping, key_out, value_out,
+                                              block_size)
+
 def concat_and_cache_mla(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,

@@ -153,6 +153,11 @@ class DynamicEngineCore(EngineCore):
 
         self.scheduler_kv_cache_config: Optional[KVCacheConfig]
 
+        # This variable is used to keep track of how many token that needs
+        # to be applied to the new kv cache after migration
+        self.tokens_to_be_applied = 0
+
+        
     def _estimate_max_blocks_per_layer(self, gpu_total_memory: int, memory_after_adding_weight: int, num_layers_on_rank: int, block_size: int) -> int:
         safe_margin = (1 - self.vllm_config.cache_config.gpu_memory_utilization) * gpu_total_memory
         memory_after_adding_weight -=  math.ceil(safe_margin)
@@ -648,31 +653,55 @@ class DynamicEngineCore(EngineCore):
                     plan = src_to_plan.setdefault(src_rank, {})
                     layer_ids = plan.setdefault(dst_rank, [])
                     layer_ids.extend(range(lo, hi + 1))
-
-            self.model_executor.start_kv_cache_migration_async(src_to_plan)
+            with self.engine_lock:
+                time_before_slot_mapping_calculation = time.time() 
+                slot_mapping = self.scheduler.start_sending_slot_mapping()
+                logger.info(f"time taken to generate slot mapping:{human_readable_duration(time.time() - time_before_slot_mapping_calculation)}")
+                self.model_executor.start_kv_cache_migration_async(src_to_plan, slot_mapping)
             time_kv_migration_end = time.time()
+
             logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
-        
-        def check_patch_sending_process():
-            assert isinstance(self.scheduler, DynamicScheduler)
+
+        def sync_by_checking_buffer_status() -> bool:
             token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 1024))
+            should_sync = True
+            assert isinstance(self.model_executor, DynamicRayDistributedExecutor) 
+            buffer_status_list = self.model_executor.get_kv_buffer_status()
+            logger.info(f"buffer_status_list: {buffer_status_list}")
+            for src_rank, rank_to_layers_ids in src_to_plan.items():
+                src_rank_buffer_status = buffer_status_list[src_rank]
+                for dst_rank, _ in rank_to_layers_ids.items():
+                    sender_token_number = src_rank_buffer_status.used_tokens[dst_rank]
+                    if sender_token_number > token_to_send_threshold:
+                        should_sync = False
+                        break
+                if not should_sync:
+                    break
+            return should_sync
+
+        def sync_by_checking_leftover_tokens() -> bool:
+            token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 128))
+            assert isinstance(self.model_executor, DynamicRayDistributedExecutor) 
+            assert isinstance(self.scheduler, DynamicScheduler)
+            applied_token_list = self.model_executor.get_applied_token_num()
+            logger.info(f"applied_token_list: {applied_token_list}")
+            logger.info(f"num of tokens for migration: {self.scheduler.num_tokens_for_migration}")
+            lag = [self.scheduler.num_tokens_for_migration - min(applied_tokens) for applied_tokens in applied_token_list]
+            logger.info(f"lag between sent and applied tokens: {lag}")
+            return max(lag) < token_to_send_threshold
+            
+        def check_patch_sending_process():
+            '''
+            Docstring for check_patch_sending_process
+            This function checks the patch sending process and synchronize the kv cache when all tokens in the sender to be sent are less than the threshold
+            '''
+            assert isinstance(self.scheduler, DynamicScheduler)
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
             time_start = time.time()
             while True:
                 time.sleep(0.3)
-                should_sync = True
-                buffer_status_list = self.model_executor.get_kv_buffer_status()
-                logger.info(f"buffer_status_list: {buffer_status_list}")
-                for src_rank, rank_to_layers_ids in src_to_plan.items():
-                    src_rank_buffer_status = buffer_status_list[src_rank]
-                    for dst_rank, _ in rank_to_layers_ids.items():
-                        sender_token_number = src_rank_buffer_status.used_tokens[dst_rank]
-                        if sender_token_number > token_to_send_threshold:
-                            should_sync = False
-                            break
-                    if not should_sync:
-                        break
-                
+
+                should_sync = sync_by_checking_leftover_tokens()
                 final_pp_layer_config = deepcopy(tmp_pp_layer_config)
                 if should_sync:
                     deleting_layer_assesses: list[int] = []

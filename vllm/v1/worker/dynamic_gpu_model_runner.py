@@ -13,16 +13,18 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+from vllm._custom_ops import flexi_reshape_and_cache_flash
 from vllm.attention.dynamic_layer import FlexiAttention
 from vllm.attention.layer import Attention
 from vllm.attention import AttentionType
 from vllm.config import (get_layers_from_vllm_config)
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
+from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import FlexiKVTensorMeta
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.sampling_params import SamplingType
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-from vllm.v1.utils import flexi_bind_kv_cache, human_readable_size, human_readable_duration
+from vllm.v1.utils import dynamic_bind_kv_cache, dynamic_flexi_bind_kv_cache, human_readable_size, human_readable_duration
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (LazyLoader)
@@ -31,7 +33,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         SlidingWindowSpec)
 from vllm.v1.utils import extract_layer_index
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.utils import bind_kv_cache
+from vllm.v1.utils import dynamic_bind_kv_cache, dynamic_bind_single_kv_tensor, dynamic_flexi_bind_single_kv_tensor
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.forward_context import get_forward_context
@@ -74,6 +76,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             kv_cache_specs: dict[str, KVCacheSpec],
             kv_cache_size: int,
             kv_cache_num_blocks: int,
+            kv_synchronizer: DynamicKVSynchronizer,
             layers: Tuple[int, int],
             ) -> None:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
@@ -82,7 +85,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         kv_caches: dict[str, torch.Tensor] = {} 
         logger.info(f"kv_cache_specs: {kv_cache_specs}")
         for layer_name, kv_cache_spec in kv_cache_specs.items():
-                if extract_layer_index(layer_name) not in range(layers[0], layers[1]+1):
+                layer_index = extract_layer_index(layer_name)
+                if layer_index not in range(layers[0], layers[1]+1):
                     continue
                 assert kv_cache_size % kv_cache_spec.page_size_bytes == 0
                 num_blocks = kv_cache_size // kv_cache_spec.page_size_bytes
@@ -96,7 +100,16 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     kv_caches[layer_name] = torch.zeros(kv_cache_shape,
                                                         dtype=dtype,
                                                         device=self.device)
-                    self.bind_layer_kv_tensor(extract_layer_index(layer_name), kv_caches[layer_name])
+                    dynamic_bind_single_kv_tensor(
+                        layer_index=layer_index,
+                        start_layer=self.model.model.start_layer,
+                        end_layer=self.model.model.end_layer,
+                        kv_caches=self.kv_caches,
+                        forward_context=self.vllm_config.compilation_config.static_forward_context,
+                        kv_synchronizer=kv_synchronizer,
+                        kv_tensor=kv_caches[layer_name],
+                        group=self.kv_cache_config.kv_cache_groups[0]
+                    )
                 else:
                     # TODO: add new branches when introducing more types of
                     # KV cache specs.
@@ -132,7 +145,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 logger.exception(f"Error in execute_model: {e}")
                 for request in scheduler_output.scheduled_new_reqs:
                     for block_id in request.block_ids:
-                        logger.info(f"request {request.req_id} block id list: {block_id}")
+                        logger.info(f"request {request.request_id} block id list: {block_id}")
                 time.sleep(1)
                 raise
             return result
@@ -210,66 +223,107 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     f"Unknown attention type: {attn_module.attn_type}")
         return kv_cache_spec
 
-    def get_layer_name_for_index(self, layer_index: int) -> str:
-        """Return the layer name in forward_context for a given global layer index.
 
-        Raises KeyError if not found or ambiguous.
-        """
-        forward_context = self.vllm_config.compilation_config.static_forward_context
-        candidates = [name for name in forward_context.keys()
-                      if extract_layer_index(name) == layer_index]
-        if not candidates:
-            raise KeyError(f"No layer name found for index {layer_index} in forward_context")
-        if len(candidates) > 1:
-            raise KeyError(f"Multiple layer names found for index {layer_index}: {candidates}")
-        return candidates[0]
+    # def bind_layer_kv_tensor(self, layer_index: int, kv_tensor: torch.Tensor) -> None:
+    #     """Bind a single layer's KV tensor to runner caches and forward context.
 
-    def bind_layer_kv_tensor(self, layer_index: int, kv_tensor: torch.Tensor) -> None:
-        """Bind a single layer's KV tensor to runner caches and forward context.
+    #     - 更新本 runner 的 `self.kv_caches`
+    #     - 将 forward context 中对应 Attention 的 `kv_cache[ve]` 指向该张量
+    #     - 如有必要，补齐 kv_cache_config 的 layer_names，确保后续 attn_metadata 构建覆盖到该层
 
-        - 更新本 runner 的 `self.kv_caches`
-        - 将 forward context 中对应 Attention 的 `kv_cache[ve]` 指向该张量
-        - 如有必要，补齐 kv_cache_config 的 layer_names，确保后续 attn_metadata 构建覆盖到该层
+    #     线程安全：内部获取 forward_lock。
+    #     """
+    #     if not isinstance(self.model, DynamicQwen3ForCausalLM):
+    #         raise AssertionError(
+    #             f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+    #     # Determine local index in runner kv cache list
+    #     start_layer: int = self.model.model.start_layer
+    #     end_layer: int = self.model.model.end_layer
+    #     assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
 
-        线程安全：内部获取 forward_lock。
-        """
-        if not isinstance(self.model, DynamicQwen3ForCausalLM):
-            raise AssertionError(
-                f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
-        # Determine local index in runner kv cache list
-        start_layer: int = self.model.model.start_layer
-        end_layer: int = self.model.model.end_layer
-        assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
+    #     local_index = layer_index - start_layer
+    #     assert local_index < len(self.kv_caches), f"Local index {local_index} is out of range, kv_tensor length: {len(self.kv_caches)}"
+    #     logger.info(f"bind kv tensor for {layer_index}, local_index={local_index}, kv_tensor length: {len(self.kv_caches)}")
+    #     # Basic sanity: non-empty tensor
+    #     assert isinstance(kv_tensor, torch.Tensor) and kv_tensor.numel() > 0, (
+    #         f"Binding empty KV tensor for layer {layer_index}")
+    #     self.kv_caches[local_index] = kv_tensor
+    #     # Bind to forward context
+    #     layer_name: str = self.get_layer_name_for_index(layer_index)
+    #     fctx: dict[str, "Attention"] = \
+    #         self.vllm_config.compilation_config.static_forward_context
+    #     if layer_name not in fctx:
+    #         raise KeyError(
+    #             f"No attention layer named {layer_name} in forward_context.")
 
-        local_index = layer_index - start_layer
-        assert local_index < len(self.kv_caches), f"Local index {local_index} is out of range, kv_tensor length: {len(self.kv_caches)}"
-        logger.info(f"bind kv tensor for {layer_index}, local_index={local_index}, kv_tensor length: {len(self.kv_caches)}")
-        # Basic sanity: non-empty tensor
-        assert isinstance(kv_tensor, torch.Tensor) and kv_tensor.numel() > 0, (
-            f"Binding empty KV tensor for layer {layer_index}")
-        self.kv_caches[local_index] = kv_tensor
-        # Bind to forward context
-        layer_name: str = self.get_layer_name_for_index(layer_index)
-        fctx: dict[str, "Attention"] = \
-            self.vllm_config.compilation_config.static_forward_context
-        if layer_name not in fctx:
-            raise KeyError(
-                f"No attention layer named {layer_name} in forward_context.")
+    #     attn_module = fctx[layer_name]
+    #     attn_module.kv_cache = [kv_tensor]
 
-        attn_module = fctx[layer_name]
-        attn_module.kv_cache = [kv_tensor]
+    #     # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
+    #     group = self.kv_cache_config.kv_cache_groups[0]
+    #     if layer_name not in group.layer_names:
+    #         # 按 layer_index 位置插入，保持有序
+    #         insert_idx = len(group.layer_names)
+    #         target_idx = extract_layer_index(layer_name)
+    #         for i, name in enumerate(group.layer_names):
+    #             if extract_layer_index(name) > target_idx:
+    #                 insert_idx = i
+    #                 break
+    #         group.layer_names.insert(insert_idx, layer_name)
 
-        # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
-        group = self.kv_cache_config.kv_cache_groups[0]
-        if layer_name not in group.layer_names:
-            # 按 layer_index 位置插入，保持有序
-            insert_idx = len(group.layer_names)
-            target_idx = extract_layer_index(layer_name)
-            for i, name in enumerate(group.layer_names):
-                if extract_layer_index(name) > target_idx:
-                    insert_idx = i
-                    break
-            group.layer_names.insert(insert_idx, layer_name)
+    # def flexi_bind_layer_kv_tensor(self, layer_index: int, kv_tensor: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+    #     """Bind a single layer's KV tensor to runner caches and forward context.
+
+    #     - 更新本 runner 的 `self.kv_caches`
+    #     - 将 forward context 中对应 Attention 的 `kv_cache[ve]` 指向该张量
+    #     - 如有必要，补齐 kv_cache_config 的 layer_names，确保后续 attn_metadata 构建覆盖到该层
+
+    #     线程安全：内部获取 forward_lock。
+    #     """
+    #     if not isinstance(self.model, DynamicQwen3ForCausalLM):
+    #         raise AssertionError(
+    #             f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+    #     # Determine local index in runner kv cache list
+    #     start_layer: int = self.model.model.start_layer
+    #     end_layer: int = self.model.model.end_layer
+    #     assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
+    #     local_index = layer_index - start_layer
+    #     assert len(self.key_caches) == len(self.value_caches) == len(self.key_cache_ptrs) == len(self.value_cache_ptrs), "key_caches and value_caches length mismatch"
+    #     assert local_index < len(self.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(self.key_caches)}"
+    #     logger.info(f"bind kv tensor for {layer_index}, local_index={local_index}, kv_tensor length: {len(self.key_caches)}")
+
+    #     key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr = self._get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping, kv_tensor)
+
+    #     self.key_caches[local_index] = key_cache_list
+    #     self.value_caches[local_index] = value_cache_list
+    #     self.key_cache_ptrs[local_index] = key_cache_ptr
+    #     self.value_cache_ptrs[local_index] = value_cache_ptr
+
+    #     # Bind to forward context
+    #     layer_name: str = self.get_layer_name_for_index(layer_index)
+    #     fctx: dict[str, "Attention"] = \
+    #         self.vllm_config.compilation_config.static_forward_context
+    #     if layer_name not in fctx:
+    #         raise KeyError(
+    #             f"No attention layer named {layer_name} in forward_context.")
+    #     attn_module = fctx[layer_name]
+    #     assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
+    #     attn_module.key_cache = key_cache_list
+    #     attn_module.value_cache = value_cache_list
+    #     attn_module.key_dev_ptr = key_cache_ptr
+    #     attn_module.value_dev_ptr = value_cache_ptr
+
+    #     # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
+    #     group = self.kv_cache_config.kv_cache_groups[0]
+    #     if layer_name not in group.layer_names:
+    #         # 按 layer_index 位置插入，保持有序
+    #         insert_idx = len(group.layer_names)
+    #         target_idx = extract_layer_index(layer_name)
+    #         for i, name in enumerate(group.layer_names):
+    #             if extract_layer_index(name) > target_idx:
+    #                 insert_idx = i
+    #                 break
+            # group.layer_names.insert(insert_idx, layer_name)
 
     def has_layer(self, layer_index: int) -> bool:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
@@ -302,7 +356,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 assert len(layers) == 2
                 loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model)
 
-    def reinitialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+    def reinitialize_kv_cache(self, kv_cache_config: KVCacheConfig, kv_synchronizer: DynamicKVSynchronizer) -> None:
         """
         Copied from initialize_kv_cache() but only called when reinitialize the kv cache.
         The only difference is that we don't need to initialize the attention backend again.
@@ -352,10 +406,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
-        bind_kv_cache(
+        dynamic_bind_kv_cache(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches)
+            self.kv_caches,
+            kv_synchronizer=kv_synchronizer)
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
@@ -388,7 +443,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
             logger.info(f"kv_caches[{i}] shape: {self.kv_caches[i].shape}")
         logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
-    def dynamic_initialize_kv_cache(self, kv_cache_config: KVCacheConfig, num_blocks: int) -> None:
+    def dynamic_initialize_kv_cache(self, 
+                                    kv_cache_config: KVCacheConfig, 
+                                    dynamic_kv_synchronizer: DynamicKVSynchronizer,
+                                    num_blocks: int
+                                    ) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
         Args:
@@ -428,17 +487,19 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
-        bind_kv_cache(
+        dynamic_bind_kv_cache(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches)
+            self.kv_caches,
+            dynamic_kv_synchronizer
+            )
         del kv_caches
         logger.info(f"debug---------------- init kv cache done, kv block num: {len(self.kv_caches[0][0])}")
         if has_kv_transfer_group():
             assert False
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
-    def dynamic_initialize_kv_cache_flexi(self, kv_cache_config: KVCacheConfig, num_blocks: int) -> None:
+    def dynamic_initialize_kv_cache_flexi(self, kv_cache_config: KVCacheConfig, kv_synchronizer: DynamicKVSynchronizer, num_blocks: int) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
         Args:
@@ -486,16 +547,18 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
         
-        flexi_bind_kv_cache(
+        dynamic_flexi_bind_kv_cache(
             key_caches,
             value_caches,
             key_cache_ptrs,
             value_cache_ptrs,
             self.vllm_config.compilation_config.static_forward_context,
+            kv_synchronizer,
             self.key_caches,
             self.value_caches,
             self.key_cache_ptrs,
-            self.value_cache_ptrs)
+            self.value_cache_ptrs
+        )
         del kv_caches
         if has_kv_transfer_group():
             assert False
@@ -754,6 +817,31 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # Sync model start if left-padded
         if new_start != start_layer:
             self.model.model.start_layer = new_start
+    
+    def get_flexi_kv_cache_from_gathered_kv_tensor(self, slot_mapping: torch.Tensor, 
+                                 gathered_kv_tensor: torch.Tensor,
+                                 ) -> Tuple[list[torch.Tensor], list[torch.Tensor], int, int]:
+        '''
+        Based on current kv cache list shape and dtype, we allocate a new kv cache list
+        and extract the data from gathered_kv_tensor to the new kv cache list.
+        after that, we also flush the new kv cache to GPU ptrs.
+        '''
+        block_num = len(self.key_caches)
+        kv_cache_shape = self.kv_cache_shape
+        assert len(kv_cache_shape) == 5 # (2, nkvblocks, blockdim, n_head, headdim)
+        block_shape = kv_cache_shape[2:]
+        kv_dtype = self.kv_cache_dtype
+
+        key_cache, value_cache = get_flexi_kv_cache(block_num, block_shape, kv_dtype, self.device)
+        key_cache_list_ptr, value_cache_list_ptr = prepare_flexi_kv_ptrs(key_cache, value_cache) 
+
+        dummy_scale = torch.tensor(1.0, device=self.device, dtype=torch.float32)
+        assert gathered_kv_tensor.shape[2:] == kv_cache_shape[2:]
+
+        flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_list_ptr,value_cache_list_ptr,  key_cache[0], value_cache[0], slot_mapping,"auto", dummy_scale, dummy_scale)
+
+        return key_cache, value_cache, key_cache_list_ptr, value_cache_list_ptr
+
 
 # def bind_kv_cache_for_layers(
 #     start_layer_index: int,

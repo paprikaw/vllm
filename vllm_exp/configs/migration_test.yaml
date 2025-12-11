@@ -30,7 +30,7 @@ projects:
         - "12,52"
     migration:
       is_migration: true
-      migration_steps: [120]
+      migration_steps: [70]
       alternative_configs:
         "0": [12, 52]
         "1": [32, 32]

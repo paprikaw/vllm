@@ -75,7 +75,7 @@ def _schedule_new_request(*req_ids: str) -> SchedulerOutput:
     for req_id in req_ids:
         new_reqs.append(
             NewRequestData(
-                req_id=req_id,
+                request_id=req_id,
                 prompt_token_ids=[1, 2, 3],
                 mm_inputs=[],
                 mm_hashes=[],

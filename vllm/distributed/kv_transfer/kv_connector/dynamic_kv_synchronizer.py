@@ -8,15 +8,18 @@ MooncakePipe.
 
 But the logic can be extended to support other pipe and lookup buffer.
 """
-from typing import TYPE_CHECKING, Optional, Union, Dict, Tuple, Literal
+from typing import TYPE_CHECKING, Generator, Optional, Union, Dict, Tuple, Literal
 import threading
 import os
 
+import bitarray
 import torch
 from pydantic import TypeAdapter
+from vllm import _custom_ops as ops
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import (
+    FlexiKVTensorMeta,
     kv_synchronizer_helper as kv_helper,
     KVPatch,
     KVPatchMeta,
@@ -84,6 +87,35 @@ class KVPatchBuffer:
             self._cv.notify_all()
             return patch
 
+class KVSlotMapping:
+    def __init__(self, size: int):
+        self.bitmap = bitarray.bitarray(size)
+        self.bitmap.setall(0)
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self.is_finished = False
+        self.stored_tokens = 0
+
+    def add_slot_mappings(self, slot_mapping: list[int], is_finished: bool) -> None:
+        with self._cv:
+            self.bitmap[slot_mapping] = 1
+            self.is_finished = is_finished
+            self.stored_tokens += len(slot_mapping)
+            self._cv.notify_all()
+
+    def get_all_slot_mappings(self) -> Tuple[list[int], bool, int]:
+        with self._cv:
+            while self.bitmap.count() == 0:
+                self._cv.wait()
+            assert not self.is_finished
+
+            slot_mapping = self.bitmap.search(bitarray.bitarray('1'))
+            stored_tokens = self.stored_tokens
+            is_finished = self.is_finished
+
+            self.bitmap.setall(0)
+            self.stored_tokens = 0
+        return list(slot_mapping), is_finished, stored_tokens
 
 class PairPipe:
     """A minimal 1:1 NCCL pipe between two actors (world_size=2).
@@ -131,7 +163,7 @@ class PairPipe:
         assert dtype is not None and shape is not None
         return torch.empty(shape, dtype=dtype, device=self.device)
 
-    def send_obj(self, obj: Union[KVTensorMeta, KVPatchMeta]) -> None:
+    def send_obj(self, obj: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]) -> None:
         self.meta_group.send_obj(obj, dst=self.peer_rank)
 
     def recv_obj(self) -> Union[KVTensorMeta, KVPatchMeta]:
@@ -211,7 +243,7 @@ class DynamicKVSynchronizer():
     ):
 
         # 使用专门的 LayerKVConnector 配置
-        self._vllm_config = config
+        self.vllm_config = config
         self.config = config.layer_kv_connector_config
         self.kv_helper = kv_helper(config)
         self.kv_synchronizer_helper = kv_helper(config)
@@ -226,11 +258,12 @@ class DynamicKVSynchronizer():
         self._pair_pipes_send: Dict[int, PairPipe] = {}
         self._pair_pipes_recv: Dict[int, PairPipe] = {}
         self.buffers: Dict[int, KVPatchBuffer] = {}
+        self.slot_mappings: Dict[int, KVSlotMapping] = {}
         # Pydantic adapters for control metadata
         self._control_adapter = TypeAdapter(Union[KVTensorMeta,
                                                   KVPatchMeta])
 
-        pp_size = int(self._vllm_config.parallel_config.pipeline_parallel_size)
+        pp_size = int(self.vllm_config.parallel_config.pipeline_parallel_size)
         # 目前这个是每一个synchronizer对应一个buffer，后续可能可以共享buffer
         self.kv_cache_transfer_in_process: dict[int, bool] = {} 
         self.last_patch_ids: Dict[int, int] = {} # rank -> patch_id
@@ -242,13 +275,18 @@ class DynamicKVSynchronizer():
 
         self.sending_synchronizer_lock = threading.Lock()
         self.recv_synchronizer_lock = threading.Lock()
-        self.kv_patch_sending = False
         # Eagerly initialize NCCL pipes for all peers (both directions).
         # This avoids first-use latency and surfaces connectivity issues early.
         try:
             self._initialize_all_pipes()
         except Exception:
             logger.exception("Eager NCCL link initialization failed; will retry lazily on demand.")
+
+        self.kv_caches = []
+        self.key_cache_list = []
+        self.value_cache_list = []
+        self.key_cache_ptrs = []
+        self.value_cache_ptrs = []
 
     def _initialize_all_pipes(self) -> None:
         """Initialize send/recv pipes to all peer ranks upfront.
@@ -258,7 +296,7 @@ class DynamicKVSynchronizer():
         Also marks peers as having no pending patches initially.
         """
         # Determine world size from vLLM parallel configuration (PP ranks).
-        pp_size = int(self._vllm_config.parallel_config.pipeline_parallel_size)
+        pp_size = int(self.vllm_config.parallel_config.pipeline_parallel_size)
 
         for peer in range(pp_size):
             if peer == self.rank:
@@ -327,7 +365,7 @@ class DynamicKVSynchronizer():
             logger.info(f"initilizing {direction} from rank {self.rank} to rank {peer_rank}")
             logger.info(f"----------------debug start to initialize {direction} from rank {self.rank} to rank {peer_rank}")
             # 设备检查
-            base_device = self._vllm_config.device_config.device
+            base_device = self.vllm_config.device_config.device
             assert isinstance(base_device, torch.device)
             assert base_device.type == "cuda"
             device = torch.device("cuda", self.local_rank)
@@ -354,7 +392,7 @@ class DynamicKVSynchronizer():
                 self._pair_pipes_recv[peer_rank] = pipe
             return pipe
 
-    def _send_meta_to_rank(self, rank: int, meta: Union[KVTensorMeta, KVPatchMeta]) -> None:
+    def _send_meta_to_rank(self, rank: int, meta: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]) -> None:
         pipe = self._ensure_pipe_and_buffer(rank, 'send')
         pipe = self._pair_pipes_send[rank]
         pipe.send_obj(meta)
@@ -419,7 +457,10 @@ class DynamicKVSynchronizer():
     def get_send_pipe(self, rank: int) -> PairPipe:
         self._ensure_pipe_and_buffer(rank, 'send')
         return self._pair_pipes_send[rank]
-
+    
+    # ########################################## #
+    # Sender side functions                      #
+    # ########################################## #
     def start_kv_tensor_transfer_sync(self, rank_to_layers_ids: dict[int, list[int]], kv_caches: list[torch.Tensor],
                               start_layer_id: int) -> None:
         """Send layers' KV cache to a peer rank.
@@ -457,7 +498,7 @@ class DynamicKVSynchronizer():
                 type='kv_patch_meta',
                 id=0,
                 layer_ids=layer_ids,
-                num_tokens=int(kv_cache.size(0)),
+                num_tokens=int(kv_caches[0].size(0)),
                 slot_mapping_dtype=torch.int64,
                 slot_mapping_shape=torch.Size([]),
                 kv_payload_dtype=torch.int64,
@@ -465,67 +506,153 @@ class DynamicKVSynchronizer():
             )
 
         return None
-        
-    def start_kv_tensor_transfer_async(self, rank_to_layers_ids: dict[int, list[int]], kv_caches: list[torch.Tensor],
-                              start_layer_id: int) -> None:
-        """Send layers' KV cache to a peer rank.
-            In each of the migration process, this function should only be called once.
-        Args:
-            rank: peer global rank to send to.
-            kv_cache: tensor to send (GPU or CPU tensor; will be moved to local GPU).
-            start_layer_id: which layer this KV cache belongs to (for receiver to demux).
-            layer_ids: which layers this KV cache belongs to (for receiver to demux).
-        """
-        assert all(transfer_in_process == False for transfer_in_process in self.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
-        assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
-        for rank, layer_ids in rank_to_layers_ids.items():
-            for layer_id in layer_ids:
-                time_start = time.time()
-                local_layer_id = layer_id - start_layer_id
-                kv_cache = kv_caches[local_layer_id]
-                # 第一次访问时默认置为 False，避免 KeyError
-                logger.info(f"[debug]: start to send kv tensor meta to rank {rank} for layer {layer_id}, kv_cache shape: {kv_cache.shape}")
-                self._send_meta_to_rank(rank, KVTensorMeta(
-                    type='kv_tensor',
-                    layer_to_be_received=set(layer_ids),
-                    layer_id=int(layer_id),
-                    num_tokens=int(kv_cache.size(0)),
-                    dtype=kv_cache.dtype,
-                    shape=kv_cache.shape))
 
-                logger.info(f"[timeline]: send kv tensor meta to rank {rank} for layer {layer_id}, time taken: {time.time() - time_start}")
-                # 使用同步发送，确保数据传输完成后再继续
-                self._send_data_to_rank(rank, kv_cache, synchronize=True)
-                logger.info(f"[timeline]: send kv tensor payload to rank {rank} for layer {layer_id}, time taken: {time.time() - time_start}, data_size: {kv_cache.numel() * kv_cache.element_size() / 1024 ** 2:.2f}MB")
-                self.kv_cache_transfer_in_process[rank] = True
-                del kv_cache
-        del kv_caches
-        logger.info(f"[debug]: finished sending kv tensor, start to send kv patch")
+    # ########################################## #
+    # Sender side functions                      #
+    # ########################################## #
+
+    def get_kv_patch(self, rank: int, start_layer_id: int, layer_ids: list[int]) -> Generator[KVPatch]:
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        if is_flexi:
+            return self._flexi_get_patch(rank,
+                                        layer_ids=layer_ids,
+                                        kv_cache_meta=self.key_cache_list[0][0],
+                                        cache_size=len(self.key_cache_list[0]),
+                                        key_cache_ptrs=self.key_cache_ptrs,
+                                        value_cache_ptrs=self.value_cache_ptrs,
+                                        start_layer_id=start_layer_id)
+        else:
+            return self._buffer_get_kv_patch(rank)
+
+    def _buffer_get_kv_patch(self, rank: int) -> Generator[KVPatch]:
         # 在发送完kv tensor之后开始发送kv patch
         while True:
-            time_start = time.time()
             kv_patch = self.buffers[rank].pop_patch()
-            self._send_meta_to_rank(rank, kv_patch.meta)
-            self._send_data_to_rank(rank, kv_patch.slot_mapping, synchronize=True, wait_for_ack=True)
-            self._send_data_to_rank(rank, kv_patch.kv_payload, synchronize=True, wait_for_ack=True)
-            self.kv_patch_sending = True
-            patch_payload_size = kv_patch.kv_payload.numel() * kv_patch.kv_payload.element_size()
-            patch_slot_mapping_size = kv_patch.slot_mapping.numel() * kv_patch.slot_mapping.element_size()
-            logger.info(f"[timeline]: send kv patch to rank {rank}, time taken: {time.time() - time_start}, data_size: {patch_slot_mapping_size / 1024 ** 2:.2f}MB + {patch_payload_size / 1024 ** 2:.2f}MB")
-            if kv_patch.meta.type == "kv_patch_finished":
-                logger.info(f"[operation]: rank {self.rank} finish the kv patch sending to rank {rank}")
+            yield kv_patch
+            if kv_patch.meta.type == "kv_patch_finished": 
                 self.kv_cache_transfer_in_process[rank] = False
                 self.kv_patch_sending = False
+                self.last_patch_ids[rank] = 0
                 break
 
-    def add_patch_to_send_buffer(self, rank: int, kv_patch: KVPatch) -> None:
-        self.buffers[rank].add_patch(kv_patch)
-        self.last_patch_ids[rank] += 1
 
-    def get_last_patch_id(self, rank: int) -> int:
-        return self.last_patch_ids[rank]
+    # 在发送完kv tensor之后开始发送kv patch
+    def _flexi_get_patch(self, rank: int, 
+                        layer_ids: list[int],
+                        kv_cache_meta: torch.Tensor, 
+                        cache_size: int,
+                        key_cache_ptrs: list[int],
+                        value_cache_ptrs: list[int],
+                        start_layer_id: int) -> Generator[KVPatch]:
+        while True:
+            time_start = time.time()
+            slot_mapping, is_finished, stored_tokens = self.slot_mappings[rank].get_all_slot_mappings()
+            slot_mapping_dev = torch.tensor(slot_mapping)
+            block_size, num_head, head_dim = kv_cache_meta.shape
+            kv_out = torch.empty(cache_size, 2, len(slot_mapping), num_head, head_dim, dtype=kv_cache_meta.dtype)
+            for layer_id in layer_ids:
+                local_layer_id = layer_id - start_layer_id
+                key_cache_ptr = key_cache_ptrs[local_layer_id]
+                value_cache_ptr = value_cache_ptrs[local_layer_id]
+                ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[layer_id][0], kv_out[layer_id][1], block_size)
 
-    def send_kv_cache_patch(self, 
+            self.last_patch_ids[rank] += 1
+            yield KVPatch(
+                KVPatchMeta(
+                    type='kv_patch_meta' if not is_finished else "kv_patch_finished",
+                    id=self.last_patch_ids[rank],
+                    layer_ids=layer_ids,
+                    num_tokens=stored_tokens,
+                    slot_mapping_dtype=torch.int64,
+                    slot_mapping_shape=torch.Size([len(slot_mapping)]),
+                    kv_payload_dtype=kv_out.dtype,
+                    kv_payload_shape=kv_out.shape,
+                ),
+                kv_out,
+                torch.tensor(slot_mapping, dtype=torch.int64)
+            )
+            if is_finished: 
+                self.kv_cache_transfer_in_process[rank] = False
+                self.kv_patch_sending = False
+                self.last_patch_ids[rank] = 0
+                break
+
+    def get_kv_tensor_from_cache(self, layer_ids: list[int],layer_id: int, start_layer_id: int, slot_mapping: Optional[torch.Tensor] = None) -> Tuple[Union[KVTensorMeta, FlexiKVTensorMeta], torch.Tensor]:
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        if is_flexi:
+            assert slot_mapping is not None, "slot_mapping should be provided when using flexi flash attention"
+            return self._flexi_get_kv_tensor(
+                                        layer_id=layer_id,
+                                        layer_ids=layer_ids,
+                                        kv_cache_meta=self.key_cache_list[0][0],
+                                        key_cache_ptrs=self.key_cache_ptrs,
+                                        value_cache_ptrs=self.value_cache_ptrs,
+                                        slot_mapping=slot_mapping,
+                                        start_layer_id=start_layer_id)
+        else:
+            return self._regular_get_kv_tensor(layer_id, layer_ids, self.kv_caches, start_layer_id)
+
+    def _regular_get_kv_tensor(self, layer_id: int, layer_ids: list[int], kv_caches: list[torch.Tensor],
+                            start_layer_id: int) -> Tuple[KVTensorMeta, torch.Tensor]:
+        assert all(transfer_in_process == False for transfer_in_process in self.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
+        assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
+        local_layer_id = layer_id - start_layer_id
+        kv_cache = kv_caches[local_layer_id]
+        # 第一次访问时默认置为 False，避免 KeyError
+        return KVTensorMeta(
+            type='kv_tensor',
+            layer_to_be_received=set(layer_ids),
+            layer_id=int(layer_id),
+            num_tokens=int(kv_cache.size(0)),
+            dtype=kv_cache.dtype,
+            shape=kv_cache.shape), kv_cache
+
+    def _flexi_get_kv_tensor(self, layer_id: int, 
+                            layer_ids: list[int],
+                            kv_cache_meta: torch.Tensor, 
+                            key_cache_ptrs: list[int],
+                            value_cache_ptrs: list[int],
+                            slot_mapping: torch.Tensor,
+                            start_layer_id: int) -> Tuple[FlexiKVTensorMeta, torch.Tensor]:
+        assert all(transfer_in_process == False for transfer_in_process in self.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
+        assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
+        local_layer_id = layer_id - start_layer_id
+        key_cache_ptr = key_cache_ptrs[local_layer_id]
+        value_cache_ptr = value_cache_ptrs[local_layer_id]
+        block_size, num_head, head_dim = kv_cache_meta.shape
+        kv_out = torch.empty(2, len(slot_mapping), num_head, head_dim, dtype=kv_cache_meta.dtype)
+        ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping, kv_out[0], kv_out[1], block_size)
+        # 第一次访问时默认置为 False，避免 KeyError
+        return FlexiKVTensorMeta(
+            type='kv_tensor',
+            layer_to_be_received=set(layer_ids),
+            layer_id=int(layer_id),
+            num_tokens=int(len(slot_mapping)),
+            kv_payload_dtype=kv_out.dtype,
+            kv_payload_shape=kv_out.shape,
+            slot_mapping_dtype=slot_mapping.dtype,
+            slot_mapping_shape=slot_mapping.shape), kv_out
+
+
+    def send_kv_tensor_to_rank(self, rank: int, kv_tensor_meta: Union[KVTensorMeta, FlexiKVTensorMeta], kv_tensor: torch.Tensor, slot_mapping: Optional[torch.Tensor] = None) -> None:
+        """Send a single KV tensor to a peer rank.
+
+        Args:
+            rank: peer global rank to send to.
+            kv_tensor_meta: metadata of the KV tensor.
+            kv_tensor: tensor to send (GPU or CPU tensor; will be moved to local GPU).
+        """
+        self.kv_cache_transfer_in_process[rank] = True
+        if isinstance(kv_tensor_meta, KVTensorMeta):
+            self._send_meta_to_rank(rank, kv_tensor_meta)
+            self._send_data_to_rank(rank, kv_tensor, synchronize=True)
+        else:
+            assert slot_mapping is not None, "slot_mapping should be provided when sending FlexiKVTensorMeta"
+            self._send_meta_to_rank(rank, kv_tensor_meta)
+            self._send_data_to_rank(rank, slot_mapping)
+            self._send_data_to_rank(rank, kv_tensor, synchronize=True)
+    
+    def send_kv_patch_to_rank(self, 
             target_rank: int,
             kv_patches: KVPatch) -> None:
 
@@ -541,53 +668,261 @@ class DynamicKVSynchronizer():
         if meta.type == "kv_patch_finished":
             self.kv_cache_transfer_in_process[target_rank] = False
 
+    # def start_kv_tensor_transfer_async(self, 
+    #                                    rank_to_layers_ids: dict[int, list[int]], 
+    #                                    kv_caches: list[torch.Tensor],
+    #                                     start_layer_id: int) -> None:
+    #     """Send layers' KV cache to a peer rank.
+    #         In each of the migration process, this function should only be called once.
+    #     Args:
+    #         rank: peer global rank to send to.
+    #         kv_cache: tensor to send (GPU or CPU tensor; will be moved to local GPU).
+    #         start_layer_id: which layer this KV cache belongs to (for receiver to demux).
+    #         layer_ids: which layers this KV cache belongs to (for receiver to demux).
+    #     """
+    #     assert all(transfer_in_process == False for transfer_in_process in self.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
+    #     assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
+    #     for rank, layer_ids in rank_to_layers_ids.items():
+    #         for layer_id in layer_ids:
+    #             time_start = time.time()
+    #             local_layer_id = layer_id - start_layer_id
+    #             kv_cache = kv_caches[local_layer_id]
+    #             # 第一次访问时默认置为 False，避免 KeyError
+    #             logger.info(f"[debug]: start to send kv tensor meta to rank {rank} for layer {layer_id}, kv_cache shape: {kv_cache.shape}")
+    #             self._send_meta_to_rank(rank, KVTensorMeta(
+    #                 type='kv_tensor',
+    #                 layer_to_be_received=set(layer_ids),
+    #                 layer_id=int(layer_id),
+    #                 num_tokens=int(kv_cache.size(0)),
+    #                 dtype=kv_cache.dtype,
+    #                 shape=kv_cache.shape))
+
+    #             logger.info(f"[timeline]: send kv tensor meta to rank {rank} for layer {layer_id}, time taken: {time.time() - time_start}")
+    #             # 使用同步发送，确保数据传输完成后再继续
+    #             self._send_data_to_rank(rank, kv_cache, synchronize=True)
+    #             logger.info(f"[timeline]: send kv tensor payload to rank {rank} for layer {layer_id}, time taken: {time.time() - time_start}, data_size: {kv_cache.numel() * kv_cache.element_size() / 1024 ** 2:.2f}MB")
+    #             self.kv_cache_transfer_in_process[rank] = True
+    #             del kv_cache
+    #     del kv_caches
+    #     logger.info(f"[debug]: finished sending kv tensor, start to send kv patch")
+    #     # 在发送完kv tensor之后开始发送kv patch
+    #     while True:
+    #         for rank in rank_to_layers_ids.keys():
+    #             time_start = time.time()
+    #             kv_patch = self.buffers[rank].pop_patch()
+    #             self._send_meta_to_rank(rank, kv_patch.meta)
+    #             self._send_data_to_rank(rank, kv_patch.slot_mapping, synchronize=True, wait_for_ack=True)
+    #             self._send_data_to_rank(rank, kv_patch.kv_payload, synchronize=True, wait_for_ack=True)
+    #             self.kv_patch_sending = True
+    #             patch_payload_size = kv_patch.kv_payload.numel() * kv_patch.kv_payload.element_size()
+    #             patch_slot_mapping_size = kv_patch.slot_mapping.numel() * kv_patch.slot_mapping.element_size()
+    #             logger.info(f"[timeline]: send kv patch to rank {rank}, time taken: {time.time() - time_start}, data_size: {patch_slot_mapping_size / 1024 ** 2:.2f}MB + {patch_payload_size / 1024 ** 2:.2f}MB")
+    #             if kv_patch.meta.type == "kv_patch_finished":
+    #                 logger.info(f"[operation]: rank {self.rank} finish the kv patch sending to rank {rank}")
+    #                 self.kv_cache_transfer_in_process[rank] = False
+    #                 self.kv_patch_sending = False
+    #                 break
+
+    # def start_kv_tensor_transfer_async_without_buffer(self, 
+    #                                          rank_to_layers_ids: dict[int, list[int]], 
+    #                                          kv_cache_meta: torch.Tensor, 
+    #                                          key_cache_ptrs: list[int],
+    #                                          value_cache_ptrs: list[int],
+    #                                          slot_mapping: list[int],
+    #                           start_layer_id: int) -> None:
+    #     """Send layers' KV cache to a peer rank.
+    #         In each of the migration process, this function should only be called once.
+    #         Different from the buffered version, this function directly gathers the kv cache from the memory pointers 
+    #         and sends them without using intermediate buffers.
+    #         Slot mappings is updated by the worker threads, which essentially replace the role of buffer.
+    #         The good thing about slot mapping is that is is implemented with dirty page, which avoids duplicated token ids.
+    #     Args:
+    #         rank: peer global rank to send to.
+    #         kv_cache: tensor to send (GPU or CPU tensor; will be moved to local GPU).
+    #         start_layer_id: which layer this KV cache belongs to (for receiver to demux).
+    #         layer_ids: which layers this KV cache belongs to (for receiver to demux).
+    #         slot_mapping: the slot mapping to gather the kv cache.
+    #     """
+    #     assert all(transfer_in_process == False for transfer_in_process in self.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
+    #     assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
+    #     slot_mapping_dev = torch.tensor(slot_mapping)
+
+    #     for rank, layer_ids in rank_to_layers_ids.items():
+    #         for layer_id in layer_ids:
+    #             time_start = time.time()
+    #             local_layer_id = layer_id - start_layer_id
+    #             key_cache_ptr = key_cache_ptrs[local_layer_id]
+    #             value_cache_ptr = value_cache_ptrs[local_layer_id]
+    #             block_size, num_head, head_dim = kv_cache_meta.shape
+    #             kv_out = torch.empty(2, len(slot_mapping), num_head, head_dim, dtype=kv_cache_meta.dtype)
+    #             ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[0], kv_out[1], block_size)
+    #             # 第一次访问时默认置为 False，避免 KeyError
+    #             logger.info(f"[debug]: start to send kv tensor meta to rank {rank} for layer {layer_id}, kv_cache block shape: {kv_cache_meta[0].shape}")
+
+    #             self._send_meta_to_rank(rank, FlexiKVTensorMeta(
+    #                 type='kv_tensor',
+    #                 layer_to_be_received=set(layer_ids),
+    #                 layer_id=int(layer_id),
+    #                 num_tokens=int(len(slot_mapping)),
+    #                 dtype=kv_out.dtype,
+    #                 shape=kv_out.shape,
+    #                 slot_mapping=slot_mapping_dev))
+
+    #             # 使用同步发送，确保数据传输完成后再继续
+    #             self._send_data_to_rank(rank, kv_out, synchronize=True)
+    #             self.kv_cache_transfer_in_process[rank] = True
+    #     logger.info(f"[debug]: finished sending kv tensor, start to send kv patch")
+    #     # 在发送完kv tensor之后开始发送kv patch
+    #     while True:
+    #         for rank, layer_ids in rank_to_layers_ids.items():
+    #             time_start = time.time()
+    #             slot_mapping, is_finished = self.slot_mappings[rank].get_all_slot_mappings()
+
+    #             block_size, num_head, head_dim = kv_cache_meta.shape
+    #             kv_out = torch.empty(len(layer_ids), 2, len(slot_mapping), num_head, head_dim, dtype=kv_cache_meta.dtype)
+    #             for layer_id in layer_ids:
+    #                 local_layer_id = layer_id - start_layer_id
+    #                 key_cache_ptr = key_cache_ptrs[local_layer_id]
+    #                 value_cache_ptr = value_cache_ptrs[local_layer_id]
+    #                 ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[layer_id][0], kv_out[layer_id][1], block_size)
+
+    #             self.last_patch_ids[rank] += 1
+    #             kv_patch = KVPatch(
+    #                 KVPatchMeta(
+    #                     type='kv_patch_meta' if not is_finished else "kv_patch_finished",
+    #                     id=self.last_patch_ids[rank],
+    #                     layer_ids=layer_ids,
+    #                     num_tokens=int(len(slot_mapping)),
+    #                     slot_mapping_dtype=torch.int64,
+    #                     slot_mapping_shape=torch.Size([len(slot_mapping)]),
+    #                     kv_payload_dtype=kv_out.dtype,
+    #                     kv_payload_shape=kv_out.shape,
+    #                 ),
+    #                 kv_out,
+    #                 torch.tensor(slot_mapping, dtype=torch.int64)
+    #             )
+    #             self._send_meta_to_rank(rank, kv_patch.meta)
+    #             self._send_data_to_rank(rank, kv_patch.slot_mapping, synchronize=True, wait_for_ack=True)
+    #             self._send_data_to_rank(rank, kv_patch.kv_payload, synchronize=True, wait_for_ack=True)
+    #             self.kv_patch_sending = True
+    #             patch_payload_size = kv_patch.kv_payload.numel() * kv_patch.kv_payload.element_size()
+    #             patch_slot_mapping_size = kv_patch.slot_mapping.numel() * kv_patch.slot_mapping.element_size()
+    #             logger.info(f"[timeline]: send kv patch to rank {rank}, time taken: {time.time() - time_start}, data_size: {patch_slot_mapping_size / 1024 ** 2:.2f}MB + {patch_payload_size / 1024 ** 2:.2f}MB")
+    #             if kv_patch.meta.type == "kv_patch_finished":
+    #                 logger.info(f"[operation]: rank {self.rank} finish the kv patch sending to rank {rank}")
+    #                 self.kv_cache_transfer_in_process[rank] = False
+    #                 self.kv_patch_sending = False
+    #                 self.last_patch_ids[rank] = 0
+    #                 break
+
+
+    def add_patch_to_send_buffer(self, rank: int, kv_patch: KVPatch) -> None:
+        self.buffers[rank].add_patch(kv_patch)
+        self.last_patch_ids[rank] += 1
+
     def finish_kv_cache_transfer(self) -> None:
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         for rank in self.last_patch_ids:
-            meta = KVPatchMeta(
-                type='kv_patch_finished',
-                id=int(self.last_patch_ids[rank]),
-                layer_ids=[],
-                num_tokens=0,
-                slot_mapping_dtype=torch.int64,
-                slot_mapping_shape=torch.Size([]),
-                kv_payload_dtype=torch.int64,
-                kv_payload_shape=torch.Size([]),
-            )
-            self.buffers[rank].add_patch(KVPatch(meta, torch.empty(0, device='cpu'), torch.empty(0, device='cpu')))
+            if is_flexi:
+                self.slot_mappings[rank].add_slot_mappings([], is_finished=True)
+            else:
+                meta = KVPatchMeta(
+                    type='kv_patch_finished',
+                    id=int(self.last_patch_ids[rank]),
+                    layer_ids=[],
+                    num_tokens=0,
+                    slot_mapping_dtype=torch.int64,
+                    slot_mapping_shape=torch.Size([]),
+                    kv_payload_dtype=torch.int64,
+                    kv_payload_shape=torch.Size([]),
+                )
+                self.buffers[rank].add_patch(KVPatch(meta, torch.empty(0, device='cpu'), torch.empty(0, device='cpu')))
         self.last_patch_ids = {}
 
-    def recv_controller(self, rank: int) -> Union[KVTensorMeta, KVPatchMeta]:
+    def add_new_tokens_to_kv_synchronizer(self, rank: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor) -> None:
+        time_start = time.time()
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        if is_flexi:
+            self.slot_mappings[rank].add_slot_mappings(slot_mapping.tolist(), is_finished=False)
+        else:
+            kv_patch = self.kv_synchronizer_helper.extract_kv_patch_from_kv_cache(self.last_patch_ids[rank], kv_caches, layer_ids, start_layer_id, slot_mapping)
+            time_after_extract_kv_patch = time.time()
+            logger.info(f"debug: ---------------------extract kv patch time: {time_after_extract_kv_patch - time_start:.2f} seconds")
+            assert kv_patch is not None
+            self.last_patch_ids[rank] += 1
+
+            self.buffers[rank].add_patch(kv_patch)
+
+    # ########################################## #
+    # Receiver side functions                      #
+    # ########################################## #
+    def get_last_patch_id(self, rank: int) -> int:
+        return self.last_patch_ids[rank]
+
+    def recv_controller(self, rank: int) -> Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]:
         pipe = self._ensure_pipe_and_buffer(rank, 'recv')
         pipe = self._pair_pipes_recv[rank]
         meta_obj = pipe.recv_obj()
         return self._control_adapter.validate_python(meta_obj)
 
-    def get_one_patch(self, rank: int) -> KVPatch:
+    def recv_kv_tensor(self,from_rank: int, meta: Union[KVTensorMeta, FlexiKVTensorMeta]) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if isinstance(meta, FlexiKVTensorMeta):
+            slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape,)
+            kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape)
+            assert kv_payload.dim() == 4 and kv_payload.size(0) == 2 
+            return slot_mapping, kv_payload
+        else:
+            kv_payload = self._recv_data_from_rank(from_rank, meta.dtype, meta.shape)
+            assert kv_payload.dim() == 4 and kv_payload.size(0) == 2 
+            return kv_payload
+
+    def recv_kv_patch(self, from_rank: int,meta: KVPatchMeta) -> Tuple[torch.Tensor, torch.Tensor]:
+        slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape, send_ack=True)
+        kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape, send_ack=True)
+        assert kv_payload.dim() == 5 and kv_payload.size(0) == 2
+        return slot_mapping, kv_payload
+
+    # def put_kv_patch_to_buffer(self, rank: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor) -> None:
+    #     time_start = time.time()
+    #     kv_patch = self.kv_synchronizer_helper.extract_kv_patch_from_kv_cache(self.last_patch_ids[rank], kv_caches, layer_ids, start_layer_id, slot_mapping)
+    #     time_after_extract_kv_patch = time.time()
+    #     logger.info(f"debug: ---------------------extract kv patch time: {time_after_extract_kv_patch - time_start:.2f} seconds")
+    #     assert kv_patch is not None
+    #     self.last_patch_ids[rank] += 1
+
+    #     self.buffers[rank].add_patch(kv_patch)
+    def get_one_patch_from_buffer(self, rank: int) -> KVPatch:
         # Ensure the recv pipe and buffer exist before popping
         kv_patch = self.buffers[rank].pop_patch()
         return kv_patch
 
-    def put_kv_patch_to_buffer(self, rank: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor) -> None:
-        time_start = time.time()
-        kv_patch = self.kv_synchronizer_helper.extract_kv_patch_from_kv_cache(self.last_patch_ids[rank], kv_caches, layer_ids, start_layer_id, slot_mapping)
-        time_after_extract_kv_patch = time.time()
-        logger.info(f"debug: ---------------------extract kv patch time: {time_after_extract_kv_patch - time_start:.2f} seconds")
-        assert kv_patch is not None
-        self.last_patch_ids[rank] += 1
-
-        self.buffers[rank].add_patch(kv_patch)
-
-    def apply_one_patch(self, kv_caches: list[torch.Tensor], start_layer_id: int, meta: KVPatchMeta, kv_payload: torch.Tensor, slot_mapping: torch.Tensor) -> int:
+    def apply_one_patch_to_kv_cache(self, start_layer_id: int, meta: KVPatchMeta, kv_payload: torch.Tensor, slot_mapping: torch.Tensor) -> int:
         keys = kv_payload[0]
         values = kv_payload[1]
         logger.info(f"apply one patch with id {meta.id}, num_tokens: {meta.num_tokens}")
         # slot_mapping 已经被裁剪过，只包含有效的 token
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
         for layer_id, key, value in zip(meta.layer_ids, keys, values):
             local_layer_id = layer_id - start_layer_id
-            kv_cache = kv_caches[local_layer_id]
-            # 使用裁剪后的 slot_mapping，从 0 到 num_tokens
-            self.kv_helper.put_kv_to_cache(self.model_executable, key, value, layer_id, kv_cache, slot_mapping, 0, meta.num_tokens)
+            if is_flexi:
+                key_cache_ptr = self.key_cache_ptrs[local_layer_id]
+                value_cache_ptr = self.value_cache_ptrs[local_layer_id]
+                key_cache_list = self.key_cache_list[local_layer_id]
+                value_cache_list = self.value_cache_list[local_layer_id] 
+                self.kv_helper.flexi_put_kv_to_cache(
+                    model_executable=self.model_executable,
+                    keys=key,
+                    values=value,
+                    key_cache_list=key_cache_list,
+                    value_cache_list=value_cache_list,
+                    key_cache_ptr=key_cache_ptr,
+                    value_cache_ptr=value_cache_ptr,
+                    layer=layer_id,
+                    slot_mapping=slot_mapping,
+                )
+            else:
+                kv_cache = self.kv_caches[local_layer_id]
+                # 使用裁剪后的 slot_mapping，从 0 到 num_tokens
+                self.kv_helper.put_kv_to_cache(self.model_executable, key, value, layer_id, kv_cache, slot_mapping, 0, meta.num_tokens)
         return meta.id
-    def is_kv_patch_sending(self) -> bool:
-        return self.kv_patch_sending

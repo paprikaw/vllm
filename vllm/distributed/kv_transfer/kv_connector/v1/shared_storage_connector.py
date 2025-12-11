@@ -286,7 +286,7 @@ class SharedStorageConnector(KVConnectorBase_V1):
 
         total_need_load = 0
         for new_req in scheduler_output.scheduled_new_reqs:
-            if new_req.req_id in self._requests_need_load:
+            if new_req.request_id in self._requests_need_load:
                 meta.add_request(token_ids=new_req.prompt_token_ids,
                                  block_ids=new_req.block_ids[0],
                                  block_size=self._block_size,
