@@ -548,10 +548,11 @@ def dynamic_flexi_bind_single_kv_tensor(
     end_layer: int,
     layer_index: int,
     slot_mapping: torch.Tensor,
+    block_num: int,
     kv_tensor: torch.Tensor,
     forward_context: dict[str, "Attention"],
     kv_synchronizer: "DynamicKVSynchronizer",
-    runner) -> None:
+    runner: "DynamicGPUModelRunner") -> None:
     """Bind a single layer's KV tensor to runner caches and forward context.
 
     - 更新本 runner 的 `self.kv_caches`
@@ -565,7 +566,7 @@ def dynamic_flexi_bind_single_kv_tensor(
     local_index = layer_index - start_layer
     assert local_index < len(runner.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(runner.key_caches)}"
 
-    key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr = runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping,kv_tensor)
+    key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr = runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping,kv_tensor, block_num)
     runner.key_caches[local_index] = key_cache_list
     runner.value_caches[local_index] = value_cache_list
     runner.key_cache_ptrs[local_index] = key_cache_ptr

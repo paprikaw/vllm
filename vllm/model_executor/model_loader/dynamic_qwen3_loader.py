@@ -132,10 +132,12 @@ def safetensors_layer_weights_iterator(
     ):
         with safe_open(st_file, framework="pt") as f:
             for name in f.keys():  # noqa: SIM118
+                logger.info(f"[debug]: starts to load the weight {name} from {st_file}")
                 if "layers" not in name or \
                     extract_layer_index(name) not in range(layer[0], layer[1]+1):
                     continue
                 param = f.get_tensor(name)
+                logger.info(f"[debug]: loaded weight {name} from {st_file} with shape {param.shape}")
                 yield name, param
 
 def process_layer_weights_after_loading(model: nn.Module, model_config: ModelConfig,

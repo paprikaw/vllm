@@ -104,11 +104,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
                         layer_index=layer_index,
                         start_layer=self.model.model.start_layer,
                         end_layer=self.model.model.end_layer,
-                        kv_caches=self.kv_caches,
                         forward_context=self.vllm_config.compilation_config.static_forward_context,
                         kv_synchronizer=kv_synchronizer,
+                        runner=self,
                         kv_tensor=kv_caches[layer_name],
-                        group=self.kv_cache_config.kv_cache_groups[0]
                     )
                 else:
                     # TODO: add new branches when introducing more types of
@@ -820,13 +819,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
     
     def get_flexi_kv_cache_from_gathered_kv_tensor(self, slot_mapping: torch.Tensor, 
                                  gathered_kv_tensor: torch.Tensor,
-                                 ) -> Tuple[list[torch.Tensor], list[torch.Tensor], int, int]:
+                                 block_num: int) -> Tuple[list[torch.Tensor], list[torch.Tensor], int, int]:
         '''
         Based on current kv cache list shape and dtype, we allocate a new kv cache list
         and extract the data from gathered_kv_tensor to the new kv cache list.
         after that, we also flush the new kv cache to GPU ptrs.
         '''
-        block_num = len(self.key_caches)
         kv_cache_shape = self.kv_cache_shape
         assert len(kv_cache_shape) == 5 # (2, nkvblocks, blockdim, n_head, headdim)
         block_shape = kv_cache_shape[2:]
@@ -834,7 +832,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
         key_cache, value_cache = get_flexi_kv_cache(block_num, block_shape, kv_dtype, self.device)
         key_cache_list_ptr, value_cache_list_ptr = prepare_flexi_kv_ptrs(key_cache, value_cache) 
-
+        logger.info(f"gathered_kv_tensor shape: {gathered_kv_tensor.shape}, kv_cache_shape: {kv_cache_shape}, block_shape:{block_shape}, block_num:{block_num}, key_cache shape:{key_cache[0].shape}, value_cache shape:{value_cache[0].shape}, key_cache length:{len(key_cache)}, value_cache length:{len(value_cache)}")
+        logger.info(f"key_cache_list_ptr {key_cache_list_ptr}, value cache list ptr:{value_cache_list_ptr}")
         dummy_scale = torch.tensor(1.0, device=self.device, dtype=torch.float32)
         assert gathered_kv_tensor.shape[-2:] == kv_cache_shape[-2:], f"gathered_kv_tensor shape {gathered_kv_tensor.shape} mismatch kv_cache_shape {kv_cache_shape}"
 

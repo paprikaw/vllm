@@ -18,7 +18,7 @@ from vllm.v1.worker.utils import get_total_gpu_memory
 from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
 from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.utils import dynamic_bind_single_kv_tensor, dynamic_flexi_bind_single_kv_tensor, report_usage_stats, WorkerMemInfo
+from vllm.v1.utils import dynamic_bind_single_kv_tensor, dynamic_flexi_bind_single_kv_tensor, get_layer_name_for_index, report_usage_stats, WorkerMemInfo
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.dynamic_gpu_model_runner import DynamicGPUModelRunner
 from vllm.model_executor.models.utils import extract_layer_index
@@ -102,32 +102,75 @@ class DynamicGPUWorker(Worker):
         assert isinstance(self.model_runner, DynamicGPUModelRunner)
         start_layer = self.model_runner.model.model.start_layer
         fctx = self.vllm_config.compilation_config.static_forward_context
-
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         for layer_id in sorted(layer_ids):
             # 1) 层已加载
             assert self.model_runner.has_layer(layer_id), (
                 f"Layer {layer_id} not loaded yet (start={start_layer})")
-            # 2) runner kv cache 非空且形状合理
             local_index = layer_id - start_layer
-            assert 0 <= local_index < len(self.model_runner.kv_caches), (
-                f"Local index {local_index} out of range for kv_caches len={len(self.model_runner.kv_caches)}")
-            kv_t = self.model_runner.kv_caches[local_index]
-            assert isinstance(kv_t, torch.Tensor) and kv_t.numel() > 0, (
-                f"KV cache for layer {layer_id} is empty/uninitialized")
-            # 3) forward context kv_cache 指向同一张量，且形状一致
-            layer_name = self.model_runner.get_layer_name_for_index(layer_id)
-            assert layer_name in fctx, f"Layer {layer_name} missing in forward context"
-            attn = fctx[layer_name]
-            assert isinstance(attn.kv_cache, list) and len(attn.kv_cache) >= 1, (
-                f"Attention.kv_cache invalid for {layer_name}")
-            bound_kv = attn.kv_cache[0]
-            assert isinstance(bound_kv, torch.Tensor) and bound_kv.numel() > 0, (
-                f"Forward context KV for {layer_name} is empty")
-            assert kv_t.shape == bound_kv.shape, (
-                f"KV shape mismatch for layer {layer_id}: runner={kv_t.shape}, fctx={bound_kv.shape}")
-            # 张量对象应当一致（引用同一存储）
-            assert kv_t.data_ptr() == bound_kv.data_ptr(), (
-                f"KV tensor for layer {layer_id} is not the same object between runner and fctx")
+
+            if is_flexi:
+                # runner kv cache 非空且形状合理
+                assert 0 <= local_index < len(self.model_runner.key_caches), (
+                    f"Local index {local_index} out of range for key_cache_list len={len(self.model_runner.value_caches)}")
+                key_t = self.model_runner.key_caches[local_index]
+                assert isinstance(key_t, list) and len(key_t) > 0, (
+                    f"Key cache for layer {layer_id} is empty/uninitialized")
+                assert 0 <= local_index < len(self.model_runner.value_caches), (
+                    f"Local index {local_index} out of range for value_cache_list len={len(self.model_runner.value_caches)}")
+                value_t = self.model_runner.value_caches[local_index]
+                assert isinstance(value_t, list) and len(value_t) > 0, (
+                    f"Value cache for layer {layer_id} is empty/uninitialized")
+                
+                # 2) dynamic_kv_synchronizer
+                assert 0 <= local_index < len(self.dynamic_kv_synchronizer.key_cache_list), (
+                    f"Local index {local_index} out of range for sync key_cache_list")
+                sync_key_t = self.dynamic_kv_synchronizer.key_cache_list[local_index]
+                assert sync_key_t is key_t, f"Sync key cache mismatch for layer {layer_id}"
+                
+                assert 0 <= local_index < len(self.dynamic_kv_synchronizer.value_cache_list), (
+                    f"Local index {local_index} out of range for sync value_cache_list")
+                sync_value_t = self.dynamic_kv_synchronizer.value_cache_list[local_index]
+                assert sync_value_t is value_t, f"Sync value cache mismatch for layer {layer_id}"
+
+                # 3) forward context
+                layer_name = get_layer_name_for_index(layer_id, fctx)
+                assert layer_name in fctx, f"Layer {layer_name} missing in forward context"
+                attn = fctx[layer_name]
+                # attn.key_cache should be the same list object as key_t
+                assert hasattr(attn, 'key_cache'), f"Attention layer {layer_name} missing key_cache"
+                assert attn.key_cache is key_t, f"Forward context key cache mismatch for layer {layer_id}"
+                assert hasattr(attn, 'value_cache'), f"Attention layer {layer_name} missing value_cache"
+                assert attn.value_cache is value_t, f"Forward context value cache mismatch for layer {layer_id}"
+                
+            else:
+                # runner kv cache 非空且形状合理
+                assert 0 <= local_index < len(self.model_runner.kv_caches), (
+                    f"Local index {local_index} out of range for kv_caches len={len(self.model_runner.kv_caches)}")
+                kv_t = self.model_runner.kv_caches[local_index]
+                assert isinstance(kv_t, torch.Tensor) and kv_t.numel() > 0, (
+                    f"KV cache for layer {layer_id} is empty/uninitialized")
+
+                # 2) dynamic_kv_synchronizer
+                assert 0 <= local_index < len(self.dynamic_kv_synchronizer.kv_caches), (
+                    f"Local index {local_index} out of range for sync kv_caches len={len(self.dynamic_kv_synchronizer.kv_caches)}")
+                sync_kv_t = self.dynamic_kv_synchronizer.kv_caches[local_index]
+                assert sync_kv_t is kv_t, f"Sync KV cache mismatch for layer {layer_id}"
+
+                # 3) forward context kv_cache 指向同一张量，且形状一致
+                layer_name = get_layer_name_for_index(layer_id, fctx)
+                assert layer_name in fctx, f"Layer {layer_name} missing in forward context"
+                attn = fctx[layer_name]
+                assert isinstance(attn.kv_cache, list) and len(attn.kv_cache) >= 1, (
+                    f"Attention.kv_cache invalid for {layer_name}")
+                bound_kv = attn.kv_cache[0]
+                assert isinstance(bound_kv, torch.Tensor) and bound_kv.numel() > 0, (
+                    f"Forward context KV for {layer_name} is empty")
+                assert kv_t.shape == bound_kv.shape, (
+                    f"KV shape mismatch for layer {layer_id}: runner={kv_t.shape}, fctx={bound_kv.shape}")
+                # 张量对象应当一致（引用同一存储）
+                assert kv_t.data_ptr() == bound_kv.data_ptr(), (
+                    f"KV tensor for layer {layer_id} is not the same object between runner and fctx")
 
     def _add_layers(self, layer_list: list[Tuple[int, int]]) -> None:
         """添加新的模型层
@@ -288,6 +331,7 @@ class DynamicGPUWorker(Worker):
     def dynamic_initialize_from_config(self, kv_cache_configs: list[KVCacheConfig], num_blocks: int) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
         self.block_size = kv_cache_configs[self.rank].kv_cache_groups[0].kv_cache_spec.block_size
+        self.block_num = num_blocks
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CuMemAllocator.get_instance()
             context = allocator.use_memory_pool(tag="kv_cache")
@@ -370,7 +414,7 @@ class DynamicGPUWorker(Worker):
         time_start = time.time()
         def _do_add():
             self._add_layers(layer_list)
-        threading.Thread(target=_do_add, daemon=False).start()
+        threading.Thread(target=_do_add, daemon=True).start()
         logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
 
     def remove_layers(self, rank: int, layer_list: list[Tuple[int, int]]) -> None:
@@ -484,11 +528,16 @@ class DynamicGPUWorker(Worker):
 
         return KVBufferStatus(used_tokens_list, free_tokens_list, capacity_list)
 
-    def get_applied_token_num(self) -> list[int]:
+    def get_applied_token_num(self, receiver_list: list[int]) -> Union[list[int], None]:
         """Return KV patch buffer status per rank.
 
         """
-        return [self.receiver_num_applied_token_dict[rank] for rank in range(self.vllm_config.parallel_config.pipeline_parallel_size) if rank != self.rank]
+        if self.rank not in receiver_list:
+            logger.info(f"Worker {self.rank} is not in the receiver list {receiver_list}, skip getting applied token num")
+            return None
+        result = [self.receiver_num_applied_token_dict[rank] for rank in range(self.vllm_config.parallel_config.pipeline_parallel_size) if rank != self.rank]
+        logger.info(f"Worker {self.rank} get applied token num: {result}, receiver_list: {receiver_list}")
+        return result
 
     def get_kv_cache_spec_for_layers(self, rank: int, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
         if self.rank != rank:
@@ -507,10 +556,12 @@ class DynamicGPUWorker(Worker):
         return
 
     def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
+        self.block_num = compacted_length
         self.model_runner.compact_kv_cache(compacted_length, bitmap)
         self.dynamic_kv_synchronizer.create_slot_mappings(compacted_length * self.block_size)
 
     def resize_kv_cache(self, new_length: int) -> None:
+        self.block_num = new_length
         self.model_runner.resize_kv_cache(new_length)
         self.dynamic_kv_synchronizer.create_slot_mappings(new_length * self.block_size)
     # ####################################### #
@@ -583,11 +634,12 @@ class DynamicGPUWorker(Worker):
         # 在发送完kv tensor之后开始发送kv patch
         for kv_patch in self.dynamic_kv_synchronizer.get_kv_patch(rank, start_layer_id, layer_ids):
             time_start = time.time()
-            self.dynamic_kv_synchronizer.send_kv_patch_to_rank(rank, kv_patch)
-
             patch_payload_size = kv_patch.kv_payload.numel() * kv_patch.kv_payload.element_size()
             patch_slot_mapping_size = kv_patch.slot_mapping.numel() * kv_patch.slot_mapping.element_size()
-            logger.info(f"[timeline]: send kv patch to rank {rank}, time taken: {time.time() - time_start}, data_size: {patch_slot_mapping_size / 1024 ** 2:.2f}MB + {patch_payload_size / 1024 ** 2:.2f}MB")
+            logger.info(f"[timeline]: send kv patch to rank {rank}, time taken: {time.time() - time_start}, data_size: {patch_slot_mapping_size / 1024 ** 2:.2f}MB + {patch_payload_size / 1024 ** 2:.2f}MB, kv patch id: {kv_patch.meta.id}")
+            self.dynamic_kv_synchronizer.send_kv_patch_to_rank(rank, kv_patch)
+
+
         # 最后发送一个 finished 的控制消息，表示本次kv cache的发送完成
 
 
@@ -662,7 +714,7 @@ class DynamicGPUWorker(Worker):
             first_time = True
             tmp_kv_tensors_dict: dict[int, torch.Tensor] = {}
             tmp_slot_mapping_dict: dict[int, torch.Tensor] = {}
-            tmp_slot_token_num: dict[int, int] = {}
+            tmp_slot_token_num: int = 0
 
             while True:
                 # 1) Firstly wait for all tensor the be received
@@ -674,11 +726,13 @@ class DynamicGPUWorker(Worker):
                     time_start = time.time()
                     first_time = False
                     self.is_all_patch_applied[from_rank] = False # 第一次接受到kv tensor时，需要将is_all_patch_applied设置为False，表示需要等待所有patch都应用完毕后才能进行配置的转换
+                    tmp_slot_token_num = meta.num_tokens
                 if meta.type != "kv_tensor":
                     assert layers_to_be_received == received_layer, "The layers to be received should be the same as the received layers"
                     break
 
                 assert meta.layer_id not in received_layer, "The layer should not be received twice"
+                assert meta.num_tokens == tmp_slot_token_num, "The num tokens should be the same for all kv tensor metas"
                 received_layer.add(meta.layer_id)
                 logger.info(f"[debug]: rank {self.rank} receive kv tensor meta {meta}")
 
@@ -690,8 +744,6 @@ class DynamicGPUWorker(Worker):
                     assert isinstance(meta, KVTensorMeta)
                     kv_tensor = self.dynamic_kv_synchronizer.recv_kv_tensor(from_rank, meta)
                     assert isinstance(kv_tensor, torch.Tensor)
-
-                tmp_slot_token_num[meta.layer_id] = meta.num_tokens
                 tmp_kv_tensors_dict[meta.layer_id] = kv_tensor
 
                 # logger.info(f"available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
@@ -712,6 +764,7 @@ class DynamicGPUWorker(Worker):
                             self.model_runner.model.model.end_layer,
                             layer_id,
                             slot_mapping,
+                            self.block_num,
                             kv_tensor,
                             self.vllm_config.compilation_config.static_forward_context,
                             self.dynamic_kv_synchronizer,
@@ -727,10 +780,9 @@ class DynamicGPUWorker(Worker):
                             runner=self.model_runner,
                             kv_tensor=kv_tensor
                         )
-                    self.receiver_num_applied_token_dict[from_rank] += tmp_slot_token_num[layer_id]
                 logger.info(f"[operation]: rank {self.rank} layer {layer_id}'s kv cache and weight is loaded")
           
-                    
+            self.receiver_num_applied_token_dict[from_rank] = tmp_slot_token_num
             # 在同步迁移中，断言：所有接收层的 KV 已完成绑定且形状一致
             try:
                 self._assert_layers_kv_bound(layers_to_be_received)
@@ -753,13 +805,13 @@ class DynamicGPUWorker(Worker):
                 assert meta.type == "kv_patch_meta" or meta.type == "kv_patch_finished", "The type of the meta should be kv_patch_meta or kv_patch_finished"
 
                 # Ensure the order of the patch
-                assert meta.id == cur_patch_id, "The patch id should be the next id of the last patch"
+                assert meta.id == cur_patch_id, f"The patch id should be the next id of the last patch, meta id: {meta.id} vs cur patch id{cur_patch_id}"
                 cur_patch_id += 1
 
                 slot_mapping, kv_payload = self.dynamic_kv_synchronizer.recv_kv_patch(from_rank, meta)
                 self.dynamic_kv_synchronizer.apply_one_patch_to_kv_cache(self.model_runner.model.model.start_layer, meta, kv_payload, slot_mapping)
                 if meta.type == "kv_patch_meta":
-                    logger.info(f"debug: ------------ Worker {self.rank} received kv patch meta from rank {from_rank}")
+                    logger.info(f"debug: ------------ Worker {self.rank} received kv patch meta from rank {from_rank}, kv payload shape: {kv_payload.shape}, slot mapping shape: {slot_mapping.shape}, num tokens: {meta.num_tokens}, patch id: {meta.id}")
                     self.receiver_num_applied_token_dict[from_rank] += meta.num_tokens
                 elif meta.type == "kv_patch_finished":
                     logger.info(f"Worker {self.rank} received kv patch finished message from rank {from_rank}")

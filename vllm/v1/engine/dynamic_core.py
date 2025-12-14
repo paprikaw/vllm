@@ -683,10 +683,11 @@ class DynamicEngineCore(EngineCore):
             token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 128))
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor) 
             assert isinstance(self.scheduler, DynamicScheduler)
-            applied_token_list = self.model_executor.get_applied_token_num()
+            receiver_list = list(adding_per_rank.keys())
+            applied_token_list = self.model_executor.get_applied_token_num(receiver_list)
             logger.info(f"applied_token_list: {applied_token_list}")
             logger.info(f"num of tokens for migration: {self.scheduler.num_tokens_for_migration}")
-            lag = [self.scheduler.num_tokens_for_migration - min(applied_tokens) for applied_tokens in applied_token_list]
+            lag = [self.scheduler.num_tokens_for_migration - min(applied_tokens) for applied_tokens in applied_token_list if applied_tokens is not None]
             logger.info(f"lag between sent and applied tokens: {lag}")
             return max(lag) < token_to_send_threshold
             

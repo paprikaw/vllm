@@ -8,7 +8,7 @@ envs:
   DEPLOYMENT_CONFIG_PATH: "/tmp/vllm_exp/vllm_config.json"
   KV_SYNC_USE_CPU: "0"
   VLLM_USE_CPU_MODEL: "0"
-  # CUDA_LAUNCH_BLOCKING: "0"
+  CUDA_LAUNCH_BLOCKING: "1"
   NCCL_DEBUG: "INFO"
   PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
   PYTORCH_USE_CUDA_DSA: "1"

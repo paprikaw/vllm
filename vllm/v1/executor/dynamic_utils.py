@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import sched
 import traceback
 from typing import TYPE_CHECKING, Dict, Tuple, Union
 
@@ -69,6 +70,7 @@ try:
 
                 # 计算通信时间（如果有上游数据）
 
+                logger.info(f"[forward]: received scheduler output, is_sync_after_migration: {scheduler_output.is_sync_after_migration}")
                 self.worker.async_migration_before_execute_callback(
                     scheduler_output.is_sync_after_migration)
                 time_after_before_execute_callback = time.time()

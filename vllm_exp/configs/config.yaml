@@ -6,6 +6,7 @@ envs:
   RAY_CGRAPH_get_timeout: "10000"
   BENCHMARK_CONFIG_PATH: "/tmp/vllm_exp/benchmark_config.json"
   DEPLOYMENT_CONFIG_PATH: "/tmp/vllm_exp/vllm_config.json"
+  CUDA_LAUNCH_BLOCKING: "1"
 projects:
   # - project: "extream-500"
   #   type: "test_migration_with_different_pp"

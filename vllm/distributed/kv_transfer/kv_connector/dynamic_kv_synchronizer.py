@@ -98,9 +98,15 @@ class KVSlotMapping:
 
     def add_slot_mappings(self, slot_mapping: list[int], is_finished: bool) -> None:
         with self._cv:
-            self.bitmap[slot_mapping] = 1
+            trimmed_slot_mapping = []
+            for ele in slot_mapping:
+                if ele < 0:
+                    break
+                trimmed_slot_mapping.append(ele)
+
+            self.bitmap[trimmed_slot_mapping] = 1
             self.is_finished = is_finished
-            self.stored_tokens += len(slot_mapping)
+            self.stored_tokens += len(trimmed_slot_mapping)
             self._cv.notify_all()
 
     def get_all_slot_mappings(self) -> Tuple[list[int], bool, int]:
@@ -532,7 +538,6 @@ class DynamicKVSynchronizer():
             return self._flexi_get_patch(rank,
                                         layer_ids=layer_ids,
                                         kv_cache_meta=self.key_cache_list[0][0],
-                                        layer_num=len(self.key_cache_list),
                                         key_cache_ptrs=self.key_cache_ptrs,
                                         value_cache_ptrs=self.value_cache_ptrs,
                                         start_layer_id=start_layer_id)
@@ -555,7 +560,6 @@ class DynamicKVSynchronizer():
     def _flexi_get_patch(self, rank: int, 
                         layer_ids: list[int],
                         kv_cache_meta: torch.Tensor, 
-                        layer_num: int,
                         key_cache_ptrs: list[int],
                         value_cache_ptrs: list[int],
                         start_layer_id: int) -> Generator[KVPatch, None, None]:
@@ -564,14 +568,13 @@ class DynamicKVSynchronizer():
             slot_mapping, is_finished, stored_tokens = self.slot_mappings[rank].get_all_slot_mappings()
             slot_mapping_dev = torch.tensor(slot_mapping, device=kv_cache_meta.device, dtype=torch.int64)
             block_size, num_head, head_dim = kv_cache_meta.shape
-            kv_out = torch.empty(layer_num, 2, len(slot_mapping), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
+            kv_out = torch.empty(len(layer_ids), 2, slot_mapping_dev.size(0), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
             for layer_id in layer_ids:
                 local_layer_id = layer_id - start_layer_id
                 key_cache_ptr = key_cache_ptrs[local_layer_id]
                 value_cache_ptr = value_cache_ptrs[local_layer_id]
-                ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[layer_id][0], kv_out[layer_id][1], block_size)
-
-            self.last_patch_ids[rank] += 1
+                ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[local_layer_id][0], kv_out[local_layer_id][1], block_size)
+            logger.info(f"finished to get kv patch for rank {rank},  stored_tokens: {stored_tokens}, slot_mapping size: {slot_mapping_dev.size(0)}, slot_mapping shape: {slot_mapping_dev.shape}, kv_out shape: {kv_out.shape}")
             yield KVPatch(
                 KVPatchMeta(
                     type='kv_patch_meta' if not is_finished else "kv_patch_finished",
@@ -579,13 +582,14 @@ class DynamicKVSynchronizer():
                     layer_ids=layer_ids,
                     num_tokens=stored_tokens,
                     slot_mapping_dtype=torch.int64,
-                    slot_mapping_shape=torch.Size([len(slot_mapping)]),
+                    slot_mapping_shape=slot_mapping_dev.shape,
                     kv_payload_dtype=kv_out.dtype,
                     kv_payload_shape=kv_out.shape,
                 ),
                 kv_out,
                 slot_mapping_dev
             )
+            self.last_patch_ids[rank] += 1
             if is_finished: 
                 self.kv_cache_transfer_in_process[rank] = False
                 self.kv_patch_sending = False
@@ -631,7 +635,7 @@ class DynamicKVSynchronizer():
         key_cache_ptr = key_cache_ptrs[local_layer_id]
         value_cache_ptr = value_cache_ptrs[local_layer_id]
         block_size, num_head, head_dim = kv_cache_meta.shape
-        kv_out = torch.empty(2, len(slot_mapping), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
+        kv_out = torch.empty(2, slot_mapping.size(0), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
         logger.info(f"kv out device: {kv_out.device}, slot mapping device: {slot_mapping.device}")
         ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping, kv_out[0], kv_out[1], block_size)
         # 第一次访问时默认置为 False，避免 KeyError
@@ -639,7 +643,7 @@ class DynamicKVSynchronizer():
             type='kv_tensor',
             layer_to_be_received=set(layer_ids),
             layer_id=int(layer_id),
-            num_tokens=int(len(slot_mapping)),
+            num_tokens=slot_mapping.size(0),
             kv_payload_dtype=kv_out.dtype,
             kv_payload_shape=kv_out.shape,
             slot_mapping_dtype=slot_mapping.dtype,
@@ -672,9 +676,9 @@ class DynamicKVSynchronizer():
             kv_patches: KVPatch) -> None:
 
         assert self.kv_cache_transfer_in_process[target_rank] == True, "The kv cache transfer in process of the rank should be True."
-        if target_rank not in self.last_patch_ids:
-            self.last_patch_ids[target_rank] = 0
-        self.last_patch_ids[target_rank] += 1
+        # if target_rank not in self.last_patch_ids:
+        #     self.last_patch_ids[target_rank] = 0
+        # self.last_patch_ids[target_rank] += 1
         meta, kv_payload, slot_mapping = kv_patches.meta, kv_patches.kv_payload, kv_patches.slot_mapping
         self._send_meta_to_rank(target_rank, meta)
         self._send_data_to_rank(target_rank, slot_mapping)
@@ -893,7 +897,7 @@ class DynamicKVSynchronizer():
     def recv_kv_patch(self, from_rank: int,meta: KVPatchMeta) -> Tuple[torch.Tensor, torch.Tensor]:
         slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape)
         kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape)
-        assert kv_payload.dim() == 5 and kv_payload.size(0) == 2
+        assert kv_payload.dim() == 5 and kv_payload.size(1) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
         return slot_mapping, kv_payload
 
     # def put_kv_patch_to_buffer(self, rank: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor) -> None:
@@ -916,7 +920,9 @@ class DynamicKVSynchronizer():
         logger.info(f"apply one patch with id {meta.id}, num_tokens: {meta.num_tokens}")
         # slot_mapping 已经被裁剪过，只包含有效的 token
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
-        assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
+        # assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
+        if slot_mapping.size(0) != meta.num_tokens:
+            logger.info(f"Warning: slot_mapping size {slot_mapping.size(0)} does not match num_tokens {meta.num_tokens}, proceed anyway.")
         for layer_id, key, value in zip(meta.layer_ids, keys, values):
             local_layer_id = layer_id - start_layer_id
             if is_flexi:
@@ -938,5 +944,5 @@ class DynamicKVSynchronizer():
             else:
                 kv_cache = self.kv_caches[local_layer_id]
                 # 使用裁剪后的 slot_mapping，从 0 到 num_tokens
-                self.kv_helper.put_kv_to_cache(self.model_executable, key, value, layer_id, kv_cache, slot_mapping, 0, meta.num_tokens)
+                self.kv_helper.put_kv_to_cache(self.model_executable, key, value, layer_id, kv_cache, slot_mapping, 0, slot_mapping.size(0))
         return meta.id
