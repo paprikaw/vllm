@@ -25,20 +25,20 @@ projects:
     vllm:
       enable_flexi_flash_attn: true  # Set to true to enable Flexi Flash Attention
       pipeline_parallel_size: 2
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.75
       start_pp_layer_partitions:
-        - "12,52"
+        - "32,32"
     migration:
       is_migration: true
-      migration_steps: [10]
+      migration_steps: [25]
       alternative_configs:
-        "0": [12, 52]
-        "1": [32, 32]
+        "0": [32, 32]
+        "1": [12, 52]
     benchmark:
       profile: false
       print_outputs: true
-      data_num_requests: [10, 50]
+      data_num_requests: [20, 50]
       input_output_lens: [[512, 64], [512, 8]]
-      running_num_requests: [10, 50]
+      running_num_requests: [20, 50]
       running_request_rates: [3.0, 1.8]
 is_log_cover: true

@@ -107,13 +107,13 @@ class KVSlotMapping:
             self.bitmap[trimmed_slot_mapping] = 1
             self.is_finished = is_finished
             self.stored_tokens += len(trimmed_slot_mapping)
+            logger.info(f"[num tokens]: sender side add len(trimmed_slot_mapping): {len(trimmed_slot_mapping)} to synchronizer, total stored tokens: {self.stored_tokens}")
             self._cv.notify_all()
 
     def get_all_slot_mappings(self) -> Tuple[list[int], bool, int]:
         with self._cv:
             while self.bitmap.count() == 0:
                 self._cv.wait()
-            assert not self.is_finished
             slot_mapping = list(self.bitmap.search(1))
             stored_tokens = self.stored_tokens
             is_finished = self.is_finished
@@ -569,12 +569,12 @@ class DynamicKVSynchronizer():
             slot_mapping_dev = torch.tensor(slot_mapping, device=kv_cache_meta.device, dtype=torch.int64)
             block_size, num_head, head_dim = kv_cache_meta.shape
             kv_out = torch.empty(len(layer_ids), 2, slot_mapping_dev.size(0), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
-            for layer_id in layer_ids:
+            logger.info(f"layer_ids: {layer_ids}, kv_out shape: {kv_out.shape}, slot mapping shape: {slot_mapping_dev.shape}, start_layer_id: {start_layer_id}")
+            for idx, layer_id in enumerate(layer_ids):
                 local_layer_id = layer_id - start_layer_id
                 key_cache_ptr = key_cache_ptrs[local_layer_id]
                 value_cache_ptr = value_cache_ptrs[local_layer_id]
-                ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[local_layer_id][0], kv_out[local_layer_id][1], block_size)
-            logger.info(f"finished to get kv patch for rank {rank},  stored_tokens: {stored_tokens}, slot_mapping size: {slot_mapping_dev.size(0)}, slot_mapping shape: {slot_mapping_dev.shape}, kv_out shape: {kv_out.shape}")
+                ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[idx][0], kv_out[idx][1], block_size)
             yield KVPatch(
                 KVPatchMeta(
                     type='kv_patch_meta' if not is_finished else "kv_patch_finished",
@@ -639,6 +639,7 @@ class DynamicKVSynchronizer():
         logger.info(f"kv out device: {kv_out.device}, slot mapping device: {slot_mapping.device}")
         ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping, kv_out[0], kv_out[1], block_size)
         # 第一次访问时默认置为 False，避免 KeyError
+        logger.info(f"[num tokens]: sender side num tokens: {slot_mapping.size(0)}")
         return FlexiKVTensorMeta(
             type='kv_tensor',
             layer_to_be_received=set(layer_ids),

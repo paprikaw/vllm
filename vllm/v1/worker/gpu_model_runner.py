@@ -1120,7 +1120,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
-
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
@@ -1128,7 +1127,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
             return self.kv_connector_no_forward(scheduler_output)
-
         # Prepare the decoder inputs.
         attn_metadata, logits_indices, spec_decode_metadata = (
             self._prepare_inputs(scheduler_output))
@@ -1206,6 +1204,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             except Exception as e:
                 time.sleep(2)
+                logger.info(f"Exception during model forward: {e}")
                 raise e
 
             self.maybe_wait_for_kv_save()
@@ -1296,7 +1295,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Record the index of the request that should not be sampled,
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
-
         # NOTE: GPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
         logprobs_tensors = sampler_output.logprobs_tensors
@@ -1308,7 +1306,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states[:num_scheduled_tokens],
             scheduler_output,
         )
-
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
         max_gen_len = sampled_token_ids.shape[-1]
@@ -1324,7 +1321,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Mask out the sampled tokens that should not be sampled.
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
-
         if not self.use_spec_decode:
             # Speculative decoding is not enabled.
             spec_token_ids = None
@@ -1333,6 +1329,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_token_ids = self.generate_draft_token_ids(
                 valid_sampled_token_ids, sampling_metadata)
         elif self.speculative_config.method == "medusa":
+
             assert isinstance(self.drafter, MedusaProposer)
             if max_gen_len == 1:
                 hidden_states = sample_hidden_states
@@ -1354,6 +1351,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 sampling_metadata=sampling_metadata,
             )
         elif self.speculative_config.use_eagle():
+            logger.info(f"debug [e]")
             assert isinstance(self.drafter, EagleProposer)
             # TODO(woosuk): Refactor the loop.
             next_token_ids: list[int] = []
@@ -1377,6 +1375,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cache group, thus using the same attention metadata.
             eagle_attn_metadata = attn_metadata[
                 self.drafter.attn_layer_names[0]]
+
 
             # NOTE: deepseek_mtp uses MLA which does not have `block_table`
             if hasattr(eagle_attn_metadata, "block_table"):

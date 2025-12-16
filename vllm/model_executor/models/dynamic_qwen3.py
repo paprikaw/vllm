@@ -1,6 +1,7 @@
 from collections.abc import Iterable
 from typing import Optional, Union, Tuple
 import gc
+import threading
 
 from huggingface_hub import delete_space_secret
 import torch
@@ -263,6 +264,10 @@ class DynamicQwen3Model(Qwen3Model):
     ) -> Union[torch.Tensor, IntermediateTensors]:
         assert self.sched_start_layer != -1 and self.sched_end_layer != -1, "Please set sched_layers first"
 
+        # 从环境变量读取每个 layer 的超时时间（秒）
+        import os
+        layer_timeout = float(os.environ.get("VLLM_LAYER_TIMEOUT", "1.0"))
+
         with self.model_lock:
             with set_current_vllm_config(self.vllm_config):
                 if get_pp_group().is_first_rank:
@@ -275,23 +280,57 @@ class DynamicQwen3Model(Qwen3Model):
                     assert intermediate_tensors is not None
                     hidden_states = intermediate_tensors["hidden_states"]
                     residual = intermediate_tensors["residual"]
+                # logger.info(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
+                # if self.sched_start_layer < 12:
+                #     start = 0
+                #     end = 12
+                # else:
+                #     start = 40
+                #     end = 41
+
                 logger.info(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
-                for layer in self.layers[self.sched_start_layer:self.sched_end_layer]:
+                for layer_idx, layer in enumerate(self.layers[self.sched_start_layer:self.sched_end_layer], start=self.sched_start_layer):
                     try:
-                        hidden_states, residual = layer(
-                        positions,
-                            hidden_states,
-                            residual,
-                        )
+                        # 使用 threading.Timer 实现超时检测
+                        layer_start_time = time.time()
+                        result = [None, None]  # 用于存储结果
+                        exception_holder = [None]  # 用于存储异常
+                        
+                        def run_layer():
+                            h, r = layer(positions, hidden_states, residual)
+                            result[0], result[1] = h, r
+
+                        
+                        # # 在新线程中运行 layer
+                        # layer_thread = threading.Thread(target=run_layer, daemon=True)
+                        # layer_thread.start()
+                        # layer_thread.join(timeout=layer_timeout)
+                        
+                        # if layer_thread.is_alive():
+                        #     # 线程仍在运行，说明超时了
+                        #     elapsed = time.time() - layer_start_time
+                        #     raise TimeoutError(
+                        #         f"Layer {layer_idx} execution exceeded {layer_timeout:.1f}s timeout "
+                        #         f"(elapsed: {elapsed:.2f}s)"
+                        #     )
+                        run_layer()
+                        # 获取结果
+                        hidden_states, residual = result[0], result[1]
+                        
+                    except TimeoutError as e:
+                        logger.error(f"Layer {layer_idx} execution timeout: {e}")
+                        raise
                     except Exception as e:
-                        print(f"error is raised, layer: {layer}")
-                        raise e
+                        logger.error(f"Error in layer {layer_idx}: {e}")
+                        raise
                 if not get_pp_group().is_last_rank:
                     return IntermediateTensors({
                         "hidden_states": hidden_states,
                         "residual": residual
                     })
+                logger.info(f"forwarding model completed 1")
                 hidden_states, _ = self.norm(hidden_states, residual)
+        logger.info(f"forwarding model completed")
         return hidden_states
 
     # def load_layer_weights(self, weights: Iterable[tuple[str, torch.Tensor]], layers: Tuple[int, int])->set[str]:

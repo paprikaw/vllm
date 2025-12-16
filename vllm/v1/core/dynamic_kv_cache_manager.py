@@ -72,7 +72,7 @@ class DynamicKVCacheManager(KVCacheManager):
                 assert block.block_hash is None
         return bitmap
 
-    def compact_kv_cache(self, compacted_length: int) -> None:
+    def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         """Compact the KV cache by moving all used blocks to the leftmost
         `compact length` portion of the cache.
         """
@@ -86,7 +86,7 @@ class DynamicKVCacheManager(KVCacheManager):
             f"Not enough free space to compact: free={free_blocks}, need={need_free}"
 
         def is_used(idx):
-            return self.block_pool.blocks[idx].ref_cnt != 0
+            return bitmap[idx]
         migrate_record: dict[int, int] = {}
         compact_cache_with_record(
             self._migrate_block, 

@@ -160,8 +160,11 @@ class FlexiAttention(Attention):
                                       self.value_dev_ptr,
                                       attn_metadata)
             else:
-                return torch.ops.vllm.flexi_unified_attention(
+                logger.info(f"start forwarding within attention")
+                res = torch.ops.vllm.flexi_unified_attention(
                     query, key, value, self.layer_name)
+                logger.info(f"end forwarding within attention")
+                return res
 
 
 def flexi_unified_attention(

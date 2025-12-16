@@ -47,7 +47,6 @@ try:
             # This method is used by Ray Compiled Graph to execute the model,
             # and it needs a special logic of self.setup_device_if_necessary()
             time_recv = time.time()  # 记录接收时间
-            
             try:
                 self.setup_device_if_necessary()
                 assert self.worker is not None, "Worker is not initialized"
@@ -70,9 +69,9 @@ try:
 
                 # 计算通信时间（如果有上游数据）
 
-                logger.info(f"[forward]: received scheduler output, is_sync_after_migration: {scheduler_output.is_sync_after_migration}")
-                self.worker.async_migration_before_execute_callback(
-                    scheduler_output.is_sync_after_migration)
+                logger.info(f"[forward]: received scheduler output, is_sync_after_migration: {scheduler_output.is_sync_after_migration}, total_migration_tokens: {scheduler_output.total_migration_tokens}")
+
+                self.worker.async_migration_before_execute_callback(scheduler_output.total_migration_tokens)
                 time_after_before_execute_callback = time.time()
                 # self.worker.sync_migration_before_execute_callback(scheduler_output.new_kv_cache_block_num)
                 

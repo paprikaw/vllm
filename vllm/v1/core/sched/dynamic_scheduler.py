@@ -203,6 +203,7 @@ class DynamicScheduler(Scheduler):
 
         self.sending_slot_mapping = False # 控制在每一次scheduler schedule的时候是否需要同时发送slot_mapping
         self.num_tokens_for_migration = 0 # 记录已经发送的slot数量，用来和worker端已处理的slot数量进行对比
+        self.total_migration_tokens = 0
 
     def async_change_configuration(self, pp_layer_config: List[Tuple[int,int]], new_kv_cache_block_num: int):
         self.change_configuration_status = ChangeConfigurationType.ASYNC_CHANGING
@@ -212,12 +213,14 @@ class DynamicScheduler(Scheduler):
         self.next_new_kv_cache_block_num = new_kv_cache_block_num
 
     def start_sending_slot_mapping(self) -> List[int]:
-        slot_mapping = self.get_slot_mapping_from_reqs(self.running)
-        self.sending_slot_mapping = True
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
-        if is_flexi:
-            self.num_tokens_for_migration = len(slot_mapping) 
-        return slot_mapping
+        with self.lock:
+            slot_mapping = self.get_slot_mapping_from_reqs(self.running)
+            self.sending_slot_mapping = True
+            is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+            if is_flexi:
+                logger.info(f"[num tokens]: scheduler side num_tokens:{len(slot_mapping)} ")
+                self.num_tokens_for_migration = len(slot_mapping) 
+            return slot_mapping
 
 
     def get_slot_mapping_from_reqs(self, reqs: Union[list[Request], list[NewRequestData]]):
@@ -362,12 +365,19 @@ class DynamicScheduler(Scheduler):
                 pp_layer_config=pp_layer_config,
                 request_queue_id=id,
                 is_sync_after_migration=True if self.change_configuration_status == ChangeConfigurationType.ASYNC_CHANGING else False,
+                total_migration_tokens=self.total_migration_tokens,
                 new_kv_cache_block_num=self.next_new_kv_cache_block_num,
                 # slot_mapping = self.get_slot_mapping_from_reqs(scheduler_output.scheduled_new_reqs) if self.sending_slot_mapping else None,
             )
 
         if self.sending_slot_mapping:
+            logger.info(f"[num tokens]: scheduler output token {output.total_num_scheduled_tokens} added")
             self.num_tokens_for_migration += output.total_num_scheduled_tokens
+        
+        # 在发送sync scheduler msg之后的第二次schedule调用中，我们要把状态复位
+        # total_migration_tokens用于验证worker
+        if self.total_migration_tokens > 0:
+            self.total_migration_tokens = 0
 
         if self.change_configuration_status == ChangeConfigurationType.ASYNC_CHANGING:
             self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
@@ -382,6 +392,7 @@ class DynamicScheduler(Scheduler):
             self.next_pp_layer_config = None
             self.next_new_kv_cache_block_num = 0
             self.sending_slot_mapping = False
+            self.total_migration_tokens = self.num_tokens_for_migration 
             self.num_tokens_for_migration = 0
 
         if self.change_configuration_status == ChangeConfigurationType.SYNC_CHANGING:
@@ -578,10 +589,12 @@ class DynamicScheduler(Scheduler):
     def get_kv_cache_utilization(self) -> float:
         return self.kv_cache_manager.usage
     
-    def shrink_block_pool(self, compacted_length: int) -> None:
+    def shrink_block_pool(self, compacted_length: int) -> bitarray:
         assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
         assert compacted_length < self.kv_cache_manager.num_gpu_blocks, "compacted_length should be smaller than current kv cache block num"
-        self.kv_cache_manager.compact_kv_cache(compacted_length)
+        bitmap = self.get_bitmap()
+        self.kv_cache_manager.compact_kv_cache(compacted_length, bitmap)
+        return bitmap
 
     def extend_block_pool(self, extended_length: int) -> None:
         assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
