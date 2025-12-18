@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+from numpy import isin
 from torch import jagged
+
+from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from .core import EngineCore
 import traceback
 import os
@@ -446,8 +449,12 @@ class DynamicEngineCore(EngineCore):
             # Try to schedule a new batch if the batch queue is not full, but
             # the scheduler may return an empty batch if all requests are scheduled.
             # Note that this is not blocking.
+            isinstance(self.scheduler, DynamicScheduler)
             if not self.batch_queue.full():
-                scheduler_output = self.scheduler.schedule()
+                scheduler_output = self.scheduler.dynamic_schedule()
+                assert isinstance(scheduler_output, DynamicSchedulerOutput)
+                # if scheduler_output.total_migration_tokens > 0:
+                    # logger.info(f"[forward]: scheduled a total {scheduler_output.total_migration_tokens} tokens, total_num_scheduled_tokens: {scheduler_output.total_num_scheduled_tokens}, is_sync_after_migration: {scheduler_output.is_sync_after_migration}")
                 if scheduler_output.total_num_scheduled_tokens > 0:
                     future = execute_func(scheduler_output)
                     self.batch_queue.put_nowait(
@@ -455,7 +462,6 @@ class DynamicEngineCore(EngineCore):
 
             scheduled_batch = (scheduler_output is not None
                                and scheduler_output.total_num_scheduled_tokens > 0)
-
             # If no more requests can be scheduled and the job queue is not empty,
             # block until the first batch in the job queue is finished.
             # TODO(comaniac): Ideally we should peek the first batch in the
@@ -569,33 +575,36 @@ class DynamicEngineCore(EngineCore):
         # 除了migration前的config和migration后的config之外，在migration的过程中
         # 还有可能出现一些中间状态的migration config
         tmp_pp_layer_config = deepcopy(self.cur_pp_layer_config)
-        for rank, layers in enumerate(pp_layer_config):
-            start_layer, end_layer = tmp_pp_layer_config[rank][0], tmp_pp_layer_config[rank][1]
-            adding_layer_list = []
-            if layers[0] < start_layer:
-                adding_layer_list.append((layers[0], start_layer - 1))
-                tmp_pp_layer_config[rank] = (layers[0], tmp_pp_layer_config[rank][1])
-            if layers[1] > end_layer:
-                adding_layer_list.append((end_layer + 1, layers[1]))
-                tmp_pp_layer_config[rank] = (tmp_pp_layer_config[rank][0], layers[1])
-            logger.info(f"rank {rank}:\n adding_layer_list: {adding_layer_list}")
-            # 在 adding 之前，校验对应 GPU 是否有足够可用显存容纳“将要新增的层”的权重；
-            # 如果不足，尝试评估：压缩（compact）KV cache 后释放的显存，是否足以腾挪出空间。
-            # 同时，如果当前的GPU available memory已经足够，则需要评估是否需要resize kv cache
-            adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
-            assess = self._assess_memory_for_layer_reconfiguration(rank, adding_layer_num, mem_infos[rank], self.cur_pp_layer_config)
-            maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
-            if len(adding_layer_list) > 0:
-                adding_per_rank[rank] = adding_layer_list
-                if assess.enough_without_compact:
-                    pass
-                elif assess.can_fit_after_compact:
-                    need_compact = True
-                else:
-                    logger.info(
-                        "Rank %s lacks memory even after KV compact estimate: max_blocks_per_layer: %s, current_used_blocks: %s",
-                        rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
-                    return []
+        bitmap = bitarray()
+        with self.engine_lock:
+            time_start = time.time()
+            for rank, layers in enumerate(pp_layer_config):
+                start_layer, end_layer = tmp_pp_layer_config[rank][0], tmp_pp_layer_config[rank][1]
+                adding_layer_list = []
+                if layers[0] < start_layer:
+                    adding_layer_list.append((layers[0], start_layer - 1))
+                    tmp_pp_layer_config[rank] = (layers[0], tmp_pp_layer_config[rank][1])
+                if layers[1] > end_layer:
+                    adding_layer_list.append((end_layer + 1, layers[1]))
+                    tmp_pp_layer_config[rank] = (tmp_pp_layer_config[rank][0], layers[1])
+                logger.info(f"rank {rank}:\n adding_layer_list: {adding_layer_list}")
+                # 在 adding 之前，校验对应 GPU 是否有足够可用显存容纳“将要新增的层”的权重；
+                # 如果不足，尝试评估：压缩（compact）KV cache 后释放的显存，是否足以腾挪出空间。
+                # 同时，如果当前的GPU available memory已经足够，则需要评估是否需要resize kv cache
+                adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
+                assess = self._assess_memory_for_layer_reconfiguration(rank, adding_layer_num, mem_infos[rank], self.cur_pp_layer_config)
+                maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
+                if len(adding_layer_list) > 0:
+                    adding_per_rank[rank] = adding_layer_list
+                    if assess.enough_without_compact:
+                        pass
+                    elif assess.can_fit_after_compact:
+                        need_compact = True
+                    else:
+                        logger.info(
+                            "Rank %s lacks memory even after KV compact estimate: max_blocks_per_layer: %s, current_used_blocks: %s",
+                            rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
+                        return []
 
 
         # with self.engine_lock:
@@ -603,21 +612,24 @@ class DynamicEngineCore(EngineCore):
             # outputs = self._drain_out_running_queue()
             # engine_core_outputs.extend(outputs)
             # logger.info(f"[timeline]: after drain out running queue, time taken: {human_readable_duration(time.time() - start_drain_out_time)}")
-        assert isinstance(self.scheduler, DynamicScheduler)
-        assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
-        compacted_length = min(maximum_kv_block_num_after_compact)
-        original_length = self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
-        if need_compact:
-            time_start_compact_kv = time.time()
-            logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
-            with self.engine_lock:
+            assert isinstance(self.scheduler, DynamicScheduler)
+            assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
+            compacted_length = min(maximum_kv_block_num_after_compact)
+            original_length = self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
+            if need_compact:
+                time_start_compact_kv = time.time()
+                logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
                 bitmap = self.scheduler.shrink_block_pool(compacted_length)
+            logger.info(f"[timeline]: engine locking time: {human_readable_duration(time.time() - time_start)}")
+
+        if need_compact:
             self._compact_kv_cache(compacted_length, bitmap)
             logger.info(f"debug -------------- KV cache compacted to {compacted_length} blocks before adding layers")
             logger.info(f"[timeline]: compact kv cache take: {human_readable_duration(time.time() - time_start_compact_kv)}")
 
             logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
 
+        time.sleep(1)
         # 需要resize kv cache来进行migration，这里的resize一定是缩小
         if compacted_length != original_length:
             assert compacted_length < original_length, f"compacted_length: {compacted_length} is greater than the current kv cache size: {original_length}"
@@ -686,17 +698,18 @@ class DynamicEngineCore(EngineCore):
             return should_sync
 
         def sync_by_checking_leftover_tokens() -> bool:
-            token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 2000))
+            token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 500))
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor) 
             assert isinstance(self.scheduler, DynamicScheduler)
             receiver_list = list(adding_per_rank.keys())
             applied_token_list = self.model_executor.get_applied_token_num(receiver_list)
             logger.info(f"applied_token_list: {applied_token_list}")
             logger.info(f"num of tokens for migration: {self.scheduler.num_tokens_for_migration}")
+            min_applied_token = min([min(applied_tokens) for applied_tokens in applied_token_list if applied_tokens is not None])
+
             lag = [self.scheduler.num_tokens_for_migration - min(applied_tokens) for applied_tokens in applied_token_list if applied_tokens is not None]
             logger.info(f"lag between sent and applied tokens: {lag}")
-            return max(lag) < token_to_send_threshold
-            
+            return min_applied_token > 0 and max(lag) < token_to_send_threshold
         def check_patch_sending_process():
             '''
             Docstring for check_patch_sending_process

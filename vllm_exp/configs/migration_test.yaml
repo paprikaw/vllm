@@ -14,7 +14,7 @@ envs:
   PYTORCH_USE_CUDA_DSA: "1"
   # PYTORCH_NO_CUDA_MEMORY_CACHING: "1"
 projects:
-  - project: "migration_test_flexi"
+  - project: "migration_test_no_flexi"
     type: "one_off_test"
     network:
       delays: [0]
@@ -23,22 +23,22 @@ projects:
         0: "head"
         1: "worker1"
     vllm:
-      enable_flexi_flash_attn: true  # Set to true to enable Flexi Flash Attention
+      enable_flexi_flash_attn: false  # Set to true to enable Flexi Flash Attention
       pipeline_parallel_size: 2
       gpu_memory_utilization: 0.75
       start_pp_layer_partitions:
         - "32,32"
     migration:
       is_migration: true
-      migration_steps: [25]
+      migration_steps: [10]
       alternative_configs:
         "0": [32, 32]
         "1": [12, 52]
     benchmark:
       profile: false
       print_outputs: true
-      data_num_requests: [20, 50]
-      input_output_lens: [[512, 64], [512, 8]]
-      running_num_requests: [20, 50]
-      running_request_rates: [3.0, 1.8]
+      data_num_requests: [10, 20]
+      input_output_lens: [[512, 128], [256, 16]]
+      running_num_requests: [10, 20]
+      running_request_rates: [3.0, 2]
 is_log_cover: true

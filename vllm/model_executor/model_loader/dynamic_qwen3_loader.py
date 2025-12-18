@@ -11,7 +11,7 @@ import time
 
 import torch
 from torch import nn
-from vllm.config import LoadConfig, LoadFormat, ModelConfig, VllmConfig
+from vllm.config import LoadConfig, LoadFormat, ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.model_loader.weight_utils import enable_tqdm
 from safetensors import safe_open
 from vllm.platforms import current_platform
@@ -86,6 +86,8 @@ class CustomModelLoader(DefaultModelLoader):
         target_device = torch.device(device_config.device)
         time_start = time.time()
         logger.info(f"[timeline]: start to load layers {layers}")
+        # 🔴 关键修复：在整个层加载过程中设置 vllm_config 上下文
+        # 这样 Qwen3Attention 初始化时才能正确获取 enable_flexi_flash_attn 设置
         with set_default_torch_dtype(model_config.dtype): 
             # 添加设备上下文管理器，与 vllm 正常初始化逻辑保持一致
             with target_device:

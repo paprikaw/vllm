@@ -4646,18 +4646,19 @@ def set_current_vllm_config(vllm_config: VllmConfig, check_compile=False):
                 " does not support it. Please open an issue on GitHub"
                 " if you want it to be supported.",
                 vllm_config.model_config.model)
-    finally:
-        _current_vllm_config = old_vllm_config
+    # 避免多线程时覆盖全局变量
+    # finally:
+    #     _current_vllm_config = old_vllm_config
 
 
 def get_current_vllm_config() -> VllmConfig:
-    if _current_vllm_config is None:
-        # in ci, usually when we test custom ops/modules directly,
-        # we don't set the vllm config. In that case, we set a default
-        # config.
-        logger.warning("Current vLLM config is not set.")
-        from vllm.config import VllmConfig
-        return VllmConfig()
+    assert _current_vllm_config is not None
+        # # in ci, usually when we test custom ops/modules directly,
+        # # we don't set the vllm config. In that case, we set a default
+        # # config.
+        # logger.warning("Current vLLM config is not set.")
+        # from vllm.config import VllmConfig
+        # return VllmConfig()
     return _current_vllm_config
 
 

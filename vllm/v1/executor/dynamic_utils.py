@@ -63,15 +63,14 @@ try:
                 else:
                     scheduler_output, intermediate_tensors = scheduler_output, None
 
-
+    
 
                 assert isinstance(scheduler_output, DynamicSchedulerOutput), f"Scheduler output is not a DynamicSchedulerOutput:{type(scheduler_output)}"
 
                 # 计算通信时间（如果有上游数据）
 
-                logger.info(f"[forward]: received scheduler output, is_sync_after_migration: {scheduler_output.is_sync_after_migration}, total_migration_tokens: {scheduler_output.total_migration_tokens}")
-
-                self.worker.async_migration_before_execute_callback(scheduler_output.total_migration_tokens)
+                # logger.info(f"[forward]: received scheduler output, is_sync_after_migration: {scheduler_output.is_sync_after_migration}, total_migration_tokens: {scheduler_output.total_migration_tokens}")
+                self.worker.async_migration_before_execute_callback(self.worker.after_migration_total_token)
                 time_after_before_execute_callback = time.time()
                 # self.worker.sync_migration_before_execute_callback(scheduler_output.new_kv_cache_block_num)
                 
@@ -89,7 +88,7 @@ try:
 
                 time_after_execute = time.time()
                 assert(len(self.worker.model_runner.input_batch.block_table.block_tables) == 1) # Only for consistent shape of attention
-                self.worker.async_migration_after_execute_callback(scheduler_output.is_sync_after_migration, scheduler_output.new_kv_cache_block_num)
+                self.worker.async_migration_after_execute_callback(scheduler_output.is_sync_after_migration, scheduler_output.new_kv_cache_block_num, scheduler_output.total_migration_tokens, scheduler_output.total_num_scheduled_tokens)
 
                 time_after_execute_callback = time.time()
                 

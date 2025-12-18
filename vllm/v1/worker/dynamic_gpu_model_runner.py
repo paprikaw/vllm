@@ -716,7 +716,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
 
         logger.info(f"resizing kv cache from {len(self.kv_caches[0][0])} to {new_length}")
-        logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         time_start = time.time()
         forward_context = self.vllm_config.compilation_config.static_forward_context
         kv, kv_length, T, H, Dh = self.kv_caches[0].shape
@@ -736,8 +735,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
             self.kv_caches[idx] = tmp_cache
             attn_module.kv_cache = [tmp_cache]
         time_end = time.time()
-        logger.info(f"resized kv cache in {human_readable_duration(time_end - time_start)} seconds")
-        logger.info(f"resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
 
     def flexi_resize_kv_cache(self, new_length: int) -> None:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
@@ -805,7 +802,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         assert len(self.key_caches) != 0
         assert len(self.key_cache_ptrs) != 0
         for key_cache in self.key_caches:
-            key_cache[ new_block_id], key_cache[ old_block_id] = key_cache[ old_block_id], key_cache[ new_block_id]
+            key_cache[new_block_id], key_cache[old_block_id] = key_cache[ old_block_id], key_cache[ new_block_id]
         for value_cache in self.value_caches:
             value_cache[ new_block_id], value_cache[ old_block_id] = value_cache[ old_block_id], value_cache[ new_block_id]
         migrate_record[old_block_id] = new_block_id

@@ -65,10 +65,13 @@ class DynamicSchedulerOutput():
     
     # Whether the scheduling output is from before the migration was started.  
     request_queue_id: int
+
     
 #     slot_mapping: Optional[list[int]] = None
     # the bitmask for the whole batch
     grammar_bitmask: Optional[npt.NDArray[np.int32]]
+
+    total_migration_tokens: int = 0
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
@@ -77,5 +80,3 @@ class DynamicSchedulerOutput():
     is_sync_after_migration: bool = False
 
     new_kv_cache_block_num: int = 0
-
-    total_migration_tokens: int = 0

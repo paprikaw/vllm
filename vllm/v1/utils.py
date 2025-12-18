@@ -721,7 +721,7 @@ def get_layer_name_for_index(layer_index: int, forward_context) -> str:
     candidates = [name for name in forward_context.keys()
                   if extract_layer_index(name) == layer_index]
     if not candidates:
-        raise KeyError(f"No layer name found for index {layer_index} in forward_context")
+        raise KeyError(f"No layer name found for index {layer_index} in forward_context, forward_context keys: {list(forward_context.keys())}")
     if len(candidates) > 1:
         raise KeyError(f"Multiple layer names found for index {layer_index}: {candidates}")
     return candidates[0]

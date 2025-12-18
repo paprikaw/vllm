@@ -1,5 +1,6 @@
 from collections import defaultdict
 from concurrent.futures import thread
+from copy import deepcopy
 import gc
 from hmac import new
 import os
@@ -102,6 +103,8 @@ class DynamicGPUWorker(Worker):
 
         self.block_size = 0
         
+
+        self.after_migration_total_token = 0
     def _assert_layers_kv_bound(self, layer_ids: set[int]) -> None:
         if not self._debug_assert_kv:
             return
@@ -262,6 +265,7 @@ class DynamicGPUWorker(Worker):
                 for i in range(len(self.model_runner.kv_caches)):
                     logger.info(f"kv cache {i}: {self.model_runner.kv_caches[i].shape}")
         
+            logger.info(f"kv scynchronizer kv cache list length after adding layers: {len(self.dynamic_kv_synchronizer.key_cache_ptrs)}")
             # 唤醒等待层加载的线程（kv tensor的绑定线程和kv patch 应用线程）。
             self._layer_loaded_cv.notify_all()
             logger.info(f"[debug]: notified all layer loaded cv waiters")
@@ -569,7 +573,6 @@ class DynamicGPUWorker(Worker):
 
 
     def _compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
-        time_start = time.time()
         runner = self.model_runner
         start_layer, end_layer = runner.model.model.start_layer, runner.model.model.end_layer
         assert isinstance(runner.model, DynamicQwen3ForCausalLM)
@@ -580,39 +583,86 @@ class DynamicGPUWorker(Worker):
         def is_used(idx):
             return bitmap[idx]
         migrate_record: dict[int, int] = {}
-        with self.model_runner.forward_lock:
-            if runner.vllm_config.dynamic_config.enable_flexi_flash_attn:
-                compact_cache_with_record(runner._migrate_block_by_swapping_ptrs, is_used, compacted_length, num_blocks, migrate_record)
-                # After swapping tensor references in Python lists, we must update the GPU pointer arrays
-                # because prepare_flexi_kv_ptrs caches the data_ptr() of each tensor on GPU
-                forward_context = runner.vllm_config.compilation_config.static_forward_context
+
+        tmp_key_cache = []
+        tmp_value_cache = []
+        for key_cache, value_cache in zip(runner.key_caches, runner.value_caches):
+            tmp_key_cache.append([page for page in key_cache])
+            tmp_value_cache.append([page for page in value_cache])
+         # Create temporary copies of the caches and pointers
+        tmp_old_key_ptrs = deepcopy(self.model_runner.key_cache_ptrs)
+        tmp_old_value_ptrs = deepcopy(self.model_runner.value_cache_ptrs)
+        tmp_new_key_ptrs: list[int] = []
+        tmp_new_value_ptrs: list[int] = []
+        
+        def _migrate_block_by_swapping_ptrs(old_block_id: int, new_block_id: int, migrate_record: dict[int, int]):
+            assert len(tmp_key_cache) != 0
+            for key_cache in tmp_key_cache:
+                key_cache[new_block_id], key_cache[old_block_id] = key_cache[ old_block_id], key_cache[ new_block_id]
+            for value_cache in tmp_value_cache:
+                value_cache[ new_block_id], value_cache[ old_block_id] = value_cache[ old_block_id], value_cache[ new_block_id]
+            migrate_record[old_block_id] = new_block_id
+
+        if runner.vllm_config.dynamic_config.enable_flexi_flash_attn:
+            compact_cache_with_record(_migrate_block_by_swapping_ptrs, is_used, compacted_length, num_blocks, migrate_record)
+
+            # Prepare new kv ptrs
+            forward_context = runner.vllm_config.compilation_config.static_forward_context
+            for layer_name, attn_module in forward_context.items():
+                idx = extract_layer_index(layer_name)
+                local_idx = idx - start_layer
+                # Free old GPU pointer arrays to avoid memory leak
+                new_k_ptrs, new_v_ptrs = prepare_flexi_kv_ptrs(
+                    tmp_key_cache[local_idx], tmp_value_cache[local_idx])
+                logger.info(f"prepare kv ptr for layer {layer_name}, new_k_ptrs: {new_k_ptrs}, new_v_ptrs: {new_v_ptrs}")
+                tmp_new_key_ptrs.append(new_k_ptrs)
+                tmp_new_value_ptrs.append(new_v_ptrs)
+            # Bind the new kv cache
+            with self.model_runner.forward_lock:
+                time_start_within_lock = time.time()
                 for layer_name, attn_module in forward_context.items():
                     idx = extract_layer_index(layer_name)
                     local_idx = idx - start_layer
+                    new_k_ptrs, new_v_ptrs = tmp_new_key_ptrs[local_idx], tmp_new_value_ptrs[local_idx]
+                    new_k_cache, new_v_cache = tmp_key_cache[local_idx], tmp_value_cache[local_idx]
                     # Free old GPU pointer arrays to avoid memory leak
-                    old_k_ptrs, old_v_ptrs = runner.key_cache_ptrs[local_idx], runner.value_cache_ptrs[local_idx]
-                    free_flexi_kv_ptrs(old_k_ptrs, old_v_ptrs)
-                    new_k_ptrs, new_v_ptrs = prepare_flexi_kv_ptrs(
-                        runner.key_caches[local_idx], runner.value_caches[local_idx])
+                    dynamic_flexi_bind_single_kv_cache(start_layer, end_layer, idx, new_k_cache, new_v_cache, new_k_ptrs, new_v_ptrs, forward_context, self.dynamic_kv_synchronizer, runner)
+                logger.info(f"after binding, synchronizer key cache ptr list: {self.dynamic_kv_synchronizer.key_cache_ptrs}, value cache ptr list: {self.dynamic_kv_synchronizer.value_cache_ptrs}") 
+                # 遍历CachedRequestState更新block_ids
+                for req_state in runner.requests.values():
+                    for i, block_ids in enumerate(req_state.block_ids):
+                        for j, block_id in enumerate(block_ids):
+                            if block_id in migrate_record:
+                                req_state.block_ids[i][j] = migrate_record[block_id]
+                # 遍历InputBatch中的block_table更新block_ids
+                for block_table in runner.input_batch.block_table:
+                    for row in block_table.block_table_np:
+                        for local_idx, block_id in enumerate(row):
+                            if block_id in migrate_record:
+                                row[local_idx] = migrate_record[block_id]
+                logger.info(f"kv cache compaction flexi take {human_readable_duration(time.time() - time_start_within_lock)} seconds within lock")
 
-                    dynamic_flexi_bind_single_kv_cache(start_layer, end_layer, idx, runner.key_caches[local_idx], runner.value_caches[local_idx], new_k_ptrs, new_v_ptrs, forward_context, self.dynamic_kv_synchronizer, runner)
-                logger.info(f"Updated GPU pointer arrays after compact")
-            else:
+            for old_k_ptrs, old_v_ptrs in zip(tmp_old_key_ptrs, tmp_old_value_ptrs):
+                free_flexi_kv_ptrs(old_k_ptrs, old_v_ptrs)
+        else:
+            with self.model_runner.forward_lock:
+                time_start_within_lock = time.time()
                 compact_cache_with_record(runner._migrate_block_by_copy_data, is_used, compacted_length, num_blocks, migrate_record)
-            logger.info(f"[debug]: migrate_record: {migrate_record}")
+                # 遍历CachedRequestState更新block_ids
+                for req_state in runner.requests.values():
+                    for i, block_ids in enumerate(req_state.block_ids):
+                        for j, block_id in enumerate(block_ids):
+                            if block_id in migrate_record:
+                                req_state.block_ids[i][j] = migrate_record[block_id]
+                # 遍历InputBatch中的block_table更新block_ids
+                for block_table in runner.input_batch.block_table:
+                    for row in block_table.block_table_np:
+                        for local_idx, block_id in enumerate(row):
+                            if block_id in migrate_record:
+                                row[local_idx] = migrate_record[block_id]
+                logger.info(f"kv cache compaction regular take {human_readable_duration(time.time() - time_start_within_lock)} seconds within lock")
 
-            # 遍历CachedRequestState更新block_ids
-            for req_state in runner.requests.values():
-                for i, block_ids in enumerate(req_state.block_ids):
-                    for j, block_id in enumerate(block_ids):
-                        if block_id in migrate_record:
-                            req_state.block_ids[i][j] = migrate_record[block_id]
-            # 遍历InputBatch中的block_table更新block_ids
-            for block_table in runner.input_batch.block_table:
-                for row in block_table.block_table_np:
-                    for local_idx, block_id in enumerate(row):
-                        if block_id in migrate_record:
-                            row[local_idx] = migrate_record[block_id]
+        logger.info(f"[debug]: migrate_record: {migrate_record}")
         
         # # ===== 关键修复：将更新后的 block table 同步到 GPU =====
         # # block_table_np 的修改已自动同步到 block_table_cpu (numpy view)
@@ -623,16 +673,17 @@ class DynamicGPUWorker(Worker):
         # logger.info(f"[debug]: block table committed to GPU")
 
         torch.cuda.synchronize()
-        time_end = time.time()
-        logger.info(f"compacted kv cache in {human_readable_duration(time_end - time_start)}")
 
     def resize_kv_cache(self, new_length: int) -> None:
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         self.block_num = new_length
+        # logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         if is_flexi:
             self.flexi_resize_kv_cache(new_length)
         else:
             self.model_runner.resize_kv_cache(new_length)
+        # logger.info(f"resized kv cache in {human_readable_duration(time_end - time_start)} seconds")
+        # logger.info(f"resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         self.dynamic_kv_synchronizer.create_slot_mappings(new_length * self.block_size)
     
     def flexi_resize_kv_cache(self, new_length: int) -> None:
@@ -728,6 +779,8 @@ class DynamicGPUWorker(Worker):
             for old_key_ptr, old_value_ptr in zip(tmp_old_key_cache_ptr_list, tmp_old_value_cache_ptr_list):
                 free_flexi_kv_ptrs(old_key_ptr, old_value_ptr)
 
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         logger.info(f"[forward]: resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
 
     # ####################################### #
@@ -949,7 +1002,6 @@ class DynamicGPUWorker(Worker):
                 logger.info(f"[operation]: rank {self.rank} layer {layer_id}'s kv cache and weight is loaded")
           
             self.receiver_num_applied_token_dict[from_rank] = tmp_slot_token_num
-            logger.info(f"[num tokens]: rank {from_rank} applied token: {self.receiver_num_applied_token_dict[from_rank]}")
             # 在同步迁移中，断言：所有接收层的 KV 已完成绑定且形状一致
             try:
                 self._assert_layers_kv_bound(layers_to_be_received)
@@ -978,7 +1030,7 @@ class DynamicGPUWorker(Worker):
                 slot_mapping, kv_payload = self.dynamic_kv_synchronizer.recv_kv_patch(from_rank, meta)
                 self.dynamic_kv_synchronizer.apply_one_patch_to_kv_cache(self.model_runner.model.model.start_layer, meta, kv_payload, slot_mapping)
                 self.receiver_num_applied_token_dict[from_rank] += meta.num_tokens
-                logger.info(f"[num tokens]: receiver side: rank {from_rank} applied token: {meta.num_tokens}")
+                logger.info(f"[num tokens]: receiver side: rank {from_rank} applied token: {meta.num_tokens}, total applied token: {self.receiver_num_applied_token_dict[from_rank]}")
                 if meta.type == "kv_patch_meta":
                     logger.info(f"debug: ------------ Worker {self.rank} received kv patch meta from rank {from_rank}, kv payload shape: {kv_payload.shape}, slot mapping shape: {slot_mapping.shape}, num tokens: {meta.num_tokens}, patch id: {meta.id}")
                 elif meta.type == "kv_patch_finished":
@@ -1006,6 +1058,7 @@ class DynamicGPUWorker(Worker):
                                                ) -> None:
         # 处于迁移中时，或这是同步批（用于发送 finished 信号），直接放行。
         if self.migration_in_process:
+            assert total_migration_token_num == 0, "If in migration process, the total migration token num should not be zero"
             logger.info(f"debug: rank {self.rank} is in migration or is sync after migration, skip kv synchronize before execute callback")
             return
 
@@ -1018,7 +1071,7 @@ class DynamicGPUWorker(Worker):
                 logger.info(f"[timeline]: after waiting for all kv cache patch to be applied, time taken: {human_readable_duration(time.time() - time_start)}")
 
                 logger.info(f"debug: ---------------------rank {self.rank} all patch applied, verify applied token num")
-                logger.info(f"[num tokens]: total migration token num: {total_migration_token_num}, applied token num: {self.receiver_num_applied_token_dict}")
+                logger.info(f"[num tokens]: total migration token num: {total_migration_token_num}")
                 # for rank in range(self.vllm_config.parallel_config.pipeline_parallel_size):
                 #     if rank != self.rank:
                 #         continue
@@ -1031,6 +1084,7 @@ class DynamicGPUWorker(Worker):
                 threading.Thread(target=do_resize, daemon=True).start()
                 logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
                 self.new_kv_cache_block_num = 0
+            self.after_migration_total_token = 0
 
     def sync_migration_before_execute_callback(self, new_kv_cache_block_num: int) -> None:
         assert self.enable_capture_kv_patch == False, "The sending kv cache should not be in process"
@@ -1042,7 +1096,7 @@ class DynamicGPUWorker(Worker):
         # if new_kv_cache_block_num != 0:
         #     self.resize_kv_cache(new_kv_cache_block_num)
 
-    def async_migration_after_execute_callback(self, is_sync: bool, new_kv_cache_block_num: int):
+    def async_migration_after_execute_callback(self, is_sync: bool, new_kv_cache_block_num: int, num_total_migration_tokens: int, num_total_new_tokens: int):
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
 
         # target_device = self.device  # set in init_device to cuda:self.local_rank
@@ -1063,7 +1117,8 @@ class DynamicGPUWorker(Worker):
                     self.rank_to_layers_ids[rank],
                     self.model_runner.model.model.start_layer,
                     slot_mapping,
-                    is_sync
+                    is_sync,
+                    num_total_new_tokens
                 )
 
             if is_sync:
@@ -1082,9 +1137,10 @@ class DynamicGPUWorker(Worker):
                 logger.info(f"[timeline]: after release kv cache for layers, time taken: {human_readable_duration(time.time() - time_start)}")
                 self.remove_layers(self.rank, layer_ranges)
                 logger.info(f"[timeline]: after remove layers, time taken: {human_readable_duration(time.time() - time_start)}")
-                self.new_kv_cache_block_num = new_kv_cache_block_num
-
                 self.finish_migration()
+
+                self.new_kv_cache_block_num = new_kv_cache_block_num
+                self.after_migration_total_token = num_total_migration_tokens
         # else:
         #     assert not is_sync, "If not sending kv cache, it should not be sync migration"
 

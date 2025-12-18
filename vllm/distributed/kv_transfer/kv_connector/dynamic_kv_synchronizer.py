@@ -96,7 +96,7 @@ class KVSlotMapping:
         self.is_finished = False
         self.stored_tokens = 0
 
-    def add_slot_mappings(self, slot_mapping: list[int], is_finished: bool) -> None:
+    def add_slot_mappings(self, slot_mapping: list[int], is_finished: bool, num_total_new_tokens: int) -> None:
         with self._cv:
             trimmed_slot_mapping = []
             for ele in slot_mapping:
@@ -104,9 +104,11 @@ class KVSlotMapping:
                     break
                 trimmed_slot_mapping.append(ele)
 
+            assert num_total_new_tokens == len(trimmed_slot_mapping), f"The num_total_new_tokens {num_total_new_tokens} is not equal to the length of trimmed_slot_mapping {len(trimmed_slot_mapping)}"
+
             self.bitmap[trimmed_slot_mapping] = 1
             self.is_finished = is_finished
-            self.stored_tokens += len(trimmed_slot_mapping)
+            self.stored_tokens += num_total_new_tokens
             logger.info(f"[num tokens]: sender side add len(trimmed_slot_mapping): {len(trimmed_slot_mapping)} to synchronizer, total stored tokens: {self.stored_tokens}")
             self._cv.notify_all()
 
@@ -632,14 +634,17 @@ class DynamicKVSynchronizer():
                             slot_mapping: torch.Tensor,
                             start_layer_id: int) -> Tuple[FlexiKVTensorMeta, torch.Tensor]:
         local_layer_id = layer_id - start_layer_id
-        key_cache_ptr = key_cache_ptrs[local_layer_id]
+        try:
+            key_cache_ptr = key_cache_ptrs[local_layer_id]
+        except Exception as e:
+            logger.error(f"key_cache_ptrs: {key_cache_ptrs}, local_layer_id: {local_layer_id}, layer_id: {layer_id}, start_layer_id: {start_layer_id}")
+            raise e
         value_cache_ptr = value_cache_ptrs[local_layer_id]
         block_size, num_head, head_dim = kv_cache_meta.shape
         kv_out = torch.empty(2, slot_mapping.size(0), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
         logger.info(f"kv out device: {kv_out.device}, slot mapping device: {slot_mapping.device}")
         ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping, kv_out[0], kv_out[1], block_size)
         # 第一次访问时默认置为 False，避免 KeyError
-        logger.info(f"[num tokens]: sender side num tokens: {slot_mapping.size(0)}")
         return FlexiKVTensorMeta(
             type='kv_tensor',
             layer_to_be_received=set(layer_ids),
@@ -859,11 +864,11 @@ class DynamicKVSynchronizer():
                 self.buffers[rank].add_patch(KVPatch(meta, torch.empty(0, device='cpu'), torch.empty(0, device='cpu')))
         self.last_patch_ids = {}
 
-    def add_new_tokens_to_kv_synchronizer(self, rank: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor, is_finished: bool) -> None:
+    def add_new_tokens_to_kv_synchronizer(self, rank: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor, is_finished: bool, num_total_new_tokens: int) -> None:
         time_start = time.time()
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         if is_flexi:
-            self.slot_mappings[rank].add_slot_mappings(slot_mapping.tolist(), is_finished=is_finished)
+            self.slot_mappings[rank].add_slot_mappings(slot_mapping.tolist(), is_finished=is_finished, num_total_new_tokens=num_total_new_tokens)
         else:
             kv_patch = self.kv_synchronizer_helper.extract_kv_patch_from_kv_cache(self.last_patch_ids[rank], kv_caches, layer_ids, start_layer_id, slot_mapping, is_finished)
             time_after_extract_kv_patch = time.time()
