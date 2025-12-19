@@ -156,9 +156,6 @@ class DynamicEngineCore(EngineCore):
 
         self.scheduler_kv_cache_config: Optional[KVCacheConfig]
 
-        # This variable is used to keep track of how many token that needs
-        # to be applied to the new kv cache after migration
-        self.tokens_to_be_applied = 0
 
         
     def _estimate_max_blocks_per_layer(self, gpu_total_memory: int, memory_after_adding_weight: int, num_layers_on_rank: int, block_size: int) -> int:
@@ -557,7 +554,7 @@ class DynamicEngineCore(EngineCore):
         """
         logger.info(f"Start migrating to new configuration {pp_layer_config}")
         assert isinstance(self.scheduler, DynamicScheduler)
-
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         engine_core_outputs = []
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
@@ -629,7 +626,7 @@ class DynamicEngineCore(EngineCore):
 
             logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
 
-        time.sleep(1)
+        time.sleep(2)
         # 需要resize kv cache来进行migration，这里的resize一定是缩小
         if compacted_length != original_length:
             assert compacted_length < original_length, f"compacted_length: {compacted_length} is greater than the current kv cache size: {original_length}"
@@ -672,9 +669,8 @@ class DynamicEngineCore(EngineCore):
                 layer_ids = plan.setdefault(dst_rank, [])
                 layer_ids.extend(range(lo, hi + 1))
 
-        time_before_slot_mapping_calculation = time.time() 
-        slot_mapping = self.scheduler.start_sending_slot_mapping()
-        logger.info(f"time taken to generate slot mapping:{human_readable_duration(time.time() - time_before_slot_mapping_calculation)}")
+        slot_mapping = self.scheduler.start_migration()
+        assert slot_mapping is not None if is_flexi else True
         self.model_executor.start_kv_cache_migration_async(src_to_plan, slot_mapping)
         time_kv_migration_end = time.time()
 

@@ -431,7 +431,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         # fire-and-forget 异步发起，每个 worker 内部用线程执行
         self.collective_rpc("async_add_layers", args=(rank, layers_list))
     
-    def start_kv_cache_migration_async(self, src_to_plan: dict[int, dict[int, list[int]]], slot_mapping: list[int]):
+    def start_kv_cache_migration_async(self, src_to_plan: dict[int, dict[int, list[int]]], slot_mapping: Optional[list[int]]):
         # 调用 worker 侧的同名方法，仅在 source_rank 上发送，其余 rank 不做事
         self.collective_rpc("start_kv_cache_migration_async", args=(src_to_plan,slot_mapping))
 

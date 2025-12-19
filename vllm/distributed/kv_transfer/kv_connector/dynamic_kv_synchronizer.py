@@ -13,6 +13,8 @@ import threading
 import os
 
 import bitarray
+from httpx import patch
+from responses import start
 import torch
 from pydantic import TypeAdapter
 from vllm import _custom_ops as ops
@@ -253,6 +255,7 @@ class DynamicKVSynchronizer():
         self.vllm_config = config
         self.config = config.layer_kv_connector_config
         self.kv_helper = kv_helper(config)
+        self.num_heads, self.head_size = self.kv_helper.get_model_args(model_executable)
         self.kv_synchronizer_helper = kv_helper(config)
         self.model_executable = model_executable
         self.kv_synchronizer_helper.model_executable = model_executable
@@ -538,13 +541,16 @@ class DynamicKVSynchronizer():
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         if is_flexi:
             return self._flexi_get_patch(rank,
-                                        layer_ids=layer_ids,
-                                        kv_cache_meta=self.key_cache_list[0][0],
-                                        key_cache_ptrs=self.key_cache_ptrs,
-                                        value_cache_ptrs=self.value_cache_ptrs,
-                                        start_layer_id=start_layer_id)
+                                            layer_ids=layer_ids,
+                                            kv_cache_meta=self.key_cache_list[0][0],
+                                            key_cache_ptrs=self.key_cache_ptrs,
+                                            value_cache_ptrs=self.value_cache_ptrs,
+                                            start_layer_id=start_layer_id)
         else:
-            return self._buffer_get_kv_patch(rank)
+            return self._get_patch(rank,
+                                    layer_ids,
+                                    self.kv_caches,
+                                    start_layer_id)
 
     def _buffer_get_kv_patch(self, rank: int) -> Generator[KVPatch, None, None]:
         # 在发送完kv tensor之后开始发送kv patch
@@ -597,6 +603,33 @@ class DynamicKVSynchronizer():
                 self.kv_patch_sending = False
                 self.last_patch_ids[rank] = 0
                 break
+    # 在发送完kv tensor之后开始发送kv patch
+    def _get_patch(self, rank: int, 
+                        layer_ids: list[int],
+                        kv_cache: list[torch.Tensor], 
+                        start_layer_id: int) -> Generator[KVPatch, None, None]:
+        while True:
+            patch_id = self.last_patch_ids[rank]
+            logger.info(f"start to get slot mapping for rank {rank}")
+            slot_mapping, is_finished, stored_tokens = self.slot_mappings[rank].get_all_slot_mappings()
+            slot_mapping_dev = torch.tensor(slot_mapping, device=kv_cache[0].device, dtype=torch.int64)
+
+            kv_patch = self.kv_helper.extract_kv_patch_from_kv_cache(
+                patch_id=patch_id,
+                kv_caches=kv_cache,
+                layer_ids=layer_ids,
+                start_layer_id=start_layer_id,
+                slot_mapping=slot_mapping_dev,
+                is_finished=is_finished
+            )
+            kv_patch.meta.num_tokens = stored_tokens
+            yield kv_patch
+            self.last_patch_ids[rank] += 1
+            if is_finished: 
+                self.kv_cache_transfer_in_process[rank] = False
+                self.kv_patch_sending = False
+                self.last_patch_ids[rank] = 0
+                break
 
     def get_kv_tensor_from_cache(self, layer_ids: list[int],layer_id: int, start_layer_id: int, slot_mapping: Optional[torch.Tensor] = None) -> Tuple[Union[KVTensorMeta, FlexiKVTensorMeta], torch.Tensor]:
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
@@ -622,7 +655,7 @@ class DynamicKVSynchronizer():
             type='kv_tensor',
             layer_to_be_received=set(layer_ids),
             layer_id=int(layer_id),
-            num_tokens=int(kv_cache.size(1)),
+            num_tokens=0,
             dtype=kv_cache.dtype,
             shape=kv_cache.shape), kv_cache
 
@@ -864,18 +897,18 @@ class DynamicKVSynchronizer():
                 self.buffers[rank].add_patch(KVPatch(meta, torch.empty(0, device='cpu'), torch.empty(0, device='cpu')))
         self.last_patch_ids = {}
 
-    def add_new_tokens_to_kv_synchronizer(self, rank: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor, is_finished: bool, num_total_new_tokens: int) -> None:
+    def add_new_tokens_to_kv_synchronizer(self, rank: int, slot_mapping: torch.Tensor, is_finished: bool, num_total_new_tokens: int) -> None:
         time_start = time.time()
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
-        if is_flexi:
-            self.slot_mappings[rank].add_slot_mappings(slot_mapping.tolist(), is_finished=is_finished, num_total_new_tokens=num_total_new_tokens)
-        else:
-            kv_patch = self.kv_synchronizer_helper.extract_kv_patch_from_kv_cache(self.last_patch_ids[rank], kv_caches, layer_ids, start_layer_id, slot_mapping, is_finished)
-            time_after_extract_kv_patch = time.time()
-            logger.info(f"debug: ---------------------extract kv patch time: {time_after_extract_kv_patch - time_start:.2f} seconds")
-            assert kv_patch is not None
-            self.last_patch_ids[rank] += 1
-            self.buffers[rank].add_patch(kv_patch)
+        # is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        # if is_flexi:
+        self.slot_mappings[rank].add_slot_mappings(slot_mapping.tolist(), is_finished=is_finished, num_total_new_tokens=num_total_new_tokens)
+        # else:
+        #     kv_patch = self.kv_synchronizer_helper.extract_kv_patch_from_kv_cache(self.last_patch_ids[rank], kv_caches, layer_ids, start_layer_id, slot_mapping, is_finished)
+        #     time_after_extract_kv_patch = time.time()
+        #     logger.info(f"debug: ---------------------extract kv patch time: {time_after_extract_kv_patch - time_start:.2f} seconds")
+        #     assert kv_patch is not None
+        #     self.last_patch_ids[rank] += 1
+        #     self.buffers[rank].add_patch(kv_patch)
 
     # ########################################## #
     # Receiver side functions                      #
@@ -897,13 +930,18 @@ class DynamicKVSynchronizer():
             return slot_mapping, kv_payload
         else:
             kv_payload = self._recv_data_from_rank(from_rank, meta.dtype, meta.shape)
-            assert kv_payload.dim() == 4 and kv_payload.size(0) == 2 
+            assert kv_payload.dim() == 5 and kv_payload.size(0) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
             return kv_payload
 
     def recv_kv_patch(self, from_rank: int,meta: KVPatchMeta) -> Tuple[torch.Tensor, torch.Tensor]:
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape)
         kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape)
-        assert kv_payload.dim() == 5 and kv_payload.size(1) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
+        if is_flexi:
+            assert kv_payload.dim() == 5 and kv_payload.size(1) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
+        else:
+            assert kv_payload.dim() == 5 and kv_payload.size(0) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
+
         return slot_mapping, kv_payload
 
     # def put_kv_patch_to_buffer(self, rank: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor) -> None:

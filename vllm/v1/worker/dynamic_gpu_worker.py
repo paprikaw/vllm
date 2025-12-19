@@ -102,6 +102,8 @@ class DynamicGPUWorker(Worker):
         self.receiver_num_applied_token_dict = defaultdict(int)
 
         self.block_size = 0
+
+        self.scheduler_output_version = 0
         
 
         self.after_migration_total_token = 0
@@ -575,10 +577,14 @@ class DynamicGPUWorker(Worker):
     def _compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         runner = self.model_runner
         start_layer, end_layer = runner.model.model.start_layer, runner.model.model.end_layer
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         assert isinstance(runner.model, DynamicQwen3ForCausalLM)
         logger.info(f"start to compact kv cache for layers {runner.model.model.start_layer} to {runner.model.model.end_layer}")
         num_blocks = len(bitmap)
-        assert num_blocks == len(runner.key_caches[0]), f"bitmap length mismatch: num_blocks: {num_blocks} != kv_cache_tensor_length: {len(runner.key_caches)}"
+        if is_flexi:
+            assert num_blocks == len(runner.key_caches[0]), f"bitmap length mismatch: num_blocks: {num_blocks} != kv_cache_tensor_length: {len(runner.key_caches)}"
+        else:
+            assert num_blocks == runner.kv_caches[0].size(1), f"bitmap length mismatch: num_blocks: {num_blocks} != kv_cache_tensor_length: {len(runner.kv_caches[0])}"
 
         def is_used(idx):
             return bitmap[idx]
@@ -660,6 +666,7 @@ class DynamicGPUWorker(Worker):
                         for local_idx, block_id in enumerate(row):
                             if block_id in migrate_record:
                                 row[local_idx] = migrate_record[block_id]
+                torch.cuda.synchronize()
                 logger.info(f"kv cache compaction regular take {human_readable_duration(time.time() - time_start_within_lock)} seconds within lock")
 
         logger.info(f"[debug]: migrate_record: {migrate_record}")
@@ -679,14 +686,49 @@ class DynamicGPUWorker(Worker):
         self.block_num = new_length
         # logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         if is_flexi:
-            self.flexi_resize_kv_cache(new_length)
+            self._flexi_resize_kv_cache(new_length)
         else:
-            self.model_runner.resize_kv_cache(new_length)
-        # logger.info(f"resized kv cache in {human_readable_duration(time_end - time_start)} seconds")
-        # logger.info(f"resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+            self._resize_kv_cache(new_length)
+
         self.dynamic_kv_synchronizer.create_slot_mappings(new_length * self.block_size)
-    
-    def flexi_resize_kv_cache(self, new_length: int) -> None:
+
+    def _resize_kv_cache(self, new_length: int) -> None:
+        time_start = time.time()
+        runner = self.model_runner
+        with runner.forward_lock:
+            assert isinstance(runner.model, DynamicQwen3ForCausalLM)
+            logger.info(f"resizing kv cache from {len(runner.kv_caches[0][0])} to {new_length}")
+            forward_context = self.vllm_config.compilation_config.static_forward_context
+            kv, kv_length, T, H, Dh = runner.kv_caches[0].shape
+            logger.info(f"num of kv tensors{len(runner.kv_caches)}")
+
+            for layer_name, attn_module in forward_context.items():
+                logger.info(f"resizing kv cache for layer {layer_name}")
+                layer_idx = extract_layer_index(layer_name)
+                idx = layer_idx - runner.model.model.start_layer
+                cache = runner.kv_caches[idx]
+                # 使用 zeros 而不是 empty 来避免未初始化的数据导致错误生成EOS
+                tmp_cache = torch.zeros((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
+                logger.info(f"tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}")
+                if new_length > kv_length:
+                    # 只复制旧的有效部分，新增的部分已经是0了
+                    tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...], non_blocking=True)
+                else:
+                    tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...], non_blocking=True)
+                dynamic_bind_single_kv_tensor(
+                    layer_idx,
+                    runner.model.model.start_layer,
+                    runner.model.model.end_layer,
+                    forward_context,
+                    self.dynamic_kv_synchronizer,
+                    runner,
+                    tmp_cache
+                )
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        logger.info(f"[timeline]: resize kv cache within: {human_readable_duration(time.time() - time_start)}")
+
+    def _flexi_resize_kv_cache(self, new_length: int) -> None:
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
         logger.info(f"resizing kv cache from {len(self.model_runner.key_caches)} to {new_length}")
         logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
@@ -1080,7 +1122,7 @@ class DynamicGPUWorker(Worker):
             if self.new_kv_cache_block_num != 0:
                 time_start = time.time()
                 def do_resize():
-                    self.resize_kv_cache(self.new_kv_cache_block_num)
+                    self._resize_kv_cache(self.new_kv_cache_block_num)
                 threading.Thread(target=do_resize, daemon=True).start()
                 logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
                 self.new_kv_cache_block_num = 0
@@ -1113,9 +1155,6 @@ class DynamicGPUWorker(Worker):
             for rank in self.rank_to_layers_ids:
                 self.dynamic_kv_synchronizer.add_new_tokens_to_kv_synchronizer(
                     rank,
-                    self.model_runner.kv_caches,
-                    self.rank_to_layers_ids[rank],
-                    self.model_runner.model.model.start_layer,
                     slot_mapping,
                     is_sync,
                     num_total_new_tokens

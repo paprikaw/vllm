@@ -201,9 +201,8 @@ class DynamicScheduler(Scheduler):
         self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
         self.next_new_kv_cache_block_num = 0
 
-        self.sending_slot_mapping = False # 控制在每一次scheduler schedule的时候是否需要同时发送slot_mapping
+        self.migration_in_process = False # 控制在每一次scheduler schedule的时候是否需要同时发送slot_mapping
         self.num_tokens_for_migration = 0 # 记录已经发送的slot数量，用来和worker端已处理的slot数量进行对比
-        self.total_migration_tokens = 0
 
     def async_change_configuration(self, pp_layer_config: List[Tuple[int,int]], new_kv_cache_block_num: int):
         self.change_configuration_status = ChangeConfigurationType.ASYNC_CHANGING
@@ -212,15 +211,18 @@ class DynamicScheduler(Scheduler):
         self.next_pp_layer_config = pp_layer_config
         self.next_new_kv_cache_block_num = new_kv_cache_block_num
 
-    def start_sending_slot_mapping(self) -> List[int]:
+    def start_migration(self) -> Union[list[int], None]:
         with self.lock:
-            slot_mapping = self.get_slot_mapping_from_reqs(self.running)
-            self.sending_slot_mapping = True
+            self.migration_in_process = True
             is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
             if is_flexi:
+                slot_mapping = self.get_slot_mapping_from_reqs(self.running)
                 logger.info(f"[num tokens]: scheduler side num_tokens:{len(slot_mapping)} ")
                 self.num_tokens_for_migration = len(slot_mapping) 
-            return slot_mapping
+                return slot_mapping
+            else:
+                self.num_tokens_for_migration = 0
+                return None
 
 
     def get_slot_mapping_from_reqs(self, reqs: Union[list[Request], list[NewRequestData]]):
@@ -373,7 +375,7 @@ class DynamicScheduler(Scheduler):
         if output.total_num_scheduled_tokens == 0:
             return output
 
-        if self.sending_slot_mapping:
+        if self.migration_in_process:
             self.num_tokens_for_migration += output.total_num_scheduled_tokens
             logger.info(f"[num tokens]: scheduler output token {output.total_num_scheduled_tokens} added, total tokens for migration: {self.num_tokens_for_migration} ")
 
@@ -390,7 +392,7 @@ class DynamicScheduler(Scheduler):
                 self.extend_block_pool(self.next_new_kv_cache_block_num)
             self.next_pp_layer_config = None
             self.next_new_kv_cache_block_num = 0
-            self.sending_slot_mapping = False
+            self.migration_in_process = False
             # self.total_migration_tokens = self.num_tokens_for_migration 
             self.num_tokens_for_migration = 0
 

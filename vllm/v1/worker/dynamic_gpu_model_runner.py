@@ -712,80 +712,80 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
     def resize_kv_cache(self, new_length: int) -> None:
         # 还没有实现在无enginelock情况下的resize_kv_cache
-        assert False
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
-
-        logger.info(f"resizing kv cache from {len(self.kv_caches[0][0])} to {new_length}")
-        time_start = time.time()
-        forward_context = self.vllm_config.compilation_config.static_forward_context
-        kv, kv_length, T, H, Dh = self.kv_caches[0].shape
-        logger.info(f"num of kv tensors{len(self.kv_caches)}")
-        for layer_name, attn_module in forward_context.items():
-            logger.info(f"resizing kv cache for layer {layer_name}")
-            idx = extract_layer_index(layer_name) - self.model.model.start_layer
-            cache = self.kv_caches[idx]
-            # 使用 zeros 而不是 empty 来避免未初始化的数据导致错误生成EOS
-            tmp_cache = torch.zeros((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
-            logger.info(f"tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}")
-            if new_length > kv_length:
-                # 只复制旧的有效部分，新增的部分已经是0了
-                tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...], non_blocking=True)
-            else:
-                tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...], non_blocking=True)
-            self.kv_caches[idx] = tmp_cache
-            attn_module.kv_cache = [tmp_cache]
-        time_end = time.time()
-
-    def flexi_resize_kv_cache(self, new_length: int) -> None:
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
-        logger.info(f"resizing kv cache from {len(self.key_caches)} to {new_length}")
-        logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
-        time_start = time.time()
-        forward_context = self.vllm_config.compilation_config.static_forward_context
-        T, H, Dh = self.key_caches[0][0].shape
-        cache_length = len(self.key_caches[0])
-        logger.info(f"num of kv tensors{cache_length}")
-
-        if new_length < cache_length:
+        # assert False
+        with self.forward_lock:
+            assert isinstance(self.model, DynamicQwen3ForCausalLM)
+            logger.info(f"resizing kv cache from {len(self.kv_caches[0][0])} to {new_length}")
+            time_start = time.time()
+            forward_context = self.vllm_config.compilation_config.static_forward_context
+            kv, kv_length, T, H, Dh = self.kv_caches[0].shape
+            logger.info(f"num of kv tensors{len(self.kv_caches)}")
             for layer_name, attn_module in forward_context.items():
                 logger.info(f"resizing kv cache for layer {layer_name}")
                 idx = extract_layer_index(layer_name) - self.model.model.start_layer
-                key_cache = self.key_caches[idx][:new_length]
-                value_cache = self.value_caches[idx][:new_length]
-                self.key_caches[idx] = key_cache
-                self.value_caches[idx] = value_cache
-                # Free old GPU pointer arrays before allocating new ones
-                old_k_ptrs, old_v_ptrs = self.key_cache_ptrs[idx], self.value_cache_ptrs[idx]
-                free_flexi_kv_ptrs(old_k_ptrs, old_v_ptrs)
-                self.key_cache_ptrs[idx], self.value_cache_ptrs[idx] = prepare_flexi_kv_ptrs(key_cache, value_cache)
-                assert isinstance(attn_module, FlexiAttention)
-                attn_module.key_cache = key_cache
-                attn_module.value_cache = value_cache
-                attn_module.key_dev_ptr = self.key_cache_ptrs[idx]
-                attn_module.value_dev_ptr = self.value_cache_ptrs[idx]
-        elif new_length > cache_length:
-            extended_kv_cache_shape = (T, H, Dh)
-            for layer_name, attn_module in forward_context.items():
-                new_allocated_block_num = new_length - cache_length
-                new_allocated_key_cache, new_allocated_value_cache = get_flexi_kv_cache( new_allocated_block_num, extended_kv_cache_shape, self.kv_cache_dtype, self.device)
-                idx = extract_layer_index(layer_name) - self.model.model.start_layer
-                key_cache = self.key_caches[idx]
-                value_cache = self.value_caches[idx]
-                key_cache.extend(new_allocated_key_cache)
-                value_cache.extend(new_allocated_value_cache)
-                # Free old GPU pointer arrays before allocating new ones
-                old_k_ptrs, old_v_ptrs = self.key_cache_ptrs[idx], self.value_cache_ptrs[idx]
-                free_flexi_kv_ptrs(old_k_ptrs, old_v_ptrs)
-                self.key_cache_ptrs[idx], self.value_cache_ptrs[idx] = prepare_flexi_kv_ptrs(key_cache, value_cache)
-                assert isinstance(attn_module, FlexiAttention)
-                attn_module.key_cache = key_cache
-                attn_module.value_cache = value_cache
-                attn_module.key_dev_ptr = self.key_cache_ptrs[idx]
-                attn_module.value_dev_ptr = self.value_cache_ptrs[idx]
+                cache = self.kv_caches[idx]
+                # 使用 zeros 而不是 empty 来避免未初始化的数据导致错误生成EOS
+                tmp_cache = torch.zeros((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
+                logger.info(f"tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}")
+                if new_length > kv_length:
+                    # 只复制旧的有效部分，新增的部分已经是0了
+                    tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...], non_blocking=True)
+                else:
+                    tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...], non_blocking=True)
+                self.kv_caches[idx] = tmp_cache
+                attn_module.kv_cache = [tmp_cache]
+            time_end = time.time()
+
+    # def flexi_resize_kv_cache(self, new_length: int) -> None:
+    #     assert isinstance(self.model, DynamicQwen3ForCausalLM)
+    #     logger.info(f"resizing kv cache from {len(self.key_caches)} to {new_length}")
+    #     logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+    #     time_start = time.time()
+    #     forward_context = self.vllm_config.compilation_config.static_forward_context
+    #     T, H, Dh = self.key_caches[0][0].shape
+    #     cache_length = len(self.key_caches[0])
+    #     logger.info(f"num of kv tensors{cache_length}")
+
+    #     if new_length < cache_length:
+    #         for layer_name, attn_module in forward_context.items():
+    #             logger.info(f"resizing kv cache for layer {layer_name}")
+    #             idx = extract_layer_index(layer_name) - self.model.model.start_layer
+    #             key_cache = self.key_caches[idx][:new_length]
+    #             value_cache = self.value_caches[idx][:new_length]
+    #             self.key_caches[idx] = key_cache
+    #             self.value_caches[idx] = value_cache
+    #             # Free old GPU pointer arrays before allocating new ones
+    #             old_k_ptrs, old_v_ptrs = self.key_cache_ptrs[idx], self.value_cache_ptrs[idx]
+    #             free_flexi_kv_ptrs(old_k_ptrs, old_v_ptrs)
+    #             self.key_cache_ptrs[idx], self.value_cache_ptrs[idx] = prepare_flexi_kv_ptrs(key_cache, value_cache)
+    #             assert isinstance(attn_module, FlexiAttention)
+    #             attn_module.key_cache = key_cache
+    #             attn_module.value_cache = value_cache
+    #             attn_module.key_dev_ptr = self.key_cache_ptrs[idx]
+    #             attn_module.value_dev_ptr = self.value_cache_ptrs[idx]
+    #     elif new_length > cache_length:
+    #         extended_kv_cache_shape = (T, H, Dh)
+    #         for layer_name, attn_module in forward_context.items():
+    #             new_allocated_block_num = new_length - cache_length
+    #             new_allocated_key_cache, new_allocated_value_cache = get_flexi_kv_cache( new_allocated_block_num, extended_kv_cache_shape, self.kv_cache_dtype, self.device)
+    #             idx = extract_layer_index(layer_name) - self.model.model.start_layer
+    #             key_cache = self.key_caches[idx]
+    #             value_cache = self.value_caches[idx]
+    #             key_cache.extend(new_allocated_key_cache)
+    #             value_cache.extend(new_allocated_value_cache)
+    #             # Free old GPU pointer arrays before allocating new ones
+    #             old_k_ptrs, old_v_ptrs = self.key_cache_ptrs[idx], self.value_cache_ptrs[idx]
+    #             free_flexi_kv_ptrs(old_k_ptrs, old_v_ptrs)
+    #             self.key_cache_ptrs[idx], self.value_cache_ptrs[idx] = prepare_flexi_kv_ptrs(key_cache, value_cache)
+    #             assert isinstance(attn_module, FlexiAttention)
+    #             attn_module.key_cache = key_cache
+    #             attn_module.value_cache = value_cache
+    #             attn_module.key_dev_ptr = self.key_cache_ptrs[idx]
+    #             attn_module.value_dev_ptr = self.value_cache_ptrs[idx]
             
-        time_end = time.time()
-        logger.info(f"resized kv cache in {human_readable_duration(time_end - time_start)} seconds")
-        logger.info(f"resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+    #     time_end = time.time()
+    #     logger.info(f"resized kv cache in {human_readable_duration(time_end - time_start)} seconds")
+    #     logger.info(f"resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
 
     def _migrate_block_by_copy_data(self, old_block_id: int, new_block_id: int, migrate_record: dict[int, int]):
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
