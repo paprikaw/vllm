@@ -134,12 +134,12 @@ def safetensors_layer_weights_iterator(
     ):
         with safe_open(st_file, framework="pt") as f:
             for name in f.keys():  # noqa: SIM118
-                logger.info(f"[debug]: starts to load the weight {name} from {st_file}")
+                logger.debug(f"[debug]: starts to load the weight {name} from {st_file}")
                 if "layers" not in name or \
                     extract_layer_index(name) not in range(layer[0], layer[1]+1):
                     continue
                 param = f.get_tensor(name)
-                logger.info(f"[debug]: loaded weight {name} from {st_file} with shape {param.shape}")
+                logger.debug(f"[debug]: loaded weight {name} from {st_file} with shape {param.shape}")
                 yield name, param
 
 def process_layer_weights_after_loading(model: nn.Module, model_config: ModelConfig,
@@ -148,16 +148,16 @@ def process_layer_weights_after_loading(model: nn.Module, model_config: ModelCon
     for name, module in model.named_modules():
         if name == "model.layers" or "layers" not in name or extract_layer_index(name) not in range(layers[0], layers[1]+1):
             continue
-        logger.info(f"[debug]: processing weights after loading for module: {name}")
+        logger.debug(f"[debug]: processing weights after loading for module: {name}")
         if isinstance(module, QKVCrossParallelLinear):
-            logger.info(f"[debug]: processing weights after loading for QKVCrossParallelLinear: {module}")
+            logger.debug(f"[debug]: processing weights after loading for QKVCrossParallelLinear: {module}")
             # NOTE(Isotr0py): special case for cross QKV layer because
             # q and kv proj aren't registered as submodules intentionally
             module.process_weights_after_loading()
             continue
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
-            logger.info(f"[debug]: processing weights after loading for quant method: {quant_method}")
+            logger.debug(f"[debug]: processing weights after loading for quant method: {quant_method}")
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
@@ -174,7 +174,7 @@ def process_layer_weights_after_loading(model: nn.Module, model_config: ModelCon
             continue
         if isinstance(module, Attention) and \
             hasattr(module, "process_weights_after_loading"):
-            logger.info(f"[debug]: processing weights after loading for Attention: {module}")
+            logger.debug(f"[debug]: processing weights after loading for Attention: {module}")
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
             module.process_weights_after_loading(model_config.dtype)

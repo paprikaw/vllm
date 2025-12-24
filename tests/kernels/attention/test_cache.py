@@ -996,6 +996,105 @@ def test_concat_and_cache_mla_cpu(
     torch.testing.assert_close(kv_cache, ref_kv_cache)
 
 @pytest.mark.parametrize("num_tokens", [1, 83, 100])
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("num_blocks", [100, 1000])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_flexi_gather_and_reshape_roundtrip(
+    num_tokens: int,
+    num_heads: int,
+    head_size: int,
+    block_size: int,
+    num_blocks: int,
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    """
+    Test that simulates sender-receiver KV cache migration:
+    1. Sender: Use flexi_gather_pages to gather KV data from cache into a contiguous tensor
+    2. Receiver: Use flexi_reshape_and_cache_flash to write the gathered data into a new cache
+    3. Verify that the original and recovered data match
+    """
+    torch.set_default_device(device)
+    
+    # === SENDER SIDE: Create source cache with random data ===
+    # Each page: [block_size, num_heads, head_size]
+    src_key_pages = [torch.randn(block_size, num_heads, head_size, dtype=dtype, device=device) for _ in range(num_blocks)]
+    src_value_pages = [torch.randn(block_size, num_heads, head_size, dtype=dtype, device=device) for _ in range(num_blocks)]
+    
+    # Prepare source pointers
+    src_key_ptrs, src_value_ptrs = prepare_flexi_kv_ptrs(src_key_pages, src_value_pages)
+    
+    # Create slot mapping - simulate which tokens to migrate
+    # Use random slots that don't exceed the available slots
+    total_slots = num_blocks * block_size
+    slot_mapping = torch.tensor(
+        random.sample(range(total_slots), num_tokens),
+        dtype=torch.int64, 
+        device=device
+    )
+    slot_mapping = torch.tensor(
+        random.sample(range(total_slots), num_tokens),
+        dtype=torch.int64, 
+        device=device
+    )
+    
+    # === SENDER: Gather KV data from source cache ===
+    # Output shape: [num_tokens, num_heads, head_size]
+    gathered_key = torch.empty(num_tokens, num_heads, head_size, dtype=dtype, device=device)
+    gathered_value = torch.empty(num_tokens, num_heads, head_size, dtype=dtype, device=device)
+    
+    ops.flexi_gather_pages(src_key_ptrs, src_value_ptrs, slot_mapping, gathered_key, gathered_value, block_size)
+    
+    # === RECEIVER SIDE: Create destination cache ===
+    # Receiver allocates new cache - same size as sender for this test
+    dst_key_pages = [torch.zeros(block_size, num_heads, head_size, dtype=dtype, device=device) for _ in range(num_blocks)]
+    dst_value_pages = [torch.zeros(block_size, num_heads, head_size, dtype=dtype, device=device) for _ in range(num_blocks)]
+    
+    # Prepare destination pointers
+    dst_key_ptrs, dst_value_ptrs = prepare_flexi_kv_ptrs(dst_key_pages, dst_value_pages)
+    
+    # Dummy scales for auto dtype
+    k_scale = torch.tensor(2.0, dtype=torch.float32, device=device)
+    v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    
+    # === RECEIVER: Write gathered data into destination cache ===
+    # Use the SAME slot_mapping - this simulates sender and receiver using compatible slot mappings
+    ops.flexi_reshape_and_cache_flash(
+        gathered_key, gathered_value,
+        dst_key_ptrs, dst_value_ptrs,
+        dst_key_pages[0], dst_value_pages[0],  # meta tensors for stride info
+        slot_mapping,
+        "auto",
+        k_scale, v_scale
+    )
+    
+    # === VERIFICATION: Compare source and destination at the same slots ===
+    for i in range(num_tokens):
+        slot = slot_mapping[i].item()
+        page_idx = slot // block_size
+        page_offset = slot % block_size
+        
+        # Check key
+        src_key_data = src_key_pages[page_idx][page_offset]
+        dst_key_data = dst_key_pages[page_idx][page_offset]
+        assert torch.allclose(src_key_data, dst_key_data, atol=1e-5, rtol=1e-5), \
+            f"Key mismatch at token {i}, slot {slot}: src={src_key_data}, dst={dst_key_data}"
+        
+        # Check value
+        src_value_data = src_value_pages[page_idx][page_offset]
+        dst_value_data = dst_value_pages[page_idx][page_offset]
+        assert torch.allclose(src_value_data, dst_value_data, atol=1e-5, rtol=1e-5), \
+            f"Value mismatch at token {i}, slot {slot}: src={src_value_data}, dst={dst_value_data}"
+    
+    # Cleanup
+    free_flexi_kv_ptrs(src_key_ptrs, src_value_ptrs)
+    free_flexi_kv_ptrs(dst_key_ptrs, dst_value_ptrs)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 83, 100])
 @pytest.mark.parametrize("num_heads", [16])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("block_size", [16])

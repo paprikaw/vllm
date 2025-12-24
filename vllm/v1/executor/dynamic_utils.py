@@ -70,7 +70,7 @@ try:
                 # 计算通信时间（如果有上游数据）
 
                 # logger.info(f"[forward]: received scheduler output, is_sync_after_migration: {scheduler_output.is_sync_after_migration}, total_migration_tokens: {scheduler_output.total_migration_tokens}")
-                self.worker.async_migration_before_execute_callback(self.worker.after_migration_total_token)
+                self.worker.async_migration_before_execute_callback(scheduler_output)
                 time_after_before_execute_callback = time.time()
                 # self.worker.sync_migration_before_execute_callback(scheduler_output.new_kv_cache_block_num)
                 
@@ -88,7 +88,7 @@ try:
 
                 time_after_execute = time.time()
                 assert(len(self.worker.model_runner.input_batch.block_table.block_tables) == 1) # Only for consistent shape of attention
-                self.worker.async_migration_after_execute_callback(scheduler_output.is_sync_after_migration, scheduler_output.new_kv_cache_block_num, scheduler_output.total_migration_tokens, scheduler_output.total_num_scheduled_tokens)
+                self.worker.async_migration_after_execute_callback(scheduler_output)
 
                 time_after_execute_callback = time.time()
                 
@@ -109,14 +109,14 @@ try:
                         residual_size_mb = residual.numel() * residual.element_size() / 1024 / 1024
                         total_size_mb = hidden_size_mb + residual_size_mb
                         
-                        logger.info(f"[forward]: rank {self.rpc_rank} Communication time from upstream: {comm_time:.2f} ms, "
+                        logger.debug(f"[forward]: rank {self.rpc_rank} Communication time from upstream: {comm_time:.2f} ms, "
                                    f"hidden_states dtype: {hidden_states.dtype}, shape: {hidden_states.shape}, size: {hidden_size_mb:.2f} MB, "
                                    f"residual dtype: {residual.dtype}, shape: {residual.shape}, size: {residual_size_mb:.2f} MB, "
                                    f"total data volume: {total_size_mb:.2f} MB, "
                                    f"bandwidth: {total_size_mb / (comm_time / 1000):.2f} MB/s")
                     else:
-                        logger.info(f"[forward]: rank {self.rpc_rank} Communication time from upstream: {comm_time:.2f} ms, no received data")
-                logger.info(f"""
+                        logger.debug(f"[forward]: rank {self.rpc_rank} Communication time from upstream: {comm_time:.2f} ms, no received data")
+                logger.debug(f"""
                 [forward]: before execute callback time: {time_after_before_execute_callback - time_recv:.2f} seconds,
                 [forward]: execute time: {time_after_execute - time_after_before_execute_callback:.2f} seconds,
                 [forward]: after execute callback time: {time_after_execute_callback - time_after_execute:.2f} seconds

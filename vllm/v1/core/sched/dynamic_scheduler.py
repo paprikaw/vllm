@@ -204,6 +204,12 @@ class DynamicScheduler(Scheduler):
         self.migration_in_process = False # 控制在每一次scheduler schedule的时候是否需要同时发送slot_mapping
         self.num_tokens_for_migration = 0 # 记录已经发送的slot数量，用来和worker端已处理的slot数量进行对比
 
+        self.cur_scheduler_output_version = 0
+
+        # 用以记录在迁移过程中，哪些rank是sender，哪些rank是receiver
+        self.sender_list_during_migration: Optional[set[int]] = None 
+        self.receiver_list_during_migration: Optional[set[int]] = None
+
     def async_change_configuration(self, pp_layer_config: List[Tuple[int,int]], new_kv_cache_block_num: int):
         self.change_configuration_status = ChangeConfigurationType.ASYNC_CHANGING
         assert self.next_new_kv_cache_block_num == 0 
@@ -211,13 +217,18 @@ class DynamicScheduler(Scheduler):
         self.next_pp_layer_config = pp_layer_config
         self.next_new_kv_cache_block_num = new_kv_cache_block_num
 
-    def start_migration(self) -> Union[list[int], None]:
+    def start_migration(self, sender_list: list[int], receiver_list: list[int], should_increase_scheduler_output_version: bool) -> Union[list[int], None]:
         with self.lock:
             self.migration_in_process = True
+            self.sender_list_during_migration = set(sender_list) 
+            self.receiver_list_during_migration = set(receiver_list)
             is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+            if should_increase_scheduler_output_version:
+                self.cur_scheduler_output_version += 1
             if is_flexi:
                 slot_mapping = self.get_slot_mapping_from_reqs(self.running)
-                logger.info(f"[num tokens]: scheduler side num_tokens:{len(slot_mapping)} ")
+                logger.info(f"[num tokens]: slot_mapping length:{len(slot_mapping)} ")
+                logger.info(f"[num tokens]: scheduler side num_tokens:{self.kv_cache_manager} ")
                 self.num_tokens_for_migration = len(slot_mapping) 
                 return slot_mapping
             else:
@@ -366,9 +377,14 @@ class DynamicScheduler(Scheduler):
                 kv_connector_metadata=scheduler_output.kv_connector_metadata,
                 pp_layer_config=pp_layer_config,
                 request_queue_id=id,
+                current_scheduler_output_version=self.cur_scheduler_output_version,
                 is_sync_after_migration=True if self.change_configuration_status == ChangeConfigurationType.ASYNC_CHANGING else False,
-                total_migration_tokens=self.num_tokens_for_migration + scheduler_output.total_num_scheduled_tokens,
+                # total_migration_tokens=self.num_tokens_for_migration + scheduler_output.total_num_scheduled_tokens,
+                total_migration_tokens=self.num_tokens_for_migration,
                 new_kv_cache_block_num=self.next_new_kv_cache_block_num,
+                migration_in_process=self.migration_in_process,
+                sender_list= self.sender_list_during_migration,
+                receiver_list= self.receiver_list_during_migration,
                 # slot_mapping = self.get_slot_mapping_from_reqs(scheduler_output.scheduled_new_reqs) if self.sending_slot_mapping else None,
             )
         # scheduled token为0的请求不应该发送给worker，因此在这里我们跳过后续的asynchronise处理
@@ -376,7 +392,7 @@ class DynamicScheduler(Scheduler):
             return output
 
         if self.migration_in_process:
-            self.num_tokens_for_migration += output.total_num_scheduled_tokens
+            # self.num_tokens_for_migration += output.total_num_scheduled_tokens
             logger.info(f"[num tokens]: scheduler output token {output.total_num_scheduled_tokens} added, total tokens for migration: {self.num_tokens_for_migration} ")
 
 
@@ -384,15 +400,16 @@ class DynamicScheduler(Scheduler):
             self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
             assert self.next_pp_layer_config is not None
             # 在最后的阶段，只有可能是expand，不可能shrink
-            assert self.next_new_kv_cache_block_num == 0 or self.next_new_kv_cache_block_num > self.kv_cache_manager.num_gpu_blocks, f"next_new_kv_cache_block_num: {self.next_new_kv_cache_block_num} is less than the current kv cache size: {self.kv_cache_manager.num_gpu_blocks}"
+            assert self.next_new_kv_cache_block_num >= self.kv_cache_manager.num_gpu_blocks, f"next_new_kv_cache_block_num: {self.next_new_kv_cache_block_num} is less than the current kv cache size: {self.kv_cache_manager.num_gpu_blocks}"
             # In here, we update the layer configuration to the next configuration
             # In the next scheduling step, we will use the next configuration
             self.update_layer_config(self.next_pp_layer_config)
-            if self.next_new_kv_cache_block_num > self.kv_cache_manager.num_gpu_blocks:
-                self.extend_block_pool(self.next_new_kv_cache_block_num)
+
             self.next_pp_layer_config = None
             self.next_new_kv_cache_block_num = 0
             self.migration_in_process = False
+            self.sender_list_during_migration = None
+            self.receiver_list_during_migration = None
             # self.total_migration_tokens = self.num_tokens_for_migration 
             self.num_tokens_for_migration = 0
 
@@ -592,7 +609,7 @@ class DynamicScheduler(Scheduler):
     
     def shrink_block_pool(self, compacted_length: int) -> bitarray:
         assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
-        assert compacted_length < self.kv_cache_manager.num_gpu_blocks, "compacted_length should be smaller than current kv cache block num"
+        assert compacted_length < self.kv_cache_manager.num_gpu_blocks, f"compacted_length {compacted_length} should be smaller than current kv cache block num {self.kv_cache_manager.num_gpu_blocks}"
         bitmap = self.get_bitmap()
         self.kv_cache_manager.compact_kv_cache(compacted_length, bitmap)
         return bitmap

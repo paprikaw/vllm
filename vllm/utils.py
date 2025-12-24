@@ -2919,3 +2919,23 @@ class DeadlockTimeoutContext:
             logger.info(f"🔓 Releasing lock: {self.lock_name}")
             self.lock.release()
         return False
+
+def hash_tensor_list(tensors: list[torch.Tensor]) -> str:
+    h = hashlib.sha256()
+    for idx, t in enumerate(tensors):
+        # 保证一致性（避免 device / stride 干扰）
+        t = t.detach().contiguous().cpu()
+
+        # 1. 元信息
+        h.update(str(idx).encode())
+        h.update(str(t.shape).encode())
+        h.update(str(t.dtype).encode())
+
+        # 2. 数据本身
+        h.update(t.numpy().tobytes())
+
+    return h.hexdigest()
+
+def tensor_to_hex(t: torch.Tensor) -> str:
+    t = t.detach().contiguous().cpu()
+    return hashlib.sha256(t.numpy().tobytes()).hexdigest()

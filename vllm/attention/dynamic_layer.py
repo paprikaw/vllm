@@ -128,6 +128,7 @@ class FlexiAttention(Attention):
                 #     assert isinstance(self_kv_cache, torch.Tensor) and self_kv_cache.numel() > 0, (
                 #         f"Attention {self.layer_name} has empty KV cache bound")
                 assert isinstance(self.impl, FlexiFlashAttentionImpl)
+                assert False
                 self.impl.flexi_forward(self,
                               query,
                               key,
@@ -173,7 +174,7 @@ def flexi_unified_attention(
     value: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-
+    assert False
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
@@ -182,14 +183,13 @@ def flexi_unified_attention(
 
     from vllm.v1.attention.backends.flexi_flash_attn import FlexiFlashAttentionImpl
     assert isinstance(self.impl, FlexiFlashAttentionImpl)
-    self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+    # self_kv_cache = self.kv_cache[forward_context.virtual_engine]
     output = self.impl.flexi_forward(self,
                   query,
                   key,
                   value,
                   self.key_cache,
                   self.value_cache,
-                  self_kv_cache,
                   self.key_dev_ptr,
                   self.value_dev_ptr,
                   attn_metadata)

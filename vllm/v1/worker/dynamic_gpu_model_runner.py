@@ -134,7 +134,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
         with self.forward_lock:
-            logger.info("start to execute model in gpu model runner")
             if not isinstance(self.model, DynamicQwen3ForCausalLM):
                 raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
             self.model.set_sched_layers(layer_config[0], layer_config[1])
@@ -528,7 +527,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             num_blocks, kv_cache_spec.block_size,
             kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
         self.kv_cache_shape = kv_cache_shape
-        assert num_blocks >= kv_cache_config.num_blocks
+        assert num_blocks >= kv_cache_config.num_blocks, f"num_blocks {num_blocks} is less than kv_cache_config.num_blocks {kv_cache_config.num_blocks}"
         assert len(kv_cache_shape) == 5 # (2, nkvblocks, blockdim, n_head, headdim)
         block_shape = kv_cache_shape[2:]
 
@@ -794,7 +793,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # loop for k and v tensor
             for i in range(2):
                 cache[i][new_block_id].copy_(cache[i][old_block_id])
-                # 这里我们只将旧的搬迁到新的，我们不对旧的block数据制0
         migrate_record[old_block_id] = new_block_id
 
     def _migrate_block_by_swapping_ptrs(self, old_block_id: int, new_block_id: int, migrate_record: dict[int, int]):
@@ -817,7 +815,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         if new_start != start_layer:
             self.model.model.start_layer = new_start
     
-    def get_flexi_kv_cache_from_gathered_kv_tensor(self, slot_mapping: torch.Tensor, 
+    def get_flexi_kv_cache_from_gathered_kv_tensor(self, slot_mapping: torch.Tensor, layer: int,
                                  gathered_kv_tensor: torch.Tensor,
                                  block_num: int) -> Tuple[list[torch.Tensor], list[torch.Tensor], int, int]:
         '''
@@ -832,12 +830,16 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
         key_cache, value_cache = get_flexi_kv_cache(block_num, block_shape, kv_dtype, self.device)
         key_cache_list_ptr, value_cache_list_ptr = prepare_flexi_kv_ptrs(key_cache, value_cache) 
-        logger.info(f"gathered_kv_tensor shape: {gathered_kv_tensor.shape}, kv_cache_shape: {kv_cache_shape}, block_shape:{block_shape}, block_num:{block_num}, key_cache shape:{key_cache[0].shape}, value_cache shape:{value_cache[0].shape}, key_cache length:{len(key_cache)}, value_cache length:{len(value_cache)}")
+        logger.info(f"gathered_kv_tensor shape: {gathered_kv_tensor.shape}, kv_cache_shape: {kv_cache_shape}, block_shape:{block_shape}, block_num:{block_num}, key_cache shape:{key_cache[0].shape}, value_cache shape:{value_cache[0].shape}, key_cache length:{len(key_cache)}, value_cache length:{len(value_cache)}, slot_mapping shape:{slot_mapping.shape}")
         logger.info(f"key_cache_list_ptr {key_cache_list_ptr}, value cache list ptr:{value_cache_list_ptr}")
-        dummy_scale = torch.tensor(1.0, device=self.device, dtype=torch.float32)
+        # dummy_scale = torch.tensor(1.0, device=self.device, dtype=torch.float32)
         assert gathered_kv_tensor.shape[-2:] == kv_cache_shape[-2:], f"gathered_kv_tensor shape {gathered_kv_tensor.shape} mismatch kv_cache_shape {kv_cache_shape}"
+        model = self.model
+        assert isinstance(model, DynamicQwen3ForCausalLM)
+        # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
+        layer_module = model.model.layers[layer]
 
-        flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_list_ptr,value_cache_list_ptr,  key_cache[0], value_cache[0], slot_mapping,"auto", dummy_scale, dummy_scale)
+        flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_list_ptr,value_cache_list_ptr,  key_cache[0], value_cache[0], slot_mapping,"auto",layer_module.self_attn.attn._k_scale, layer_module.self_attn.attn._v_scale)
 
         return key_cache, value_cache, key_cache_list_ptr, value_cache_list_ptr
 

@@ -66,6 +66,8 @@ class DynamicSchedulerOutput():
     # Whether the scheduling output is from before the migration was started.  
     request_queue_id: int
 
+    current_scheduler_output_version: int
+
     
 #     slot_mapping: Optional[list[int]] = None
     # the bitmask for the whole batch
@@ -79,4 +81,9 @@ class DynamicSchedulerOutput():
     # Whether the scheduling output is from before the migration was started.  
     is_sync_after_migration: bool = False
 
+    migration_in_process: bool = False
+
     new_kv_cache_block_num: int = 0
+
+    sender_list: Optional[set[int]] = None
+    receiver_list: Optional[set[int]] = None

@@ -667,11 +667,7 @@ class DynamicKVSynchronizer():
                             slot_mapping: torch.Tensor,
                             start_layer_id: int) -> Tuple[FlexiKVTensorMeta, torch.Tensor]:
         local_layer_id = layer_id - start_layer_id
-        try:
-            key_cache_ptr = key_cache_ptrs[local_layer_id]
-        except Exception as e:
-            logger.error(f"key_cache_ptrs: {key_cache_ptrs}, local_layer_id: {local_layer_id}, layer_id: {layer_id}, start_layer_id: {start_layer_id}")
-            raise e
+        key_cache_ptr = key_cache_ptrs[local_layer_id]
         value_cache_ptr = value_cache_ptrs[local_layer_id]
         block_size, num_head, head_dim = kv_cache_meta.shape
         kv_out = torch.empty(2, slot_mapping.size(0), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
