@@ -576,13 +576,16 @@ class DynamicKVSynchronizer():
             slot_mapping, is_finished, stored_tokens = self.slot_mappings[rank].get_all_slot_mappings()
             slot_mapping_dev = torch.tensor(slot_mapping, device=kv_cache_meta.device, dtype=torch.int64)
             block_size, num_head, head_dim = kv_cache_meta.shape
-            kv_out = torch.empty(len(layer_ids), 2, slot_mapping_dev.size(0), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
+            # 为了匹配receiver端的期望，使用shape: [2, num_layers, num_tokens, num_heads, head_dim]
+            # 第0维是K/V区分，第1维是layers
+            kv_out = torch.empty(2, len(layer_ids), slot_mapping_dev.size(0), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
             logger.info(f"layer_ids: {layer_ids}, kv_out shape: {kv_out.shape}, slot mapping shape: {slot_mapping_dev.shape}, start_layer_id: {start_layer_id}")
             for idx, layer_id in enumerate(layer_ids):
                 local_layer_id = layer_id - start_layer_id
                 key_cache_ptr = key_cache_ptrs[local_layer_id]
                 value_cache_ptr = value_cache_ptrs[local_layer_id]
-                ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[idx][0], kv_out[idx][1], block_size)
+                # 填充到 kv_out[0][idx] (keys) 和 kv_out[1][idx] (values)
+                ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[0][idx], kv_out[1][idx], block_size)
             yield KVPatch(
                 KVPatchMeta(
                     type='kv_patch_meta' if not is_finished else "kv_patch_finished",
@@ -667,11 +670,7 @@ class DynamicKVSynchronizer():
                             slot_mapping: torch.Tensor,
                             start_layer_id: int) -> Tuple[FlexiKVTensorMeta, torch.Tensor]:
         local_layer_id = layer_id - start_layer_id
-        try:
-            key_cache_ptr = key_cache_ptrs[local_layer_id]
-        except Exception as e:
-            logger.error(f"key_cache_ptrs: {key_cache_ptrs}, local_layer_id: {local_layer_id}, layer_id: {layer_id}, start_layer_id: {start_layer_id}")
-            raise e
+        key_cache_ptr = key_cache_ptrs[local_layer_id]
         value_cache_ptr = value_cache_ptrs[local_layer_id]
         block_size, num_head, head_dim = kv_cache_meta.shape
         kv_out = torch.empty(2, slot_mapping.size(0), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
@@ -938,7 +937,7 @@ class DynamicKVSynchronizer():
         slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape)
         kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape)
         if is_flexi:
-            assert kv_payload.dim() == 5 and kv_payload.size(1) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
+            assert kv_payload.dim() == 5 and kv_payload.size(0) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
         else:
             assert kv_payload.dim() == 5 and kv_payload.size(0) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
 

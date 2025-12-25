@@ -49,6 +49,7 @@ def collect_aliases() -> Dict[str, str]:
         "delay": "delay",
         "start_pp_layer_partition": "pp",
         "is_migration": "mig",
+        "enable_flexi_flash_attn": "flexi"
     }
 
 class ModelCfg(BaseModel):

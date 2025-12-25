@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+from pprint import pp
+import re
+from cv2 import resize
 from numpy import isin
 from torch import jagged
 
@@ -548,14 +551,14 @@ class DynamicEngineCore(EngineCore):
 
             return engine_core_outputs
 
-    def change_model_configuration_by_kv_transfer_async(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
+    def change_model_configuration_by_kv_transfer_async(self, pp_layer_config: list[Tuple[int, int]]):
         """
         Our fancy implementation of model configuration change
         """
         logger.info(f"Start migrating to new configuration {pp_layer_config}")
+        self.migration_status = MigrationStatus.MIGRATING
         assert isinstance(self.scheduler, DynamicScheduler)
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
-        engine_core_outputs = []
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         time_start = time.time()
@@ -574,7 +577,6 @@ class DynamicEngineCore(EngineCore):
         tmp_pp_layer_config = deepcopy(self.cur_pp_layer_config)
         bitmap = bitarray()
         with self.engine_lock:
-            time_start = time.time()
             for rank, layers in enumerate(pp_layer_config):
                 start_layer, end_layer = tmp_pp_layer_config[rank][0], tmp_pp_layer_config[rank][1]
                 adding_layer_list = []
@@ -598,10 +600,12 @@ class DynamicEngineCore(EngineCore):
                     elif assess.can_fit_after_compact:
                         need_compact = True
                     else:
-                        logger.info(
-                            "Rank %s lacks memory even after KV compact estimate: max_blocks_per_layer: %s, current_used_blocks: %s",
-                            rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
-                        return []
+                        raise RuntimeError(f"Rank {rank} lacks memory for adding layers even after KV compact estimate: max_blocks_per_layer: {assess.max_blocks_per_layer}, current_used_blocks: {self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()}")
+                        # logger.info(
+                        #     "Rank %s lacks memory even after KV compact estimate: max_blocks_per_layer: %s, current_used_blocks: %s",
+                        #     rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
+                        # return []
+                out = self._drain_out_running_queue()
 
 
         # with self.engine_lock:
@@ -626,7 +630,6 @@ class DynamicEngineCore(EngineCore):
 
             logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
 
-        time.sleep(2)
         # 需要resize kv cache来进行migration，这里的resize一定是缩小
         if compacted_length != original_length:
             assert compacted_length < original_length, f"compacted_length: {compacted_length} is greater than the current kv cache size: {original_length}"
@@ -669,9 +672,15 @@ class DynamicEngineCore(EngineCore):
                 layer_ids = plan.setdefault(dst_rank, [])
                 layer_ids.extend(range(lo, hi + 1))
 
-        slot_mapping = self.scheduler.start_migration()
-        assert slot_mapping is not None if is_flexi else True
-        self.model_executor.start_kv_cache_migration_async(src_to_plan, slot_mapping)
+        sender_list = list(src_to_plan.keys())
+        receiver_list = list(adding_per_rank.keys())
+        with self.engine_lock:
+            out = self._drain_out_running_queue()
+            slot_mapping = self.scheduler.start_migration(sender_list, receiver_list, compacted_length != original_length)
+            assert slot_mapping is not None if is_flexi else True
+            self.model_executor.start_kv_cache_migration_async(src_to_plan, slot_mapping)
+            time.sleep(10)
+
         time_kv_migration_end = time.time()
 
         logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
@@ -694,7 +703,7 @@ class DynamicEngineCore(EngineCore):
             return should_sync
 
         def sync_by_checking_leftover_tokens() -> bool:
-            token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 500))
+            token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 2000))
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor) 
             assert isinstance(self.scheduler, DynamicScheduler)
             receiver_list = list(adding_per_rank.keys())
@@ -706,55 +715,68 @@ class DynamicEngineCore(EngineCore):
             lag = [self.scheduler.num_tokens_for_migration - min(applied_tokens) for applied_tokens in applied_token_list if applied_tokens is not None]
             logger.info(f"lag between sent and applied tokens: {lag}")
             return min_applied_token > 0 and max(lag) < token_to_send_threshold
-        def check_patch_sending_process():
-            '''
-            Docstring for check_patch_sending_process
-            This function checks the patch sending process and synchronize the kv cache when all tokens in the sender to be sent are less than the threshold
-            '''
-            assert isinstance(self.scheduler, DynamicScheduler)
-            assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
-            time_start = time.time()
-            while True:
-                time.sleep(0.3)
 
-                should_sync = sync_by_checking_leftover_tokens()
-                final_pp_layer_config = deepcopy(tmp_pp_layer_config)
-                if should_sync:
-                    deleting_layer_assesses: list[int] = []
-                    for rank, layers in enumerate(pp_layer_config):
-                        # 计算对于每一个rank而言，需要删除哪一些layers
-                        start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
-                        deleting_layer_list = []
-                        if layers[0] > start_layer:
-                            deleting_layer_list.append((start_layer, layers[0] - 1))
-                            final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
-                        if layers[1] < end_layer:
-                            deleting_layer_list.append((layers[1] + 1, end_layer))
-                            final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
-                        deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
-                        assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
-                        deleting_layer_assesses.append(assess.max_blocks_per_layer)
+        '''
+        Following checks the patch sending process and synchronize the kv cache when all tokens in the sender to be sent are less than the threshold
+        '''
+        assert isinstance(self.scheduler, DynamicScheduler)
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        resized_block_num = 0
+        while True:
+            time.sleep(0.3)
 
-                    for rank, layers in enumerate(final_pp_layer_config):
-                        assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
+            should_sync = sync_by_checking_leftover_tokens()
+            final_pp_layer_config = deepcopy(tmp_pp_layer_config)
+            if should_sync:
+                deleting_layer_assesses: list[int] = []
+                for rank, layers in enumerate(pp_layer_config):
+                    # 计算对于每一个rank而言，需要删除哪一些layers
+                    start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
+                    deleting_layer_list = []
+                    if layers[0] > start_layer:
+                        deleting_layer_list.append((start_layer, layers[0] - 1))
+                        final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
+                    if layers[1] < end_layer:
+                        deleting_layer_list.append((layers[1] + 1, end_layer))
+                        final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
+                    deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
+                    assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
+                    deleting_layer_assesses.append(assess.max_blocks_per_layer)
 
-                    resized_block_num = min(deleting_layer_assesses)
-                    logger.info("all tokens to be sent is less than the threshold, start to synchronize the kv cache, resized_block_num: {resized_block_num}")
-                    if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
-                        assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
-                        logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
+                for rank, layers in enumerate(final_pp_layer_config):
+                    assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
 
-                    # 如果resized_block_num和当前kv cache size相同，则不需要进行resize
-                    if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
-                        resized_block_num = 0
+                resized_block_num = min(deleting_layer_assesses)
+                logger.info("all tokens to be sent is less than the threshold, start to synchronize the kv cache, resized_block_num: {resized_block_num}")
+                if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
+                    assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
+                    logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
 
-                    self.scheduler.async_change_configuration(pp_layer_config, resized_block_num)
-                    break
+                self.scheduler.async_change_configuration(pp_layer_config, resized_block_num)
+                self.cur_pp_layer_config = pp_layer_config
+                break
 
-            logger.info(f"[timeline]: after check patch sending process, time taken: {human_readable_duration(time.time() - time_start)}")
+        assert resized_block_num != 0
+        if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
+            logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
+            self.migration_status = MigrationStatus.NOT_MIGRATING
+            return out
 
-        threading.Thread(target=check_patch_sending_process, daemon=True).start()
-        return engine_core_outputs
+        time_start_checking_resizing_done = time.time()
+        # Checking if the resizing is done and needed to extend the block pool
+        while True:
+            time.sleep(0.3)
+            resizing_done = self.model_executor.get_is_kv_resizing_done()
+            logger.info(f"resizing_done status: {resizing_done}")
+            if all(resizing_done):
+                with self.scheduler.lock:
+                    self.scheduler.extend_block_pool(resized_block_num)
+                break
+
+        self.migration_status = MigrationStatus.NOT_MIGRATING
+        logger.info(f"[timeline]: after check resizing done process, time taken: {human_readable_duration(time.time() - time_start_checking_resizing_done)}")
+        logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
+        return out
 
     def change_model_configuration_by_kv_transfer_sync(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
         """
@@ -1381,16 +1403,18 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         kv_utilizations = deque(maxlen=WINDOW)
 
         num_of_requests = 0 
+        cur_config = 1 # Start from 1, 0 is the initial config
         while True:
             num_of_requests += self.request_num_queue.get()
             logger.info("num_of_requests: " + str(num_of_requests))
             if num_of_requests in migration_steps:
                 logger.info("change model configuration")
-                outputs = self.change_model_configuration_by_kv_transfer_async(alternative_configs[1])
+                self.change_model_configuration_by_kv_transfer_async(alternative_configs[cur_config])
+                cur_config += 1
                 # outputs = self.migrate_layer_v1(1, 0, 24)
-                logger.info("debug-------- engineoutput when migration: " + str(outputs))
-                for output in outputs:
-                    self.output_queue.put_nowait(output)
+                # logger.info("debug-------- engineoutput when migration: " + str(outputs))
+                # for output in outputs:
+                #     self.output_queue.put_nowait(output)
 
     def test_kv_cache_compact_thread(self):
         return

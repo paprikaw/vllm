@@ -288,7 +288,7 @@ class DynamicQwen3Model(Qwen3Model):
                 #     start = 40
                 #     end = 41
 
-                logger.info(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
+                logger.debug(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
                 for layer_idx, layer in enumerate(self.layers[self.sched_start_layer:self.sched_end_layer], start=self.sched_start_layer):
                     try:
                         # 使用 threading.Timer 实现超时检测
@@ -328,9 +328,7 @@ class DynamicQwen3Model(Qwen3Model):
                         "hidden_states": hidden_states,
                         "residual": residual
                     })
-                logger.info(f"forwarding model completed 1")
                 hidden_states, _ = self.norm(hidden_states, residual)
-        logger.info(f"forwarding model completed")
         return hidden_states
 
     # def load_layer_weights(self, weights: Iterable[tuple[str, torch.Tensor]], layers: Tuple[int, int])->set[str]:

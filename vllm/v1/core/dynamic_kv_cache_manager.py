@@ -94,7 +94,7 @@ class DynamicKVCacheManager(KVCacheManager):
             compacted_length, 
             total,
             migrate_record)
-        logger.info(f"[debug]: scheduler migrate_record: {migrate_record}")
+        logger.debug(f"[debug]: scheduler migrate_record: {migrate_record}")
         logger.info(f"before kv cache shrinking, the kv cache utilization is {self.block_pool.get_usage()}")
         # left, right = 0, len(self.block_pool.blocks) - 1
         # while left < right:
@@ -118,6 +118,8 @@ class DynamicKVCacheManager(KVCacheManager):
     def extend_kv_cache(self, extended_length: int) -> None:
         """ Extend the KV cache to a certain length
         """
+        logger.info(f"before kv cache extending, the kv cache utilization is {self.block_pool.get_usage()}")
         self.block_pool.extend_block_pool(extended_length)
-        assert self.block_pool.num_gpu_blocks == extended_length
+        self.num_gpu_blocks = extended_length
+        logger.info(f"after kv cache extending, the kv cache utilization is {self.block_pool.get_usage()}")
         return

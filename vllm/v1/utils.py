@@ -565,8 +565,8 @@ def dynamic_flexi_bind_single_kv_tensor(
     assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
     local_index = layer_index - start_layer
     assert local_index < len(runner.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(runner.key_caches)}"
-
-    key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr = runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping,kv_tensor, block_num)
+    logger.info(f"bind single kv tensor for {layer_index}, slot_mapping:{slot_mapping}")
+    key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr = runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping,layer_index, kv_tensor, block_num)
     runner.key_caches[local_index] = key_cache_list
     runner.value_caches[local_index] = value_cache_list
     runner.key_cache_ptrs[local_index] = key_cache_ptr

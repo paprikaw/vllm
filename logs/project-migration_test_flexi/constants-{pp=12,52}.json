@@ -9,7 +9,7 @@
     ],
     "max_model_len": 4096,
     "pipeline_parallel_size": 2,
-    "gpu_memory_utilization": 0.8,
+    "gpu_memory_utilization": 0.75,
     "chunked_prefill": true,
     "enable_cuda_graph": false,
     "enable_nsight": false,
@@ -30,11 +30,11 @@
     "input_output_lens": [
       [
         512,
-        64
+        128
       ],
       [
-        512,
-        8
+        256,
+        32
       ]
     ]
   }

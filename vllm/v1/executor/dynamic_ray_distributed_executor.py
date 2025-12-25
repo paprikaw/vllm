@@ -435,6 +435,9 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         # 调用 worker 侧的同名方法，仅在 source_rank 上发送，其余 rank 不做事
         self.collective_rpc("start_kv_cache_migration_async", args=(src_to_plan,slot_mapping))
 
+    def get_is_kv_resizing_done(self) -> list[bool]:
+        return self.collective_rpc("get_is_kv_resizing_done")
+
     def get_applied_token_num(self, receiver_list: list[int]) -> list[list[int]]:
         """Return KV patch buffer status per rank.
         """

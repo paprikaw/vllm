@@ -279,7 +279,8 @@ def one_off_test(cfg: Config, logm: LogManager):
     try:
         # Start vllm
         spec = ServerRunSpec(cfg.vllm.start_pp_layer_partitions[0], cfg.migration.is_migration)
-        vars_mapping = {"start_pp_layer_partition": spec.start_pp_layer_partition}
+        vars_mapping = {"start_pp_layer_partition": spec.start_pp_layer_partition,
+                        "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn}
         logm.write_constants_meta(vars_mapping)
         proc = start_vllm(cfg=cfg, spec=spec, logm=logm, vars=vars_mapping)
         bench_spec = BenchmarkRunSpec(input_output_len=cfg.benchmark.input_output_lens, running_request_rate_list=cfg.benchmark.running_request_rates)
