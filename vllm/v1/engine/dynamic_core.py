@@ -605,7 +605,6 @@ class DynamicEngineCore(EngineCore):
                         #     "Rank %s lacks memory even after KV compact estimate: max_blocks_per_layer: %s, current_used_blocks: %s",
                         #     rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
                         # return []
-                out = self._drain_out_running_queue()
 
 
         # with self.engine_lock:
@@ -644,7 +643,9 @@ class DynamicEngineCore(EngineCore):
         # self.model_executor.resize_kv_cache(1700)
         # self.scheduler.shrink_block_pool(1700)
         # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
+        logger.info(f"adding_per_rank: {adding_per_rank}")
         for r, add_list in adding_per_rank.items():
+            logger.info(f"rank {r}: adding layers {add_list}")
             self.model_executor.async_add_layers(r, add_list)
         time_kv_compact_end = time.time()
 
@@ -674,12 +675,9 @@ class DynamicEngineCore(EngineCore):
 
         sender_list = list(src_to_plan.keys())
         receiver_list = list(adding_per_rank.keys())
-        with self.engine_lock:
-            out = self._drain_out_running_queue()
-            slot_mapping = self.scheduler.start_migration(sender_list, receiver_list, compacted_length != original_length)
-            assert slot_mapping is not None if is_flexi else True
-            self.model_executor.start_kv_cache_migration_async(src_to_plan, slot_mapping)
-            time.sleep(10)
+        slot_mapping = self.scheduler.start_migration(sender_list, receiver_list, compacted_length != original_length)
+        assert slot_mapping is not None if is_flexi else True
+        self.model_executor.start_kv_cache_migration_async(src_to_plan, slot_mapping)
 
         time_kv_migration_end = time.time()
 
@@ -760,8 +758,7 @@ class DynamicEngineCore(EngineCore):
         if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
             logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
             self.migration_status = MigrationStatus.NOT_MIGRATING
-            return out
-
+            return
         time_start_checking_resizing_done = time.time()
         # Checking if the resizing is done and needed to extend the block pool
         while True:
@@ -776,7 +773,6 @@ class DynamicEngineCore(EngineCore):
         self.migration_status = MigrationStatus.NOT_MIGRATING
         logger.info(f"[timeline]: after check resizing done process, time taken: {human_readable_duration(time.time() - time_start_checking_resizing_done)}")
         logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
-        return out
 
     def change_model_configuration_by_kv_transfer_sync(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
         """

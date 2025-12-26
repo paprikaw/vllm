@@ -23,25 +23,25 @@ projects:
         0: "head"
         1: "worker1"
     vllm:
-      enable_flexi_flash_attn: true  # Set to true to enable Flexi Flash Attention
+      enable_flexi_flash_attn: false  # Set to true to enable Flexi Flash Attention
       pipeline_parallel_size: 2
       gpu_memory_utilization: 0.75
       start_pp_layer_partitions:
         - "32,32"
     migration:
       is_migration: true
-      # migration_steps: [30,60,100]
-      migration_steps: [20]
+      migration_steps: [20,60,100]
+      # migration_steps: [100]
       alternative_configs:
         "0": [32, 32]
-        "1": [20, 44]
-        # "2": [32, 32]
-        # "3": [20, 44]
+        "1": [12, 52]
+        "2": [32, 32]
+        "3": [20, 44]
     benchmark:
       profile: false
       print_outputs: true
-      data_num_requests: [20, 30]
+      data_num_requests: [50, 80]
       input_output_lens: [[512, 256], [512, 16]]
-      running_num_requests: [20, 30]
+      running_num_requests: [50, 80]
       running_request_rates: [1.8, 1.8]
 is_log_cover: true

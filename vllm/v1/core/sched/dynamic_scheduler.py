@@ -616,7 +616,7 @@ class DynamicScheduler(Scheduler):
 
     def extend_block_pool(self, extended_length: int) -> None:
         assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
-        assert extended_length > self.kv_cache_manager.num_gpu_blocks, "extended_length should be larger than current kv cache block num"
+        assert extended_length > self.kv_cache_manager.num_gpu_blocks, f"extended_length should be larger than current kv cache block num, {extended_length}: {extended_length}, current: {self.kv_cache_manager.num_gpu_blocks}"
         self.kv_cache_manager.extend_kv_cache(extended_length)
 
     def get_bitmap(self) -> bitarray:

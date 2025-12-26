@@ -740,7 +740,6 @@ class DynamicGPUWorker(Worker):
                 layer_idx = extract_layer_index(layer_name)
                 idx = layer_idx - runner.model.model.start_layer
                 cache = runner.kv_caches[idx]
-                # 使用 zeros 而不是 empty 来避免未初始化的数据导致错误生成EOS
                 tmp_cache = torch.zeros((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
                 logger.info(f"tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}")
                 if new_length > kv_length:
