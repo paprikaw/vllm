@@ -1,0 +1,52 @@
+envs:
+  NCCL_DEBUG: INFO
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+  VLLM_TORCH_PROFILER_DIR: /home/bxb1/data/vllm_workbench/profiler/
+  RAY_CGRAPH_get_timeout: "10000"
+  BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+  DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+  KV_SYNC_USE_CPU: "0"
+  VLLM_USE_CPU_MODEL: "0"
+  CUDA_LAUNCH_BLOCKING: "0"
+  NCCL_DEBUG: "INFO"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+  # PYTORCH_USE_CUDA_DSA: "1"
+  # PYTORCH_NO_CUDA_MEMORY_CACHING: "1"
+projects:
+  - project: "migration_test_async_no_migration"
+    type: "one_off_test"
+    model:
+      path: "/home/bxb1/data/huggingface/Qwen3-32B-AWQ"
+    #   name: ""
+    network:
+      delays: [0]
+      # 每个 pipeline 并行 rank 的可达 IP（请根据实际机器 IP 修改）
+      rank_to_ip:
+        0: "spartan-gpgpu143"
+        1: "spartan-gpgpu143"
+    vllm:
+      head_addr: "localhost"
+      pipeline_parallel_size: 2
+      enable_flexi_flash_attn: true  # Set to true to enable Flexi Flash Attention
+      gpu_memory_utilization: 0.75
+      start_pp_layer_partitions:
+        - "32,32"
+    migration:
+      is_migration: true
+      migration_steps: [25]
+      # migration_steps: [100]
+      alternative_configs:
+        "0": [32, 32]
+        "1": [12, 52]
+        "2": [32, 32]
+        "3": [20, 44]
+    benchmark:
+      benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+      profile: false
+      print_outputs: true
+      data_num_requests: [25, 25]
+      input_output_lens: [[512, 256], [512, 256]]
+      running_num_requests: [25, 25]
+      running_request_rates: [1.8, 1.8]
+is_log_cover: true

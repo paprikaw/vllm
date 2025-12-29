@@ -210,7 +210,8 @@ class DynamicGPUWorker(Worker):
             # 记录扩容前的起始 layer，便于在 start_layer 左移时重排本地 kv 索引基准
             old_start_layer = self.model_runner.model.model.start_layer
             old_end_layer = self.model_runner.model.model.end_layer
-            self.model_runner.add_layers(layer_list)
+            assert self.device is not None
+            self.model_runner.add_layers(layer_list, self.device)
 
             # 接收完weights之后，在这里进行kv cache数据结构的扩展，保证后续kv cache tensor绑定的正确性
             new_start_layer = self.model_runner.model.model.start_layer
@@ -280,6 +281,7 @@ class DynamicGPUWorker(Worker):
             # 唤醒等待层加载的线程（kv tensor的绑定线程和kv patch 应用线程）。
             self._layer_loaded_cv.notify_all()
             logger.info(f"[debug]: notified all layer loaded cv waiters")
+            torch.cuda.synchronize()
 
 
     def init_device(self):
@@ -335,13 +337,14 @@ class DynamicGPUWorker(Worker):
             logger.info(f"Rank {self.rank}: waiting for all ranks to finish model loading before KV synchronizer init")
             torch.distributed.barrier()
             logger.info(f"Rank {self.rank}: all ranks ready, initializing KV synchronizer")
-
+        assert self.device is not None
         # Initialize KV synchronizer AFTER model is ready (needs model for args)
         self.dynamic_kv_synchronizer = DynamicKVSynchronizer(
             rank=self.rank,
             local_rank=self.local_rank,
             config=self.vllm_config,
-            model_executable=self.model_runner.model
+            model_executable=self.model_runner.model,
+            device=self.device
         )
         # 启动所有监听其它rank的发送过来的kv cache的线程
         for rank in range(self.vllm_config.parallel_config.pipeline_parallel_size):
@@ -445,7 +448,8 @@ class DynamicGPUWorker(Worker):
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip removing model layers")
             return None
         logger.info(f"Remove Model Layers: {layer_list}")
-        self.model_runner.remove_layers(layer_list)
+        assert self.device is not None
+        self.model_runner.remove_layers(layer_list, self.device)
 
     def release_kv_cache_for_layers(self, rank: int, layers_list: list[Tuple[int, int]]) -> None:
         if self.rank != rank:
@@ -736,12 +740,14 @@ class DynamicGPUWorker(Worker):
             logger.info(f"num of kv tensors{len(runner.kv_caches)}")
 
             for layer_name, attn_module in forward_context.items():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
                 logger.info(f"resizing kv cache for layer {layer_name}")
                 layer_idx = extract_layer_index(layer_name)
                 idx = layer_idx - runner.model.model.start_layer
                 cache = runner.kv_caches[idx]
                 tmp_cache = torch.zeros((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
-                logger.info(f"tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}")
+                logger.info(f"current thread: {threading.current_thread().name} tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}")
                 if new_length > kv_length:
                     # 只复制旧的有效部分，新增的部分已经是0了
                     tmp_cache[:, :kv_length, ...].copy_(cache[:, :kv_length, ...])
@@ -756,8 +762,6 @@ class DynamicGPUWorker(Worker):
                     runner,
                     tmp_cache
                 )
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
             logger.info(f"[timeline]: resize kv cache within: {human_readable_duration(time.time() - time_start)}")
 
     def _flexi_resize_kv_cache(self, new_length: int) -> None:
@@ -1057,7 +1061,9 @@ class DynamicGPUWorker(Worker):
                 # logger.info(f"available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
 
             logger.info(f"[debug]: receive kv tensor finished, start to bind kv cache")
+            time_start_bind_kv_cache = time.time()
             # 在kv cache绑定前，weight必须loading结束
+            # streams = [torch.cuda.Stream() for _ in range(len(tmp_kv_tensors_dict))]
             for layer_id, kv_tensor in tmp_kv_tensors_dict.items():
                 with self._layer_loaded_cv:
                     while not self.model_runner.has_layer(layer_id):
@@ -1067,6 +1073,7 @@ class DynamicGPUWorker(Worker):
                     logger.info(f"[debug]: rank {self.rank} bind layer {layer_id}'s kv cache and weight")
                     if is_flexi:
                         slot_mapping = tmp_slot_mapping_dict[layer_id]
+                        assert self.device is not None
                         dynamic_flexi_bind_single_kv_tensor(
                             self.model_runner.model.model.start_layer,
                             self.model_runner.model.model.end_layer,
@@ -1076,7 +1083,8 @@ class DynamicGPUWorker(Worker):
                             kv_tensor,
                             self.vllm_config.compilation_config.static_forward_context,
                             self.dynamic_kv_synchronizer,
-                            self.model_runner
+                            self.model_runner,
+                            self.device,
                         )
                     else:
                         dynamic_bind_single_kv_tensor(
@@ -1089,7 +1097,8 @@ class DynamicGPUWorker(Worker):
                             kv_tensor=kv_tensor
                         )
                 logger.info(f"[operation]: rank {self.rank} layer {layer_id}'s kv cache and weight is loaded")
-          
+            torch.cuda.synchronize()
+            logger.info(f"[timeline]: bind kv cache time taken: {human_readable_duration(time.time() - time_start_bind_kv_cache)}")
             self.receiver_num_applied_token_dict[from_rank] = tmp_slot_token_num
             # 在同步迁移中，断言：所有接收层的 KV 已完成绑定且形状一致
             try:

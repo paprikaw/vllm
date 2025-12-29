@@ -28,8 +28,8 @@ if (DEFINED ENV{VLLM_FLASH_ATTN_SRC_DIR})
   set(VLLM_FLASH_ATTN_SRC_DIR $ENV{VLLM_FLASH_ATTN_SRC_DIR})
 endif()
 
-# Force use local flash-attention for development
-set(VLLM_FLASH_ATTN_SRC_DIR "/root/vllm_workbench/flash-attention")
+# Force use local flash-attention for development (commented out to use env var)
+# set(VLLM_FLASH_ATTN_SRC_DIR "/home/bxb1/vllm_workbench/flash-attention")
 
 if(VLLM_FLASH_ATTN_SRC_DIR)
   message(STATUS "Using local vllm-flash-attn source directory: ${VLLM_FLASH_ATTN_SRC_DIR}")

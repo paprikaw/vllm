@@ -962,12 +962,17 @@ def gptq_marlin_gemm(a: torch.Tensor,
                      use_atomic_add: bool = False,
                      use_fp32_reduce: bool = False,
                      is_zp_float: bool = False) -> torch.Tensor:
-    return torch.ops._C.gptq_marlin_gemm(a, c, b_q_weight, b_scales,
+    try:
+        res = torch.ops._C.gptq_marlin_gemm(a, c, b_q_weight, b_scales,
                                          global_scale, b_zeros, g_idx, perm,
                                          workspace, b_q_type.id, size_m,
                                          size_n, size_k, is_k_full,
                                          use_atomic_add, use_fp32_reduce,
                                          is_zp_float)
+    except Exception as e:
+        logger.info(f"gptq_marlin_gemm failed, input parameter shapes:\n a: {a.shape}\n b_q_weight: {b_q_weight.shape}\n b_scales: {b_scales.shape}\n, workspace: {workspace.shape}\n, b_q_type: {b_q_type}\n size_m: {size_m}\n size_n: {size_n}\n size_k: {size_k}\n is_k_full: {is_k_full}\n use_atomic_add: {use_atomic_add}\n use_fp32_reduce: {use_fp32_reduce}\n is_zp_float: {is_zp_float}")
+        raise e
+    return res
 
 
 # machete

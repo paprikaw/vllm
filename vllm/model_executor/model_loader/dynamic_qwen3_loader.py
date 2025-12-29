@@ -80,17 +80,18 @@ class CustomModelLoader(DefaultModelLoader):
                    model_config: ModelConfig,
                    layers: Tuple[int, int],
                    model: DynamicQwen3ForCausalLM,
+                   device: torch.device
                    ) -> None:
         assert isinstance(model, DynamicQwen3ForCausalLM), "model must be a DynamicQwen3ForCausalLM instance"
-        device_config = vllm_config.device_config
-        target_device = torch.device(device_config.device)
         time_start = time.time()
         logger.info(f"[timeline]: start to load layers {layers}")
-        # 🔴 关键修复：在整个层加载过程中设置 vllm_config 上下文
-        # 这样 Qwen3Attention 初始化时才能正确获取 enable_flexi_flash_attn 设置
         with set_default_torch_dtype(model_config.dtype): 
             # 添加设备上下文管理器，与 vllm 正常初始化逻辑保持一致
-            with target_device:
+            # 注意：这里使用 target_device，确保整个加载过程在正确的设备上
+            with device:
+                torch.cuda.set_device(device)
+                # 再次显式设置当前设备，确保后续操作在正确的设备上
+                logger.info(f"before weight loading, explicitly set device to current device: {torch.cuda.current_device()}")
                 logger.info(f"before weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
                 # 只收集属于指定层范围的参数名，更易读
                 model.add_layers(layers)
@@ -112,7 +113,7 @@ class CustomModelLoader(DefaultModelLoader):
                         raise ValueError(
                             "Following weights were not initialized from "
                             f"checkpoint: {weights_not_loaded}")
-                process_layer_weights_after_loading(model, model_config, target_device, layers)
+                process_layer_weights_after_loading(model, model_config, device, layers)
                 logger.info(f"[timeline]: after process layer weights after loading, time taken: {human_readable_duration(time.time() - time_start)}")
         return
 

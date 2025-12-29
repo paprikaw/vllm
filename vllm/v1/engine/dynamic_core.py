@@ -745,7 +745,7 @@ class DynamicEngineCore(EngineCore):
                     assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
 
                 resized_block_num = min(deleting_layer_assesses)
-                logger.info("all tokens to be sent is less than the threshold, start to synchronize the kv cache, resized_block_num: {resized_block_num}")
+                logger.info(f"all tokens to be sent is less than the threshold, start to synchronize the kv cache, resized_block_num: {resized_block_num}")
                 if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
                     assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
                     logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")

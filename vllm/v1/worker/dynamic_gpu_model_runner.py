@@ -33,7 +33,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         SlidingWindowSpec)
 from vllm.v1.utils import extract_layer_index
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.utils import dynamic_bind_kv_cache, dynamic_bind_single_kv_tensor, dynamic_flexi_bind_single_kv_tensor
+from vllm.v1.utils import dynamic_bind_kv_cache, dynamic_bind_single_kv_tensor
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.forward_context import get_forward_context
@@ -47,7 +47,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from bitarray import bitarray
 from vllm.v1.core.dynamic_kv_cache_utils import compact_cache_with_record
 from vllm.distributed.kv_transfer.kv_connector.dynamic_kv_synchronizer import DynamicKVSynchronizer
-from vllm.v1.worker.utils import get_flexi_kv_cache
+from vllm.v1.worker.utils import get_flexi_kv_cache, get_flexi_kv_cache_multi_stream
 from vllm.vllm_flash_attn.flash_attn_interface import prepare_flexi_kv_ptrs, free_flexi_kv_ptrs
 
 if TYPE_CHECKING:
@@ -328,7 +328,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         logger.info(f"debug: ---------------------has_layer: {layer_index} in range {self.model.model.start_layer} to {self.model.model.end_layer}")
         return layer_index in range(self.model.model.start_layer, self.model.model.end_layer)
 
-    def add_layers(self, layers_list: list[Tuple[int, int]]) -> None:
+    def add_layers(self, layers_list: list[Tuple[int, int]], device: torch.device) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
             raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
         torch.cuda.synchronize()
@@ -352,7 +352,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         with set_current_vllm_config(self.vllm_config):
             for layers in layers_list:
                 assert len(layers) == 2
-                loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model)
+                loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model, device)
 
     def reinitialize_kv_cache(self, kv_cache_config: KVCacheConfig, kv_synchronizer: DynamicKVSynchronizer) -> None:
         """
@@ -363,6 +363,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
                 "supported yet.")
+        assert False
         self.kv_cache_config = kv_cache_config
         kv_caches: dict[str, torch.Tensor] = {}
         for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
@@ -404,11 +405,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
-        dynamic_bind_kv_cache(
-            kv_caches,
-            self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches,
-            kv_synchronizer=kv_synchronizer)
+        # dynamic_bind_kv_cache(
+        #     kv_caches,
+        #     self.vllm_config.compilation_config.static_forward_context,
+        #     self.kv_caches,
+        #     kv_synchronizer=kv_synchronizer)
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
@@ -422,24 +423,26 @@ class DynamicGPUModelRunner(GPUModelRunner):
         t: torch.Tensor = self.kv_caches[0]
         return int(t.numel() * t.element_size())
 
-    def remove_layers(self, layers_list: list[Tuple[int, int]]) -> None:
-        if not isinstance(self.model, DynamicQwen3ForCausalLM):
-            raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
-        logger.info(f"before delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-        for layers in layers_list:
-            logger.info(f"Deleting layers {layers}")
-            self.model.delete_layers(layers)
+    def remove_layers(self, layers_list: list[Tuple[int, int]], device: torch.device) -> None:
+        with device:
+            torch.cuda.set_device(device)
+            if not isinstance(self.model, DynamicQwen3ForCausalLM):
+                raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+            logger.info(f"before delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+            for layers in layers_list:
+                logger.info(f"Deleting layers {layers}")
+                self.model.delete_layers(layers)
 
-        deleted_layers = set(layer for layers in layers_list for layer in range(layers[0], layers[1]+1))
-        logger.info(f"deleted layer set {deleted_layers}")
-        # Delete the layer from forward context
-        self.vllm_config.compilation_config.static_forward_context = {
-            layer_name: attn_module for layer_name, attn_module in self.vllm_config.compilation_config.static_forward_context.items()
-            if extract_layer_index(layer_name) not in deleted_layers
-        }
-        for i in range(len(self.kv_caches)):
-            logger.info(f"kv_caches[{i}] shape: {self.kv_caches[i].shape}")
-        logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+            deleted_layers = set(layer for layers in layers_list for layer in range(layers[0], layers[1]+1))
+            logger.info(f"deleted layer set {deleted_layers}")
+            # Delete the layer from forward context
+            self.vllm_config.compilation_config.static_forward_context = {
+                layer_name: attn_module for layer_name, attn_module in self.vllm_config.compilation_config.static_forward_context.items()
+                if extract_layer_index(layer_name) not in deleted_layers
+            }
+            for i in range(len(self.kv_caches)):
+                logger.info(f"kv_caches[{i}] shape: {self.kv_caches[i].shape}")
+            logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
     def dynamic_initialize_kv_cache(self, 
                                     kv_cache_config: KVCacheConfig, 
@@ -817,18 +820,19 @@ class DynamicGPUModelRunner(GPUModelRunner):
     
     def get_flexi_kv_cache_from_gathered_kv_tensor(self, slot_mapping: torch.Tensor, layer: int,
                                  gathered_kv_tensor: torch.Tensor,
-                                 block_num: int) -> Tuple[list[torch.Tensor], list[torch.Tensor], int, int]:
+                                 block_num: int, stream: Optional[torch.cuda.Stream] = None) -> Tuple[list[torch.Tensor], list[torch.Tensor], int, int]:
         '''
         Based on current kv cache list shape and dtype, we allocate a new kv cache list
         and extract the data from gathered_kv_tensor to the new kv cache list.
         after that, we also flush the new kv cache to GPU ptrs.
         '''
+        time_start = time.time()
         kv_cache_shape = self.kv_cache_shape
         assert len(kv_cache_shape) == 5 # (2, nkvblocks, blockdim, n_head, headdim)
         block_shape = kv_cache_shape[2:]
         kv_dtype = self.kv_cache_dtype
 
-        key_cache, value_cache = get_flexi_kv_cache(block_num, block_shape, kv_dtype, self.device)
+        key_cache, value_cache = get_flexi_kv_cache_multi_stream(block_num, block_shape, kv_dtype, self.device, stream)
         key_cache_list_ptr, value_cache_list_ptr = prepare_flexi_kv_ptrs(key_cache, value_cache) 
         logger.info(f"gathered_kv_tensor shape: {gathered_kv_tensor.shape}, kv_cache_shape: {kv_cache_shape}, block_shape:{block_shape}, block_num:{block_num}, key_cache shape:{key_cache[0].shape}, value_cache shape:{value_cache[0].shape}, key_cache length:{len(key_cache)}, value_cache length:{len(value_cache)}, slot_mapping shape:{slot_mapping.shape}")
         logger.info(f"key_cache_list_ptr {key_cache_list_ptr}, value cache list ptr:{value_cache_list_ptr}")

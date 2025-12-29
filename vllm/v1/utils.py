@@ -24,6 +24,7 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
 from vllm.utils import get_mp_context, kill_process_tree
 from vllm.v1.executor.abstract import Executor
 from vllm.dynamic_config import DynamicConfig
+# from vllm.v1.worker.dynamic_gpu_model_runner import DynamicGPUModelRunner
 from vllm.v1.worker.utils import get_flexi_kv_cache
 
 if TYPE_CHECKING:
@@ -552,7 +553,9 @@ def dynamic_flexi_bind_single_kv_tensor(
     kv_tensor: torch.Tensor,
     forward_context: dict[str, "Attention"],
     kv_synchronizer: "DynamicKVSynchronizer",
-    runner: "DynamicGPUModelRunner") -> None:
+    runner: "DynamicGPUModelRunner",
+    device: torch.device,
+    stream: Optional[torch.cuda.streams.Stream] = None) -> None:
     """Bind a single layer's KV tensor to runner caches and forward context.
 
     - 更新本 runner 的 `self.kv_caches`
@@ -561,44 +564,46 @@ def dynamic_flexi_bind_single_kv_tensor(
 
     线程安全：内部获取 forward_lock。
     """
-    # Determine local index in runner kv cache list
-    assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
-    local_index = layer_index - start_layer
-    assert local_index < len(runner.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(runner.key_caches)}"
-    logger.info(f"bind single kv tensor for {layer_index}, slot_mapping:{slot_mapping}")
-    key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr = runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping,layer_index, kv_tensor, block_num)
-    runner.key_caches[local_index] = key_cache_list
-    runner.value_caches[local_index] = value_cache_list
-    runner.key_cache_ptrs[local_index] = key_cache_ptr
-    runner.value_cache_ptrs[local_index] = value_cache_ptr
-    kv_synchronizer.key_cache_list[local_index] = key_cache_list
-    kv_synchronizer.value_cache_list[local_index] = value_cache_list
-    kv_synchronizer.key_cache_ptrs[local_index] = key_cache_ptr
-    kv_synchronizer.value_cache_ptrs[local_index] = value_cache_ptr
+    with device:
+        torch.cuda.set_device(device)
+        # Determine local index in runner kv cache list
+        assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
+        local_index = layer_index - start_layer
+        assert local_index < len(runner.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(runner.key_caches)}"
+        logger.info(f"bind single kv tensor for {layer_index}, slot_mapping:{slot_mapping}")
+        key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr = runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping,layer_index, kv_tensor, block_num, stream)
+        runner.key_caches[local_index] = key_cache_list
+        runner.value_caches[local_index] = value_cache_list
+        runner.key_cache_ptrs[local_index] = key_cache_ptr
+        runner.value_cache_ptrs[local_index] = value_cache_ptr
+        kv_synchronizer.key_cache_list[local_index] = key_cache_list
+        kv_synchronizer.value_cache_list[local_index] = value_cache_list
+        kv_synchronizer.key_cache_ptrs[local_index] = key_cache_ptr
+        kv_synchronizer.value_cache_ptrs[local_index] = value_cache_ptr
 
-    # Bind to forward context
-    layer_name: str = get_layer_name_for_index(layer_index, forward_context)
-    if layer_name not in forward_context:
-        raise KeyError(
-            f"No attention layer named {layer_name} in forward_context.")
-    attn_module = forward_context[layer_name]
-    assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
-    attn_module.key_cache = key_cache_list
-    attn_module.value_cache = value_cache_list
-    attn_module.key_dev_ptr = key_cache_ptr
-    attn_module.value_dev_ptr = value_cache_ptr
+        # Bind to forward context
+        layer_name: str = get_layer_name_for_index(layer_index, forward_context)
+        if layer_name not in forward_context:
+            raise KeyError(
+                f"No attention layer named {layer_name} in forward_context.")
+        attn_module = forward_context[layer_name]
+        assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
+        attn_module.key_cache = key_cache_list
+        attn_module.value_cache = value_cache_list
+        attn_module.key_dev_ptr = key_cache_ptr
+        attn_module.value_dev_ptr = value_cache_ptr
 
-    group = runner.kv_cache_config.kv_cache_groups[0]
-    # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
-    if layer_name not in group.layer_names:
-        # 按 layer_index 位置插入，保持有序
-        insert_idx = len(group.layer_names)
-        target_idx = extract_layer_index(layer_name)
-        for i, name in enumerate(group.layer_names):
-            if extract_layer_index(name) > target_idx:
-                insert_idx = i
-                break
-        group.layer_names.insert(insert_idx, layer_name)
+        group = runner.kv_cache_config.kv_cache_groups[0]
+        # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
+        if layer_name not in group.layer_names:
+            # 按 layer_index 位置插入，保持有序
+            insert_idx = len(group.layer_names)
+            target_idx = extract_layer_index(layer_name)
+            for i, name in enumerate(group.layer_names):
+                if extract_layer_index(name) > target_idx:
+                    insert_idx = i
+                    break
+            group.layer_names.insert(insert_idx, layer_name)
 
 def dynamic_flexi_bind_single_kv_cache(
     start_layer: int,

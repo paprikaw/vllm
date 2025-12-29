@@ -64,6 +64,7 @@ class VllmCfg(BaseModel):
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
     enable_flexi_flash_attn: bool = False
+    head_addr: str = "head"
     port: int = 8000
     ray_port: int = 6379
     start_pp_layer_partitions: list[str] = ["8,56"]
@@ -85,6 +86,8 @@ class BenchCfg(BaseModel):
     input_output_lens: list[list[int]]
     # Whether to print each request's generated output in benchmark logs
     print_outputs: bool = False
+    # Path to benchmark script
+    benchmark_script_path: str = "/root/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
 
     @field_validator("running_request_rates")
     @classmethod

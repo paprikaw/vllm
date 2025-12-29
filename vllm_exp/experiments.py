@@ -151,7 +151,8 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
     return proc
 
 def start_benchmark(cfg: Config, spec: BenchmarkRunSpec, logm: LogManager, vars: Optional[dict[str, Any]] = None) -> bool:
-    base_url = f"http://head:{cfg.vllm.port}"
+    # Use localhost instead of 'head' for local development
+    base_url = f"http://{cfg.vllm.head_addr}:{cfg.vllm.port}"
     ok = False
     if not wait_ready(base_url, 300):
         C.print("[red]ERROR[/] vLLM not ready in time")
@@ -160,7 +161,7 @@ def start_benchmark(cfg: Config, spec: BenchmarkRunSpec, logm: LogManager, vars:
     benchmark_config_path = os.environ.get("BENCHMARK_CONFIG_PATH")
     assert benchmark_config_path is not None
     bench_args = [
-        "python3", "/root/vllm_workbench/vllm/benchmarks/benchmark_serving.py",
+        "python3", cfg.benchmark.benchmark_script_path,
         "--request-rate", str(spec.request_rate),
         "--backend", "openai-chat",
         "--model", cfg.model.path,
@@ -174,7 +175,7 @@ def start_benchmark(cfg: Config, spec: BenchmarkRunSpec, logm: LogManager, vars:
         "--pattern-batch-size", str(cfg.benchmark.pattern_batch_size),
         "--benchmark-config", str(benchmark_config_path),
     ]
-
+    C.print(f"start to run benchmark with args: {bench_args}")
     if cfg.benchmark.print_outputs:
         bench_args.append("--print-outputs")
 

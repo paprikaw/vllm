@@ -85,6 +85,32 @@ def get_flexi_kv_cache(size: int, block_shape: Tuple[int, int, int], kv_cache_dt
     return [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)], \
         [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
 
+def get_flexi_kv_cache_multi_stream(size: int, block_shape: Tuple[int, int, int], kv_cache_dtype: torch.dtype, device: torch.device, stream: Optional[torch.cuda.Stream] = None) -> Tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """
+    Create KV cache tensors on the specified device.
+    
+    Args:
+        size: Number of cache blocks to create
+        block_shape: Shape of each cache block
+        kv_cache_dtype: Data type for cache tensors
+        device: Target device for allocation
+        stream: Optional CUDA stream for async allocation. If provided, allocations
+                will be performed on this stream, enabling parallel creation of
+                multiple KV caches.
+    
+    Returns:
+        Tuple of (k_cache_list, v_cache_list)
+    """
+    if stream is not None and device.type == 'cuda':
+        with torch.cuda.stream(stream):
+            k_cache = [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
+            v_cache = [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
+    else:
+        k_cache = [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
+        v_cache = [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
+    
+    return k_cache, v_cache
+
 @dataclass
 class KVBufferStatus:
     used_tokens: dict[int, int]

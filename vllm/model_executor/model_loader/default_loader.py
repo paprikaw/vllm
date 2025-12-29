@@ -270,6 +270,7 @@ class DefaultModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
+                logger.info(f"loading model on device: {torch.cuda.current_device()}")
                 model = initialize_model(vllm_config=vllm_config,
                                          model_config=model_config)
             logger.info(f"initialize model weights: {model}")

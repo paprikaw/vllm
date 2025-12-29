@@ -247,6 +247,7 @@ class DynamicKVSynchronizer():
         self,
         rank: int,
         local_rank: int,
+        device: torch.device,
         config: VllmConfig,
         model_executable: torch.nn.Module
     ):
@@ -285,7 +286,8 @@ class DynamicKVSynchronizer():
             self.kv_cache_transfer_in_process[peer] = False
             self.last_patch_ids[peer] = 0
 
-
+        # Initialize device
+        self.device = device
         self.sending_synchronizer_lock = threading.Lock()
         self.recv_synchronizer_lock = threading.Lock()
         # Eagerly initialize NCCL pipes for all peers (both directions).
@@ -390,11 +392,6 @@ class DynamicKVSynchronizer():
                 return self._pair_pipes_recv[peer_rank]
             logger.info(f"initilizing {direction} from rank {self.rank} to rank {peer_rank}")
             logger.info(f"----------------debug start to initialize {direction} from rank {self.rank} to rank {peer_rank}")
-            # 设备检查
-            base_device = self.vllm_config.device_config.device
-            assert isinstance(base_device, torch.device)
-            assert base_device.type == "cuda"
-            device = torch.device("cuda", self.local_rank)
 
             # 确定本通道的“源”端（作为 TCPStore server 的一侧）
             src_rank = self.rank if direction == 'send' else peer_rank
@@ -409,7 +406,7 @@ class DynamicKVSynchronizer():
                              port=port,
                              pair_rank=pair_rank,
                              store_timeout_s=self.config.store_timeout_s,
-                             device=device)
+                             device=self.device)
             max_kv_patch_buffer_size = int(os.environ.get('MAX_KV_PATCH_BUFFER_SIZE', 5000))
             if direction == 'send':
                 self._pair_pipes_send[peer_rank] = pipe
@@ -472,9 +469,11 @@ class DynamicKVSynchronizer():
         Returns:
             Received tensor on local GPU.
         """
-        pipe = self._ensure_pipe_and_buffer(rank, 'recv')
-        pipe = self._pair_pipes_recv[rank]
-        return pipe.recv_data(dtype, shape, send_ack=send_ack)
+        with self.device:
+            torch.cuda.set_device(self.device)
+            pipe = self._ensure_pipe_and_buffer(rank, 'recv')
+            pipe = self._pair_pipes_recv[rank]
+            return pipe.recv_data(dtype, shape, send_ack=send_ack)
 
     def get_recv_pipe(self, rank: int) -> PairPipe:
         self._ensure_pipe_and_buffer(rank, 'recv')
@@ -719,8 +718,8 @@ class DynamicKVSynchronizer():
         # self.last_patch_ids[target_rank] += 1
         meta, kv_payload, slot_mapping = kv_patches.meta, kv_patches.kv_payload, kv_patches.slot_mapping
         self._send_meta_to_rank(target_rank, meta)
-        self._send_data_to_rank(target_rank, slot_mapping)
-        self._send_data_to_rank(target_rank, kv_payload)
+        self._send_data_to_rank(target_rank, slot_mapping, wait_for_ack=True)
+        self._send_data_to_rank(target_rank, kv_payload, wait_for_ack=True)
 
         if meta.type == "kv_patch_finished":
             self.kv_cache_transfer_in_process[target_rank] = False
@@ -934,8 +933,8 @@ class DynamicKVSynchronizer():
 
     def recv_kv_patch(self, from_rank: int,meta: KVPatchMeta) -> Tuple[torch.Tensor, torch.Tensor]:
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
-        slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape)
-        kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape)
+        slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape, True)
+        kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape, True)
         if is_flexi:
             assert kv_payload.dim() == 5 and kv_payload.size(0) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
         else:

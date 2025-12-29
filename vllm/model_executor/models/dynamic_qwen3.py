@@ -297,8 +297,14 @@ class DynamicQwen3Model(Qwen3Model):
                         exception_holder = [None]  # 用于存储异常
                         
                         def run_layer():
-                            h, r = layer(positions, hidden_states, residual)
-                            result[0], result[1] = h, r
+                            try:
+                                h, r = layer(positions, hidden_states, residual)
+                                result[0], result[1] = h, r
+                            except Exception as e:
+                                logger.info(f"""Exception in layer {layer_idx}""")
+                                logger.info(f"self weights: {list(layer.named_parameters())}")
+                                raise e
+
 
                         
                         # # 在新线程中运行 layer
