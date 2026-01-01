@@ -14,7 +14,7 @@ envs:
   PYTORCH_USE_CUDA_DSA: "1"
   # PYTORCH_NO_CUDA_MEMORY_CACHING: "1"
 projects:
-  - project: "migration_test_with_migration"
+  - project: "migration_test_with_no_migration"
     type: "one_off_test"
     network:
       delays: [0]

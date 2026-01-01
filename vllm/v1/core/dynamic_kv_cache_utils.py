@@ -1,5 +1,4 @@
 from typing import Callable
-from .kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
 
 def compact_cache(migrate_func: Callable[[int, int], None], is_used: Callable[[int], bool], compacted_length: int, kv_cache_length: int):
     left, right = 0, kv_cache_length - 1

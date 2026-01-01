@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 from collections.abc import Iterable
+import time
 from typing import Any, Optional, Union
 import gc
 import torch
@@ -51,6 +52,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.pooling_metadata import PoolingMetadata
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors, PoolerOutput
+from vllm.v1.utils import human_readable_duration
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper, is_pp_missing_parameter,
@@ -356,12 +358,16 @@ class Qwen2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         logger.info(f"Forwarding with layers:{self.start_layer} to {self.end_layer}")
+        forwarding_start_time = time.time()
         for layer in self.layers[self.start_layer:self.end_layer]:
+            layer_start_time = time.time()
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
             )
+            logger.info(f"after Layer forwarding took {human_readable_duration(time.time() - layer_start_time)}")
+        logger.info(f"after forwarding took {human_readable_duration(time.time() - forwarding_start_time)}")
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,

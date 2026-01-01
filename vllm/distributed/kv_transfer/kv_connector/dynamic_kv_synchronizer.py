@@ -163,7 +163,7 @@ class PairPipe:
         # NCCL data-plane communicator
             self._nccl = PyNcclCommunicator(group=self.meta_group, device=local_rank)
             # 创建专用的 CUDA stream 用于 KV 传输，避免与模型计算的 stream 冲突
-            self._kv_transfer_stream = torch.cuda.Stream(device=self.device)
+            self._kv_transfer_stream = torch.cuda.Stream(device=self.device, priority=1)
         else:
             self._nccl = None
             self._kv_transfer_stream = None
@@ -718,8 +718,11 @@ class DynamicKVSynchronizer():
         # self.last_patch_ids[target_rank] += 1
         meta, kv_payload, slot_mapping = kv_patches.meta, kv_patches.kv_payload, kv_patches.slot_mapping
         self._send_meta_to_rank(target_rank, meta)
+        logger.info(f"sent meta to rank {target_rank}, patch id: {meta.id}, layer ids: {meta.layer_ids}, num tokens: {meta.num_tokens}")
         self._send_data_to_rank(target_rank, slot_mapping, wait_for_ack=True)
+        logger.info(f"sent slot mapping to rank {target_rank}, patch id: {meta.id}")
         self._send_data_to_rank(target_rank, kv_payload, wait_for_ack=True)
+        logger.info(f"sent kv payload to rank {target_rank}, patch id: {meta.id}")
 
         if meta.type == "kv_patch_finished":
             self.kv_cache_transfer_in_process[target_rank] = False

@@ -605,22 +605,20 @@ class DynamicEngineCore(EngineCore):
                         #     "Rank %s lacks memory even after KV compact estimate: max_blocks_per_layer: %s, current_used_blocks: %s",
                         #     rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
                         # return []
-
-
+        logger.info(f"[timeline]: engine locking time: {human_readable_duration(time.time() - time_start)}")
         # with self.engine_lock:
             # start_drain_out_time = time.time()
             # outputs = self._drain_out_running_queue()
             # engine_core_outputs.extend(outputs)
             # logger.info(f"[timeline]: after drain out running queue, time taken: {human_readable_duration(time.time() - start_drain_out_time)}")
-            assert isinstance(self.scheduler, DynamicScheduler)
-            assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
-            compacted_length = min(maximum_kv_block_num_after_compact)
-            original_length = self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
-            if need_compact:
-                time_start_compact_kv = time.time()
-                logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
-                bitmap = self.scheduler.shrink_block_pool(compacted_length)
-            logger.info(f"[timeline]: engine locking time: {human_readable_duration(time.time() - time_start)}")
+        assert isinstance(self.scheduler, DynamicScheduler)
+        assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
+        compacted_length = min(maximum_kv_block_num_after_compact)
+        original_length = self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
+        if need_compact:
+            time_start_compact_kv = time.time()
+            logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
+            bitmap = self.scheduler.shrink_block_pool(compacted_length)
 
         if need_compact:
             self._compact_kv_cache(compacted_length, bitmap)

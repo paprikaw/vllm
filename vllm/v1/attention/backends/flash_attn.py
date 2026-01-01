@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Attention layer with FlashAttention."""
 from dataclasses import dataclass
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
@@ -20,6 +21,7 @@ from vllm.platforms import current_platform
 from vllm.utils import cdiv
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.utils import human_readable_duration
 from vllm.v1.worker.block_table import BlockTable
 
 if TYPE_CHECKING:
@@ -552,6 +554,7 @@ class FlashAttentionImpl(AttentionImpl):
               {q,k,v}_descale to be (num_sequences, num_kv_heads).
               We use torch's .expand() to avoid duplicating values
         """
+        time_start = time.time()
         assert output is not None, "Output tensor must be provided."
 
         if attn_metadata is None:
@@ -640,6 +643,7 @@ class FlashAttentionImpl(AttentionImpl):
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
             )
+            logger.info(f"[FLEXI DEBUG] attention forward took {human_readable_duration(time.time() - time_start)}")
             return output
 
         assert not use_local_attn, (

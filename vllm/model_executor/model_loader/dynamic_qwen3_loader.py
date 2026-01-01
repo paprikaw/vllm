@@ -85,11 +85,14 @@ class CustomModelLoader(DefaultModelLoader):
         assert isinstance(model, DynamicQwen3ForCausalLM), "model must be a DynamicQwen3ForCausalLM instance"
         time_start = time.time()
         logger.info(f"[timeline]: start to load layers {layers}")
+        # 创建低优先级 stream（priority 值越大优先级越低）
+        # 注意：这主要影响 GPU kernel 执行，对 CPU I/O 无效
         with set_default_torch_dtype(model_config.dtype): 
             # 添加设备上下文管理器，与 vllm 正常初始化逻辑保持一致
             # 注意：这里使用 target_device，确保整个加载过程在正确的设备上
             with device:
                 torch.cuda.set_device(device)
+                # 使用 with 语句确保所有 CUDA 操作都在低优先级 stream 上执行
                 # 再次显式设置当前设备，确保后续操作在正确的设备上
                 logger.info(f"before weight loading, explicitly set device to current device: {torch.cuda.current_device()}")
                 logger.info(f"before weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")

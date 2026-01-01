@@ -13,11 +13,9 @@ from datetime import timedelta
 
 import torch
 
-from vllm.attention.dynamic_layer import FlexiAttention
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.dynamic_kv_synchronizer import DynamicKVSynchronizer
 from vllm.logger import init_logger
-from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
@@ -25,7 +23,6 @@ from vllm.utils import get_mp_context, kill_process_tree
 from vllm.v1.executor.abstract import Executor
 from vllm.dynamic_config import DynamicConfig
 # from vllm.v1.worker.dynamic_gpu_model_runner import DynamicGPUModelRunner
-from vllm.v1.worker.utils import get_flexi_kv_cache
 
 if TYPE_CHECKING:
     from vllm.attention.layer import Attention
@@ -488,7 +485,7 @@ def dynamic_flexi_bind_kv_cache(
     # Bind kv_caches to forward context
     for layer_name, attn in forward_context.items():
         # NOTE: Use list because of v0 PP virtual engine.
-        assert isinstance(attn, FlexiAttention)
+        # assert isinstance(attn, FlexiAttention)
         attn.key_cache = key_cache[layer_name]
         attn.value_cache = value_cache[layer_name]
         attn.key_dev_ptr = key_dev_ptr[layer_name]
@@ -515,7 +512,6 @@ def dynamic_bind_single_kv_tensor(
     
     # Determine local index in runner kv cache list
     assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
-
     local_index = layer_index - start_layer
     assert local_index < len(runner.kv_caches), f"Local index {local_index} is out of range, kv_tensor length: {len(runner.kv_caches)}"
     logger.info(f"bind kv tensor for {layer_index}, local_index={local_index}, kv_tensor length: {len(runner.kv_caches)}")
@@ -587,7 +583,7 @@ def dynamic_flexi_bind_single_kv_tensor(
             raise KeyError(
                 f"No attention layer named {layer_name} in forward_context.")
         attn_module = forward_context[layer_name]
-        assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
+        # assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
         attn_module.key_cache = key_cache_list
         attn_module.value_cache = value_cache_list
         attn_module.key_dev_ptr = key_cache_ptr
@@ -615,7 +611,7 @@ def dynamic_flexi_bind_single_kv_cache(
     value_cache_ptr: int,
     forward_context: dict[str, "Attention"],
     kv_synchronizer: "DynamicKVSynchronizer",
-    runner: "DynamicGPUModelRunner") -> None:
+    runner: "DynamicGPUModelRunner"):
     """Bind a single layer's KV tensor to runner caches and forward context.
 
     - 更新本 runner 的 `self.kv_caches`
@@ -644,8 +640,10 @@ def dynamic_flexi_bind_single_kv_cache(
         raise KeyError(
             f"No attention layer named {layer_name} in forward_context.")
     attn_module = forward_context[layer_name]
-    assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
+    # assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
+    old_cache = attn_module.key_cache
     attn_module.key_cache = key_cache_list
+    old_value_cache = attn_module.value_cache
     attn_module.value_cache = value_cache_list
     attn_module.key_dev_ptr = key_cache_ptr
     attn_module.value_dev_ptr = value_cache_ptr
@@ -661,6 +659,7 @@ def dynamic_flexi_bind_single_kv_cache(
                 insert_idx = i
                 break
         group.layer_names.insert(insert_idx, layer_name)
+    return old_cache, old_value_cache
 def copy_slice(from_tensor: torch.Tensor, to_tensor: torch.Tensor,
                length: int) -> torch.Tensor:
     """

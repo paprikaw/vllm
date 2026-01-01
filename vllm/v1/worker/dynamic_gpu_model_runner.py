@@ -133,7 +133,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
         layer_config: Tuple[int, int],
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+        time_start = time.time()
         with self.forward_lock:
+            logger.info(f"getting forward lock taking {human_readable_duration(time.time() - time_start)}")
             if not isinstance(self.model, DynamicQwen3ForCausalLM):
                 raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
             self.model.set_sched_layers(layer_config[0], layer_config[1])
@@ -331,21 +333,23 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def add_layers(self, layers_list: list[Tuple[int, int]], device: torch.device) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
             raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+        logger.info(f"before add layer, synchronize")
         torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        available_memory = torch.cuda.mem_get_info()[0]
-        num_added_layers = sum([layer[1] - layer[0] + 1 for layer in layers_list])
-        time_wait = 0
-        while available_memory < num_added_layers * self.model.get_layer_weight_size() and time_wait < 10:
-            time_wait += 1
-            time.sleep(0.1)
-            gc.collect()
-            torch.cuda.empty_cache()
-            available_memory = torch.cuda.mem_get_info()[0]
-            logger.info(f"waiting for available memory to be enough, time_wait: {time_wait}, available_memory: {available_memory}")
-        assert available_memory > num_added_layers * self.model.get_layer_weight_size(), \
-            f"Available memory: {human_readable_size(available_memory)} is not enough for {num_added_layers} layers"
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        # available_memory = torch.cuda.mem_get_info()[0]
+        # num_added_layers = sum([layer[1] - layer[0] + 1 for layer in layers_list])
+        # time_wait = 0
+        # while available_memory < num_added_layers * self.model.get_layer_weight_size() and time_wait < 10:
+        #     logger.info(f"before add layer, empty cache")
+        #     time_wait += 1
+        #     time.sleep(0.1)
+        #     gc.collect()
+        #     torch.cuda.empty_cache()
+        #     available_memory = torch.cuda.mem_get_info()[0]
+        #     logger.info(f"waiting for available memory to be enough, time_wait: {time_wait}, available_memory: {available_memory}")
+        # assert available_memory > num_added_layers * self.model.get_layer_weight_size(), \
+        #     f"Available memory: {human_readable_size(available_memory)} is not enough for {num_added_layers} layers"
 
         model: DynamicQwen3ForCausalLM = self.model
         loader = CustomModelLoader(self.vllm_config.load_config)
@@ -831,19 +835,19 @@ class DynamicGPUModelRunner(GPUModelRunner):
         assert len(kv_cache_shape) == 5 # (2, nkvblocks, blockdim, n_head, headdim)
         block_shape = kv_cache_shape[2:]
         kv_dtype = self.kv_cache_dtype
+        with torch.cuda.stream(stream):
+            key_cache, value_cache = get_flexi_kv_cache_multi_stream(block_num, block_shape, kv_dtype, self.device, stream)
+            key_cache_list_ptr, value_cache_list_ptr = prepare_flexi_kv_ptrs(key_cache, value_cache) 
+            logger.info(f"gathered_kv_tensor shape: {gathered_kv_tensor.shape}, kv_cache_shape: {kv_cache_shape}, block_shape:{block_shape}, block_num:{block_num}, key_cache shape:{key_cache[0].shape}, value_cache shape:{value_cache[0].shape}, key_cache length:{len(key_cache)}, value_cache length:{len(value_cache)}, slot_mapping shape:{slot_mapping.shape}")
+            logger.info(f"key_cache_list_ptr {key_cache_list_ptr}, value cache list ptr:{value_cache_list_ptr}")
+            # dummy_scale = torch.tensor(1.0, device=self.device, dtype=torch.float32)
+            assert gathered_kv_tensor.shape[-2:] == kv_cache_shape[-2:], f"gathered_kv_tensor shape {gathered_kv_tensor.shape} mismatch kv_cache_shape {kv_cache_shape}"
+            model = self.model
+            assert isinstance(model, DynamicQwen3ForCausalLM)
+            # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
+            layer_module = model.model.layers[layer]
 
-        key_cache, value_cache = get_flexi_kv_cache_multi_stream(block_num, block_shape, kv_dtype, self.device, stream)
-        key_cache_list_ptr, value_cache_list_ptr = prepare_flexi_kv_ptrs(key_cache, value_cache) 
-        logger.info(f"gathered_kv_tensor shape: {gathered_kv_tensor.shape}, kv_cache_shape: {kv_cache_shape}, block_shape:{block_shape}, block_num:{block_num}, key_cache shape:{key_cache[0].shape}, value_cache shape:{value_cache[0].shape}, key_cache length:{len(key_cache)}, value_cache length:{len(value_cache)}, slot_mapping shape:{slot_mapping.shape}")
-        logger.info(f"key_cache_list_ptr {key_cache_list_ptr}, value cache list ptr:{value_cache_list_ptr}")
-        # dummy_scale = torch.tensor(1.0, device=self.device, dtype=torch.float32)
-        assert gathered_kv_tensor.shape[-2:] == kv_cache_shape[-2:], f"gathered_kv_tensor shape {gathered_kv_tensor.shape} mismatch kv_cache_shape {kv_cache_shape}"
-        model = self.model
-        assert isinstance(model, DynamicQwen3ForCausalLM)
-        # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
-        layer_module = model.model.layers[layer]
-
-        flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_list_ptr,value_cache_list_ptr,  key_cache[0], value_cache[0], slot_mapping,"auto",layer_module.self_attn.attn._k_scale, layer_module.self_attn.attn._v_scale)
+            flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_list_ptr,value_cache_list_ptr,  key_cache[0], value_cache[0], slot_mapping,"auto",layer_module.self_attn.attn._k_scale, layer_module.self_attn.attn._v_scale)
 
         return key_cache, value_cache, key_cache_list_ptr, value_cache_list_ptr
 

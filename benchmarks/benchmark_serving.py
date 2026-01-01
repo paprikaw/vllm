@@ -212,12 +212,19 @@ def calculate_metrics(
     except KeyError:
         raise ValueError("Environment variable METRICS_FILE_NAME is not set")
     print(f"Writing metrics to {file_name}")
+    
+    # 从 outputs 中提取时间戳
+    from datetime import datetime
+    timestamps = [output.timestamp for output in outputs]
+    datetimes = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] 
+                 for ts in timestamps]
+    
     with open(file_name, "a", newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["tpots", "ttfts", "e2els"])
+        writer.writerow(["timestamp", "datetime", "tpots", "ttfts", "e2els"])
         # 确保几个 list 长度一致
-        for t,  tf, e in zip(tpots, ttfts, e2els):
-            writer.writerow([t, tf, e])
+        for ts, dt, t, tf, e in zip(timestamps, datetimes, tpots, ttfts, e2els):
+            writer.writerow([ts, dt, t, tf, e])
     if goodput_config_dict:
         valid_metrics = []
         slo_values = []

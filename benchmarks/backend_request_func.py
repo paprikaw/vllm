@@ -46,6 +46,8 @@ class RequestFuncOutput:
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
+    timestamp: float = 0.0  # Unix timestamp when request started
+    start_time: float = 0.0  # perf_counter when request started
 
 
 async def async_request_tgi(
@@ -79,6 +81,10 @@ async def async_request_tgi(
 
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
+        output.timestamp = time.time()  # Record Unix timestamp
+        output.start_time = st
+        output.timestamp = time.time()  # Record Unix timestamp
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
@@ -220,6 +226,8 @@ async def async_request_deepspeed_mii(
         output.ttft = 0
 
         st = time.perf_counter()
+        output.start_time = st
+        output.timestamp = time.time()  # Record Unix timestamp
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -288,6 +296,8 @@ async def async_request_openai_completions(
 
         generated_text = ""
         st = time.perf_counter()
+        output.start_time = st
+        output.timestamp = time.time()  # Record Unix timestamp
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -393,6 +403,8 @@ async def async_request_openai_chat_completions(
         generated_text = ""
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
+        output.timestamp = time.time()  # Record Unix timestamp
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -492,10 +504,12 @@ async def async_request_openai_audio(
 
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
+            st = time.perf_counter()
+            output.start_time = st
+            output.timestamp = time.time()  # Record Unix timestamp
 
             generated_text = ""
             ttft = 0.0
-            st = time.perf_counter()
             most_recent_timestamp = st
             try:
                 async with session.post(

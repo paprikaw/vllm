@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from itertools import accumulate
 import os
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import torch
@@ -28,6 +29,7 @@ from vllm.attention.utils.fa_utils import (flash_attn_supports_fp8,
 from vllm.logger import init_logger
 from vllm.multimodal import MultiModalPlaceholderMap
 from vllm.utils import async_tensor_h2d, make_tensor_with_pad
+from vllm.v1.utils import human_readable_duration
 from vllm.vllm_flash_attn import (flash_attn_varlen_func,
                                   flash_attn_with_kvcache)
 from vllm.v1.attention.backends.flash_attn import (FlashAttentionBackend, FlashAttentionImpl,FlashAttentionMetadata)
@@ -104,6 +106,7 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
               {q,k,v}_descale to be (num_sequences, num_kv_heads).
               We use torch's .expand() to avoid duplicating values
         """
+        time_start = time.time()
         assert output is not None, "Output tensor must be provided."
 
         if attn_metadata is None:
@@ -255,6 +258,8 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
                 cached_k_ptrs=k_cache_dev_ptr,
                 cached_v_ptrs=v_cache_dev_ptr,
             )
+
+            logger.info(f"[FLEXI DEBUG] attention forward took {human_readable_duration(time.time() - time_start)}")
             # torch.testing.assert_close(output, copied_output, atol=2e-2, rtol=1e-2), \
             #     f"{torch.max(torch.abs(output - copied_output))}"
             return output

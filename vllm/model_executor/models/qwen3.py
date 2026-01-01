@@ -44,6 +44,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+from vllm.v1.utils import human_readable_duration
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .qwen2 import Qwen2MLP as Qwen3MLP
@@ -235,7 +236,6 @@ class Qwen3DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        logger.debug(f"inside decoder layer")
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 

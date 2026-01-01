@@ -14,7 +14,7 @@ envs:
   # PYTORCH_USE_CUDA_DSA: "1"
   # PYTORCH_NO_CUDA_MEMORY_CACHING: "1"
 projects:
-  - project: "migration_test_async_no_migration"
+  - project: "migration_test_async_with_migration"
     type: "one_off_test"
     model:
       path: "/home/bxb1/data/huggingface/Qwen3-32B-AWQ"
@@ -34,7 +34,7 @@ projects:
         - "32,32"
     migration:
       is_migration: true
-      migration_steps: [25]
+      migration_steps: [50]
       # migration_steps: [100]
       alternative_configs:
         "0": [32, 32]
@@ -45,8 +45,8 @@ projects:
       benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
       profile: false
       print_outputs: true
-      data_num_requests: [25, 25]
-      input_output_lens: [[512, 256], [512, 256]]
-      running_num_requests: [25, 25]
-      running_request_rates: [1.8, 1.8]
+      data_num_requests: [100]
+      input_output_lens: [[512, 128]]
+      running_num_requests: [100]
+      running_request_rates: [2]
 is_log_cover: true

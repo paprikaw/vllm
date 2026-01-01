@@ -12,6 +12,7 @@ from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 
 from vllm.sequence import IntermediateTensors
+from vllm.v1.utils import human_readable_duration
 
 from .qwen2 import Qwen2Model
 from .qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3Model
@@ -209,7 +210,9 @@ class DynamicQwen3Model(Qwen3Model):
         assert deleted_start_layer >= old_start_layer and deleted_end_layer <= old_end_layer, f"layers must be in the range of start_layer and end_layer, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
         assert deleted_start_layer == old_start_layer or deleted_end_layer == old_end_layer, f"model layers must be continuous after delete layers, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
 
+        tmp_layer_dict = []
         with self.model_lock:
+            time_start = time.time()
             for layer_idx in range(deleted_start_layer, deleted_end_layer):
                 # # 1. 删除子模块引用
                 layer = self.layers[layer_idx]
@@ -222,7 +225,7 @@ class DynamicQwen3Model(Qwen3Model):
                 #     delattr(layer, name)
                 self.layers[layer_idx] = PPMissingLayer()  # 占位符
                 logger.info(f"Layer {layer_idx} deleted successfully.")
-                del layer
+                tmp_layer_dict.append(layer)
                 # 2. 显式从 _modules 中删除（可选但更保险）
                 # 由于 nn.ModuleList 自动注册子模块，这一步确保彻底清除
                 # prefix = f"layers.{layer_idx}"
@@ -231,6 +234,9 @@ class DynamicQwen3Model(Qwen3Model):
                 #     self._modules.pop(key)
             # gc.collect()
             # torch.cuda.empty_cache()
+            
+            logger.info(f"Deleted layers took {human_readable_duration(time.time() - time_start)}")
+        tmp_layer_dict = []
 
         # Update the start_layer and end_layer
         if deleted_start_layer == old_start_layer:
@@ -267,8 +273,9 @@ class DynamicQwen3Model(Qwen3Model):
         # 从环境变量读取每个 layer 的超时时间（秒）
         import os
         layer_timeout = float(os.environ.get("VLLM_LAYER_TIMEOUT", "1.0"))
-
+        time_start = time.time()
         with self.model_lock:
+            logger.info(f"getting model lock taking {human_readable_duration(time.time() - time_start)}")
             with set_current_vllm_config(self.vllm_config):
                 if get_pp_group().is_first_rank:
                     if inputs_embeds is not None:
@@ -289,6 +296,7 @@ class DynamicQwen3Model(Qwen3Model):
                 #     end = 41
 
                 logger.debug(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
+                forwarding_start_time = time.time()
                 for layer_idx, layer in enumerate(self.layers[self.sched_start_layer:self.sched_end_layer], start=self.sched_start_layer):
                     try:
                         # 使用 threading.Timer 实现超时检测
@@ -329,6 +337,8 @@ class DynamicQwen3Model(Qwen3Model):
                     except Exception as e:
                         logger.error(f"Error in layer {layer_idx}: {e}")
                         raise
+                    logger.info(f"after Layer forwarding took {human_readable_duration(time.time() - layer_start_time)}, layer {layer_idx}")
+                logger.info(f"after forwarding took {human_readable_duration(time.time() - forwarding_start_time)}")
                 if not get_pp_group().is_last_rank:
                     return IntermediateTensors({
                         "hidden_states": hidden_states,
