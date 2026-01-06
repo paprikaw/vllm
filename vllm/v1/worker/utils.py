@@ -101,14 +101,25 @@ def get_flexi_kv_cache_multi_stream(size: int, block_shape: Tuple[int, int, int]
     Returns:
         Tuple of (k_cache_list, v_cache_list)
     """
+    k_cache = []
+    v_cache = []
     if stream is not None and device.type == 'cuda':
         with torch.cuda.stream(stream):
-            k_cache = [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
-            v_cache = [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
+            with torch.no_grad():
+                for _ in range(size):
+                    k_tensor = torch.empty(block_shape, dtype=kv_cache_dtype, device=device)
+                    v_tensor = torch.empty(block_shape, dtype=kv_cache_dtype, device=device)
+                    k_cache.append(k_tensor)
+                    v_cache.append(v_tensor)
+                # k_cache = [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
+                # v_cache = [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
     else:
-        k_cache = [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
-        v_cache = [torch.empty(block_shape, dtype=kv_cache_dtype, device=device) for _ in range(size)]
-    
+        with torch.no_grad():
+            for _ in range(size):
+                k_tensor = torch.empty(block_shape, dtype=kv_cache_dtype, device=device)
+                v_tensor = torch.empty(block_shape, dtype=kv_cache_dtype, device=device)
+                k_cache.append(k_tensor)
+                v_cache.append(v_tensor)
     return k_cache, v_cache
 
 @dataclass

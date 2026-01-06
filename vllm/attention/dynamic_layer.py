@@ -72,10 +72,10 @@ class FlexiAttention(Attention):
                              blocksparse_params, logits_soft_cap, attn_type,
                              **extra_impl_args)
         self.backend = backend_name_to_enum(attn_backend.get_name())
-        self.key_cache: list[torch.Tensor] = []
-        self.value_cache: list[torch.Tensor] = []
         self.key_dev_ptr: int
         self.value_dev_ptr: int
+        self.num_blocks: int
+        self.page_meta: torch.Tensor
 
     def forward(
         self,
@@ -133,16 +133,20 @@ class FlexiAttention(Attention):
                               query,
                               key,
                               value,
-                              self.key_cache,
-                              self.value_cache,
                               self_kv_cache,
                               self.key_dev_ptr,
                               self.value_dev_ptr,
                               attn_metadata,
                               output=output)
             else:
+                import time
+                attn_start = time.time()
                 torch.ops.vllm.flexi_unified_attention_with_output(
                     query, key, value, output, self.layer_name)
+                attn_time = time.time() - attn_start
+                from vllm.logger import init_logger
+                logger = init_logger(__name__)
+                logger.debug(f"[perf_analysis] FlexiAttention {self.layer_name}: flexi_unified_attention took {attn_time:.4f}s")
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
@@ -155,11 +159,12 @@ class FlexiAttention(Attention):
                                       query,
                                       key,
                                       value,
-                                      self.key_cache,
-                                      self.value_cache,
                                       self.key_dev_ptr,
                                       self.value_dev_ptr,
-                                      attn_metadata)
+                                      self.page_meta,
+                                        attn_metadata,
+                                      self.num_blocks,
+                                      )
             else:
                 res = torch.ops.vllm.flexi_unified_attention(
                     query, key, value, self.layer_name)
@@ -228,11 +233,11 @@ def flexi_unified_attention_with_output(
                   query,
                   key,
                   value,
-                  self.key_cache,
-                  self.value_cache,
                   self.key_dev_ptr,
                   self.value_dev_ptr,
+                  self.page_meta,
                   attn_metadata,
+                  self.num_blocks,
                   output=output)
     # maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 

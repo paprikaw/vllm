@@ -163,7 +163,7 @@ class PairPipe:
         # NCCL data-plane communicator
             self._nccl = PyNcclCommunicator(group=self.meta_group, device=local_rank)
             # 创建专用的 CUDA stream 用于 KV 传输，避免与模型计算的 stream 冲突
-            self._kv_transfer_stream = torch.cuda.Stream(device=self.device, priority=1)
+            self._kv_transfer_stream = torch.cuda.Stream(device=self.device, priority=0)
         else:
             self._nccl = None
             self._kv_transfer_stream = None
@@ -536,12 +536,12 @@ class DynamicKVSynchronizer():
     # Sender side functions                      #
     # ########################################## #
 
-    def get_kv_patch(self, rank: int, start_layer_id: int, layer_ids: list[int]) -> Generator[KVPatch, None, None]:
+    def get_kv_patch(self, rank: int, start_layer_id: int, layer_ids: list[int], kv_meta: torch.Tensor) -> Generator[KVPatch, None, None]:
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         if is_flexi:
             return self._flexi_get_patch(rank,
                                             layer_ids=layer_ids,
-                                            kv_cache_meta=self.key_cache_list[0][0],
+                                            kv_cache_meta=kv_meta,
                                             key_cache_ptrs=self.key_cache_ptrs,
                                             value_cache_ptrs=self.value_cache_ptrs,
                                             start_layer_id=start_layer_id)
@@ -633,14 +633,14 @@ class DynamicKVSynchronizer():
                 self.last_patch_ids[rank] = 0
                 break
 
-    def get_kv_tensor_from_cache(self, layer_ids: list[int],layer_id: int, start_layer_id: int, slot_mapping: Optional[torch.Tensor] = None) -> Tuple[Union[KVTensorMeta, FlexiKVTensorMeta], torch.Tensor]:
+    def get_kv_tensor_from_cache(self, layer_ids: list[int],layer_id: int, start_layer_id: int, kv_cache_meta: torch.Tensor, slot_mapping: Optional[torch.Tensor] = None) -> Tuple[Union[KVTensorMeta, FlexiKVTensorMeta], torch.Tensor]:
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         if is_flexi:
             assert slot_mapping is not None, "slot_mapping should be provided when using flexi flash attention"
             return self._flexi_get_kv_tensor(
                                         layer_id=layer_id,
                                         layer_ids=layer_ids,
-                                        kv_cache_meta=self.key_cache_list[0][0],
+                                        kv_cache_meta=kv_cache_meta,
                                         key_cache_ptrs=self.key_cache_ptrs,
                                         value_cache_ptrs=self.value_cache_ptrs,
                                         slot_mapping=slot_mapping,
@@ -959,7 +959,7 @@ class DynamicKVSynchronizer():
         kv_patch = self.buffers[rank].pop_patch()
         return kv_patch
 
-    def apply_one_patch_to_kv_cache(self, start_layer_id: int, meta: KVPatchMeta, kv_payload: torch.Tensor, slot_mapping: torch.Tensor) -> int:
+    def apply_one_patch_to_kv_cache(self, start_layer_id: int, meta: KVPatchMeta, kv_payload: torch.Tensor,  slot_mapping: torch.Tensor, page_meta: Optional[torch.Tensor] = None,) -> int:
         keys = kv_payload[0]
         values = kv_payload[1]
         logger.info(f"apply one patch with id {meta.id}, num_tokens: {meta.num_tokens}")
@@ -968,26 +968,26 @@ class DynamicKVSynchronizer():
         # assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
         if slot_mapping.size(0) != meta.num_tokens:
             logger.info(f"Warning: slot_mapping size {slot_mapping.size(0)} does not match num_tokens {meta.num_tokens}, proceed anyway.")
-        for layer_id, key, value in zip(meta.layer_ids, keys, values):
-            local_layer_id = layer_id - start_layer_id
-            if is_flexi:
-                key_cache_ptr = self.key_cache_ptrs[local_layer_id]
-                value_cache_ptr = self.value_cache_ptrs[local_layer_id]
-                key_cache_list = self.key_cache_list[local_layer_id]
-                value_cache_list = self.value_cache_list[local_layer_id] 
-                self.kv_helper.flexi_put_kv_to_cache(
-                    model_executable=self.model_executable,
-                    keys=key,
-                    values=value,
-                    key_cache_list=key_cache_list,
-                    value_cache_list=value_cache_list,
-                    key_cache_ptr=key_cache_ptr,
-                    value_cache_ptr=value_cache_ptr,
-                    layer=layer_id,
-                    slot_mapping=slot_mapping,
-                )
-            else:
-                kv_cache = self.kv_caches[local_layer_id]
-                # 使用裁剪后的 slot_mapping，从 0 到 num_tokens
-                self.kv_helper.put_kv_to_cache(self.model_executable, key, value, layer_id, kv_cache, slot_mapping, 0, slot_mapping.size(0))
+        with self.device:
+            logger.info(f"apply kv patch to kv cache on device {self.device}")
+            for layer_id, key, value in zip(meta.layer_ids, keys, values):
+                local_layer_id = layer_id - start_layer_id
+                if is_flexi:
+                    assert page_meta is not None, "page_meta should be provided when using flexi flash attention"
+                    key_cache_ptr = self.key_cache_ptrs[local_layer_id]
+                    value_cache_ptr = self.value_cache_ptrs[local_layer_id]
+                    self.kv_helper.flexi_put_kv_to_cache(
+                        model_executable=self.model_executable,
+                        page_meta=page_meta,
+                        keys=key,
+                        values=value,
+                        key_cache_ptr=key_cache_ptr,
+                        value_cache_ptr=value_cache_ptr,
+                        layer=layer_id,
+                        slot_mapping=slot_mapping,
+                    )
+                else:
+                    kv_cache = self.kv_caches[local_layer_id]
+                    # 使用裁剪后的 slot_mapping，从 0 到 num_tokens
+                    self.kv_helper.put_kv_to_cache(self.model_executable, key, value, layer_id, kv_cache, slot_mapping, 0, slot_mapping.size(0))
         return meta.id

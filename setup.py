@@ -16,7 +16,7 @@ from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from setuptools_scm import get_version
-from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
+from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME, CUDAExtension, BuildExtension
 
 
 def load_module_from_path(module_name, path):
@@ -132,6 +132,10 @@ class cmake_build_ext(build_ext):
     # Perform cmake configuration for a single extension.
     #
     def configure(self, ext: CMakeExtension) -> None:
+        # Skip non-CMake extensions (e.g., CUDAExtension)
+        if not isinstance(ext, CMakeExtension):
+            return
+            
         # If we've already configured using the CMakeLists.txt for
         # this extension, exit early.
         if ext.cmake_lists_dir in cmake_build_ext.did_config:
@@ -209,61 +213,81 @@ class cmake_build_ext(build_ext):
             cwd=self.build_temp)
 
     def build_extensions(self) -> None:
-        # Ensure that CMake is present and working
-        try:
-            subprocess.check_output(['cmake', '--version'])
-        except OSError as e:
-            raise RuntimeError('Cannot find CMake executable') from e
+        # Separate extensions by type
+        cmake_extensions = [ext for ext in self.extensions if isinstance(ext, CMakeExtension)]
+        cuda_extensions = [ext for ext in self.extensions if getattr(ext, '_is_cuda_extension', False)]
+        
+        # Build CMake extensions
+        if cmake_extensions:
+            # Ensure that CMake is present and working
+            try:
+                subprocess.check_output(['cmake', '--version'])
+            except OSError as e:
+                raise RuntimeError('Cannot find CMake executable') from e
 
-        # Create build directory if it does not exist.
-        if not os.path.exists(self.build_temp):
-            os.makedirs(self.build_temp)
+            # Create build directory if it does not exist.
+            if not os.path.exists(self.build_temp):
+                os.makedirs(self.build_temp)
 
-        targets = []
+            targets = []
 
-        def target_name(s: str) -> str:
-            return s.removeprefix("vllm.").removeprefix("vllm_flash_attn.")
+            def target_name(s: str) -> str:
+                return s.removeprefix("vllm.").removeprefix("vllm_flash_attn.")
 
-        # Build all the extensions
-        for ext in self.extensions:
-            self.configure(ext)
-            targets.append(target_name(ext.name))
+            # Build all CMake extensions
+            for ext in cmake_extensions:
+                self.configure(ext)
+                targets.append(target_name(ext.name))
 
-        num_jobs, _ = self.compute_num_jobs()
+            num_jobs, _ = self.compute_num_jobs()
 
-        build_args = [
-            "--build",
-            ".",
-            f"-j={num_jobs}",
-            *[f"--target={name}" for name in targets],
-        ]
-
-        subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
-
-        # Install the libraries
-        for ext in self.extensions:
-            # Install the extension into the proper location
-            outdir = Path(self.get_ext_fullpath(ext.name)).parent.absolute()
-
-            # Skip if the install directory is the same as the build directory
-            if outdir == self.build_temp:
-                continue
-
-            # CMake appends the extension prefix to the install path,
-            # and outdir already contains that prefix, so we need to remove it.
-            # We assume only the final component of extension prefix is added by
-            # CMake, this is currently true for current extensions but may not
-            # always be the case.
-            prefix = outdir
-            if '.' in ext.name:
-                prefix = prefix.parent
-
-            # prefix here should actually be the same for all components
-            install_args = [
-                "cmake", "--install", ".", "--prefix", prefix, "--component",
-                target_name(ext.name)
+            build_args = [
+                "--build",
+                ".",
+                f"-j={num_jobs}",
+                *[f"--target={name}" for name in targets],
             ]
-            subprocess.check_call(install_args, cwd=self.build_temp)
+
+            subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
+
+            # Install the libraries
+            for ext in cmake_extensions:
+                # Install the extension into the proper location
+                outdir = Path(self.get_ext_fullpath(ext.name)).parent.absolute()
+
+                # Skip if the install directory is the same as the build directory
+                if outdir == self.build_temp:
+                    continue
+
+                # CMake appends the extension prefix to the install path,
+                # and outdir already contains that prefix, so we need to remove it.
+                prefix = outdir
+                if '.' in ext.name:
+                    prefix = prefix.parent
+
+                # prefix here should actually be the same for all components
+                install_args = [
+                    "cmake", "--install", ".", "--prefix", prefix, "--component",
+                    target_name(ext.name)
+                ]
+                subprocess.check_call(install_args, cwd=self.build_temp)
+        
+        # Build CUDAExtensions using torch's BuildExtension
+        if cuda_extensions:
+            # Use torch's BuildExtension for CUDAExtension
+            torch_builder = BuildExtension(self.distribution)
+            torch_builder.initialize_options()
+            torch_builder.finalize_options()
+            torch_builder.extensions = cuda_extensions
+            torch_builder.build_lib = self.build_lib
+            torch_builder.build_temp = self.build_temp + "_cuda"  # Use separate build dir
+            torch_builder.inplace = self.inplace
+            torch_builder.parallel = self.parallel
+            torch_builder.compiler = self.compiler
+            torch_builder.build_extensions()
+        
+        # Restore all extensions
+        self.extensions = cmake_extensions + cuda_extensions
 
     def run(self):
         # First, run the standard build_ext command to compile the extensions
@@ -661,6 +685,19 @@ if _is_cuda():
         ext_modules.append(
             CMakeExtension(name="vllm._flashmla_C", optional=True))
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
+    
+    # kv_cache_allocator: Use CUDAExtension for Python 3.12 compatibility
+    # (torch.utils.cpp_extension handles pybind11 compatibility automatically)
+    kv_cache_ext = CUDAExtension(
+        name='vllm.kv_cache_allocator',
+        sources=['csrc/kv_cache_allocator_optimized.cpp'],
+        extra_compile_args={
+            'cxx': ['-O3', '-std=c++17'],
+        }
+    )
+    # Mark this extension so we can identify it as a CUDA extension
+    kv_cache_ext._is_cuda_extension = True
+    ext_modules.append(kv_cache_ext)
 
 if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))

@@ -3,7 +3,7 @@
 import functools
 import json
 import os
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 
@@ -998,7 +998,7 @@ def inplace_fused_experts(hidden_states: torch.Tensor,
                           w2: torch.Tensor,
                           topk_weights: torch.Tensor,
                           topk_ids: torch.Tensor,
-                          activation: str = "silu",
+                          activation: Optional[str] = None,
                           apply_router_weight_on_input: bool = False,
                           use_fp8_w8a8: bool = False,
                           use_int8_w8a8: bool = False,
@@ -1013,9 +1013,9 @@ def inplace_fused_experts(hidden_states: torch.Tensor,
                           w2_zp: Optional[torch.Tensor] = None,
                           a1_scale: Optional[torch.Tensor] = None,
                           a2_scale: Optional[torch.Tensor] = None,
-                          block_shape: Optional[list[int]] = None) -> None:
+                          block_shape: Optional[List[int]] = None) -> None:
     fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids, True,
-                       activation, apply_router_weight_on_input, use_fp8_w8a8,
+                       activation or "silu", apply_router_weight_on_input, use_fp8_w8a8,
                        use_int8_w8a8, use_int8_w8a16, use_int4_w4a16,
                        per_channel_quant, global_num_experts, expert_map,
                        w1_scale, w2_scale, w1_zp, w2_zp, a1_scale, a2_scale,
@@ -1028,7 +1028,7 @@ def inplace_fused_experts_fake(
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        activation: str = "silu",
+        activation: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         use_fp8_w8a8: bool = False,
         use_int8_w8a8: bool = False,
@@ -1043,7 +1043,7 @@ def inplace_fused_experts_fake(
         w2_zp: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[list[int]] = None) -> None:
+        block_shape: Optional[List[int]] = None) -> None:
     pass
 
 
@@ -1062,7 +1062,7 @@ def outplace_fused_experts(
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        activation: str = "silu",
+        activation: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         use_fp8_w8a8: bool = False,
         use_int8_w8a8: bool = False,
@@ -1077,9 +1077,9 @@ def outplace_fused_experts(
         w2_zp: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[list[int]] = None) -> torch.Tensor:
+        block_shape: Optional[List[int]] = None) -> torch.Tensor:
     return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids,
-                              False, activation, apply_router_weight_on_input,
+                              False, activation or "silu", apply_router_weight_on_input,
                               use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16,
                               use_int4_w4a16, per_channel_quant,
                               global_num_experts, expert_map, w1_scale,
@@ -1093,7 +1093,7 @@ def outplace_fused_experts_fake(
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        activation: str = "silu",
+        activation: Optional[str] = None,
         use_fp8_w8a8: bool = False,
         use_int8_w8a8: bool = False,
         use_int8_w8a16: bool = False,
@@ -1107,7 +1107,7 @@ def outplace_fused_experts_fake(
         w2_zp: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[list[int]] = None) -> torch.Tensor:
+        block_shape: Optional[List[int]] = None) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
 

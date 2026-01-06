@@ -1,0 +1,198 @@
+envs:
+  NCCL_DEBUG: INFO
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+  VLLM_TORCH_PROFILER_DIR: /home/bxb1/data/vllm_workbench/profiler/
+  RAY_CGRAPH_get_timeout: "10000"
+  BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+  DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+  KV_SYNC_USE_CPU: "0"
+  VLLM_USE_CPU_MODEL: "0"
+  CUDA_LAUNCH_BLOCKING: "0"
+  NCCL_DEBUG: "INFO"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+
+projects:
+  # Test 1: Regular (no flexi) with memory stress
+  - project: "stress_test_empty"
+    type: "one_off_test"
+    model:
+      path: "/home/bxb1/data/huggingface/Qwen3-32B-AWQ"
+    network:
+      delays: [0]
+      rank_to_ip:
+        0: "spartan-gpgpu143"
+        1: "spartan-gpgpu143"
+    vllm:
+      head_addr: "localhost"
+      pipeline_parallel_size: 2
+      enable_flexi_flash_attn: true  # Regular version
+      gpu_memory_utilization: 0.75
+      start_pp_layer_partitions:
+        - "12,52"
+    migration:
+      is_migration: false  # No migration, just run inference
+      tester_start_step: 20  # Start stress tester after 20 requests
+      alternative_configs:
+        "0": [12, 52]
+      memory_stress_tester:
+        enabled: true
+        num_tensors_per_allocation: 15000  # Allocate 10000 tensors per cycle
+        tensor_shape: [16, 8, 128]  # KV cache block shape
+        allocation_interval_ms: 0  
+        num_allocation_cycles: 20  # Keep 20 cycles in memory
+        max_total_allocations: 20
+        allocation_strategy: "torch_empty"
+        test_rank: [0]
+    benchmark:
+      benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+      profile: false
+      print_outputs: false
+      data_num_requests: [100]
+      input_output_lens: [[512, 128]]
+      running_num_requests: [100]
+      running_request_rates: [2]
+envs:
+  NCCL_DEBUG: INFO
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+  VLLM_TORCH_PROFILER_DIR: /home/bxb1/data/vllm_workbench/profiler/
+  RAY_CGRAPH_get_timeout: "10000"
+  BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+  DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+  KV_SYNC_USE_CPU: "0"
+  VLLM_USE_CPU_MODEL: "0"
+  CUDA_LAUNCH_BLOCKING: "0"
+  NCCL_DEBUG: "INFO"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+
+
+# projects:
+#   # Test 1: Regular (no flexi) with memory stress
+#   - project: "stress_test_clean"
+#     type: "one_off_test"
+#     model:
+#       path: "/home/bxb1/data/huggingface/Qwen3-32B-AWQ"
+#     network:
+#       delays: [0]
+#       rank_to_ip:
+#         0: "spartan-gpgpu143"
+#         1: "spartan-gpgpu143"
+#     vllm:
+#       head_addr: "localhost"
+#       pipeline_parallel_size: 2
+#       enable_flexi_flash_attn: false  # Regular version
+#       gpu_memory_utilization: 0.75
+#       start_pp_layer_partitions:
+#         - "12,52"
+#     migration:
+#       is_migration: false  # No migration, just run inference
+#       tester_start_step: 20  # Start stress tester after 20 requests
+#       alternative_configs:
+#         "0": [12, 52]
+#       memory_stress_tester:
+#         enabled: false
+#         num_tensors_per_allocation: 10000  # Allocate 10000 tensors per cycle
+#         tensor_shape: [16, 8, 128]  # KV cache block shape
+#         allocation_interval_ms: 0  
+#         num_allocation_cycles: 10  # Keep 10 cycles in memory
+#         max_total_allocations: 10
+#         allocation_strategy: "cuda_malloc_async"
+#     benchmark:
+#       benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+#       profile: false
+#       print_outputs: false
+#       data_num_requests: [50]
+#       input_output_lens: [[512, 128]]
+#       running_num_requests: [50]
+#       running_request_rates: [2]
+
+
+# envs:
+#   NCCL_DEBUG: INFO
+#   NCCL_CUMEM_HOST_ENABLE: "0"
+#   VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+#   VLLM_TORCH_PROFILER_DIR: /home/bxb1/data/vllm_workbench/profiler/
+#   RAY_CGRAPH_get_timeout: "10000"
+#   BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+#   DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+#   KV_SYNC_USE_CPU: "0"
+#   VLLM_USE_CPU_MODEL: "0"
+#   CUDA_LAUNCH_BLOCKING: "0"
+#   NCCL_DEBUG: "INFO"
+#   PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+# projects:
+#   # Test: memory stress with empty
+#   - project: "stress_test_empty"
+#     type: "one_off_test"
+#     model:
+#       path: "/home/bxb1/data/huggingface/Qwen3-32B-AWQ"
+#     network:
+#       delays: [0]
+#       rank_to_ip:
+#         0: "spartan-gpgpu143"
+#         1: "spartan-gpgpu143"
+#     vllm:
+#       head_addr: "localhost"
+#       pipeline_parallel_size: 2
+#       enable_flexi_flash_attn: true  # Regular version
+#       gpu_memory_utilization: 0.75
+#       start_pp_layer_partitions:
+#         - "12,52"
+#     migration:
+#       is_migration: false  # No migration, just run inference
+#       tester_start_step: 20  # Start stress tester after 20 requests
+#       alternative_configs:
+#         "0": [12, 52]
+#       memory_stress_tester:
+#         enabled: true
+#         num_tensors_per_allocation: 10000  # Allocate 10000 tensors per cycle
+#         tensor_shape: [16, 8, 128]  # KV cache block shape
+#         allocation_interval_ms: 0  
+#         num_allocation_cycles: 10  # Keep 10 cycles in memory
+#         max_total_allocations: 10
+#         allocation_strategy: "torch_empty"
+#     benchmark:
+#       benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+#       profile: false
+#       print_outputs: false
+#       data_num_requests: [50]
+#       input_output_lens: [[512, 128]]
+#       running_num_requests: [50]
+#       running_request_rates: [2]
+  # # Test 2: Flexi with memory stress
+  # - project: "stress_test_flexi"
+  #   type: "one_off_test"
+  #   model:
+  #     path: "/home/bxb1/data/huggingface/Qwen3-32B-AWQ"
+  #   network:
+  #     delays: [0]
+  #     rank_to_ip:
+  #       0: "spartan-gpgpu143"
+  #       1: "spartan-gpgpu143"
+  #   vllm:
+  #     head_addr: "localhost"
+  #     pipeline_parallel_size: 2
+  #     enable_flexi_flash_attn: true  # Flexi version
+  #     gpu_memory_utilization: 0.75
+  #     start_pp_layer_partitions:
+  #       - "12,52"
+  #   migration:
+  #     alternative_configs:
+  #       "0": [12, 52]
+  #     is_migration: false
+  #     tester_start_step: 20  # Start stress tester after 20 requests
+  #     memory_stress_tester:
+  #       enabled: true
+  #       num_tensors_per_allocation: 10000
+  #       tensor_shape: [16, 8, 128]
+  #       allocation_interval_ms: 100
+  #       num_allocation_cycles: 5
+  #   benchmark:
+  #     benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+  #     profile: false
+  #     print_outputs: false
+  #     data_num_requests: [100]
+  #     input_output_lens: [[512, 128]]
+  #     running_num_requests: [100]
+  #     running_request_rates: [2]

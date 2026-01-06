@@ -57,7 +57,7 @@ from vllm.version import __version__ as VLLM_VERSION
 from .utils import get_new_layer_config_with_migration_action
 from vllm.v1.utils import WorkerMemInfo, LayerAddingAssessResult, human_readable_duration
 from dataclasses import dataclass
-from vllm.dynamic_config import DynamicConfig
+from vllm.dynamic_config import MigrationConfig
 from copy import deepcopy
 
 
@@ -74,7 +74,7 @@ class DynamicEngineCore(EngineCore):
                  vllm_config: VllmConfig,
                  executor_class: type[Executor],
                  log_stats: bool,
-                 dynamic_config: DynamicConfig,
+                 dynamic_config: MigrationConfig,
                  executor_fail_callback: Optional[Callable] = None
                  ):
 
@@ -451,12 +451,18 @@ class DynamicEngineCore(EngineCore):
             # Note that this is not blocking.
             isinstance(self.scheduler, DynamicScheduler)
             if not self.batch_queue.full():
+                schedule_start = time.time()
                 scheduler_output = self.scheduler.dynamic_schedule()
+                schedule_time = time.time() - schedule_start
+                logger.info(f"[perf_analysis] scheduler.dynamic_schedule() took {schedule_time:.4f}s")
                 assert isinstance(scheduler_output, DynamicSchedulerOutput)
                 # if scheduler_output.total_migration_tokens > 0:
                     # logger.info(f"[forward]: scheduled a total {scheduler_output.total_migration_tokens} tokens, total_num_scheduled_tokens: {scheduler_output.total_num_scheduled_tokens}, is_sync_after_migration: {scheduler_output.is_sync_after_migration}")
                 if scheduler_output.total_num_scheduled_tokens > 0:
+                    exec_start = time.time()
                     future = execute_func(scheduler_output)
+                    exec_submit_time = time.time() - exec_start
+                    logger.info(f"[perf_analysis] execute_func() submit took {exec_submit_time:.4f}s")
                     self.batch_queue.put_nowait(
                         (future, scheduler_output))  # type: ignore
 
@@ -471,10 +477,16 @@ class DynamicEngineCore(EngineCore):
             if not scheduled_batch and not self.batch_queue.empty():
                 future, scheduler_output = self.batch_queue.get_nowait()
                 # Blocking until the first result is available.
+                result_start = time.time()
                 model_output = future.result()
+                result_time = time.time() - result_start
+                logger.info(f"[perf_analysis] future.result() (model execution) took {result_time:.4f}s")
                 self.batch_queue.task_done()
+                update_start = time.time()
                 engine_core_outputs = self.scheduler.update_from_output(
                     scheduler_output, model_output)
+                update_time = time.time() - update_start
+                logger.info(f"[perf_analysis] scheduler.update_from_output() took {update_time:.4f}s")
             logger.info(f"[forward]: step with batch queue in {time.time() - time_start:.2f} seconds")
 
             return engine_core_outputs
@@ -564,7 +576,11 @@ class DynamicEngineCore(EngineCore):
         time_start = time.time()
         # 先获取一次内存快照
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        logger.info(f"[perf_analysis] About to call get_workers_mem_info()")
+        mem_info_start = time.time()
         mem_infos = self.model_executor.get_workers_mem_info()
+        mem_info_time = time.time() - mem_info_start
+        logger.info(f"[perf_analysis] get_workers_mem_info() took {mem_info_time:.4f}s")
 
         # Adding/removing
         need_compact = False
@@ -1035,7 +1051,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        dynamic_config: DynamicConfig,
+        dynamic_config: MigrationConfig,
         on_head_node: bool,
         input_address: str,
         executor_class: type[Executor],
@@ -1106,6 +1122,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                 daemon=True)
             self.output_thread.start()
             threading.Thread(target=self.migration_thread, daemon=True).start()
+            threading.Thread(target=self.stress_tester_thread, daemon=True).start()
             threading.Thread(target=self.metrics_thread, daemon=True).start()
             threading.Thread(target=self.test_kv_cache_compact_thread, daemon=True).start()
             logger.info(f"kv cache config: {self.vllm_config.cache_config}")
@@ -1370,6 +1387,37 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         else:
             logger.info(f"TEST_MIGRATION is not set, skipping migration")
             return
+
+    def stress_tester_thread(self):
+        """Thread to start memory stress tester at specified request count."""
+        import os
+
+        if self.vllm_config.dynamic_config.tester_start_step is None:
+            logger.info("tester_start_step is not set, skipping stress tester thread")
+            return
+        
+        if not hasattr(self.vllm_config.dynamic_config, 'memory_stress_tester') or \
+           self.vllm_config.dynamic_config.memory_stress_tester is None or \
+           not self.vllm_config.dynamic_config.memory_stress_tester.get('enabled', False):
+            logger.info("Memory stress tester not enabled, skipping")
+            return
+
+        tester_start_step = self.vllm_config.dynamic_config.tester_start_step
+        logger.info(f"Stress tester will start at request #{tester_start_step}")
+        
+        num_of_requests = 0
+        while True:
+            num_of_requests += self.request_num_queue.get()
+            logger.info(f"stress_tester_thread: num_of_requests={num_of_requests}")
+            
+            if num_of_requests >= tester_start_step:
+                logger.info(f"Starting memory stress tester at request #{num_of_requests}")
+                # Send RPC to all workers to start stress tester
+                self.model_executor.collective_rpc(
+                    "start_stress_tester",
+                )
+                logger.info("Memory stress tester started on all workers")
+                break
 
     def migration_thread(self):
         import os

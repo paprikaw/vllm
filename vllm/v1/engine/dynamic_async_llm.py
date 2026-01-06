@@ -18,7 +18,7 @@ from vllm.v1.metrics.loggers import (StatLoggerBase, StatLoggerFactory,
 from .async_llm import AsyncLLM
 from .dynamic_core_client import DynamicAsyncMPClient
 from ..executor.dynamic_ray_distributed_executor import DynamicRayDistributedExecutor 
-from vllm.dynamic_config import DynamicConfig
+from vllm.dynamic_config import MigrationConfig
 
 logger = init_logger(__name__)
 
@@ -30,7 +30,7 @@ class DynamicAsyncLLM(AsyncLLM):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        dynamic_config: DynamicConfig,
+        dynamic_config: MigrationConfig,
         executor_class: type[Executor],
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
@@ -126,7 +126,7 @@ class DynamicAsyncLLM(AsyncLLM):
     def from_vllm_config_with_dynamic_config(
         cls,
         vllm_config: VllmConfig,
-        dynamic_config: DynamicConfig,
+        dynamic_config: MigrationConfig,
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[list[StatLoggerFactory]] = None,

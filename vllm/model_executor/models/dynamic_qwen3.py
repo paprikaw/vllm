@@ -298,9 +298,9 @@ class DynamicQwen3Model(Qwen3Model):
                 logger.debug(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
                 forwarding_start_time = time.time()
                 for layer_idx, layer in enumerate(self.layers[self.sched_start_layer:self.sched_end_layer], start=self.sched_start_layer):
+                    layer_start_time = time.time()
                     try:
                         # 使用 threading.Timer 实现超时检测
-                        layer_start_time = time.time()
                         result = [None, None]  # 用于存储结果
                         exception_holder = [None]  # 用于存储异常
                         
@@ -337,7 +337,7 @@ class DynamicQwen3Model(Qwen3Model):
                     except Exception as e:
                         logger.error(f"Error in layer {layer_idx}: {e}")
                         raise
-                    logger.info(f"after Layer forwarding took {human_readable_duration(time.time() - layer_start_time)}, layer {layer_idx}")
+                    logger.debug(f"after Layer forwarding took {human_readable_duration(time.time() - layer_start_time)}, layer {layer_idx}")
                 logger.info(f"after forwarding took {human_readable_duration(time.time() - forwarding_start_time)}")
                 if not get_pp_group().is_last_rank:
                     return IntermediateTensors({

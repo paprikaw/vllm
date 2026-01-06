@@ -25,9 +25,10 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.sampling_params import SamplingType
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.v1.utils import dynamic_bind_kv_cache, dynamic_flexi_bind_kv_cache, human_readable_size, human_readable_duration
-from vllm.logger import init_logger
+
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (LazyLoader)
+from vllm.kv_allocator import kv_allocator
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheSpec, KVCacheConfig,
                                         SlidingWindowSpec)
@@ -48,7 +49,6 @@ from bitarray import bitarray
 from vllm.v1.core.dynamic_kv_cache_utils import compact_cache_with_record
 from vllm.distributed.kv_transfer.kv_connector.dynamic_kv_synchronizer import DynamicKVSynchronizer
 from vllm.v1.worker.utils import get_flexi_kv_cache, get_flexi_kv_cache_multi_stream
-from vllm.vllm_flash_attn.flash_attn_interface import prepare_flexi_kv_ptrs, free_flexi_kv_ptrs
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
-
+from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
@@ -65,10 +65,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.forward_lock = Lock()
-        self.key_caches: list[list[torch.Tensor]] = []
-        self.value_caches: list[list[torch.Tensor]] = []
+        self.key_caches: list[list[int]] = []
+        self.value_caches: list[list[int]] = []
         self.key_cache_ptrs: list[int] = []
         self.value_cache_ptrs: list[int] = []
+        self.page_meta: Optional[torch.Tensor] = None
     # def load_model(self)->float:
     #     super().load_model()
     #     return self.model_memory_usage
@@ -521,8 +522,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         kv_caches: dict[str, torch.Tensor] = {} 
         key_cache_ptrs: dict[str, int] = {}
         value_cache_ptrs: dict[str, int] = {}
-        key_caches: dict[str, list[torch.Tensor]] = {}
-        value_caches: dict[str, list[torch.Tensor]] = {}
+        key_caches: dict[str, list[int]] = {}
+        value_caches: dict[str, list[int]] = {}
         assert len(kv_cache_config.kv_cache_groups) == 1, "Only one KV cache group is supported."
         assert len(self.attn_backends) == 1, "Only one attention backend is supported."
 
@@ -537,15 +538,34 @@ class DynamicGPUModelRunner(GPUModelRunner):
         assert num_blocks >= kv_cache_config.num_blocks, f"num_blocks {num_blocks} is less than kv_cache_config.num_blocks {kv_cache_config.num_blocks}"
         assert len(kv_cache_shape) == 5 # (2, nkvblocks, blockdim, n_head, headdim)
         block_shape = kv_cache_shape[2:]
+        # Create page_meta tensor with correct shape [block_size, num_heads]
+        # This tensor's dtype AND strides are used by flexi flash attention kernels
+        # to understand the KV cache memory layout
+        # block_shape is (block_size, num_heads, head_size)
+        block_size, num_heads, head_size = block_shape
+        
+        # Get the actual KV cache dtype (not the string "auto")
+        from vllm.utils import get_kv_cache_torch_dtype
+        kv_cache_torch_dtype = get_kv_cache_torch_dtype(
+            self.kv_cache_dtype, self.model_config.dtype
+        )
+        
+        # CRITICAL FIX: Use zeros() instead of empty() to avoid garbage data
+        # page_meta provides stride/shape info to kernels. If it contains uninitialized
+        # garbage values, kernels may compute wrong offsets leading to:
+        # 1. Corrupted outputs (jebrish text)
+        # 2. CUDA illegal memory access errors
+        # This is especially critical during migration when page_meta is reused
+        # for apply_one_patch_to_kv_cache operations.
+        self.page_meta = torch.zeros((block_size, num_heads, head_size), dtype=kv_cache_torch_dtype, device=self.device)
+        logger.info(f"page_meta initialized: shape={self.page_meta.shape}, strides={self.page_meta.stride()}, dtype={self.page_meta.dtype}")
 
         start_time = time.time()
         for layer_name in kv_cache_group.layer_names:
-            key_caches[layer_name], value_caches[layer_name] = get_flexi_kv_cache(
-                kv_cache_shape[1], block_shape, self.kv_cache_dtype, self.device)
-            key_cache_ptrs[layer_name], value_cache_ptrs[layer_name] = prepare_flexi_kv_ptrs(key_caches[layer_name], value_caches[layer_name])
+            key_caches[layer_name], value_caches[layer_name], key_cache_ptrs[layer_name], value_cache_ptrs[layer_name], _ = kv_allocator.allocate_with_cuda_async(kv_cache_shape[1], list(block_shape), self.kv_cache_dtype, self.device)
         
         logger.info(f"time to intialize kv blocks:{human_readable_duration(time.time() - start_time)}")
-        logger.info(f"key cache shape: {key_caches[kv_cache_group.layer_names[0]][0].shape}, value cache shape:{value_caches[kv_cache_group.layer_names[0]][0].shape}")
+        # logger.info(f"key cache shape: {key_caches[kv_cache_group.layer_names[0]][0].shape}, value cache shape:{value_caches[kv_cache_group.layer_names[0]][0].shape}")
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
             # validate all draft model layers belong to the same kv cache
@@ -562,7 +582,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
             self.key_caches,
             self.value_caches,
             self.key_cache_ptrs,
-            self.value_cache_ptrs
+            self.value_cache_ptrs,
+            self.page_meta
         )
         del kv_caches
         if has_kv_transfer_group():
@@ -679,9 +700,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 idx = extract_layer_index(layer_name) - self.model.model.start_layer
                 # Free old GPU pointer arrays to avoid memory leak
                 old_k_ptrs, old_v_ptrs = self.key_cache_ptrs[idx], self.value_cache_ptrs[idx]
-                free_flexi_kv_ptrs(old_k_ptrs, old_v_ptrs)
+                kv_allocator.free_page_list(old_k_ptrs, self.device)
+                kv_allocator.free_page_list(old_v_ptrs, self.device)
                 # Allocate new GPU pointer arrays with updated tensor addresses
-                self.key_cache_ptrs[idx], self.value_cache_ptrs[idx] = prepare_flexi_kv_ptrs(
+                self.key_cache_ptrs[idx], self.value_cache_ptrs[idx] = kv_allocator.prepare_flexi_kv_ptrs(
                     self.key_caches[idx], self.value_caches[idx])
                 assert isinstance(attn_module, FlexiAttention)
                 attn_module.key_dev_ptr = self.key_cache_ptrs[idx]
@@ -824,7 +846,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
     
     def get_flexi_kv_cache_from_gathered_kv_tensor(self, slot_mapping: torch.Tensor, layer: int,
                                  gathered_kv_tensor: torch.Tensor,
-                                 block_num: int, stream: Optional[torch.cuda.Stream] = None) -> Tuple[list[torch.Tensor], list[torch.Tensor], int, int]:
+                                 block_num: int, stream: Optional[torch.cuda.Stream] = None) -> Tuple[list[int], list[int], int, int]:
         '''
         Based on current kv cache list shape and dtype, we allocate a new kv cache list
         and extract the data from gathered_kv_tensor to the new kv cache list.
@@ -836,10 +858,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
         block_shape = kv_cache_shape[2:]
         kv_dtype = self.kv_cache_dtype
         with torch.cuda.stream(stream):
-            key_cache, value_cache = get_flexi_kv_cache_multi_stream(block_num, block_shape, kv_dtype, self.device, stream)
-            key_cache_list_ptr, value_cache_list_ptr = prepare_flexi_kv_ptrs(key_cache, value_cache) 
-            logger.info(f"gathered_kv_tensor shape: {gathered_kv_tensor.shape}, kv_cache_shape: {kv_cache_shape}, block_shape:{block_shape}, block_num:{block_num}, key_cache shape:{key_cache[0].shape}, value_cache shape:{value_cache[0].shape}, key_cache length:{len(key_cache)}, value_cache length:{len(value_cache)}, slot_mapping shape:{slot_mapping.shape}")
-            logger.info(f"key_cache_list_ptr {key_cache_list_ptr}, value cache list ptr:{value_cache_list_ptr}")
+            key_cache, value_cache, key_cache_page_list, value_cache_page_list, _ = kv_allocator.allocate_with_cuda_async(block_num, list(block_shape), kv_dtype, self.device)
+            logger.info(f"gathered_kv_tensor shape: {gathered_kv_tensor.shape}, kv_cache_shape: {kv_cache_shape}, block_shape:{block_shape}, block_num:{block_num}, key_cache length:{len(key_cache)}, value_cache length:{len(value_cache)}, slot_mapping shape:{slot_mapping.shape}, time spent: {human_readable_duration(time.time() - time_start)}")
+            logger.info(f"key_cache_list_ptr {key_cache_page_list}, value cache list ptr:{value_cache_page_list}")
             # dummy_scale = torch.tensor(1.0, device=self.device, dtype=torch.float32)
             assert gathered_kv_tensor.shape[-2:] == kv_cache_shape[-2:], f"gathered_kv_tensor shape {gathered_kv_tensor.shape} mismatch kv_cache_shape {kv_cache_shape}"
             model = self.model
@@ -847,9 +868,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
             layer_module = model.model.layers[layer]
 
-            flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_list_ptr,value_cache_list_ptr,  key_cache[0], value_cache[0], slot_mapping,"auto",layer_module.self_attn.attn._k_scale, layer_module.self_attn.attn._v_scale)
+            flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_page_list,value_cache_page_list,  self.page_meta, self.page_meta, slot_mapping,"auto",layer_module.self_attn.attn._k_scale, layer_module.self_attn.attn._v_scale)
 
-        return key_cache, value_cache, key_cache_list_ptr, value_cache_list_ptr
+        return key_cache, value_cache, key_cache_page_list, value_cache_page_list
 
 
 # def bind_kv_cache_for_layers(

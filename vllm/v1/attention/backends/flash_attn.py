@@ -643,7 +643,7 @@ class FlashAttentionImpl(AttentionImpl):
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
             )
-            logger.info(f"[FLEXI DEBUG] attention forward took {human_readable_duration(time.time() - time_start)}")
+            # logger.debug(f"[FLEXI DEBUG] attention forward took {human_readable_duration(time.time() - time_start)}")
             return output
 
         assert not use_local_attn, (

@@ -28,6 +28,91 @@ from .log import LogManager
 app = typer.Typer(no_args_is_help=True)
 C = Console()
 
+
+def generate_analysis_report(logm: LogManager, vars: Optional[dict[str, Any]] = None):
+    """
+    Automatically generate analysis files in the log directory after experiment completes.
+    Uses logm.get_path_with_log_type to construct filenames consistently.
+    """
+    try:
+        log_dir = logm.get_dir()
+        
+        # Find all server log files
+        server_logs = list(log_dir.glob("server-*.log"))
+        
+        if not server_logs:
+            C.print(f"[yellow]Warning: No server logs found in {log_dir}[/]")
+            return
+        
+        C.print(f"[bold cyan]Generating analysis reports in {log_dir}[/]")
+        
+        # If vars is provided, only analyze the corresponding server log
+        if vars is not None:
+            server_log_path = logm.get_path_with_log_type("server", "log", vars)
+            if not server_log_path.exists():
+                C.print(f"[yellow]Warning: Server log not found: {server_log_path}[/]")
+                return
+            server_logs = [server_log_path]
+        
+        # Process each server log
+        for log_file in sorted(server_logs):
+            # Use logm.get_path_with_log_type to construct analysis filename
+            # This ensures consistency with server log naming
+            analysis_path = logm.get_path_with_log_type("analysis", "txt", vars)
+            
+            C.print(f"  Analyzing {log_file.name} -> {analysis_path.name}")
+            
+            # Run analysis on this server log
+            with open(analysis_path, 'w') as f:
+                f.write("=" * 80 + "\n")
+                f.write("VLLM EXPERIMENT ANALYSIS REPORT\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(f"Source Log: {log_file.name}\n")
+                f.write(f"Log Directory: {log_dir}\n")
+                f.write(f"Generated at: {datetime.datetime.now().isoformat()}\n\n")
+                
+                # Run the log analyzer
+                analyzer_script = Path(__file__).parent / "log_analysing_tools" / "analyze_log_metrics.py"
+                
+                if analyzer_script.exists():
+                    import sys
+                    from io import StringIO
+                    
+                    # Capture stdout
+                    old_stdout = sys.stdout
+                    sys.stdout = captured_output = StringIO()
+                    
+                    try:
+                        # Import and run analyzer
+                        sys.path.insert(0, str(analyzer_script.parent))
+                        from analyze_log_metrics import LogMetricsAnalyzer
+                        
+                        analyzer = LogMetricsAnalyzer(str(log_file))
+                        analyzer.analyze_file()
+                        analyzer.generate_report(top_n=50)
+                        
+                        # Get captured output
+                        output = captured_output.getvalue()
+                        f.write(output)
+                        
+                    except Exception as e:
+                        f.write(f"Error analyzing {log_file.name}: {e}\n")
+                        import traceback
+                        f.write(traceback.format_exc())
+                    finally:
+                        sys.stdout = old_stdout
+                else:
+                    f.write(f"Warning: Analyzer script not found at {analyzer_script}\n")
+            
+            C.print(f"  [green]✓[/] Generated: {analysis_path.name}")
+        
+        C.print(f"[bold green]✓ All analysis reports generated successfully[/]")
+        
+    except Exception as e:
+        C.print(f"[red]Error generating analysis report: {e}[/]")
+        import traceback
+        traceback.print_exc()
+
 # =========================
 # Config models
 # =========================
@@ -107,9 +192,12 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
         "--worker-cls", "vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker",
     ]
     # Add dynamic config for flexi flash attention
-    if cfg.vllm.enable_flexi_flash_attn:
-        dynamic_cfg = json.dumps({"enable_flexi_flash_attn": True})
-        serve_args.extend(["-D", dynamic_cfg])
+    dynamic_cfg = json.dumps({
+        "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
+        "tester_start_step": cfg.migration.tester_start_step,
+        "memory_stress_tester": cfg.migration.memory_stress_tester,
+        })
+    serve_args.extend(["-D", dynamic_cfg])
     
     if cfg.vllm.chunked_prefill:
         serve_args.append("--enable-chunked-prefill")
@@ -135,12 +223,13 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
     if deployment_config_path is not None:
         config_file_path = Path(deployment_config_path)
         config_file_path.parent.mkdir(parents=True, exist_ok=True)
+        config_dict = {
+            "alternative_configs": {"pp_layer_configs": cfg.migration.alternative_configs},
+            "migration_steps": cfg.migration.migration_steps,
+            "compact_steps": cfg.migration.compact_steps,
+        }
         with open(config_file_path, "w") as f:
-            json.dump({
-                "alternative_configs": {"pp_layer_configs": cfg.migration.alternative_configs},
-                "migration_steps": cfg.migration.migration_steps,
-                "compact_steps": cfg.migration.compact_steps,
-            }, f)
+            json.dump(config_dict, f)
     proc = subprocess.Popen(
         serve_args,
         stdout=log_fd,
@@ -270,6 +359,8 @@ def partition_and_request_rate(cfg: Config, logm: LogManager):
             stop_tree(proc)
         time.sleep(3)
         C.print(f"[bold cyan] Running is finished")
+        # Generate analysis report for all server logs
+        generate_analysis_report(logm, None)
 
 def one_off_test(cfg: Config, logm: LogManager):
     cfg.path_policy = get_path_policy_from_var_keys([])
@@ -277,6 +368,7 @@ def one_off_test(cfg: Config, logm: LogManager):
     proc = None
     # benchmark每发送num_requests次请求，都对应一个request_rate_list_compact中的request_rate
     assert len(cfg.vllm.start_pp_layer_partitions) == 1 
+    vars_mapping = None
     try:
         # Start vllm
         spec = ServerRunSpec(cfg.vllm.start_pp_layer_partitions[0], cfg.migration.is_migration)
@@ -300,6 +392,8 @@ def one_off_test(cfg: Config, logm: LogManager):
             stop_tree(proc)
         time.sleep(3)
         C.print(f"[bold cyan] Running is finished")
+        # Generate analysis report
+        generate_analysis_report(logm, vars_mapping)
 
 def test_migration_with_different_pp(cfg: Config, logm: LogManager):
     cfg.path_policy = get_path_policy_from_var_keys(["start_pp_layer_partition", "is_migration"])
@@ -340,3 +434,5 @@ def test_migration_with_different_pp(cfg: Config, logm: LogManager):
             stop_tree(proc)
         time.sleep(3)
         C.print(f"[bold cyan] Running is finished")
+        # Generate analysis report for all server logs
+        generate_analysis_report(logm, None)

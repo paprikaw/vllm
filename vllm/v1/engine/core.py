@@ -12,7 +12,7 @@ from concurrent.futures import Future
 from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
-from vllm.dynamic_config import DynamicConfig
+from vllm.dynamic_config import MigrationConfig
 
 import msgspec
 import zmq

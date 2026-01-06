@@ -118,8 +118,7 @@ class model_aware_kv_ops_helper:
                 layer_module.self_attn.attn._k_scale,
                 layer_module.self_attn.attn._v_scale,
             )
-    def flexi_put_kv_to_cache(self, model_executable: torch.nn.Module, keys, values,
-                         key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, layer, slot_mapping):
+    def flexi_put_kv_to_cache(self, model_executable: torch.nn.Module, page_meta, keys, values,key_cache_ptr, value_cache_ptr, layer, slot_mapping):
         # Resolve layer module if an integer layer id is provided.
         # layer can be either a module or a global layer index.
         layer_module = layer
@@ -155,8 +154,8 @@ class model_aware_kv_ops_helper:
                                               value=values,
                                               key_cache_ptr=key_cache_ptr,
                                               value_cache_ptr=value_cache_ptr,
-                                              key_cache_meta=key_cache_list[0],
-                                              value_cache_meta=value_cache_list[0],
+                                              key_cache_meta=page_meta,
+                                              value_cache_meta=page_meta,
                                               slot_mapping=slot_mapping,
                                               kv_cache_dtype=layer_module.self_attn.attn.kv_cache_dtype,
                                               k_scale=layer_module.self_attn.attn._k_scale,

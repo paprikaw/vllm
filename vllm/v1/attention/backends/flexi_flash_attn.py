@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from itertools import accumulate
 import os
 import time
+
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import torch
@@ -85,11 +86,11 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        key_cache_list: list[torch.Tensor],
-        value_cache_list: list[torch.Tensor],
         k_cache_dev_ptr: int,
         v_cache_dev_ptr: int,
+        page_meta: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
+        num_blocks: int,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
@@ -106,7 +107,6 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
               {q,k,v}_descale to be (num_sequences, num_kv_heads).
               We use torch's .expand() to avoid duplicating values
         """
-        time_start = time.time()
         assert output is not None, "Output tensor must be provided."
 
         if attn_metadata is None:
@@ -133,16 +133,14 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
         # DEBUG: Verify that key_cache_list and key_cache share the same memory
         # assert key_cache_list[0].data_ptr() == key_cache[0].data_ptr(), \
         #     f"Memory mismatch! key_cache_list[0].data_ptr()={key_cache_list[0].data_ptr()}, key_cache[0].data_ptr()={key_cache[0].data_ptr()}" 
-        key_cache_meta = key_cache_list[0]
-        value_cache_meta = value_cache_list[0]
 
         torch.ops._C_cache_ops.flexi_reshape_and_cache_flash(
             key,
             value,
             k_cache_dev_ptr,
             v_cache_dev_ptr,
-            key_cache_meta,
-            value_cache_meta,
+            page_meta,
+            page_meta,
             attn_metadata.slot_mapping,
             self.kv_cache_dtype,
             layer._k_scale,
@@ -234,11 +232,12 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
             #     v_descale=layer._v_scale.expand(descale_shape),
             # )
             # return output
+
             flexi_flash_attn_varlen_func(
                 q=query[:num_actual_tokens],
-                k_meta=key_cache_meta,
-                v_meta=value_cache_meta,
-                num_blocks=len(key_cache_list),
+                k_meta=page_meta,
+                v_meta=page_meta,
+                num_blocks=num_blocks,
                 out=output[:num_actual_tokens],
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=max_seqlen_q,
@@ -259,7 +258,6 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
                 cached_v_ptrs=v_cache_dev_ptr,
             )
 
-            logger.info(f"[FLEXI DEBUG] attention forward took {human_readable_duration(time.time() - time_start)}")
             # torch.testing.assert_close(output, copied_output, atol=2e-2, rtol=1e-2), \
             #     f"{torch.max(torch.abs(output - copied_output))}"
             return output

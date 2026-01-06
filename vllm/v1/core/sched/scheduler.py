@@ -448,6 +448,9 @@ class Scheduler(SchedulerInterface):
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
                 if request.status == RequestStatus.WAITING:
+                    admission_time = time.monotonic()
+                    wait_since_arrival = (admission_time - request.arrival_time) * 1000
+                    logger.info(f"[ttft_trace] Request {request.request_id}: Selected for PREFILL, waited {wait_since_arrival:.2f}ms, num_tokens={request.num_tokens}, num_computed_tokens={request.num_computed_tokens}, scheduling {num_new_tokens} new tokens")
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)

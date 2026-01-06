@@ -21,7 +21,7 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import get_mp_context, kill_process_tree
 from vllm.v1.executor.abstract import Executor
-from vllm.dynamic_config import DynamicConfig
+from vllm.dynamic_config import MigrationConfig
 # from vllm.v1.worker.dynamic_gpu_model_runner import DynamicGPUModelRunner
 
 if TYPE_CHECKING:
@@ -250,7 +250,7 @@ class CoreEngineProcManager:
         start_index: int,
         local_start_index: int,
         vllm_config: VllmConfig,
-        dynamic_config: DynamicConfig,
+        dynamic_config: MigrationConfig,
         on_head_node: bool,
         input_address: str,
         executor_class: type[Executor],
@@ -427,16 +427,17 @@ def dynamic_bind_kv_cache(
         forward_context[layer_name].kv_cache = [kv_cache]
 
 def dynamic_flexi_bind_kv_cache(
-    key_cache: dict[str, list[torch.Tensor]],
-    value_cache: dict[str, list[torch.Tensor]],
+    key_cache: dict[str, list[int]],
+    value_cache: dict[str, list[int]],
     key_dev_ptr: dict[str, int],
     value_dev_ptr: dict[str, int],
     forward_context: dict[str, "Attention"],
     kv_synchronizer: "DynamicKVSynchronizer",
-    runner_key_caches: list[list[torch.Tensor]],
-    runner_value_caches: list[list[torch.Tensor]],
+    runner_key_caches: list[list[int]],
+    runner_value_caches: list[list[int]],
     runner_key_dev_ptrs: list[int],
     runner_value_dev_ptrs: list[int],
+    page_meta: torch.Tensor,
 ) -> None:
     """
     Bind the allocated KV cache to both ModelRunner and forward context so
@@ -481,15 +482,16 @@ def dynamic_flexi_bind_kv_cache(
         kv_synchronizer.value_cache_list.append(value_cache[layer_name])
         kv_synchronizer.key_cache_ptrs.append(key_dev_ptr[layer_name])
         kv_synchronizer.value_cache_ptrs.append(value_dev_ptr[layer_name])
-    
+    # import dyn
+    from vllm.attention.dynamic_layer import FlexiAttention 
     # Bind kv_caches to forward context
     for layer_name, attn in forward_context.items():
         # NOTE: Use list because of v0 PP virtual engine.
-        # assert isinstance(attn, FlexiAttention)
-        attn.key_cache = key_cache[layer_name]
-        attn.value_cache = value_cache[layer_name]
+        assert isinstance(attn, FlexiAttention)
         attn.key_dev_ptr = key_dev_ptr[layer_name]
         attn.value_dev_ptr = value_dev_ptr[layer_name]
+        attn.page_meta = page_meta
+        attn.num_blocks = len(runner_key_caches[0])  # all layers have the same num_blocks
 
 
 def dynamic_bind_single_kv_tensor(
@@ -584,10 +586,11 @@ def dynamic_flexi_bind_single_kv_tensor(
                 f"No attention layer named {layer_name} in forward_context.")
         attn_module = forward_context[layer_name]
         # assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
-        attn_module.key_cache = key_cache_list
-        attn_module.value_cache = value_cache_list
+        logger.info(f"debug: bind key dev ptr{key_cache_ptr} to layer {layer_name}")
         attn_module.key_dev_ptr = key_cache_ptr
         attn_module.value_dev_ptr = value_cache_ptr
+        attn_module.num_blocks = len(key_cache_list)
+        attn_module.page_meta = runner.page_meta
 
         group = runner.kv_cache_config.kv_cache_groups[0]
         # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
@@ -641,12 +644,10 @@ def dynamic_flexi_bind_single_kv_cache(
             f"No attention layer named {layer_name} in forward_context.")
     attn_module = forward_context[layer_name]
     # assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
-    old_cache = attn_module.key_cache
-    attn_module.key_cache = key_cache_list
-    old_value_cache = attn_module.value_cache
-    attn_module.value_cache = value_cache_list
     attn_module.key_dev_ptr = key_cache_ptr
     attn_module.value_dev_ptr = value_cache_ptr
+    attn_module.num_blocks = len(key_cache_list)
+    attn_module.page_meta = runner.page_meta
 
     group = runner.kv_cache_config.kv_cache_groups[0]
     # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
@@ -659,7 +660,7 @@ def dynamic_flexi_bind_single_kv_cache(
                 insert_idx = i
                 break
         group.layer_names.insert(insert_idx, layer_name)
-    return old_cache, old_value_cache
+    return
 def copy_slice(from_tensor: torch.Tensor, to_tensor: torch.Tensor,
                length: int) -> torch.Tensor:
     """

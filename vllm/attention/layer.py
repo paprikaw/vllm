@@ -251,8 +251,13 @@ class Attention(nn.Module):
                 return self.impl.forward(self, query, key, value,
                                          self_kv_cache, attn_metadata)
             else:
-                return torch.ops.vllm.unified_attention(
+                import time
+                attn_start = time.time()
+                result = torch.ops.vllm.unified_attention(
                     query, key, value, self.layer_name)
+                attn_time = time.time() - attn_start
+                logger.info(f"[perf_analysis] RegularAttention {self.layer_name}: unified_attention took {attn_time:.4f}s")
+                return result
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)

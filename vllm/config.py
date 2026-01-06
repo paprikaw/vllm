@@ -4125,11 +4125,22 @@ class DynamicConfig:
     """Whether to enable Flexi Flash Attention implementation. When enabled,
     uses the FlexiFlashAttentionImpl for attention computations which may
     provide performance benefits for certain workloads."""
+    
+    tester_start_step: Optional[int] = None
+    """The step at which to start the memory stress tester. If None, the tester
+    will not be started automatically."""
+    
+    memory_stress_tester: Optional[dict[str, Any]] = None
+    """Configuration for the memory stress tester used to evaluate KV cache
+    allocation performance. Contains parameters like num_tensors_per_allocation,
+    tensor_shape, allocation_interval_ms, etc."""
 
     def compute_hash(self) -> str:
         """Compute hash for dynamic config."""
         factors: list[Any] = []
         factors.append(self.enable_flexi_flash_attn)
+        factors.append(self.tester_start_step)
+        factors.append(self.memory_stress_tester)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
 

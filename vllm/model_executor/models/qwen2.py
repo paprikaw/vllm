@@ -366,7 +366,7 @@ class Qwen2Model(nn.Module):
                 hidden_states,
                 residual,
             )
-            logger.info(f"after Layer forwarding took {human_readable_duration(time.time() - layer_start_time)}")
+            logger.debug(f"after Layer forwarding took {human_readable_duration(time.time() - layer_start_time)}")
         logger.info(f"after forwarding took {human_readable_duration(time.time() - forwarding_start_time)}")
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({

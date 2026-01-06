@@ -9,6 +9,23 @@ tools: ['vscode', 'execute', 'read', 'agent', 'edit', 'search', 'web', 'pylance-
 
 This agent is specialized for working with an extended version of vLLM that enables dynamic pipeline parallelism configuration switching and KV cache migration capabilities. The agent has deep knowledge of the codebase architecture, experimental setup, and best practices for development and testing.
 
+## Basic setup
+
+Python Environment: /data/gpfs/projects/punim2715/vllm_workbench/.venv/bin/python
+
+## Basic Rules
+1. You should always follows the user defines basic setup above. 
+
+2. If you fell that there is a need to update the agent.md, please do so in a concise manner, the agent.md file is ".github/agents/vllm_agent.agent.md"
+
+3. If you have come to a conclusion for a problem, please generate a reports under ./reports directory
+
+4. In the process of solving a problem, you will find youself generating all sorts of tools to analyse log, trying to use the exisiting tools provided in the **./vllm_exp/tools**, if you need a new tools, please think of maybe adding feature to exising one. Try to make it easy to maintain, you should think these set of tools as a framework of log analysing. If the things you want to do can only be done by temporary scripts and not be easily integrated to existing tools, you should place it in /tmp directory.
+
+5. When you are performing a long task, sometimes you need to run tools and waiting for the results. You shouldn't hand the control back to user, instead you should keep monitoring the progress of the task. You can "sleep 30" to wait for 30 seconds before checking again.
+
+6. If you are going to test a vllm inferencing process without migration, simply set the migration_step higher than the total number of requests, so that no migration will happen.
+
 ## Background
 
 ### Repository Context
@@ -122,6 +139,40 @@ python /home/bxb1/vllm_workbench/vllm/logs/analyze_log_metrics.py "/home/bxb1/vl
 - Centralized logging for all experiments
 - Structured output for analysis
 - Timestamped experiment runs
+
+### Test Types
+Currently, please only use one_off_test as the test type
+#### 1. `one_off_test` - Single Configuration Test
+**Purpose**: Run a single configuration without sweeping parameters. Ideal for performance profiling and detailed analysis.
+
+**Key Characteristics:**
+- Single `start_pp_layer_partitions` value (must have length 1)
+- Uses `running_request_rates` + `running_num_requests` (staged rate changes)
+- No `path_policy` needed (defaults to empty)
+
+**Configuration Example:**
+```yaml
+projects:
+  - project: "my_test"
+    type: "one_off_test"
+    vllm:
+      pipeline_parallel_size: 2
+      enable_flexi_flash_attn: false
+      start_pp_layer_partitions: ["32,32"]  # Must be single element
+    migration:
+      is_migration: false  # No migration
+      # DO NOT set migration_steps or alternative_configs when is_migration: false
+    benchmark:
+      data_num_requests: [100]
+      input_output_lens: [[512, 128]]
+      running_request_rates: [2]      # Rate for each stage
+      running_num_requests: [100]     # Requests per stage
+```
+
+**⚠️ Important Notes:**
+- **When `is_migration: false`**: Do NOT include `migration_steps` or `alternative_configs`
+- **When `is_migration: true`**: Must include `migration_steps` (list of request numbers when migration occurs) and `alternative_configs` (pipeline configurations to switch to)
+
 
 ## Development Best Practices
 

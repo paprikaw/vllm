@@ -75,6 +75,8 @@ class MigrationCfg(BaseModel):
     alternative_configs: dict[str, list[int]] = {}
     migration_steps: list[int] = []
     compact_steps: list[int] = []
+    tester_start_step: Optional[int] = None
+    memory_stress_tester: Optional[Dict[str, Any]] = None
 
 class BenchCfg(BaseModel):
     running_num_requests: list[int] = []

@@ -92,12 +92,21 @@ class PPLayerConfigs(BaseModel):
         del self.pp_layer_configs[key]
 
 
-class DynamicConfig(BaseModel):
+class MigrationConfig(BaseModel):
     alternative_configs: PPLayerConfigs
     migration_steps: list[int] = Field(default_factory=list)
     compact_steps: list[int] = Field(default_factory=list)
     """
     Configurations that is used when switching between different pipeline configurations.
+    
+    tester_start_step: Optional int - At which request number to start the memory stress tester (similar to migration_steps)
+    
+    memory_stress_tester: Optional configuration for KV cache allocation stress testing
+        enabled: bool - Whether to enable stress testing
+        num_tensors_per_allocation: int - Number of tensors per allocation cycle (like num_blocks)
+        tensor_shape: list[int] - Shape of each tensor, e.g. [16, 8, 128] for KV block
+        allocation_interval_ms: int - Interval between allocation cycles in milliseconds
+        num_allocation_cycles: int - Number of allocation cycles to maintain in memory
     """
 
     # 允许 alternative_configs 以多种形式传入，并在这里包一层/转成 PPLayerConfigs

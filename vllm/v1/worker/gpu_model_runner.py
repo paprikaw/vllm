@@ -1199,12 +1199,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                  num_tokens=num_input_tokens):
             self.maybe_setup_kv_connector(scheduler_output)
             try:
+                model_forward_start = time.time()
                 model_output = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
                 )
+                model_forward_end = time.time()
+                logger.info(f"[perf_analysis] model.forward() CPU time: {model_forward_end - model_forward_start:.4f}s")
             except Exception as e:
                 time.sleep(2)
                 logger.info(f"Exception during model forward: {e}")

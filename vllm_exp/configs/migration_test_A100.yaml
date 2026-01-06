@@ -17,7 +17,7 @@ projects:
   - project: "migration_test_async_with_migration"
     type: "one_off_test"
     model:
-      path: "/home/bxb1/data/huggingface/Qwen3-32B-AWQ"
+      path: "/home/bxb1/data/huggingface/Qwen3-32B"
     #   name: ""
     network:
       delays: [0]
@@ -28,7 +28,7 @@ projects:
     vllm:
       head_addr: "localhost"
       pipeline_parallel_size: 2
-      enable_flexi_flash_attn: true  # Set to true to enable Flexi Flash Attention
+      enable_flexi_flash_attn: false # Set to true to enable Flexi Flash Attention
       gpu_memory_utilization: 0.75
       start_pp_layer_partitions:
         - "32,32"
@@ -50,3 +50,41 @@ projects:
       running_num_requests: [100]
       running_request_rates: [2]
 is_log_cover: true
+
+# projects:
+#   - project: "migration_test_async_with_migration"
+#     type: "one_off_test"
+#     model:
+#       path: "/home/bxb1/data/huggingface/Qwen3-32B-AWQ"
+#     #   name: ""
+#     network:
+#       delays: [0]
+#       # 每个 pipeline 并行 rank 的可达 IP（请根据实际机器 IP 修改）
+#       rank_to_ip:
+#         0: "spartan-gpgpu143"
+#         1: "spartan-gpgpu143"
+#     vllm:
+#       head_addr: "localhost"
+#       pipeline_parallel_size: 2
+#       enable_flexi_flash_attn: false  # Set to true to enable Flexi Flash Attention
+#       gpu_memory_utilization: 0.75
+#       start_pp_layer_partitions:
+#         - "32,32"
+#     migration:
+#       is_migration: true
+#       migration_steps: [50]
+#       # migration_steps: [100]
+#       alternative_configs:
+#         "0": [32, 32]
+#         "1": [28, 36]
+#         "2": [32, 32]
+#         "3": [20, 44]
+#     benchmark:
+#       benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+#       profile: false
+#       print_outputs: true
+#       data_num_requests: [100]
+#       input_output_lens: [[512, 128]]
+#       running_num_requests: [100]
+#       running_request_rates: [2]
+# is_log_cover: true

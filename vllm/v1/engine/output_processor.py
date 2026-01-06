@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
+from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.transformers_utils.tokenizer import AnyTokenizer
@@ -15,6 +16,8 @@ from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (IterationStats, LoRARequestStates,
                                    RequestStateStats)
+
+logger = init_logger(__name__)
 
 
 class RequestOutputCollector:
@@ -324,6 +327,8 @@ class OutputProcessor:
         If you need to touch every element of the batch, do it from
         within the loop below.
         """
+        import time
+        process_start = time.time()
 
         request_outputs: list[RequestOutput] = []
         reqs_to_abort: list[str] = []
@@ -333,6 +338,12 @@ class OutputProcessor:
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
+
+            # Log first token generation
+            if req_state.is_prefilling and len(engine_core_output.new_token_ids) > 0:
+                first_token_time = time.time()
+                ttft = (first_token_time - req_state.stats.arrival_time) * 1000 if req_state.stats else 0
+                logger.info(f"[ttft_trace] Request {req_id}: FIRST TOKEN generated at {first_token_time:.6f}, TTFT={ttft:.2f}ms")
 
             # 1) Compute stats for this iteration.
             self._update_stats_from_output(req_state, engine_core_output,

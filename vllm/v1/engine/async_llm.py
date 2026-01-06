@@ -249,13 +249,19 @@ class AsyncLLM(EngineClient):
                            prompt: Optional[str],
                            parent_req: Optional[ParentRequest], index: int,
                            queue: RequestOutputCollector):
+        import time
+        enqueue_time = time.time()
+        logger.info(f"[ttft_trace] Request {request.request_id}: Enqueued at {enqueue_time:.6f}, arrival_time={request.arrival_time:.6f}, wait_in_queue={(enqueue_time - request.arrival_time)*1000:.2f}ms")
 
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index,
                                           queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
+        add_to_core_start = time.time()
         await self.engine_core.add_request_async(request)
+        add_to_core_time = (time.time() - add_to_core_start) * 1000
+        logger.info(f"[ttft_trace] Request {request.request_id}: Added to EngineCore in {add_to_core_time:.2f}ms")
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
