@@ -29,8 +29,7 @@ class DynamicBlockPool(BlockPool):
         blk_from = self.blocks[block_id_from]
         blk_to   = self.blocks[block_id_to]
 
-        # 建议在迁移前确保两边都不在使用中（ref_cnt == 0）
-        assert blk_from.ref_cnt != 0, "block_id_from is in use (ref_cnt > 0)"
+        assert blk_from.ref_cnt != 0, "block_id_from is not in use (ref_cnt == 0)"
         assert blk_to.ref_cnt == 0, "block_id_to is in use (ref_cnt > 0)"
 
         if self.enable_caching:

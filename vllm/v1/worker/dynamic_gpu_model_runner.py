@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import FlexiKVTensorMeta
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.dynamic_utils import ForegroundBackgroundGate
 from vllm.sampling_params import SamplingType
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.v1.utils import dynamic_bind_kv_cache, dynamic_flexi_bind_kv_cache, human_readable_size, human_readable_duration
@@ -65,6 +66,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.forward_lock = Lock()
+        self.fbgate = ForegroundBackgroundGate()
         self.key_caches: list[list[int]] = []
         self.value_caches: list[list[int]] = []
         self.key_cache_ptrs: list[int] = []
@@ -135,8 +137,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
         time_start = time.time()
-        with self.forward_lock:
-            logger.info(f"getting forward lock taking {human_readable_duration(time.time() - time_start)}")
+        logger.info(f"getting forward lock taking {human_readable_duration(time.time() - time_start)}")
+        with self.fbgate.foreground():
             if not isinstance(self.model, DynamicQwen3ForCausalLM):
                 raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
             self.model.set_sched_layers(layer_config[0], layer_config[1])
@@ -867,7 +869,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             assert isinstance(model, DynamicQwen3ForCausalLM)
             # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
             layer_module = model.model.layers[layer]
-
+            logger.info(f"before gather kv tensor using kernal, device:{torch.cuda.current_device()}, stream:{torch.cuda.current_stream()}")
             flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_page_list,value_cache_page_list,  self.page_meta, self.page_meta, slot_mapping,"auto",layer_module.self_attn.attn._k_scale, layer_module.self_attn.attn._v_scale)
 
         return key_cache, value_cache, key_cache_page_list, value_cache_page_list

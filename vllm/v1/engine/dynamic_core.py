@@ -454,7 +454,6 @@ class DynamicEngineCore(EngineCore):
                 schedule_start = time.time()
                 scheduler_output = self.scheduler.dynamic_schedule()
                 schedule_time = time.time() - schedule_start
-                logger.info(f"[perf_analysis] scheduler.dynamic_schedule() took {schedule_time:.4f}s")
                 assert isinstance(scheduler_output, DynamicSchedulerOutput)
                 # if scheduler_output.total_migration_tokens > 0:
                     # logger.info(f"[forward]: scheduled a total {scheduler_output.total_migration_tokens} tokens, total_num_scheduled_tokens: {scheduler_output.total_num_scheduled_tokens}, is_sync_after_migration: {scheduler_output.is_sync_after_migration}")
@@ -462,7 +461,6 @@ class DynamicEngineCore(EngineCore):
                     exec_start = time.time()
                     future = execute_func(scheduler_output)
                     exec_submit_time = time.time() - exec_start
-                    logger.info(f"[perf_analysis] execute_func() submit took {exec_submit_time:.4f}s")
                     self.batch_queue.put_nowait(
                         (future, scheduler_output))  # type: ignore
 
@@ -480,13 +478,11 @@ class DynamicEngineCore(EngineCore):
                 result_start = time.time()
                 model_output = future.result()
                 result_time = time.time() - result_start
-                logger.info(f"[perf_analysis] future.result() (model execution) took {result_time:.4f}s")
                 self.batch_queue.task_done()
                 update_start = time.time()
                 engine_core_outputs = self.scheduler.update_from_output(
                     scheduler_output, model_output)
                 update_time = time.time() - update_start
-                logger.info(f"[perf_analysis] scheduler.update_from_output() took {update_time:.4f}s")
             logger.info(f"[forward]: step with batch queue in {time.time() - time_start:.2f} seconds")
 
             return engine_core_outputs
@@ -573,14 +569,9 @@ class DynamicEngineCore(EngineCore):
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
-        time_start = time.time()
         # 先获取一次内存快照
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
-        logger.info(f"[perf_analysis] About to call get_workers_mem_info()")
-        mem_info_start = time.time()
         mem_infos = self.model_executor.get_workers_mem_info()
-        mem_info_time = time.time() - mem_info_start
-        logger.info(f"[perf_analysis] get_workers_mem_info() took {mem_info_time:.4f}s")
 
         # Adding/removing
         need_compact = False
@@ -593,6 +584,7 @@ class DynamicEngineCore(EngineCore):
         tmp_pp_layer_config = deepcopy(self.cur_pp_layer_config)
         bitmap = bitarray()
         with self.engine_lock:
+            time_start = time.time()
             for rank, layers in enumerate(pp_layer_config):
                 start_layer, end_layer = tmp_pp_layer_config[rank][0], tmp_pp_layer_config[rank][1]
                 adding_layer_list = []
@@ -621,22 +613,24 @@ class DynamicEngineCore(EngineCore):
                         #     "Rank %s lacks memory even after KV compact estimate: max_blocks_per_layer: %s, current_used_blocks: %s",
                         #     rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
                         # return []
-        logger.info(f"[timeline]: engine locking time: {human_readable_duration(time.time() - time_start)}")
-        # with self.engine_lock:
             # start_drain_out_time = time.time()
             # outputs = self._drain_out_running_queue()
             # engine_core_outputs.extend(outputs)
             # logger.info(f"[timeline]: after drain out running queue, time taken: {human_readable_duration(time.time() - start_drain_out_time)}")
-        assert isinstance(self.scheduler, DynamicScheduler)
-        assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
-        compacted_length = min(maximum_kv_block_num_after_compact)
-        original_length = self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
+            assert isinstance(self.scheduler, DynamicScheduler)
+            assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
+            compacted_length = min(maximum_kv_block_num_after_compact)
+            original_length = self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
+            if need_compact:
+                time_start_compact_kv = time.time()
+                bitmap = self.scheduler.shrink_block_pool(compacted_length)
+                logger.info(f"[debug]: compacted_length for scheduler in {human_readable_duration(time.time() - time_start_compact_kv)}, compacted to: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
+
+            logger.info(f"[timeline]: engine locking time: {human_readable_duration(time.time() - time_start)}")
+
+        # with self.engine_lock:
         if need_compact:
             time_start_compact_kv = time.time()
-            logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
-            bitmap = self.scheduler.shrink_block_pool(compacted_length)
-
-        if need_compact:
             self._compact_kv_cache(compacted_length, bitmap)
             logger.info(f"debug -------------- KV cache compacted to {compacted_length} blocks before adding layers")
             logger.info(f"[timeline]: compact kv cache take: {human_readable_duration(time.time() - time_start_compact_kv)}")
@@ -1486,7 +1480,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         while True:
             metrics = self.metrics_queue.get()
             util = getattr(metrics, "kv_cache_utilization", None)
-            logger.info(f"kv_cache_utilization: {util}")
+            # logger.info(f"kv_cache_utilization: {util}")
 
 @dataclass
 class DynamicMetricsOutput:

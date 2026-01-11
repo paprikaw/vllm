@@ -71,36 +71,36 @@ try:
                     scheduler_output, intermediate_tensors = scheduler_output, None
 
     
+                with self.worker.model_runner.forward_lock:
+                    assert isinstance(scheduler_output, DynamicSchedulerOutput), f"Scheduler output is not a DynamicSchedulerOutput:{type(scheduler_output)}"
+                    # 计算通信时间（如果有上游数据）
+                    # logger.info(f"[perf_analysis] rank {self.rpc_rank}: About to call async_migration_before_execute_callback()")
+                    callback_start = time.time()
+                    self.worker.async_migration_before_execute_callback(scheduler_output)
+                    time_after_before_execute_callback = time.time()
+                    callback_time = time_after_before_execute_callback - callback_start
+                    # logger.info(f"[perf_analysis] rank {self.rpc_rank}: async_migration_before_execute_callback() took {callback_time:.4f}s")
+                    # self.worker.sync_migration_before_execute_callback(scheduler_output.new_kv_cache_block_num)
 
-                assert isinstance(scheduler_output, DynamicSchedulerOutput), f"Scheduler output is not a DynamicSchedulerOutput:{type(scheduler_output)}"
-                # 计算通信时间（如果有上游数据）
-                # logger.info(f"[perf_analysis] rank {self.rpc_rank}: About to call async_migration_before_execute_callback()")
-                callback_start = time.time()
-                self.worker.async_migration_before_execute_callback(scheduler_output)
-                time_after_before_execute_callback = time.time()
-                callback_time = time_after_before_execute_callback - callback_start
-                # logger.info(f"[perf_analysis] rank {self.rpc_rank}: async_migration_before_execute_callback() took {callback_time:.4f}s")
-                # self.worker.sync_migration_before_execute_callback(scheduler_output.new_kv_cache_block_num)
-
-                # Execute model in high priority stream
-                # logger.info(f"[perf_analysis] rank {self.rpc_rank}: About to execute_model()")
-                exec_start = time.time()
-                assert self.worker.high_priority_stream is not None, "high_priority_stream is not initialized"
-                with torch.cuda.stream(self.worker.high_priority_stream):
-                    try:
-                        model_exec_start = time.time()
-                        output = self.worker.model_runner.execute_model(
-                        create_from_dynamic_scheduler_output(scheduler_output), 
-                        scheduler_output.pp_layer_config[self.rpc_rank],
-                        intermediate_tensors)
-                        model_exec_end = time.time()
-                        model_exec_cpu_time = model_exec_end - model_exec_start
-                    except Exception as e:
-                        print(traceback.format_exc())
-                        print(f"scheduler_output: {scheduler_output}")
-                        print(f"error is raised within the compiled ray DAG graph, error: {e}")
-                        time.sleep(1)
-                        raise e
+                    # Execute model in high priority stream
+                    # logger.info(f"[perf_analysis] rank {self.rpc_rank}: About to execute_model()")
+                    exec_start = time.time()
+                    assert self.worker.high_priority_stream is not None, "high_priority_stream is not initialized"
+                    with torch.cuda.stream(self.worker.high_priority_stream):
+                        try:
+                            model_exec_start = time.time()
+                            output = self.worker.model_runner.execute_model(
+                            create_from_dynamic_scheduler_output(scheduler_output), 
+                            scheduler_output.pp_layer_config[self.rpc_rank],
+                            intermediate_tensors)
+                            model_exec_end = time.time()
+                            model_exec_cpu_time = model_exec_end - model_exec_start
+                        except Exception as e:
+                            print(traceback.format_exc())
+                            print(f"scheduler_output: {scheduler_output}")
+                            print(f"error is raised within the compiled ray DAG graph, error: {e}")
+                            time.sleep(1)
+                            raise e
                 
                 # CRITICAL: Synchronize the high priority stream before using results
                 # This ensures all computations are complete before we access the output tensors
@@ -110,15 +110,12 @@ try:
 
                 time_after_execute = time.time()
                 exec_time = time_after_execute - exec_start
-                logger.info(f"[perf_analysis] rank {self.rpc_rank}: execute_model() took {exec_time:.4f}s (model_runner CPU: {model_exec_cpu_time:.4f}s, sync: {sync_time:.4f}s, GPU compute: {sync_time:.4f}s)")
                 assert(len(self.worker.model_runner.input_batch.block_table.block_tables) == 1) # Only for consistent shape of attention
-                logger.info(f"[perf_analysis] rank {self.rpc_rank}: About to call async_migration_after_execute_callback()")
                 after_callback_start = time.time()
                 self.worker.async_migration_after_execute_callback(scheduler_output)
 
                 time_after_execute_callback = time.time()
                 after_callback_time = time_after_execute_callback - after_callback_start
-                logger.info(f"[perf_analysis] rank {self.rpc_rank}: async_migration_after_execute_callback() took {after_callback_time:.4f}s")
 
                 # 在发送给下游前，打包时间戳
                 if isinstance(output, IntermediateTensors):
@@ -145,6 +142,7 @@ try:
                     else:
                         logger.info(f"[forward]: rank {self.rpc_rank} Communication time from upstream: {comm_time:.2f} ms, no received data")
                 logger.info(f"""
+                [forward]: forwarding from layer{scheduler_output.pp_layer_config[self.worker.rank][0]} to layer{scheduler_output.pp_layer_config[self.worker.rank][1]},
                 [forward]: before execute callback time: {time_after_before_execute_callback - time_recv:.2f} seconds,
                 [forward]: execute time: {time_after_execute - time_after_before_execute_callback:.2f} seconds,
                 [forward]: after execute callback time: {time_after_execute_callback - time_after_execute:.2f} seconds

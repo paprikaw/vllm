@@ -78,6 +78,8 @@ from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from dynamic_benchmark_dataset import PatternDataset
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
+_BENCH_PHASE_BOUNDARY_TOKEN = "=== VLLM_EXP_BENCH_PHASE_BOUNDARY ==="
+
 
 
 @dataclass
@@ -163,6 +165,7 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
+    metrics_file_name: Optional[str] = None,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -175,6 +178,10 @@ def calculate_metrics(
     all_itls: list[list[float]] = []
     e2els: list[float] = []
     for i in range(len(outputs)):
+        # Skip Exception objects that were added as placeholders
+        if isinstance(outputs[i], Exception):
+            actual_output_lens.append(0)
+            continue
         if outputs[i].success:
             output_len = outputs[i].output_tokens
 
@@ -195,8 +202,8 @@ def calculate_metrics(
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
                 tpot = latency_minus_ttft / (output_len - 1)
-                tpots.append(tpot)
             # Note: if output_len <= 1, we regard tpot as 0 for goodput
+            tpots.append(tpot)
             all_tpots.append(tpot)
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
@@ -207,24 +214,32 @@ def calculate_metrics(
             actual_output_lens.append(0)
 
     # 将以上这些metrics作为csv输出到文件中
-    try:
-        file_name = os.environ["METRICS_FILE_NAME"]
-    except KeyError:
-        raise ValueError("Environment variable METRICS_FILE_NAME is not set")
-    print(f"Writing metrics to {file_name}")
+    file_name = metrics_file_name
+    if file_name is None:
+        try:
+            file_name = os.environ["METRICS_FILE_NAME"]
+        except KeyError:
+            file_name = None
+    if file_name:
+        print(f"Writing metrics to {file_name}")
     
-    # 从 outputs 中提取时间戳
-    from datetime import datetime
-    timestamps = [output.timestamp for output in outputs]
-    datetimes = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] 
-                 for ts in timestamps]
-    
-    with open(file_name, "a", newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "datetime", "tpots", "ttfts", "e2els"])
-        # 确保几个 list 长度一致
-        for ts, dt, t, tf, e in zip(timestamps, datetimes, tpots, ttfts, e2els):
-            writer.writerow([ts, dt, t, tf, e])
+    if file_name:
+        # 从 outputs 中提取时间戳（仅记录成功请求，避免行数/字段不一致）
+        from datetime import datetime
+        success_outputs = [o for o in outputs if o.success]
+        timestamps = [output.timestamp for output in success_outputs]
+        datetimes = [
+            datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            for ts in timestamps
+        ]
+
+        # Overwrite to keep each metrics file phase-pure and avoid
+        # duplicate headers across multiple calculate_metrics() calls.
+        with open(file_name, "w", newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "datetime", "tpots", "ttfts", "e2els"])
+            for ts, dt, t, tf, e in zip(timestamps, datetimes, tpots, ttfts, e2els):
+                writer.writerow([ts, dt, t, tf, e])
     if goodput_config_dict:
         valid_metrics = []
         slo_values = []
@@ -320,48 +335,49 @@ async def run_multi_stage_benchmark(
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
     print_outputs: bool,
+    warmup_stage_count: int = 0,
 ):
     """
     执行多阶段基准测试，每个阶段使用不同的请求速率和请求数量
     """
     
-    metrics = []
-    results = []
-    
-    # 计算每个阶段的起始索引
-    start_indices = [0]
-    for num_req in running_num_requests[:-1]:
-        start_indices.append(start_indices[-1] + num_req)
-    
+    # Execute stages sequentially: wait warmup fully completes before main.
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
-    
+
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
-    
+
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
-    start_time = time.perf_counter()
+    warmup_start_perf = time.perf_counter()
+
+    # 计算每个阶段的起始索引
+    start_indices = [0]
+    for num_req in running_num_requests[:-1]:
+        start_indices.append(start_indices[-1] + num_req)
+
+    warmup_end_wall_ts: Optional[float] = None
+    warmup_end_perf: Optional[float] = None
+
     tasks: list[asyncio.Task] = []
-        
     for stage_idx, (request_rate, num_req) in enumerate(zip(request_rate_list, running_num_requests)):
         print(f"\n{'='*20} Stage {stage_idx + 1} {'='*20}")
         print(f"Request rate: {request_rate} req/s")
         print(f"Number of requests: {num_req}")
-        
-        # 获取当前阶段的请求
+
         start_idx = start_indices[stage_idx]
         end_idx = start_idx + num_req
         stage_requests = input_requests[start_idx:end_idx]
-        
-        # 为当前阶段创建 LoRA 模块迭代器（如果需要）
+
         stage_lora_modules = None
         if lora_modules:
             stage_lora_modules = iter(
                 [random.choice(list(lora_modules)) for _ in range(len(stage_requests))]
             )
-        
+
+        stage_tasks: list[asyncio.Task] = []
         async for request in get_request(stage_requests, request_rate, burstiness):
             prompt, prompt_len, output_len, mm_content = (
                 request.prompt,
@@ -369,7 +385,7 @@ async def run_multi_stage_benchmark(
                 request.expected_output_len,
                 request.multi_modal_data,
             )
-            
+
             req_model_id, req_model_name = model_id, model_name
             if stage_lora_modules:
                 req_lora_module = next(stage_lora_modules)
@@ -387,14 +403,39 @@ async def run_multi_stage_benchmark(
                 ignore_eos=ignore_eos,
                 extra_body=extra_body,
             )
-            
-            tasks.append(
-                asyncio.create_task(
-                    limited_request_func(request_func_input=request_func_input, pbar=pbar)
-                )
+            t = asyncio.create_task(
+                limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
-        
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+            stage_tasks.append(t)
+            tasks.append(t)
+
+        # Wait for this stage to fully finish before continuing.
+        if stage_tasks:
+            await asyncio.gather(*stage_tasks, return_exceptions=True)
+
+        # Emit boundary marker after warmup stage fully completes.
+        if warmup_stage_count > 0 and (stage_idx + 1) == warmup_stage_count:
+            warmup_end_wall_ts = time.time()
+            warmup_end_perf = time.perf_counter()
+            # IMPORTANT: stdout is piped when invoked by vllm_exp; without an
+            # explicit flush, Python may buffer this line and delay the
+            # warmup→main boundary detection until process termination.
+            print(
+                f"{_BENCH_PHASE_BOUNDARY_TOKEN} boundary_ts={warmup_end_wall_ts:.6f}",
+                flush=True,
+            )
+
+    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Verify outputs length matches expectations
+    expected_total = sum(running_num_requests)
+    if len(outputs) != expected_total:
+        print(f"WARNING: Expected {expected_total} outputs but got {len(outputs)}")
+        print(f"Tasks created: {len(tasks)}, Outputs received: {len(outputs)}")
+        print(f"Running num requests per stage: {running_num_requests}")
+        # Pad with None if outputs are missing to prevent IndexError
+        while len(outputs) < expected_total:
+            outputs.append(Exception("Task result missing"))
 
     # Optionally print per-request outputs, grouped by stage
     if print_outputs:
@@ -403,9 +444,15 @@ async def run_multi_stage_benchmark(
             e = s + num_req
             stage_total_output_tokens = 0
             for i in range(s, e):
+                if i >= len(outputs):
+                    print(f"[Stage {s_idx + 1}] Request {i - s}: MISSING (index {i} >= {len(outputs)})")
+                    continue
                 out = outputs[i]
                 rel_i = i - s
-                if out.success:
+                # Handle both exceptions and RequestFuncOutput objects
+                if isinstance(out, Exception):
+                    print(f"[Stage {s_idx + 1}] Request {rel_i}: EXCEPTION: {out}")
+                elif out.success:
                     # Accumulate output token count with tokenizer fallback
                     output_len = len(
                         tokenizer(out.generated_text, add_special_tokens=False).input_ids
@@ -418,121 +465,169 @@ async def run_multi_stage_benchmark(
         
     if pbar is not None:
         pbar.close()
-        
-    duration = time.perf_counter() - start_time
-        
-    # 计算指标
+
+    total_duration = time.perf_counter() - warmup_start_perf
+
+    # Compute full-run metrics (no per-phase file write by default)
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
-        dur_s=duration,
+        dur_s=total_duration,
         tokenizer=tokenizer,
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
+        # Do not write request_metrics for the combined run; warmup/main
+        # are written to separate phase files.
+        metrics_file_name="",
     )
         
-    # 打印当前阶段的结果
-    print("{s:{c}^{n}}".format(s=" Benchmark Result ", n=50, c="-"))
+    def _print_latency_block(m: BenchmarkMetrics) -> None:
+        def process_one_metric(
+            metric_attribute_name: str,
+            metric_name: str,
+            metric_header: str,
+        ) -> None:
+            """Print stats for one latency metric."""
+            if metric_attribute_name not in selected_percentile_metrics:
+                return
+            print("{s:{c}^{n}}".format(s=metric_header, n=50, c="-"))
+            print(
+                "{:<40} {:<10.2f}".format(
+                    f"Mean {metric_name} (ms):",
+                    getattr(m, f"mean_{metric_attribute_name}_ms"),
+                )
+            )
+            print(
+                "{:<40} {:<10.2f}".format(
+                    f"Median {metric_name} (ms):",
+                    getattr(m, f"median_{metric_attribute_name}_ms"),
+                )
+            )
+            for p, value in getattr(m, f"percentiles_{metric_attribute_name}_ms"):
+                p_word = str(int(p)) if int(p) == p else str(p)
+                print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
+
+        process_one_metric("ttft", "TTFT", "Time to First Token")
+        process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
+        process_one_metric("itl", "ITL", "Inter-token Latency")
+        process_one_metric("e2el", "E2EL", "End-to-end Latency")
+
+    # Print summary for full run
+    print("{s:{c}^{n}}".format(s=" Benchmark Result (Total) ", n=50, c="-"))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Duration (s):", duration))
+    print("{:<40} {:<10.2f}".format("Duration (s):", total_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Request throughput (req/s):", metrics.request_throughput
-        )
-    )
+    print("{:<40} {:<10.2f}".format("Request throughput (req/s):", metrics.request_throughput))
     if goodput_config_dict:
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Request goodput (req/s):", metrics.request_goodput
-            )
-        )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Output token throughput (tok/s):", metrics.output_throughput
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Total Token throughput (tok/s):", metrics.total_token_throughput
-        )
-    )
-    
-    # 打印延迟指标
-    def process_one_metric(
-        metric_attribute_name: str,
-        metric_name: str,
-        metric_header: str,
-    ):
-        """打印指定指标的统计信息"""
-        if metric_attribute_name not in selected_percentile_metrics:
-            return
-        print("{s:{c}^{n}}".format(s=metric_header, n=50, c="-"))
-        print(
-            "{:<40} {:<10.2f}".format(
-                f"Mean {metric_name} (ms):",
-                getattr(metrics, f"mean_{metric_attribute_name}_ms"),
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                f"Median {metric_name} (ms):",
-                getattr(metrics, f"median_{metric_attribute_name}_ms"),
-            )
-        )
-        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}_ms"):
-            p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
-    
-    process_one_metric("ttft", "TTFT", "Time to First Token")
-    process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
-    process_one_metric("itl", "ITL", "Inter-token Latency")
-    process_one_metric("e2el", "E2EL", "End-to-end Latency")
+        print("{:<40} {:<10.2f}".format("Request goodput (req/s):", metrics.request_goodput))
+    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", metrics.output_throughput))
+    print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):", metrics.total_token_throughput))
+    _print_latency_block(metrics)
         
-    # 保存当前阶段的结果
+    # Optionally compute and print warmup/main split metrics.
+    warmup_metrics = None
+    main_metrics = None
+    warmup_count = 0
+    if warmup_stage_count > 0:
+        warmup_count = sum(running_num_requests[:warmup_stage_count])
+        warmup_inputs = input_requests[:warmup_count]
+        warmup_outputs = outputs[:warmup_count]
+        main_inputs = input_requests[warmup_count:]
+        main_outputs = outputs[warmup_count:]
+
+        # Determine phase durations based on each phase's actual request window
+        # (start_time .. start_time+latency) to make split stats stable even if
+        # warmup/main overlap in flight.
+        def _phase_duration(phase_outputs: list[RequestFuncOutput]) -> float:
+            oks = [o for o in phase_outputs if o.success]
+            if not oks:
+                return 0.0
+            start = min(o.start_time for o in oks)
+            end = max(o.start_time + o.latency for o in oks)
+            return max(0.0, end - start)
+
+        warmup_dur = _phase_duration(warmup_outputs)
+        main_dur = _phase_duration(main_outputs)
+
+        warmup_file = os.environ.get("METRICS_FILE_NAME_WARMUP")
+        main_file = os.environ.get("METRICS_FILE_NAME_MAIN") or os.environ.get("METRICS_FILE_NAME")
+
+        warmup_metrics, _ = calculate_metrics(
+            input_requests=warmup_inputs,
+            outputs=warmup_outputs,
+            dur_s=warmup_dur,
+            tokenizer=tokenizer,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
+            goodput_config_dict=goodput_config_dict,
+            metrics_file_name=warmup_file,
+        )
+        main_metrics, _ = calculate_metrics(
+            input_requests=main_inputs,
+            outputs=main_outputs,
+            dur_s=main_dur,
+            tokenizer=tokenizer,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
+            goodput_config_dict=goodput_config_dict,
+            metrics_file_name=main_file,
+        )
+
+        def _print_block(title: str, m: BenchmarkMetrics, dur: float):
+            print("{s:{c}^{n}}".format(s=title, n=50, c="="))
+            print("{:<40} {:<10}".format("Successful requests:", m.completed))
+            print("{:<40} {:<10.2f}".format("Duration (s):", dur))
+            print("{:<40} {:<10}".format("Total input tokens:", m.total_input))
+            print("{:<40} {:<10}".format("Total generated tokens:", m.total_output))
+            print("{:<40} {:<10.2f}".format("Request throughput (req/s):", m.request_throughput))
+            if goodput_config_dict:
+                print("{:<40} {:<10.2f}".format("Request goodput (req/s):", m.request_goodput))
+            print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", m.output_throughput))
+            print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):", m.total_token_throughput))
+            _print_latency_block(m)
+
+        _print_block(" Warmup Benchmark Result ", warmup_metrics, warmup_dur)
+        _print_block(" Main Benchmark Result ", main_metrics, main_dur)
+
+    # Return structured result for callers.
     result = {
-        "request_rate": request_rate,
-        "num_requests": num_req,
-        "duration": duration,
-        "completed": metrics.completed,
-        "total_input_tokens": metrics.total_input,
-        "total_output_tokens": metrics.total_output,
-        "request_throughput": metrics.request_throughput,
-        "request_goodput": metrics.request_goodput if goodput_config_dict else None,
-        "output_throughput": metrics.output_throughput,
-        "total_token_throughput": metrics.total_token_throughput,
-        "mean_ttft_ms": metrics.mean_ttft_ms,
-        "median_ttft_ms": metrics.median_ttft_ms,
-        "std_ttft_ms": metrics.std_ttft_ms,
-        "mean_tpot_ms": metrics.mean_tpot_ms,
-        "median_tpot_ms": metrics.median_tpot_ms,
-        "std_tpot_ms": metrics.std_tpot_ms,
-        "mean_itl_ms": metrics.mean_itl_ms,
-        "median_itl_ms": metrics.median_itl_ms,
-        "std_itl_ms": metrics.std_itl_ms,
-        "mean_e2el_ms": metrics.mean_e2el_ms,
-        "median_e2el_ms": metrics.median_e2el_ms,
-        "std_e2el_ms": metrics.std_e2el_ms,
+        "total": {
+            "duration": total_duration,
+            "completed": metrics.completed,
+            "total_input_tokens": metrics.total_input,
+            "total_output_tokens": metrics.total_output,
+            "request_throughput": metrics.request_throughput,
+            "request_goodput": metrics.request_goodput if goodput_config_dict else None,
+            "output_throughput": metrics.output_throughput,
+            "total_token_throughput": metrics.total_token_throughput,
+        },
+        "warmup": None,
+        "main": None,
+        "warmup_boundary_ts": warmup_end_wall_ts,
+        "warmup_request_count": warmup_count,
     }
-        
-    # 添加百分位数指标
-    for p, value in metrics.percentiles_ttft_ms:
-        p_word = str(int(p)) if int(p) == p else str(p)
-        result[f"p{p_word}_ttft_ms"] = value
-        
-    for p, value in metrics.percentiles_tpot_ms:
-        p_word = str(int(p)) if int(p) == p else str(p)
-        result[f"p{p_word}_tpot_ms"] = value
-        
-    for p, value in metrics.percentiles_itl_ms:
-        p_word = str(int(p)) if int(p) == p else str(p)
-        result[f"p{p_word}_itl_ms"] = value
-        
-    for p, value in metrics.percentiles_e2el_ms:
-        p_word = str(int(p)) if int(p) == p else str(p)
-        result[f"p{p_word}_e2el_ms"] = value
+    if warmup_metrics is not None:
+        result["warmup"] = {
+            "completed": warmup_metrics.completed,
+            "total_input_tokens": warmup_metrics.total_input,
+            "total_output_tokens": warmup_metrics.total_output,
+            "request_throughput": warmup_metrics.request_throughput,
+            "request_goodput": warmup_metrics.request_goodput if goodput_config_dict else None,
+            "output_throughput": warmup_metrics.output_throughput,
+            "total_token_throughput": warmup_metrics.total_token_throughput,
+        }
+    if main_metrics is not None:
+        result["main"] = {
+            "completed": main_metrics.completed,
+            "total_input_tokens": main_metrics.total_input,
+            "total_output_tokens": main_metrics.total_output,
+            "request_throughput": main_metrics.request_throughput,
+            "request_goodput": main_metrics.request_goodput if goodput_config_dict else None,
+            "output_throughput": main_metrics.output_throughput,
+            "total_token_throughput": main_metrics.total_token_throughput,
+        }
         
     print("-" * 50)
     
@@ -574,7 +669,7 @@ async def run_multi_stage_benchmark(
     
     # 返回总体结果
     
-    return results
+    return result
 
 
 async def benchmark(
@@ -600,6 +695,7 @@ async def benchmark(
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
     print_outputs: bool,
+    warmup_stage_count: int = 0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -696,6 +792,7 @@ async def benchmark(
             selected_percentiles=selected_percentiles,
             goodput_config_dict=goodput_config_dict,
             print_outputs=print_outputs,
+            warmup_stage_count=warmup_stage_count,
         )
     
     # 原有的单阶段基准测试逻辑
@@ -751,13 +848,16 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Optionally print per-request outputs
     if print_outputs:
         total_output_tokens = 0
         for idx, out in enumerate(outputs):
-            if out.success:
+            # Handle both exceptions and RequestFuncOutput objects
+            if isinstance(out, Exception):
+                print(f"Request {idx}: EXCEPTION: {out}")
+            elif out.success:
                 print(f"Request {idx}: {out.generated_text}")
                 # Accumulate output token count with tokenizer fallback
                 output_len = out.output_tokens
@@ -1088,19 +1188,48 @@ def main(args: argparse.Namespace):
         )
 
     elif args.dataset_name == "pattern":
-        input_output_len: list[Tuple[int,int]] = []
-        assert len(benchmark_config.input_output_lens) != 0
-        for ele in benchmark_config.input_output_lens:
-            assert isinstance(ele,list)
-            assert len(ele) == 2
-            input_output_len.append((ele[0],ele[1]))
-        input_requests =  PatternDataset(dataset_path=args.dataset_path).pattern_sample(
-            tokenizer=tokenizer,
-            num_requests=benchmark_config.data_num_requests,
-            input_output_len=input_output_len,
-            prefix_len=args.pattern_prefix_len,
-            range_ratio=args.pattern_range_ratio,
-        )
+        def _to_pairs(v: list[list[int]]) -> list[Tuple[int, int]]:
+            pairs: list[Tuple[int, int]] = []
+            assert len(v) != 0
+            for ele in v:
+                assert isinstance(ele, list)
+                assert len(ele) == 2
+                pairs.append((ele[0], ele[1]))
+            return pairs
+
+        pattern_ds = PatternDataset(dataset_path=args.dataset_path)
+
+        # If warmup is enabled in benchmark config, build a single combined
+        # request list (warmup first, then main) so the benchmark can run once.
+        if getattr(benchmark_config, "warmup", None) is not None and benchmark_config.warmup.enabled:
+            warm = benchmark_config.warmup
+            warm_pairs = _to_pairs(warm.input_output_lens)
+            main_pairs = _to_pairs(benchmark_config.input_output_lens)
+
+            warm_requests = pattern_ds.pattern_sample(
+                tokenizer=tokenizer,
+                num_requests=warm.data_num_requests,
+                input_output_len=warm_pairs,
+                prefix_len=args.pattern_prefix_len,
+                range_ratio=args.pattern_range_ratio,
+            )
+            main_requests = pattern_ds.pattern_sample(
+                tokenizer=tokenizer,
+                num_requests=benchmark_config.data_num_requests,
+                input_output_len=main_pairs,
+                prefix_len=args.pattern_prefix_len,
+                range_ratio=args.pattern_range_ratio,
+            )
+            input_requests = warm_requests + main_requests
+        else:
+            input_output_len = _to_pairs(benchmark_config.input_output_lens)
+            input_requests = pattern_ds.pattern_sample(
+                tokenizer=tokenizer,
+                num_requests=benchmark_config.data_num_requests,
+                input_output_len=input_output_len,
+                prefix_len=args.pattern_prefix_len,
+                range_ratio=args.pattern_range_ratio,
+            )
     else:
         # For datasets that follow a similar structure, use a mapping.
         dataset_mapping = {
@@ -1156,6 +1285,20 @@ def main(args: argparse.Namespace):
     gc.freeze()
 
 
+    # Combine warmup+main stage definitions (request rates + running request counts)
+    # into a single multi-stage run when warmup is enabled.
+    compact_rates = benchmark_config.running_request_rates
+    running_nums = benchmark_config.running_num_requests
+    warmup_stage_count = 0
+    if getattr(benchmark_config, "warmup", None) is not None and benchmark_config.warmup.enabled:
+        warm = benchmark_config.warmup
+        warmup_stage_count = len(warm.running_num_requests)
+        compact_rates = (warm.running_request_rates or []) + (benchmark_config.running_request_rates or [])
+        running_nums = (warm.running_num_requests or []) + (benchmark_config.running_num_requests or [])
+        # Allow separate request_metrics outputs for warmup/main.
+        # (Files are provided by the launcher via env vars.)
+        os.environ.setdefault("METRICS_FILE_NAME_MAIN", os.environ.get("METRICS_FILE_NAME", ""))
+
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -1167,8 +1310,8 @@ def main(args: argparse.Namespace):
             input_requests=input_requests,
             logprobs=args.logprobs,
             request_rate=args.request_rate,
-            compact_kv_request_rate_list=benchmark_config.running_request_rates,
-            running_num_requests=benchmark_config.running_num_requests,
+            compact_kv_request_rate_list=compact_rates,
+            running_num_requests=running_nums,
             burstiness=args.burstiness,
             disable_tqdm=args.disable_tqdm,
             profile=args.profile,
@@ -1180,6 +1323,7 @@ def main(args: argparse.Namespace):
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
             print_outputs=args.print_outputs,
+            warmup_stage_count=warmup_stage_count,
         )
     )
 

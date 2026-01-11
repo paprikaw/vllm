@@ -9,6 +9,7 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import get_pp_group
+from vllm.kv_allocator import ForegroundBackgroundGate
 from vllm.logger import init_logger
 
 from vllm.sequence import IntermediateTensors
@@ -73,6 +74,9 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
         self.layer_weight_size = -1
+
+    def add_fbgate(self, fbgate: ForegroundBackgroundGate) -> None:
+        self.model.add_fbgate(fbgate)
 
     def add_layers(self, layers: Tuple[int, int], decoder_layer_type: type[nn.Module] = Qwen3DecoderLayer) -> None:
         self.model.add_layers(layers, decoder_layer_type)
@@ -147,7 +151,7 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
         return self.layer_weight_size
 
 class DynamicQwen3Model(Qwen3Model):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", ):
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix)
         self.sched_start_layer = self.start_layer
@@ -155,10 +159,13 @@ class DynamicQwen3Model(Qwen3Model):
         self.model_lock = Lock()
         self.cache_config = vllm_config.cache_config
         self.vllm_config = vllm_config  # 保存vllm_config用于后续add_layers
+        self.fbgate: Optional[ForegroundBackgroundGate] = None
         # self.layer_module = vllm_config.compilation_config.static_forward_context
         # logger.info(f"Initlized Dyanmic Qwen3 Model, layers: {self.layers}")
         # logger.info(f"Initlized Dyanmic Qwen3 Model, vllm_config: {self.vllm_config.compilation_config.static_forward_context}")
 
+    def add_fbgate(self, fbgate: ForegroundBackgroundGate) -> None:
+        self.fbgate = fbgate
 
     def add_layers(self, 
                     layers: Tuple[int, int], 
@@ -346,6 +353,82 @@ class DynamicQwen3Model(Qwen3Model):
                     })
                 hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        '''
+        Copied from qwen2.py
+        We will use fbgate here to load weights
+        '''
+        # assert self.fbgate is not None, "fbgate is not set, please call add_fbgate first"
+        if self.fbgate is None:
+            logger.info("fbgate is not set")
+        else:
+            logger.info("fbgate is set")
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: set[str] = set()
+        # 这里的fuse操作有可能导致GPU显存不足。
+        # 我们不能假设模型加载的最小显存开支就等于模型权重大小。
+        def weight_load(name, loaded_weight):
+            time_start = time.time()
+            if "rotary_emb.inv_freq" in name:
+               return 
+            if (self.quant_config is not None and
+                (scale_name := self.quant_config.get_cache_scale(name))):
+                # Loading kv cache quantization scales
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else
+                                 loaded_weight[0])
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                return 
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                if weight_name not in name:
+                   continue  # 修复：应该continue而不是return
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                   continue 
+                if is_pp_missing_parameter(name, self):
+                   continue 
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                   return 
+                # Remapping the name of FP8 kv-scale.
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                   return 
+                if is_pp_missing_parameter(name, self):
+                   return 
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
+            # logger.info(f"Loaded weight for {name} took {human_readable_duration(time.time() - time_start)}")
+            loaded_params.add(name)
+
+        for name, loaded_weight in weights:
+            # fbgate is now handled at the iterator level in default_loader.py
+            # so we don't need to wrap it here again
+            weight_load(name, loaded_weight)
+
+        return loaded_params
+
 
     # def load_layer_weights(self, weights: Iterable[tuple[str, torch.Tensor]], layers: Tuple[int, int])->set[str]:
     #     # Mostly copied from Qwen2Model.load_layer_weights

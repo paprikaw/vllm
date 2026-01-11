@@ -30,7 +30,7 @@ class CustomModelLoader(DefaultModelLoader):
 
     def _get_layer_weights_iterator(
             self, source: DefaultModelLoader.Source, 
-            layers: Tuple[int, int],
+            layers: Tuple[int, int], fbgate = None
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
@@ -44,6 +44,7 @@ class CustomModelLoader(DefaultModelLoader):
             hf_weights_files,
             self.load_config.use_tqdm_on_load,
             layers,
+            fbgate
         )
 
         if self.counter_before_loading_weights == 0.0:
@@ -58,6 +59,13 @@ class CustomModelLoader(DefaultModelLoader):
         model: nn.Module,
         layers: Tuple[int, int],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # 获取 fbgate (如果存在)
+        fbgate = None
+        if hasattr(model, 'model') and hasattr(model.model, 'fbgate'):
+            fbgate = model.model.fbgate
+            if fbgate is not None:
+                logger.info("Found fbgate in model.model, will use it for weight loading")
+
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
@@ -67,14 +75,14 @@ class CustomModelLoader(DefaultModelLoader):
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides",
                                              None),
         )
-        yield from self._get_layer_weights_iterator(primary_weights, layers)
+        yield from self._get_layer_weights_iterator(primary_weights, layers, fbgate)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_layer_weights_iterator(source, layers)
+            yield from self._get_layer_weights_iterator(source, layers, fbgate)
 
     def load_qwen3_layers(self, vllm_config: VllmConfig,
                    model_config: ModelConfig,
@@ -128,6 +136,7 @@ def safetensors_layer_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     layer: Tuple[int, int],
+    fbgate = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     for st_file in tqdm(
@@ -138,12 +147,21 @@ def safetensors_layer_weights_iterator(
     ):
         with safe_open(st_file, framework="pt") as f:
             for name in f.keys():  # noqa: SIM118
-                logger.debug(f"[debug]: starts to load the weight {name} from {st_file}")
+                logger.info(f"[debug]: starts to load the weight {name} from {st_file}")
+                time_start = time.time()
                 if "layers" not in name or \
                     extract_layer_index(name) not in range(layer[0], layer[1]+1):
                     continue
-                param = f.get_tensor(name)
-                logger.debug(f"[debug]: loaded weight {name} from {st_file} with shape {param.shape}")
+                if fbgate is not None:
+                    with fbgate.background():
+                        logger.info(f"[Weight Loading] Got lock before loading weight, took {human_readable_duration(time.time() - time_start)}")
+                        time_now = time.time()
+                        param = f.get_tensor(name)  # ← 在这里读取时使用 fbgate
+                        logger.info(f"[Weight Loading] Loaded weight for {name} took {human_readable_duration(time.time() - time_now)} in device {param.device}")
+                    torch.cuda.synchronize()
+                else:
+                    param = f.get_tensor(name)
+                    torch.cuda.synchronize()
                 yield name, param
 
 def process_layer_weights_after_loading(model: nn.Module, model_config: ModelConfig,

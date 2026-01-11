@@ -9,6 +9,8 @@ import signal
 import shutil
 import subprocess
 import time
+import threading
+import csv
 from dataclasses import dataclass, asdict, field
 from hashlib import sha1
 from pathlib import Path
@@ -134,6 +136,147 @@ class TcRunSpec():
 
 class MultiConfig(BaseModel):
     projects: List[Config]
+
+
+_PHASE_MARKER_TOKEN = "=== VLLM_EXP_PHASE_BOUNDARY ==="
+_BENCH_PHASE_BOUNDARY_TOKEN = "=== VLLM_EXP_BENCH_PHASE_BOUNDARY ==="
+
+
+def _phase_marker_line(phase_from: str, phase_to: str, boundary_ts: float) -> bytes:
+    # Keep it simple and unique; make it easy to grep.
+    return (f"{_PHASE_MARKER_TOKEN} from={phase_from} to={phase_to} boundary_ts={boundary_ts:.6f}\n").encode("utf-8")
+
+
+class _ProcStdoutCapture:
+    """Capture a subprocess stdout stream into a single raw log file.
+
+    We also support injecting a marker line, protected by a lock, to avoid
+    interleaving/corrupt writes.
+    """
+
+    def __init__(self, proc: subprocess.Popen, raw_log_path: Path):
+        if proc.stdout is None:
+            raise ValueError("proc.stdout is None; start process with stdout=PIPE")
+        self._proc = proc
+        self._raw_log_path = raw_log_path
+        self._raw_log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Unbuffered binary file to preserve original output bytes.
+        self._fd = open(self._raw_log_path, "wb", buffering=0)
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="vllm_exp_stdout_capture", daemon=True)
+        self._thread.start()
+
+    @property
+    def raw_log_path(self) -> Path:
+        return self._raw_log_path
+
+    def write_marker(self, marker_line: bytes) -> None:
+        with self._lock:
+            self._fd.write(marker_line)
+            try:
+                self._fd.flush()
+            except Exception:
+                pass
+
+    def _run(self) -> None:
+        # Stream read loop.
+        try:
+            while True:
+                chunk = self._proc.stdout.readline()  # type: ignore[union-attr]
+                if not chunk:
+                    break
+                with self._lock:
+                    self._fd.write(chunk)
+        finally:
+            try:
+                with self._lock:
+                    self._fd.flush()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        try:
+            self._thread.join(timeout=10)
+        except Exception:
+            pass
+        try:
+            with self._lock:
+                self._fd.flush()
+                self._fd.close()
+        except Exception:
+            pass
+
+
+def _split_server_log_by_marker(raw_path: Path, warmup_path: Path, main_path: Path) -> bool:
+    """Split a raw server log into warmup/main parts.
+
+    Returns True if marker was found and split happened.
+    The marker line itself is not included in either output file.
+    """
+    marker_bytes = _PHASE_MARKER_TOKEN.encode("utf-8")
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    warmup_path.parent.mkdir(parents=True, exist_ok=True)
+    main_path.parent.mkdir(parents=True, exist_ok=True)
+
+    found = False
+    # Always overwrite outputs to keep behavior deterministic.
+    with open(raw_path, "rb") as r, open(warmup_path, "wb") as w_warm, open(main_path, "wb") as w_main:
+        out = w_warm
+        while True:
+            line = r.readline()
+            if not line:
+                break
+            if marker_bytes in line:
+                found = True
+                out = w_main
+                continue
+            out.write(line)
+    return found
+
+
+def _split_timestamp_metrics_csv(raw_path: Path, boundary_ts: float, warmup_path: Path, main_path: Path) -> None:
+    """Split vLLM timestamp metrics CSV by timestamp column.
+
+    The output CSVs contain only valid CSV rows (no markers).
+    """
+    warmup_path.parent.mkdir(parents=True, exist_ok=True)
+    main_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not raw_path.exists():
+        return
+
+    with open(raw_path, "r", newline="", encoding="utf-8", errors="ignore") as r, \
+            open(warmup_path, "w", newline="") as w_warm, \
+            open(main_path, "w", newline="") as w_main:
+        reader = csv.reader(r)
+        warm_writer = csv.writer(w_warm)
+        main_writer = csv.writer(w_main)
+
+        header: Optional[list[str]] = None
+        for row in reader:
+            if not row:
+                continue
+            # Header row
+            if row[0] == "timestamp":
+                header = row
+                continue
+            if header is None:
+                # If header is missing for some reason, synthesize the minimal known header.
+                header = ["timestamp"]
+            try:
+                ts = float(row[0])
+            except Exception:
+                # Skip malformed lines.
+                continue
+            if ts < boundary_ts:
+                # Ensure header exists once
+                if w_warm.tell() == 0:
+                    warm_writer.writerow(header)
+                warm_writer.writerow(row)
+            else:
+                if w_main.tell() == 0:
+                    main_writer.writerow(header)
+                main_writer.writerow(row)
 ## Utils 
 def load_config(path: str) -> MultiConfig:
     with open(path, "r") as f:
@@ -239,7 +382,102 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
     )
     return proc
 
-def start_benchmark(cfg: Config, spec: BenchmarkRunSpec, logm: LogManager, vars: Optional[dict[str, Any]] = None) -> bool:
+
+def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManager,
+                               vars: Optional[dict[str, Any]] = None) -> tuple[subprocess.Popen, _ProcStdoutCapture, Path]:
+    """Start vLLM with stdout captured to a single raw log file.
+
+    Returns (proc, capture, timestamp_metrics_raw_path).
+    """
+    extra_env = {}
+    extra_env["VLLM_PP_LAYER_PARTITION"] = spec.start_pp_layer_partition
+    if cfg.migration.is_migration:
+        extra_env["TEST_MIGRATION"] = "1"
+        extra_env[f"PATTERN_BATCH_SIZE"] = str(cfg.benchmark.pattern_batch_size)
+    else:
+        extra_env["TEST_MIGRATION"] = "0"
+
+    if cfg.migration.is_compact_kv:
+        extra_env["TEST_KV_COMPACT"] = "1"
+    else:
+        extra_env["TEST_KV_COMPACT"] = "0"
+
+    env = os.environ.copy()
+    if cfg.network.rank_to_ip:
+        import json as _json
+        env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(cfg.network.rank_to_ip)
+    env.update(extra_env)
+
+    serve_args = [
+        "vllm", "serve", cfg.model.path,
+        "--pipeline-parallel-size", str(cfg.vllm.pipeline_parallel_size),
+        "--gpu-memory-utilization", str(cfg.vllm.gpu_memory_utilization),
+        "--max-model-len", str(cfg.vllm.max_model_len),
+        "--served-model-name", cfg.model.name,
+        "--distributed-executor-backend", "ray",
+        "--disable-log-requests",
+        "--no-enable-prefix-caching",
+        "--scheduler-cls", "vllm.v1.core.sched.dynamic_scheduler.DynamicScheduler",
+        "--worker-cls", "vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker",
+    ]
+    dynamic_cfg = json.dumps({
+        "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
+        "tester_start_step": cfg.migration.tester_start_step,
+        "memory_stress_tester": cfg.migration.memory_stress_tester,
+    })
+    serve_args.extend(["-D", dynamic_cfg])
+
+    if cfg.vllm.chunked_prefill:
+        serve_args.append("--enable-chunked-prefill")
+    if not cfg.vllm.enable_cuda_graph:
+        serve_args.append("--enforce-eager")
+    if cfg.vllm.enable_nsight:
+        serve_args.append("--ray-workers-use-nsight")
+
+    # Timestamp metrics: write a raw CSV, then split into warmup/main later.
+    metrics_raw_path = logm.get_path_with_log_type("timestamp_metrics_raw", "csv", vars)
+    if metrics_raw_path.exists():
+        os.remove(metrics_raw_path)
+    env["VLLM_METRICS_CSV_PATH"] = str(metrics_raw_path)
+
+    raw_log_path = logm.get_path_with_log_type("server_raw", "log", vars)
+    if raw_log_path.exists():
+        os.remove(raw_log_path)
+
+    deployment_config_path = os.environ.get("DEPLOYMENT_CONFIG_PATH")
+    if deployment_config_path is not None:
+        config_file_path = Path(deployment_config_path)
+        config_file_path.parent.mkdir(parents=True, exist_ok=True)
+        config_dict = {
+            "alternative_configs": {"pp_layer_configs": cfg.migration.alternative_configs},
+            "migration_steps": cfg.migration.migration_steps,
+            "compact_steps": cfg.migration.compact_steps,
+        }
+        with open(config_file_path, "w") as f:
+            json.dump(config_dict, f)
+
+    proc = subprocess.Popen(
+        serve_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        preexec_fn=os.setsid,
+        bufsize=0,
+    )
+    capture = _ProcStdoutCapture(proc, raw_log_path)
+    return proc, capture, metrics_raw_path
+
+def start_benchmark(
+    cfg: Config,
+    spec: BenchmarkRunSpec,
+    logm: LogManager,
+    vars: Optional[dict[str, Any]] = None,
+    *,
+    log_basename: str = "benchmark",
+    request_metrics_basename: str = "request_metrics",
+    benchmark_cfg_override: Optional[dict[str, Any]] = None,
+    on_stdout_line: Optional[Callable[[str], None]] = None,
+) -> bool:
     # Use localhost instead of 'head' for local development
     base_url = f"http://{cfg.vllm.head_addr}:{cfg.vllm.port}"
     ok = False
@@ -275,27 +513,50 @@ def start_benchmark(cfg: Config, spec: BenchmarkRunSpec, logm: LogManager, vars:
     config_file_path = Path(benchmark_config_path)
     config_file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(config_file_path, "w", encoding="utf-8") as f:
-        json.dump(cfg.benchmark.model_dump(), f, indent=2, ensure_ascii=False)
+        cfg_payload = benchmark_cfg_override if benchmark_cfg_override is not None else cfg.benchmark.model_dump()
+        json.dump(cfg_payload, f, indent=2, ensure_ascii=False)
     
     # 规定metrics文件的命名方式
-    metrics_file_name = logm.get_path_with_log_type("request_metrics", "csv", vars)
+    metrics_file_name = logm.get_path_with_log_type(request_metrics_basename, "csv", vars)
     if metrics_file_name.exists():
         os.remove(metrics_file_name)
     envs = os.environ.copy()
     envs.update({"METRICS_FILE_NAME": str(metrics_file_name)})
 
-    log_path = logm.get_path_with_log_type("benchmark", "log", vars)
+    log_path = logm.get_path_with_log_type(log_basename, "log", vars)
     if log_path.exists():
         os.remove(log_path)
-    bench_fd = open(log_path, "wb", buffering=0)
     C.print(f"[bold cyan] log_path: {log_path}")
-    ret = subprocess.run(
-        bench_args,
-        stdout=bench_fd,
-        stderr=subprocess.STDOUT,
-        env=envs
-    )
-    ok = (ret.returncode == 0)
+
+    if on_stdout_line is None:
+        bench_fd = open(log_path, "wb", buffering=0)
+        ret = subprocess.run(
+            bench_args,
+            stdout=bench_fd,
+            stderr=subprocess.STDOUT,
+            env=envs,
+        )
+        ok = (ret.returncode == 0)
+    else:
+        # Stream stdout so we can detect phase boundary markers in real time.
+        proc = subprocess.Popen(
+            bench_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=envs,
+            bufsize=0,
+        )
+        assert proc.stdout is not None
+        with open(log_path, "wb", buffering=0) as bench_fd:
+            for raw in iter(proc.stdout.readline, b""):
+                bench_fd.write(raw)
+                try:
+                    line = raw.decode("utf-8", errors="ignore").rstrip("\n")
+                    on_stdout_line(line)
+                except Exception:
+                    pass
+        retcode = proc.wait()
+        ok = (retcode == 0)
     return ok
 
 # def start_benchmark(cfg: Config, log_fd, spec: BenchmarkRunSpec, extra_env: Dict[str,str]) -> subprocess.Popen:
@@ -375,15 +636,108 @@ def one_off_test(cfg: Config, logm: LogManager):
         vars_mapping = {"start_pp_layer_partition": spec.start_pp_layer_partition,
                         "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn}
         logm.write_constants_meta(vars_mapping)
-        proc = start_vllm(cfg=cfg, spec=spec, logm=logm, vars=vars_mapping)
-        bench_spec = BenchmarkRunSpec(input_output_len=cfg.benchmark.input_output_lens, running_request_rate_list=cfg.benchmark.running_request_rates)
+        proc, capture, timestamp_metrics_raw_path = start_vllm_with_raw_logging(cfg=cfg, spec=spec, logm=logm, vars=vars_mapping)
 
-        # 使用同样的方式对benchmark的文件命名
-        ok = start_benchmark(cfg=cfg, spec=bench_spec, logm=logm, vars=vars_mapping)
-        if not ok:
-            stop_tree(proc)
-            raise Exception("Benchmark failed")
+        # Single benchmark run. If warmup is enabled, benchmark script will
+        # submit warmup stages then immediately submit main stages (no pause)
+        # and print a boundary marker line. We detect that marker live and
+        # inject a corresponding server marker into server_raw.
+
+        boundary_ts: Optional[float] = None
+        warmup_enabled = cfg.benchmark.warmup is not None and cfg.benchmark.warmup.enabled
+
+        # Prepare per-phase request_metrics outputs (benchmark script writes valid CSV only).
+        if warmup_enabled:
+            req_warm = logm.get_path_with_log_type("request_metrics_warmup", "csv", vars_mapping)
+            req_main = logm.get_path_with_log_type("request_metrics", "csv", vars_mapping)
+            if req_warm.exists():
+                os.remove(req_warm)
+            if req_main.exists():
+                os.remove(req_main)
+            os.environ["METRICS_FILE_NAME_WARMUP"] = str(req_warm)
+            os.environ["METRICS_FILE_NAME_MAIN"] = str(req_main)
+
+        def _on_bench_line(line: str) -> None:
+            nonlocal boundary_ts
+            if boundary_ts is not None:
+                return
+            if _BENCH_PHASE_BOUNDARY_TOKEN in line:
+                # Expected format: "=== VLLM_EXP_BENCH_PHASE_BOUNDARY === boundary_ts=..."
+                try:
+                    parts = line.split("boundary_ts=")
+                    ts = float(parts[-1].strip())
+                except Exception:
+                    ts = time.time()
+                boundary_ts = ts
+                capture.write_marker(_phase_marker_line("warmup", "main", boundary_ts))
+
+        bench_spec = BenchmarkRunSpec(
+            input_output_len=cfg.benchmark.input_output_lens,
+            running_request_rate_list=cfg.benchmark.running_request_rates,
+        )
+        # Keep a single benchmark log file. It will contain the boundary marker
+        # line and both warmup/main summary blocks.
+        bench_log_basename = "benchmark"
+        ok = start_benchmark(
+            cfg=cfg,
+            spec=bench_spec,
+            logm=logm,
+            vars=vars_mapping,
+            log_basename=bench_log_basename,
+            request_metrics_basename="request_metrics",
+            benchmark_cfg_override=cfg.benchmark.model_dump(),
+            on_stdout_line=_on_bench_line if warmup_enabled else None,
+        )
+        benchmark_failed = not ok
+        if benchmark_failed:
+            C.print("[yellow]WARNING:[/] Benchmark failed, but will attempt to process logs")
+        
         stop_tree(proc)
+
+        # Ensure raw capture thread is done.
+        capture.close()
+
+        # Split server raw log into warmup/main (marker excluded from outputs)
+        # Even if benchmark failed, we should still try to split the logs that were captured.
+        server_raw_path = logm.get_path_with_log_type("server_raw", "log", vars_mapping)
+        server_warmup_path = logm.get_path_with_log_type("server_warmup", "log", vars_mapping)
+        server_main_path = logm.get_path_with_log_type("server", "log", vars_mapping)
+        if server_warmup_path.exists():
+            os.remove(server_warmup_path)
+        if server_main_path.exists():
+            os.remove(server_main_path)
+        split_ok = _split_server_log_by_marker(server_raw_path, server_warmup_path, server_main_path)
+        if not split_ok:
+            # No boundary marker found (e.g., warmup disabled): keep compatibility by
+            # making server-*.log contain the full raw log for downstream analysis.
+            if server_warmup_path.exists():
+                os.remove(server_warmup_path)
+            if server_main_path.exists():
+                os.remove(server_main_path)
+            shutil.copyfile(server_raw_path, server_main_path)
+
+        # Split timestamp metrics CSV by boundary_ts if warmup was enabled and marker inserted.
+        if boundary_ts is not None and split_ok:
+            ts_warmup_path = logm.get_path_with_log_type("timestamp_metrics_warmup", "csv", vars_mapping)
+            ts_main_path = logm.get_path_with_log_type("timestamp_metrics", "csv", vars_mapping)
+            if ts_warmup_path.exists():
+                os.remove(ts_warmup_path)
+            if ts_main_path.exists():
+                os.remove(ts_main_path)
+            _split_timestamp_metrics_csv(timestamp_metrics_raw_path, boundary_ts, ts_warmup_path, ts_main_path)
+        else:
+            # No warmup boundary: keep compatibility by producing a main timestamp_metrics from raw.
+            ts_main_path = logm.get_path_with_log_type("timestamp_metrics", "csv", vars_mapping)
+            if ts_main_path.exists():
+                os.remove(ts_main_path)
+            if timestamp_metrics_raw_path.exists():
+                shutil.copyfile(timestamp_metrics_raw_path, ts_main_path)
+
+        # After attempting to process all logs, raise exception if benchmark failed
+        if benchmark_failed:
+            raise Exception("Benchmark failed (logs have been split if possible)")
+
+        # Note: benchmark log is not split into separate files by design.
     except Exception as e:
         C.print(f"[red]ERROR[/] {e}")
         ok = False

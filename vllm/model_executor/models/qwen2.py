@@ -391,6 +391,7 @@ class Qwen2Model(nn.Module):
         # 这里的fuse操作有可能导致GPU显存不足。
         # 我们不能假设模型加载的最小显存开支就等于模型权重大小。
         for name, loaded_weight in weights:
+            time_start = time.time()
             if "rotary_emb.inv_freq" in name:
                 continue
             if (self.quant_config is not None and
@@ -431,6 +432,8 @@ class Qwen2Model(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+            torch.cuda.synchronize()
+            logger.info(f"Loaded weight for {name} took {human_readable_duration(time.time() - time_start)}")
             loaded_params.add(name)
         return loaded_params
 

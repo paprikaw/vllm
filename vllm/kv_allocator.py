@@ -21,6 +21,7 @@ import torch
 kv_allocator_available = False
 _cpp_module = None
 
+from vllm.dynamic_utils import ForegroundBackgroundGate
 from vllm.logger import init_logger
 logger = init_logger(__name__)
 
@@ -36,10 +37,10 @@ except ImportError as e:
     )
 class KVAllocator():
     def __init__(self):
-        self.allocate_lock: Optional[threading.Lock] = None
+        self.fb_gate: Optional[ForegroundBackgroundGate] = None
 
-    def set_lock(self, lock: threading.Lock) -> None:
-        self.allocate_lock = lock
+    def set_lock(self, lock: ForegroundBackgroundGate) -> None:
+        self.fb_gate = lock
 
     def allocate_python_style(
         self,
@@ -109,8 +110,10 @@ class KVAllocator():
         if stream_ptr == 0:
             current_stream = torch.cuda.current_stream(device)
             stream_ptr = current_stream.cuda_stream
-        if self.allocate_lock:
-            with self.allocate_lock:
+        if self.fb_gate is not None:
+            with self.fb_gate.background():
+                alloc_time_ms = (time.perf_counter() - start_time) * 1000
+                logger.info(f"async kv allocation with lock: alloc_time={alloc_time_ms:.2f}ms")
                 results =  _cpp_module.allocate_with_cuda_async(size, block_shape, dtype, device, stream_ptr)
         else:
             results = _cpp_module.allocate_with_cuda_async(size, block_shape, dtype, device, stream_ptr)

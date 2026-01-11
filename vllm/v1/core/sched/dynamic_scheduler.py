@@ -493,13 +493,12 @@ class DynamicScheduler(Scheduler):
                 # Log queue status
                 _, cur_running = self.running_controller.get_cur()
                 cur_waiting = self.waiting_controller.get_cur()
-                logger.info(f"[ttft_trace] Scheduler: migration_status=NOT_MIGRATING, waiting_reqs={len(cur_waiting)}, running_reqs={len(cur_running)}")
                 for req in list(cur_waiting)[:5]:  # Log first 5 waiting requests
                     wait_time = (time.time() - req.arrival_time) * 1000
-                    logger.info(f"[ttft_trace] Waiting request {req.request_id}: wait_time={wait_time:.2f}ms, num_tokens={req.num_tokens}, num_computed_tokens={req.num_computed_tokens}")
+                    # logger.info(f"[ttft_trace] Waiting request {req.request_id}: wait_time={wait_time:.2f}ms, num_tokens={req.num_tokens}, num_computed_tokens={req.num_computed_tokens}")
                 scheduler_output = self._schedule(is_old_request=True)
                 schedule_total_time = (time.time() - schedule_start_time) * 1000
-                logger.info(f"[ttft_trace] Scheduler: dynamic_schedule() took {schedule_total_time:.2f}ms")
+                # logger.info(f"[ttft_trace] Scheduler: dynamic_schedule() took {schedule_total_time:.2f}ms")
                 return scheduler_output
 
             _, cur_running = self.running_controller.get_cur()

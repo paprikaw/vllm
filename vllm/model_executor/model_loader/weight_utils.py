@@ -457,6 +457,7 @@ def np_cache_weights_iterator(
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
+    fbgate = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     for st_file in tqdm(
@@ -467,7 +468,16 @@ def safetensors_weights_iterator(
     ):
         with safe_open(st_file, framework="pt") as f:
             for name in f.keys():  # noqa: SIM118
-                param = f.get_tensor(name)
+                time_start = time.time()
+                if fbgate is not None:
+                    logger.info(f"[Weight Loading] Loading weight for {name} using fbgate")
+                    with fbgate.background():
+                        param = f.get_tensor(name)  # ← 在这里读取时使用 fbgate
+                else:
+                    logger.info(f"[Weight Loading] Loading weight for {name} without fbgate")
+                    param = f.get_tensor(name)
+                torch.cuda.synchronize()
+                # logger.info(f"[Weight Loading] Loaded weight for {name} took {human_readable_duration(time.time() - time_start)}")
                 yield name, param
 
 # def layers_safetensors_weights_iterator(
@@ -801,3 +811,43 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
 
     # If there were no matches, return the untouched param name
     return name
+
+def human_readable_duration(seconds: float) -> str:
+    """Return a concise human-readable duration string.
+
+    Examples:
+        0.532 -> "532ms"
+        12.3  -> "12.3s"
+        75.0  -> "1m 15.0s"
+        3720  -> "1h 2m 0.0s"
+    """
+    try:
+        if seconds < 0:
+            # Guard against negative inputs; show absolute value with prefix
+            return f"-{human_readable_duration(-seconds)}"
+        if seconds < 1e-3:
+            # microseconds
+            return f"{seconds * 1e6:.0f}µs"
+        if seconds < 1:
+            # milliseconds
+            return f"{seconds * 1e3:.0f}ms"
+
+        # For >= 1 second, format as h m s with a decimal on seconds
+        total_seconds = float(seconds)
+        td = timedelta(seconds=total_seconds)
+        # Extract hours, minutes, seconds
+        total_sec_int = int(td.total_seconds())
+        hours, rem = divmod(total_sec_int, 3600)
+        minutes, secs_int = divmod(rem, 60)
+        secs_rem = total_seconds - (hours * 3600 + minutes * 60)
+
+        parts: list[str] = []
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes or hours:
+            parts.append(f"{minutes}m")
+        parts.append(f"{secs_rem:.1f}s")
+        return " ".join(parts)
+    except Exception:
+        # Fallback to raw seconds if any unexpected error happens
+        return f"{seconds:.3f}s"

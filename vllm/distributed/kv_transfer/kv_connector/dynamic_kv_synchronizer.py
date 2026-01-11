@@ -201,7 +201,7 @@ class PairPipe:
             ack = self.meta_group.recv_obj(src=self.peer_rank)
             assert ack == "ACK", f"Expected ACK, got {ack}"
 
-    def recv_data(self, dtype: torch.dtype, shape: torch.Size, send_ack: bool = False) -> torch.Tensor:
+    def recv_data(self, dtype: torch.dtype, shape: torch.Size, stream=None, send_ack: bool = False) -> torch.Tensor:
         """Data-plane receive: allocate buffer and perform NCCL recv.
 
         Args:
@@ -214,7 +214,7 @@ class PairPipe:
         if self.is_use_nccl:
             assert self._nccl is not None, "The nccl communicator should be initialized"
             buf = self._prepare_recv_buffer(dtype, shape)
-            self._nccl.recv(buf, src=self.peer_rank)
+            self._nccl.recv(buf, src=self.peer_rank, stream=stream)
         else:
             buf = self.data_group.recv_obj(src=self.peer_rank)
             assert isinstance(buf, torch.Tensor), "The object should be a torch.Tensor"
@@ -473,7 +473,7 @@ class DynamicKVSynchronizer():
             torch.cuda.set_device(self.device)
             pipe = self._ensure_pipe_and_buffer(rank, 'recv')
             pipe = self._pair_pipes_recv[rank]
-            return pipe.recv_data(dtype, shape, send_ack=send_ack)
+            return pipe.recv_data(dtype, shape, stream=pipe._kv_transfer_stream, send_ack=send_ack)
 
     def get_recv_pipe(self, rank: int) -> PairPipe:
         self._ensure_pipe_and_buffer(rank, 'recv')
@@ -969,7 +969,7 @@ class DynamicKVSynchronizer():
         if slot_mapping.size(0) != meta.num_tokens:
             logger.info(f"Warning: slot_mapping size {slot_mapping.size(0)} does not match num_tokens {meta.num_tokens}, proceed anyway.")
         with self.device:
-            logger.info(f"apply kv patch to kv cache on device {self.device}")
+            logger.info(f"[listen loop] apply kv patch to kv cache on device {self.device}")
             for layer_id, key, value in zip(meta.layer_ids, keys, values):
                 local_layer_id = layer_id - start_layer_id
                 if is_flexi:
@@ -990,4 +990,10 @@ class DynamicKVSynchronizer():
                     kv_cache = self.kv_caches[local_layer_id]
                     # 使用裁剪后的 slot_mapping，从 0 到 num_tokens
                     self.kv_helper.put_kv_to_cache(self.model_executable, key, value, layer_id, kv_cache, slot_mapping, 0, slot_mapping.size(0))
+            try:
+                torch.cuda.synchronize()
+            except Exception as e:
+                logger.info(f"current device: {torch.cuda.current_device()}, device context: {self.device}")
+                raise e
+
         return meta.id

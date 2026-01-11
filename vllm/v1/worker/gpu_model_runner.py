@@ -1207,7 +1207,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     inputs_embeds=inputs_embeds,
                 )
                 model_forward_end = time.time()
-                logger.info(f"[perf_analysis] model.forward() CPU time: {model_forward_end - model_forward_start:.4f}s")
             except Exception as e:
                 time.sleep(2)
                 logger.info(f"Exception during model forward: {e}")

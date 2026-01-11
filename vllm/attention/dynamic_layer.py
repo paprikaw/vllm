@@ -146,7 +146,6 @@ class FlexiAttention(Attention):
                 attn_time = time.time() - attn_start
                 from vllm.logger import init_logger
                 logger = init_logger(__name__)
-                logger.debug(f"[perf_analysis] FlexiAttention {self.layer_name}: flexi_unified_attention took {attn_time:.4f}s")
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:

@@ -233,31 +233,35 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
             # )
             # return output
 
-            flexi_flash_attn_varlen_func(
-                q=query[:num_actual_tokens],
-                k_meta=page_meta,
-                v_meta=page_meta,
-                num_blocks=num_blocks,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                seqused_k=seqused_k,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=True,
-                alibi_slopes=self.alibi_slopes,
-                window_size=self.sliding_window,
-                block_table=block_table,
-                softcap=self.logits_soft_cap,
-                scheduler_metadata=scheduler_metadata,
-                fa_version=self.vllm_flash_attn_version,
-                q_descale=layer._q_scale.expand(descale_shape),
-                k_descale=layer._k_scale.expand(descale_shape),
-                v_descale=layer._v_scale.expand(descale_shape),
-                cached_k_ptrs=k_cache_dev_ptr,
-                cached_v_ptrs=v_cache_dev_ptr,
-            )
+            try:
+                flexi_flash_attn_varlen_func(
+                    q=query[:num_actual_tokens],
+                    k_meta=page_meta,
+                    v_meta=page_meta,
+                    num_blocks=num_blocks,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    scheduler_metadata=scheduler_metadata,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=layer._q_scale.expand(descale_shape),
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                    cached_k_ptrs=k_cache_dev_ptr,
+                    cached_v_ptrs=v_cache_dev_ptr,
+                )
 
+            except Exception as e:
+                logger.info(f"Error is happening, k_meta device: {page_meta.device}, v_meta device: {page_meta.device}, query device: {query.device}, output device: {output.device}, cached_k_ptrs: {k_cache_dev_ptr}, cached_v_ptrs: {v_cache_dev_ptr}")
+                raise e
             # torch.testing.assert_close(output, copied_output, atol=2e-2, rtol=1e-2), \
             #     f"{torch.max(torch.abs(output - copied_output))}"
             return output

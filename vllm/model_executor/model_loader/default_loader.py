@@ -173,7 +173,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-            self, source: "Source"
+            self, source: "Source", fbgate = None
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
@@ -199,6 +199,7 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = safetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    fbgate,  # Pass fbgate to iterator
                 )
         else:
             weights_iterator = pt_weights_iterator(
@@ -240,6 +241,13 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # 获取 fbgate (如果存在)
+        fbgate = None
+        if hasattr(model, 'model') and hasattr(model.model, 'fbgate'):
+            fbgate = model.model.fbgate
+            if fbgate is not None:
+                logger.info("Found fbgate in model.model, will use it for weight loading")
+        
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
@@ -249,14 +257,14 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides",
                                              None),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(primary_weights, fbgate)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(source, fbgate)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model,

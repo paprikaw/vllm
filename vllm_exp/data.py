@@ -59,7 +59,7 @@ class ModelCfg(BaseModel):
 class VllmCfg(BaseModel):
     pipeline_parallel_size: int = 2
     gpu_memory_utilization: float = 0.9
-    max_model_len: int = 4096
+    max_model_len: int = 40960
     chunked_prefill: bool = True
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
@@ -78,6 +78,44 @@ class MigrationCfg(BaseModel):
     tester_start_step: Optional[int] = None
     memory_stress_tester: Optional[Dict[str, Any]] = None
 
+class WarmupBenchCfg(BaseModel):
+    """Optional warmup stage config for vllm_exp.
+
+    This mirrors the request-related fields used by the formal benchmark.
+    The warmup stage is executed (and logged separately) only when enabled.
+    """
+
+    enabled: bool = False
+    running_num_requests: list[int] = []
+    data_num_requests: list[int] = []
+    sweep_request_rates: list[float] = []
+    running_request_rates: list[float] = []
+    input_output_lens: list[list[int]] = []
+
+    @field_validator("running_request_rates")
+    @classmethod
+    def _check_running_request_rate_len(cls, v: List[float], info: ValidationInfo):
+        num_requests = info.data.get("running_num_requests") or []
+        if v and not num_requests:
+            raise ValueError("当提供 warmup.running_request_rates 时，必须同时提供 warmup.running_num_requests。")
+        if v and num_requests and len(v) != len(num_requests):
+            raise ValueError(
+                f"warmup.running_request_rates 长度 {len(v)} 必须与 warmup.running_num_requests 长度 {len(num_requests)} 一致"
+            )
+        return v
+
+    @field_validator("input_output_lens")
+    @classmethod
+    def _check_io_lens_len(cls, v: List[List[int]], info: ValidationInfo):
+        num_requests = info.data.get("data_num_requests") or []
+        if v and not num_requests:
+            raise ValueError("当提供 warmup.input_output_lens 时，必须同时提供 warmup.data_num_requests。")
+        if v and num_requests and len(v) != len(num_requests):
+            raise ValueError(
+                f"warmup.input_output_lens 长度 {len(v)} 必须与 warmup.data_num_requests 长度 {len(num_requests)} 一致"
+            )
+        return v
+
 class BenchCfg(BaseModel):
     running_num_requests: list[int] = []
     data_num_requests: list[int] = []
@@ -90,6 +128,9 @@ class BenchCfg(BaseModel):
     print_outputs: bool = False
     # Path to benchmark script
     benchmark_script_path: str = "/root/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+
+    # Optional warmup stage (separate logs + metrics)
+    warmup: Optional[WarmupBenchCfg] = None
 
     @field_validator("running_request_rates")
     @classmethod
