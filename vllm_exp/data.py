@@ -128,6 +128,9 @@ class BenchCfg(BaseModel):
     print_outputs: bool = False
     # Path to benchmark script
     benchmark_script_path: str = "/root/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+    # Burstiness factor for request generation (default 1.0 = Poisson process)
+    # Higher values (e.g., 100) result in more uniform/constant request rate
+    burstiness: float = 100.0
 
     # Optional warmup stage (separate logs + metrics)
     warmup: Optional[WarmupBenchCfg] = None

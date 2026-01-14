@@ -117,8 +117,11 @@ class DynamicGPUWorker(Worker):
         # 记录当前rank是否已经结束 kv resizing
         self.kv_resizing_done = False
 
-        # stream
-        self.high_priority_stream: Optional[torch.cuda.Stream] = None
+        # streams
+        self.inference_stream = None
+        self.migration_stream = None
+        
+
 
 
         # page meta
@@ -243,17 +246,19 @@ class DynamicGPUWorker(Worker):
         time_start = time.time()
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         with DeadlockTimeoutContext(self._layer_loaded_cv, "_layer_loaded_cv", timeout=2):
-            logger.info(f"start to load layer lock")
-            # 记录扩容前的起始 layer，便于在 start_layer 左移时重排本地 kv 索引基准
-            old_start_layer = self.model_runner.model.model.start_layer
-            old_end_layer = self.model_runner.model.model.end_layer
-            assert self.device is not None
-            self.model_runner.add_layers(layer_list, self.device)
+            assert self.migration_stream is not None
+            with torch.cuda.stream(self.migration_stream):
+                logger.info(f"start to load layer, current stream:{torch.cuda.current_stream()}")
+                # 记录扩容前的起始 layer，便于在 start_layer 左移时重排本地 kv 索引基准
+                old_start_layer = self.model_runner.model.model.start_layer
+                old_end_layer = self.model_runner.model.model.end_layer
+                assert self.device is not None
+                self.model_runner.add_layers(layer_list, self.device)
 
-            # 接收完weights之后，在这里进行kv cache数据结构的扩展，保证后续kv cache tensor绑定的正确性
-            new_start_layer = self.model_runner.model.model.start_layer
-            new_end_layer = self.model_runner.model.model.end_layer
-            logger.info(f"debug: ---------------------add layers, old_start_layer: {old_start_layer}, new_start_layer: {new_start_layer}, old_end_layer: {old_end_layer}, new_end_layer: {new_end_layer}")
+                # 接收完weights之后，在这里进行kv cache数据结构的扩展，保证后续kv cache tensor绑定的正确性
+                new_start_layer = self.model_runner.model.model.start_layer
+                new_end_layer = self.model_runner.model.model.end_layer
+                logger.info(f"debug: ---------------------add layers, old_start_layer: {old_start_layer}, new_start_layer: {new_start_layer}, old_end_layer: {old_end_layer}, new_end_layer: {new_end_layer}")
 
             # 在这里更新kv_cache_group
             if is_flexi:
@@ -360,7 +365,8 @@ class DynamicGPUWorker(Worker):
         self.model_runner: DynamicGPUModelRunner = DynamicGPUModelRunner(
             self.vllm_config, self.device)
         kv_allocator.set_lock(self.model_runner.fbgate)
-        self.high_priority_stream = torch.cuda.Stream(device=self.device, priority=-5)
+        self.inference_stream = torch.cuda.Stream(device=self.device, priority=-5)
+        self.migration_stream = torch.cuda.Stream(device=self.device)
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
@@ -722,7 +728,7 @@ class DynamicGPUWorker(Worker):
                         for local_idx, block_id in enumerate(row):
                             if block_id in migrate_record:
                                 row[local_idx] = migrate_record[block_id]
-                logger.info(f"kv cache compaction flexi take {human_readable_duration(time.time() - time_start_within_lock)} seconds within lock")
+                logger.info(f"[timeline]: kv cache compaction within lock take {human_readable_duration(time.time() - time_start_within_lock)}")
                 self.migration_records_for_specific_scheduler_output_version[self.cur_scheduler_output_version] = migrate_record
                 self.cur_scheduler_output_version += 1
             assert self.device is not None
@@ -747,7 +753,7 @@ class DynamicGPUWorker(Worker):
                             if block_id in migrate_record:
                                 row[local_idx] = migrate_record[block_id]
                 torch.cuda.synchronize()
-                logger.info(f"kv cache compaction regular take {human_readable_duration(time.time() - time_start_within_lock)} seconds within lock")
+                logger.info(f"timeline]: kv cache compaction within lock take {human_readable_duration(time.time() - time_start_within_lock)}")
                 self.migration_records_for_specific_scheduler_output_version[self.cur_scheduler_output_version] = migrate_record
                 self.cur_scheduler_output_version += 1
 
@@ -1144,7 +1150,7 @@ class DynamicGPUWorker(Worker):
     def _listen_loop(self, from_rank: int):
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
-        time_start = time.time()
+        time_start = None
         while True:
             received_layer = set()
             layers_to_be_received  = set()
@@ -1188,8 +1194,8 @@ class DynamicGPUWorker(Worker):
                 tmp_kv_tensors_dict[meta.layer_id] = kv_tensor
 
                 # logger.info(f"available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
-
-            logger.info(f"[debug]: receive kv tensor finished, start to bind kv cache")
+            assert time_start is not None
+            logger.info(f"[debug]: receive kv tensor finished, time taken {human_readable_duration(time.time() - time_start)} start to bind kv cache")
             time_start_bind_kv_cache = time.time()
             # 在kv cache绑定前，weight必须loading结束
             # streams = [torch.cuda.Stream() for _ in range(len(tmp_kv_tensors_dict))]
@@ -1200,7 +1206,6 @@ class DynamicGPUWorker(Worker):
                     while not self.model_runner.has_layer(layer_id):
                         logger.info(f"[debug]: rank {self.rank} waiting for layer {layer_id} to be loaded")
                         self._layer_loaded_cv.wait()
-                logger.info(f"[debug]: rank {self.rank} bind layer {layer_id}'s kv cache and weight")
                 if is_flexi:
                     slot_mapping = tmp_slot_mapping_dict[layer_id]
                     assert self.device is not None
@@ -1228,7 +1233,6 @@ class DynamicGPUWorker(Worker):
                             runner=self.model_runner,
                             kv_tensor=kv_tensor
                         )
-                logger.info(f"[operation]: rank {self.rank} layer {layer_id}'s kv cache and weight is loaded")
                 tmp_kv_tensors_dict.pop(layer_id)
             torch.cuda.synchronize()
             logger.info(f"[timeline]: bind kv cache time taken: {human_readable_duration(time.time() - time_start_bind_kv_cache)}")

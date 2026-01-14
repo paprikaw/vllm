@@ -123,15 +123,15 @@ allocate_with_cuda_async(
     // Allocate device memory for pointer arrays
     void** k_ptrs_dev;
     void** v_ptrs_dev;
-    cudaMallocAsync(&k_ptrs_dev, size * sizeof(void*));
-    cudaMemcpy(k_ptrs_dev, k_ptrs.data(),
+    cudaMallocAsync(&k_ptrs_dev, size * sizeof(void*), stream);
+    cudaMemcpyAsync(k_ptrs_dev, k_ptrs.data(),
                size * sizeof(void*),
-               cudaMemcpyHostToDevice);
+               cudaMemcpyHostToDevice, stream);
     
-    cudaMallocAsync(&v_ptrs_dev, size * sizeof(void*));
-    cudaMemcpy(v_ptrs_dev, v_ptrs.data(),
+    cudaMallocAsync(&v_ptrs_dev, size * sizeof(void*), stream);
+    cudaMemcpyAsync(v_ptrs_dev, v_ptrs.data(),
                size * sizeof(void*),
-               cudaMemcpyHostToDevice);
+               cudaMemcpyHostToDevice, stream);
     // Synchronize stream to ensure all allocations are complete
     cudaStreamSynchronize(stream);
     

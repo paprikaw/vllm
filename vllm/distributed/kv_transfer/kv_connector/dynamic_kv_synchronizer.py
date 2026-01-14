@@ -163,7 +163,7 @@ class PairPipe:
         # NCCL data-plane communicator
             self._nccl = PyNcclCommunicator(group=self.meta_group, device=local_rank)
             # 创建专用的 CUDA stream 用于 KV 传输，避免与模型计算的 stream 冲突
-            self._kv_transfer_stream = torch.cuda.Stream(device=self.device, priority=0)
+            self._kv_transfer_stream = None
         else:
             self._nccl = None
             self._kv_transfer_stream = None
@@ -968,6 +968,7 @@ class DynamicKVSynchronizer():
         # assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
         if slot_mapping.size(0) != meta.num_tokens:
             logger.info(f"Warning: slot_mapping size {slot_mapping.size(0)} does not match num_tokens {meta.num_tokens}, proceed anyway.")
+        torch.cuda.synchronize()
         with self.device:
             logger.info(f"[listen loop] apply kv patch to kv cache on device {self.device}")
             for layer_id, key, value in zip(meta.layer_ids, keys, values):

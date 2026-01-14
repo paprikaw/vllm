@@ -468,7 +468,9 @@ async def run_multi_stage_benchmark(
 
     total_duration = time.perf_counter() - warmup_start_perf
 
-    # Compute full-run metrics (no per-phase file write by default)
+    # Compute full-run metrics
+    # If no warmup, write to metrics_file_name. Otherwise, write to separate phase files.
+    full_run_metrics_file = "" if warmup_stage_count > 0 else os.environ.get("METRICS_FILE_NAME")
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
@@ -477,9 +479,9 @@ async def run_multi_stage_benchmark(
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
-        # Do not write request_metrics for the combined run; warmup/main
-        # are written to separate phase files.
-        metrics_file_name="",
+        # Write request_metrics for full run if warmup is disabled.
+        # Otherwise, warmup/main are written to separate phase files.
+        metrics_file_name=full_run_metrics_file,
     )
         
     def _print_latency_block(m: BenchmarkMetrics) -> None:
@@ -1095,6 +1097,11 @@ def main(args: argparse.Namespace):
             raise ValueError(f"Benchmark config file not found: {args.benchmark_config}")
         with open(args.benchmark_config, 'r') as f:
             benchmark_config = BenchCfg.model_validate(json.load(f))
+        
+        # Override args.burstiness with value from config file if present
+        if hasattr(benchmark_config, 'burstiness'):
+            args.burstiness = benchmark_config.burstiness
+            print(f"Using burstiness from config file: {args.burstiness}")
 
     if args.dataset_name is None:
         raise ValueError(

@@ -11,10 +11,12 @@ envs:
   CUDA_LAUNCH_BLOCKING: "0"
   NCCL_DEBUG: "INFO"
   PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+  VLLM_USE_RAY_COMPILED_DAG: "1"
   # PYTORCH_USE_CUDA_DSA: "1"
   # PYTORCH_NO_CUDA_MEMORY_CACHING: "1"
 projects:
-  - project: "migration_test_async_with_migration_split"
+  - project: "migration_test_async_with_no_migration_no_warmup"
 
     type: "one_off_test"
     model:
@@ -35,7 +37,7 @@ projects:
         - "32,32"
     migration:
       is_migration: true
-      migration_steps: [130]
+      migration_steps: [100]
       # migration_steps: [100]
       alternative_configs:
         "0": [32, 32]
@@ -53,13 +55,14 @@ projects:
       data_num_requests: [200]
       input_output_lens: [[800, 64]]
       running_num_requests: [200]
-      running_request_rates: [2.0]
+      running_request_rates: [1.8]
+      burstiness: 100.0  # Higher value = more uniform rate (匀速发送)
       warmup:
-        enabled: true
-        data_num_requests: [15]
+        enabled: false
+        data_num_requests: [25]
         input_output_lens: [[10000, 50]]
-        running_request_rates: [15]
-        running_num_requests: [15]
+        running_request_rates: [25]
+        running_num_requests: [25]
 is_log_cover: true
 
 # projects:

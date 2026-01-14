@@ -58,8 +58,8 @@ METRIC_CONFIGS = [
     ),
     MetricConfig(
         name="compact_kv_cache",
-        display_name="Compact KV Cache Times (During Migration)",
-        log_pattern=r'\[timeline\]: compact kv cache take: ([0-9.eE+-]+\s*[a-zµ]+)',
+        display_name="Compact KV Cache Times (Within Lock)",
+        log_pattern=r'\[timeline\]: kv cache compaction within lock take ([0-9.eE+-]+\s*[a-zµ]+)',
         metric_type=MetricType.SPECIAL,
         description="Time spent compacting KV cache"
     ),

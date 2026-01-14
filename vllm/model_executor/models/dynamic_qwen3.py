@@ -309,33 +309,10 @@ class DynamicQwen3Model(Qwen3Model):
                     try:
                         # 使用 threading.Timer 实现超时检测
                         result = [None, None]  # 用于存储结果
-                        exception_holder = [None]  # 用于存储异常
                         
-                        def run_layer():
-                            try:
-                                h, r = layer(positions, hidden_states, residual)
-                                result[0], result[1] = h, r
-                            except Exception as e:
-                                logger.info(f"""Exception in layer {layer_idx}""")
-                                logger.info(f"self weights: {list(layer.named_parameters())}")
-                                raise e
+                        h, r = layer(positions, hidden_states, residual)
+                        result[0], result[1] = h, r
 
-
-                        
-                        # # 在新线程中运行 layer
-                        # layer_thread = threading.Thread(target=run_layer, daemon=True)
-                        # layer_thread.start()
-                        # layer_thread.join(timeout=layer_timeout)
-                        
-                        # if layer_thread.is_alive():
-                        #     # 线程仍在运行，说明超时了
-                        #     elapsed = time.time() - layer_start_time
-                        #     raise TimeoutError(
-                        #         f"Layer {layer_idx} execution exceeded {layer_timeout:.1f}s timeout "
-                        #         f"(elapsed: {elapsed:.2f}s)"
-                        #     )
-                        run_layer()
-                        # 获取结果
                         hidden_states, residual = result[0], result[1]
                         
                     except TimeoutError as e:
@@ -378,7 +355,6 @@ class DynamicQwen3Model(Qwen3Model):
         # 这里的fuse操作有可能导致GPU显存不足。
         # 我们不能假设模型加载的最小显存开支就等于模型权重大小。
         def weight_load(name, loaded_weight):
-            time_start = time.time()
             if "rotary_emb.inv_freq" in name:
                return 
             if (self.quant_config is not None and
@@ -425,8 +401,15 @@ class DynamicQwen3Model(Qwen3Model):
         for name, loaded_weight in weights:
             # fbgate is now handled at the iterator level in default_loader.py
             # so we don't need to wrap it here again
-            weight_load(name, loaded_weight)
-
+            if self.fbgate is None:
+                weight_load(name, loaded_weight)
+            else:
+                with self.fbgate.background():
+                    time_start = time.time()
+                    # weight_load(name, loaded_weight)
+                    logger.info(f"[Weight Loading] Loaded weight for {name} took {human_readable_duration(time.time() - time_start)}, with stream id: {torch.cuda.current_stream()}")
+        if self.fbgate is not None:
+            raise RuntimeError("fbgate should be all released after weight loading")
         return loaded_params
 
 

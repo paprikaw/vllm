@@ -48,7 +48,7 @@ try:
             # and it needs a special logic of self.setup_device_if_necessary()
             time_recv = time.time()  # 记录接收时间
             assert isinstance(self.worker, DynamicGPUWorker)
-            assert self.worker.high_priority_stream is not None, "high_priority_stream is not initialized"
+            assert self.worker.inference_stream is not None, "high_priority_stream is not initialized"
             
             # Use high priority stream for model execution with proper synchronization
             # The high priority stream ensures compute kernels are scheduled with higher priority,
@@ -85,8 +85,8 @@ try:
                     # Execute model in high priority stream
                     # logger.info(f"[perf_analysis] rank {self.rpc_rank}: About to execute_model()")
                     exec_start = time.time()
-                    assert self.worker.high_priority_stream is not None, "high_priority_stream is not initialized"
-                    with torch.cuda.stream(self.worker.high_priority_stream):
+                    assert self.worker.inference_stream is not None, "high_priority_stream is not initialized"
+                    with torch.cuda.stream(self.worker.inference_stream):
                         try:
                             model_exec_start = time.time()
                             output = self.worker.model_runner.execute_model(
@@ -105,7 +105,7 @@ try:
                 # CRITICAL: Synchronize the high priority stream before using results
                 # This ensures all computations are complete before we access the output tensors
                 sync_start = time.time()
-                torch.cuda.synchronize(self.worker.high_priority_stream)
+                torch.cuda.synchronize(self.worker.device)
                 sync_time = time.time() - sync_start
 
                 time_after_execute = time.time()
