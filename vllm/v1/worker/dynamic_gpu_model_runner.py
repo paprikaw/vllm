@@ -72,9 +72,45 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self.key_cache_ptrs: list[int] = []
         self.value_cache_ptrs: list[int] = []
         self.page_meta: Optional[torch.Tensor] = None
-    # def load_model(self)->float:
-    #     super().load_model()
-    #     return self.model_memory_usage
+        # Create CustomModelLoader for weight preloading
+        self.custom_loader = CustomModelLoader(self.vllm_config.load_config)
+
+    def load_model(self) -> None:
+        """Override to use CustomModelLoader with weight preloading."""
+        logger.info("Starting to load model %s...", self.model_config.model)
+        from vllm.utils import DeviceMemoryProfiler, GiB_bytes
+        from vllm.distributed.parallel_state import prepare_communication_buffer_for_model
+        
+        with DeviceMemoryProfiler() as m:
+            time_before_load = time.perf_counter()
+            logger.info(f"start to load model, vllm_config: {self.vllm_config}")
+            
+            # Use CustomModelLoader which will preload all weights
+            self.model = self.custom_loader.load_model(
+                vllm_config=self.vllm_config,
+                model_config=self.model_config
+            )
+            
+            if self.lora_config:
+                logger.info(f"applied lora config")
+                self.model = self.load_lora_model(self.model,
+                                                  self.model_config,
+                                                  self.scheduler_config,
+                                                  self.lora_config,
+                                                  self.device)
+            if hasattr(self, "drafter"):
+                logger.info("Loading drafter model...")
+                self.drafter.load_model(self.model)
+            if self.use_aux_hidden_state_outputs:
+                self.model.set_aux_hidden_state_layers(
+                    self.model.get_eagle3_aux_hidden_state_layers())
+            time_after_load = time.perf_counter()
+        
+        self.model_memory_usage = m.consumed_memory
+        logger.info("Model loading took %.4f GiB and %.6f seconds",
+                    self.model_memory_usage / GiB_bytes,
+                    time_after_load - time_before_load)
+        prepare_communication_buffer_for_model(self.model)
     def initialize_kv_cache_for_layers(self, 
             kv_cache_specs: dict[str, KVCacheSpec],
             kv_cache_size: int,
@@ -355,11 +391,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
         #     f"Available memory: {human_readable_size(available_memory)} is not enough for {num_added_layers} layers"
 
         model: DynamicQwen3ForCausalLM = self.model
-        loader = CustomModelLoader(self.vllm_config.load_config)
+        # Use the existing custom_loader that has preloaded weights
         with set_current_vllm_config(self.vllm_config):
             for layers in layers_list:
                 assert len(layers) == 2
-                loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model, device)
+                self.custom_loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model, device)
 
     def reinitialize_kv_cache(self, kv_cache_config: KVCacheConfig, kv_synchronizer: DynamicKVSynchronizer) -> None:
         """

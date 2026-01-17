@@ -2,7 +2,7 @@
 /vllm/_version.py
 
 # vllm-flash-attn built from source
-vllm/vllm_flash_attn/*
+# vllm/vllm_flash_attn/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

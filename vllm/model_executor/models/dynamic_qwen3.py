@@ -337,6 +337,7 @@ class DynamicQwen3Model(Qwen3Model):
         Copied from qwen2.py
         We will use fbgate here to load weights
         '''
+        from vllm.model_executor.layers.linear import RowParallelLinear
         # assert self.fbgate is not None, "fbgate is not set, please call add_fbgate first"
         if self.fbgate is None:
             logger.info("fbgate is not set")
@@ -351,14 +352,24 @@ class DynamicQwen3Model(Qwen3Model):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        # Create a mapping from parameter name to its parent module
+        # This is needed to call chunk_weight_loader on the module, not the parameter
+        param_to_module = {}
+        for module_name, module in self.named_modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                full_param_name = f"{module_name}.{param_name}" if module_name else param_name
+                param_to_module[full_param_name] = module
+        
         loaded_params: set[str] = set()
         # 这里的fuse操作有可能导致GPU显存不足。
         # 我们不能假设模型加载的最小显存开支就等于模型权重大小。
         def weight_load(name, loaded_weight):
+            from vllm.model_executor.layers.linear import MergedColumnParallelLinear, RowParallelLinear
             if "rotary_emb.inv_freq" in name:
                return 
             if (self.quant_config is not None and
                 (scale_name := self.quant_config.get_cache_scale(name))):
+                assert False
                 # Loading kv cache quantization scales
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader",
@@ -379,37 +390,64 @@ class DynamicQwen3Model(Qwen3Model):
                    continue 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if isinstance(param_to_module[name], MergedColumnParallelLinear):
+                    time_start = time.time()
+                    weight_loader(self.fbgate, param, loaded_weight, shard_id)
+                    logger.info(f"stacked params, loaded weight using weight loader: {weight_loader} for param: {name}, took {human_readable_duration(time.time() - time_start)}")
+                    break
+
+                if self.fbgate is not None:
+                    with self.fbgate.background():
+                        time_start = time.time()
+                        weight_loader(param, loaded_weight, shard_id)
+                        logger.info(f"stacked params, loaded weight using weight loader: {weight_loader} for param: {name}, took {human_readable_duration(time.time() - time_start)}")
+                else:
+                    time_start = time.time()
+                    weight_loader(param, loaded_weight, shard_id)
+                    logger.info(f"stacked params, loaded weight using weight loader: {weight_loader} for param: {name}, took {human_readable_duration(time.time() - time_start)}")
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                   return 
+                    return 
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
-                   return 
+                    return 
                 if is_pp_missing_parameter(name, self):
-                   return 
+                    return 
                 param = params_dict[name]
+                
+                # Check if the parameter's parent module has chunk_weight_loader
+                # chunk_weight_loader = getattr(parent_module, "chunk_weight_loader", None) if parent_module else None
                 weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
+                        default_weight_loader)
+                assert not isinstance(param_to_module[name], MergedColumnParallelLinear)
+                if isinstance(param_to_module[name], RowParallelLinear):
+                    time_start = time.time()
+                    weight_loader(self.fbgate, param, loaded_weight)
+                    logger.info(f"loaded weight using weight loader: {weight_loader} for param: {name}, took {human_readable_duration(time.time() - time_start)}")
+                    loaded_params.add(name)
+                    return
+                if self.fbgate is not None:
+                    with self.fbgate.background():
+                        time_start = time.time()
+                        weight_loader(param, loaded_weight)
+                        logger.info(f"loaded weight using weight loader: {weight_loader} for param: {name}, took {human_readable_duration(time.time() - time_start)}")
+                else:
+                    start_time = time.time()
+                    weight_loader(param, loaded_weight)
+                    logger.info(f"loaded weight using weight loader: {weight_loader} for param: {name}, took {human_readable_duration(time.time() - start_time)}")
             # logger.info(f"Loaded weight for {name} took {human_readable_duration(time.time() - time_start)}")
             loaded_params.add(name)
-
+        logger.info(f"start to load weights inside dynamic qwen3")
         for name, loaded_weight in weights:
             # fbgate is now handled at the iterator level in default_loader.py
             # so we don't need to wrap it here again
-            if self.fbgate is None:
-                weight_load(name, loaded_weight)
-            else:
-                with self.fbgate.background():
-                    time_start = time.time()
-                    # weight_load(name, loaded_weight)
-                    logger.info(f"[Weight Loading] Loaded weight for {name} took {human_readable_duration(time.time() - time_start)}, with stream id: {torch.cuda.current_stream()}")
-        if self.fbgate is not None:
-            raise RuntimeError("fbgate should be all released after weight loading")
+            time_start = time.time()
+            weight_load(name, loaded_weight)
+            logger.info(f"[Weight Loading] Loaded weight for {name} took {human_readable_duration(time.time() - time_start)}, with stream id: {torch.cuda.current_stream()}")
+            
         return loaded_params
 
 

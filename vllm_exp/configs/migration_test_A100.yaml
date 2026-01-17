@@ -31,13 +31,13 @@ projects:
     vllm:
       head_addr: "localhost"
       pipeline_parallel_size: 2
-      enable_flexi_flash_attn: true # Set to true to enable Flexi Flash Attention
+      enable_flexi_flash_attn: false # Set to true to enable Flexi Flash Attention
       gpu_memory_utilization: 0.75
       start_pp_layer_partitions:
         - "32,32"
     migration:
       is_migration: true
-      migration_steps: [100]
+      migration_steps: [300]
       # migration_steps: [100]
       alternative_configs:
         "0": [32, 32]
@@ -52,10 +52,10 @@ projects:
       # input_output_lens: [[1024, 32], [512, 128]]
       # running_num_requests: [40, 160]
       # running_request_rates: [40, 2]
-      data_num_requests: [200]
+      data_num_requests: [100]
       input_output_lens: [[800, 64]]
-      running_num_requests: [200]
-      running_request_rates: [1.8]
+      running_num_requests: [100]
+      running_request_rates: [2]
       burstiness: 100.0  # Higher value = more uniform rate (匀速发送)
       warmup:
         enabled: false

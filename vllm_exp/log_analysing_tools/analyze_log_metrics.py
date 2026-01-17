@@ -101,6 +101,12 @@ METRIC_CONFIGS = [
         display_name="After Forwarding Took",
         log_pattern=r'after forwarding took ([0-9.eE+-]+\s*[a-zµ]+)',
     ),
+    MetricConfig(
+        name="attn_forward",
+        display_name="Attention Forward Times",
+        log_pattern=r'\[timeline\] attention forward took ([0-9.eE+-]+\s*[a-zµ]+)',
+        description="Time taken for attention forward"
+    ),
     
     # Communication
     MetricConfig(

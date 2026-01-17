@@ -366,6 +366,7 @@ class DynamicGPUWorker(Worker):
             self.vllm_config, self.device)
         kv_allocator.set_lock(self.model_runner.fbgate)
         self.inference_stream = torch.cuda.Stream(device=self.device, priority=-5)
+        logger.info(f"high priority inference stream created: {self.inference_stream}")
         self.migration_stream = torch.cuda.Stream(device=self.device)
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -753,7 +754,7 @@ class DynamicGPUWorker(Worker):
                             if block_id in migrate_record:
                                 row[local_idx] = migrate_record[block_id]
                 torch.cuda.synchronize()
-                logger.info(f"timeline]: kv cache compaction within lock take {human_readable_duration(time.time() - time_start_within_lock)}")
+                logger.info(f"[timeline]: kv cache compaction within lock take {human_readable_duration(time.time() - time_start_within_lock)}")
                 self.migration_records_for_specific_scheduler_output_version[self.cur_scheduler_output_version] = migrate_record
                 self.cur_scheduler_output_version += 1
 

@@ -2,6 +2,7 @@
 
 import itertools
 from abc import abstractmethod
+import time
 from typing import Any, Literal, Optional, Union
 
 import torch
@@ -13,6 +14,7 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               split_tensor_along_last_dim,
                               tensor_model_parallel_all_gather,
                               tensor_model_parallel_all_reduce)
+from vllm.dynamic_utils import ForegroundBackgroundGate
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
@@ -554,6 +556,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                          return_bias=return_bias)
 
     def weight_loader(self,
+                      fbgate: Optional[ForegroundBackgroundGate],
                       param: Parameter,
                       loaded_weight: torch.Tensor,
                       loaded_shard_id: Optional[int] = None):
@@ -641,7 +644,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
                 loaded_weight_shard = loaded_weight.narrow(
                     output_dim, shard_offset, shard_size)
-                self.weight_loader(param, loaded_weight_shard, shard_id)
+                self.weight_loader(fbgate, param, loaded_weight_shard, shard_id)
             return
 
         assert loaded_shard_id < len(self.output_sizes)
@@ -702,7 +705,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     "the same for all partitions.")
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        chunked_copy_inplace("MergeColumnParallelLinear Loader", fbgate=fbgate,  src=loaded_weight, dst=param_data)
+        # param_data.copy_(loaded_weight)
 
     def _load_fused_module_from_checkpoint(self, param: BasevLLMParameter,
                                            loaded_weight: torch.Tensor):
@@ -1220,7 +1224,49 @@ class RowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+    # def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+    #     tp_rank = get_tensor_model_parallel_rank()
+    #     tp_size = get_tensor_model_parallel_world_size()
+    #     input_dim = getattr(param, "input_dim", None)
+    #     use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+    #     is_sharded_weight = getattr(param, "is_sharded_weight", False)
+    #     # bitsandbytes loads the weights of the specific portion
+    #     # no need to narrow
+    #     is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+
+    #     # Special case for GGUF
+    #     is_gguf_weight = getattr(param, "is_gguf_weight", False)
+    #     is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+    #     if is_gguf_weight_type:
+    #         param.weight_type = loaded_weight.item()
+
+    #     # Materialize GGUF UninitializedParameter
+    #     if is_gguf_weight and isinstance(param, UninitializedParameter):
+    #         weight_shape = list(loaded_weight.shape)
+    #         if input_dim:
+    #             weight_shape[input_dim] = weight_shape[input_dim] // tp_size
+    #         param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
+
+    #     param_data = param.data
+    #     if input_dim is not None and not is_sharded_weight:
+    #         shard_size = param_data.shape[input_dim]
+    #         start_idx = tp_rank * shard_size
+    #         loaded_weight = loaded_weight.narrow(input_dim, start_idx,
+    #                                              shard_size)
+
+    #     # Special case for loading scales off disk, which often do not
+    #     # have a shape (such as in the case of AutoFP8).
+    #     if len(loaded_weight.shape) == 0:
+    #         loaded_weight = loaded_weight.reshape(1)
+
+    #     assert param_data.shape == loaded_weight.shape
+    #     time_start = time.time()
+    #     param_data.copy_(loaded_weight)
+    #     logger.info(f"Row Linear Loader, copy from {param_data.shape} to {loaded_weight.shape} time taken to copy: {human_readable_duration(time.time() - time_start)}")
+
+
+    def weight_loader(self, fbgate: Optional[ForegroundBackgroundGate], param: Parameter, loaded_weight: torch.Tensor):
+
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
         input_dim = getattr(param, "input_dim", None)
@@ -1256,7 +1302,9 @@ class RowParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        time_start = time.time()
+        chunked_copy_inplace("Row Linear Loader", fbgate=fbgate,  src=loaded_weight, dst=param_data)
+        logger.info(f"Row Linear Loader, copy from {param_data.shape} to {loaded_weight.shape} time taken to copy: {human_readable_duration(time.time() - time_start)}")
 
     def weight_loader_v2(self, param: BasevLLMParameter,
                          loaded_weight: torch.Tensor):
@@ -1521,3 +1569,148 @@ class QKVCrossParallelLinear(LinearBase):
         s += f", tp_size={get_tensor_model_parallel_world_size()}"
         s += ", gather_output=False"
         return s
+
+
+def human_readable_duration(seconds: float) -> str:
+    """Return a concise human-readable duration string.
+
+    Examples:
+        0.532 -> "532ms"
+        12.3  -> "12.3s"
+        75.0  -> "1m 15.0s"
+        3720  -> "1h 2m 0.0s"
+    """
+    try:
+        if seconds < 0:
+            # Guard against negative inputs; show absolute value with prefix
+            return f"-{human_readable_duration(-seconds)}"
+        if seconds < 1e-3:
+            # microseconds
+            return f"{seconds * 1e6:.0f}µs"
+        if seconds < 1:
+            # milliseconds
+            return f"{seconds * 1e3:.0f}ms"
+
+        # For >= 1 second, format as h m s with a decimal on seconds
+        total_seconds = float(seconds)
+        td = timedelta(seconds=total_seconds)
+        # Extract hours, minutes, seconds
+        total_sec_int = int(td.total_seconds())
+        hours, rem = divmod(total_sec_int, 3600)
+        minutes, secs_int = divmod(rem, 60)
+        secs_rem = total_seconds - (hours * 3600 + minutes * 60)
+
+        parts: list[str] = []
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes or hours:
+            parts.append(f"{minutes}m")
+        parts.append(f"{secs_rem:.1f}s")
+        return " ".join(parts)
+    except Exception:
+        # Fallback to raw seconds if any unexpected error happens
+        return f"{seconds:.3f}s"
+
+def chunked_copy_inplace(
+    name: str,
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    n_copy: Optional[int] = None,
+    fbgate: Optional[ForegroundBackgroundGate] = None,
+    chunk_size_mb: float = 10.0,
+    non_blocking: bool = False,
+) -> torch.Tensor:
+    """
+    分批执行 tensor copy (inplace),完全兼容 tensor.copy_() 的用法
+    
+    这个函数可以直接替换 `dst.copy_(src)`,接口完全兼容
+    
+    Args:
+        dst: 目标 tensor (会被修改)
+        src: 源 tensor
+        n_copy: 分成多少批 (None 则根据 chunk_size_mb 自动计算)
+        chunk_size_mb: 每批的大小 (MB),仅当 n_copy=None 时使用
+        non_blocking: 是否使用非阻塞 copy
+        fbgate: ForegroundBackgroundGate 对象,用于控制前后台执行上下文
+    
+    Returns:
+        dst (用于链式调用,兼容原生 copy_ 行为)
+    
+    Example:
+        >>> # 原代码
+        >>> param_data.copy_(loaded_weight)
+        
+        >>> # 新代码 - 直接替换
+        >>> chunked_copy_inplace(param_data, loaded_weight)
+        
+        >>> # 或者指定参数
+        >>> chunked_copy_inplace(param_data, loaded_weight, n_copy=20)
+    """
+    # 参数验证
+    assert dst.shape == src.shape, f"Shape mismatch: dst {dst.shape} vs src {src.shape}"
+    
+    # 如果 tensor 很小或不在 CUDA 上,直接 copy
+    total_bytes = src.numel() * src.element_size()
+    min_size_for_chunking = 5 * 1024 * 1024  # 5MB
+    
+    if total_bytes < min_size_for_chunking:
+        time_start = time.time()
+        dst.copy_(src, non_blocking=non_blocking)
+        logger.info(f"[Weight Loading] Direct copy for {name} of size {human_readable_size(total_bytes)} took {human_readable_duration(time.time() - time_start)}")
+        return dst
+    
+    # 自动计算 n_copy
+    if n_copy is None:
+        total_mb = total_bytes / (1024 * 1024)
+        n_copy = max(1, int(total_mb / chunk_size_mb + 0.5))
+    
+    
+    # 如果 n_copy = 1,直接 copy
+    if n_copy == 1:
+        time_start = time.time()
+        dst.copy_(src, non_blocking=non_blocking)
+        logger.info(f"[Weight Loading] Direct copy for {name} of size {human_readable_size(total_bytes)} took {human_readable_duration(time.time() - time_start)}")
+        return dst
+    
+    # 展平为 1D 方便切片
+    dst_flat = dst.view(-1)
+    src_flat = src.view(-1)
+    total_elements = dst_flat.numel()
+    
+    # 计算每批的大小
+    chunk_size = (total_elements + n_copy - 1) // n_copy
+    
+    # 使用当前 stream
+    for i in range(n_copy):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, total_elements)
+        
+        if start_idx >= total_elements:
+            break
+        if fbgate is not None:
+            with fbgate.background():
+                time_start = time.time()
+                dst_flat[start_idx:end_idx].copy_(
+                    src_flat[start_idx:end_idx],
+                    non_blocking=non_blocking
+                )
+                logger.info(f"[Weight Loading] Chunked copy for {name} chunk {i+1}/{n_copy} took {human_readable_duration(time.time() - time_start)}")
+        else:
+            dst_flat[start_idx:end_idx].copy_(
+                src_flat[start_idx:end_idx],
+                non_blocking=non_blocking
+            )
+    return dst
+
+def human_readable_size(size: int) -> str:
+    """Return a concise human-readable size string.
+    """
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 ** 2:
+        return f"{size / 1024:.2f}KB"
+    if size < 1024 ** 3:
+        return f"{size / 1024 ** 2:.2f}MB"
+
+    return f"{size / 1024 ** 3:.2f}GB"
+
