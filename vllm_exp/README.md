@@ -106,13 +106,16 @@ projects:
     vllm:
       pipeline_parallel_size: 2
       gpu_memory_utilization: 0.9
-      start_pp_layer_partitions: ["28,36", "16,48"]
+      start_pp_layer_partitions: ["28,36"]  # Initial config (used at startup)
     migration:
       is_migration: true
       migration_steps: [100]
+      # alternative_configs: Migration target configs ONLY (not initial config)
+      # "0" = first migration target, "1" = second migration target, etc.
+      # The initial config comes from start_pp_layer_partitions above
       alternative_configs:
-        "0": [28, 36]
-        "1": [16, 48]
+        "0": [16, 48]  # First migration: switch to [16, 48]
+        "1": [28, 36]  # Second migration: switch back to [28, 36]
     benchmark:
       sweep_request_rates: [2.5]
       pattern_batch_size: 250

@@ -18,7 +18,7 @@ from functools import cached_property
 from importlib.util import find_spec
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Literal, Optional,
-                    Protocol, TypeVar, Union, cast, get_args, get_origin)
+                    Protocol, TypeVar, Union, cast, get_args, get_origin, Dict)
 
 import regex as re
 import torch
@@ -1719,6 +1719,11 @@ class ParallelConfig:
 
     placement_group: Optional["PlacementGroup"] = None
     """ray distributed model workers placement group."""
+
+    ray_rank_to_node: Optional[Dict[int, str]] = None
+    """Mapping from rank to Ray node IP/hostname for explicit worker placement.
+    Example: {0: "192.168.1.1", 1: "192.168.1.2"} places rank 0 on first node
+    and rank 1 on second node. Used for cross-node pipeline parallelism."""
 
     distributed_executor_backend: Optional[Union[DistributedExecutorBackend,
                                                  type["ExecutorBase"]]] = None

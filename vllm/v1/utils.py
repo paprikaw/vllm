@@ -426,6 +426,23 @@ def dynamic_bind_kv_cache(
         # NOTE: Use list because of v0 PP virtual engine.
         forward_context[layer_name].kv_cache = [kv_cache]
 
+
+def create_ptr_tensor_from_list(ptr_list: list[int], device: torch.device) -> torch.Tensor:
+    """
+    Create a uint64 tensor from a list of pointers.
+    
+    Args:
+        ptr_list: List of raw memory addresses (int)
+        device: Target device for the tensor
+    
+    Returns:
+        torch.Tensor of shape (num_blocks,) with dtype uint64
+    """
+    # Create tensor on CPU first then move to GPU
+    ptr_tensor = torch.tensor(ptr_list, dtype=torch.uint64, device='cpu')
+    return ptr_tensor.to(device)
+
+
 def dynamic_flexi_bind_kv_cache(
     key_cache: dict[str, list[int]],
     value_cache: dict[str, list[int]],
@@ -438,6 +455,8 @@ def dynamic_flexi_bind_kv_cache(
     runner_key_dev_ptrs: list[int],
     runner_value_dev_ptrs: list[int],
     page_meta: torch.Tensor,
+    runner_k_ptr_tensors: list[torch.Tensor],
+    runner_v_ptr_tensors: list[torch.Tensor],
 ) -> None:
     """
     Bind the allocated KV cache to both ModelRunner and forward context so
@@ -448,23 +467,31 @@ def dynamic_flexi_bind_kv_cache(
          kv_caches.
       2) Associates each attention layer in the `forward_context` with its 
          corresponding KV cache in kv_caches.
+      3) Creates and binds k_ptr_tensor/v_ptr_tensor for flexi_direct implementation.
 
     Args:
-        key_cache: The allocated key caches with layer names as keys.
-        value_cache: The allocated value caches with layer names as keys.
+        key_cache: The allocated key caches with layer names as keys (list of page pointers).
+        value_cache: The allocated value caches with layer names as keys (list of page pointers).
         forward_context: The global forward context containing all Attention 
         layers with layer names as keys.
         runner_key_caches: The key_cache declared by ModelRunner.
         runner_value_caches: The value_cache declared by ModelRunner.
+        runner_k_ptr_tensors: List to store k_ptr_tensors (per-layer pointer tensors).
+        runner_v_ptr_tensors: List to store v_ptr_tensors (per-layer pointer tensors).
     """
     # Bind kv_caches to ModelRunner
     assert len(runner_key_caches) == 0
     assert len(runner_value_caches) == 0
+    assert len(runner_k_ptr_tensors) == 0
+    assert len(runner_v_ptr_tensors) == 0
 
     # Convert kv_caches dict to a list of tensors in the order of layer_index.
     index2name = defaultdict(list)
     for layer_name in key_cache:
         index2name[extract_layer_index(layer_name)].append(layer_name)
+
+    # Get device from page_meta
+    device = page_meta.device
 
     for layer_index in sorted(index2name.keys()):
         layer_names = index2name[layer_index]
@@ -482,7 +509,14 @@ def dynamic_flexi_bind_kv_cache(
         kv_synchronizer.value_cache_list.append(value_cache[layer_name])
         kv_synchronizer.key_cache_ptrs.append(key_dev_ptr[layer_name])
         kv_synchronizer.value_cache_ptrs.append(value_dev_ptr[layer_name])
-    # import dyn
+        
+        # Create ptr tensors for flexi_direct implementation
+        # key_cache[layer_name] is a list of pointers (int), convert to tensor
+        k_ptr_tensor = create_ptr_tensor_from_list(key_cache[layer_name], device)
+        v_ptr_tensor = create_ptr_tensor_from_list(value_cache[layer_name], device)
+        runner_k_ptr_tensors.append(k_ptr_tensor)
+        runner_v_ptr_tensors.append(v_ptr_tensor)
+
     from vllm.attention.dynamic_layer import FlexiAttention 
     # Bind kv_caches to forward context
     for layer_name, attn in forward_context.items():
@@ -570,40 +604,48 @@ def dynamic_flexi_bind_single_kv_tensor(
         assert local_index < len(runner.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(runner.key_caches)}"
         key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr = runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping,layer_index, kv_tensor, block_num, stream)
         logger.info(f"bind single kv tensor for {layer_index}, slot_mapping:{slot_mapping}, key_cache_ptr:{key_cache_ptr}, value_cache_ptr:{value_cache_ptr}")
+        k_ptr_tensor = create_ptr_tensor_from_list(key_cache_list, device)
+        v_ptr_tensor = create_ptr_tensor_from_list(value_cache_list, device)
+
+        with runner.forward_lock:        
+            runner.key_caches[local_index] = key_cache_list
+            runner.value_caches[local_index] = value_cache_list
+            runner.key_cache_ptrs[local_index] = key_cache_ptr
+            runner.value_cache_ptrs[local_index] = value_cache_ptr
         
-        runner.key_caches[local_index] = key_cache_list
-        runner.value_caches[local_index] = value_cache_list
-        runner.key_cache_ptrs[local_index] = key_cache_ptr
-        runner.value_cache_ptrs[local_index] = value_cache_ptr
-        kv_synchronizer.key_cache_list[local_index] = key_cache_list
-        kv_synchronizer.value_cache_list[local_index] = value_cache_list
-        kv_synchronizer.key_cache_ptrs[local_index] = key_cache_ptr
-        kv_synchronizer.value_cache_ptrs[local_index] = value_cache_ptr
+            # Create and bind k_ptr_tensor and v_ptr_tensor for flexi_direct implementation
+            runner.k_ptr_tensors[local_index] = k_ptr_tensor
+            runner.v_ptr_tensors[local_index] = v_ptr_tensor
+        
+            kv_synchronizer.key_cache_list[local_index] = key_cache_list
+            kv_synchronizer.value_cache_list[local_index] = value_cache_list
+            kv_synchronizer.key_cache_ptrs[local_index] = key_cache_ptr
+            kv_synchronizer.value_cache_ptrs[local_index] = value_cache_ptr
 
-        # Bind to forward context
-        layer_name: str = get_layer_name_for_index(layer_index, forward_context)
-        if layer_name not in forward_context:
-            raise KeyError(
-                f"No attention layer named {layer_name} in forward_context.")
-        attn_module = forward_context[layer_name]
-        # assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
-        logger.info(f"debug: bind key dev ptr{key_cache_ptr} to layer {layer_name}")
-        attn_module.key_dev_ptr = key_cache_ptr
-        attn_module.value_dev_ptr = value_cache_ptr
-        attn_module.num_blocks = len(key_cache_list)
-        attn_module.page_meta = runner.page_meta
+            # Bind to forward context
+            layer_name: str = get_layer_name_for_index(layer_index, forward_context)
+            if layer_name not in forward_context:
+                raise KeyError(
+                    f"No attention layer named {layer_name} in forward_context.")
+            attn_module = forward_context[layer_name]
+            # assert isinstance(attn_module, FlexiAttention), f"Attention module for layer {layer_name} is not FlexiAttention"
+            logger.info(f"debug: bind key dev ptr{key_cache_ptr} to layer {layer_name}")
+            attn_module.key_dev_ptr = key_cache_ptr
+            attn_module.value_dev_ptr = value_cache_ptr
+            attn_module.num_blocks = len(key_cache_list)
+            attn_module.page_meta = runner.page_meta
 
-        group = runner.kv_cache_config.kv_cache_groups[0]
-        # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
-        if layer_name not in group.layer_names:
-            # 按 layer_index 位置插入，保持有序
-            insert_idx = len(group.layer_names)
-            target_idx = extract_layer_index(layer_name)
-            for i, name in enumerate(group.layer_names):
-                if extract_layer_index(name) > target_idx:
-                    insert_idx = i
-                    break
-            group.layer_names.insert(insert_idx, layer_name)
+            group = runner.kv_cache_config.kv_cache_groups[0]
+            # 3) 补齐 kv_cache_config 的 layer_names，保证后续 attn_metadata 覆盖
+            if layer_name not in group.layer_names:
+                # 按 layer_index 位置插入，保持有序
+                insert_idx = len(group.layer_names)
+                target_idx = extract_layer_index(layer_name)
+                for i, name in enumerate(group.layer_names):
+                    if extract_layer_index(name) > target_idx:
+                        insert_idx = i
+                        break
+                group.layer_names.insert(insert_idx, layer_name)
 
 def dynamic_flexi_bind_single_kv_cache(
     start_layer: int,
@@ -613,6 +655,8 @@ def dynamic_flexi_bind_single_kv_cache(
     value_cache_list: list[int],
     key_cache_ptr: int,
     value_cache_ptr: int,
+    k_ptr_tensor: torch.Tensor,
+    v_ptr_tensor: torch.Tensor,
     forward_context: dict[str, "Attention"],
     kv_synchronizer: "DynamicKVSynchronizer",
     runner: "DynamicGPUModelRunner"):
@@ -628,7 +672,10 @@ def dynamic_flexi_bind_single_kv_cache(
     assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
     local_index = layer_index - start_layer
     assert local_index < len(runner.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(runner.key_caches)}"
-
+            
+        
+    runner.k_ptr_tensors[local_index] = k_ptr_tensor
+    runner.v_ptr_tensors[local_index] = v_ptr_tensor
     runner.key_caches[local_index] = key_cache_list
     runner.value_caches[local_index] = value_cache_list
     runner.key_cache_ptrs[local_index] = key_cache_ptr

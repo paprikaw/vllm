@@ -252,6 +252,7 @@ set(VLLM_EXT_SRC
   "csrc/quantization/activation_kernels.cu"
   "csrc/cuda_utils_kernels.cu"
   "csrc/prepare_inputs/advance_step.cu"
+  "csrc/ptr_table_kernels.cu"
   "csrc/custom_all_reduce.cu"
   "csrc/torch_bindings.cpp")
 

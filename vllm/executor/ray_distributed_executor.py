@@ -342,18 +342,36 @@ class RayDistributedExecutor(DistributedExecutorBase):
 
         env_vars_to_copy.extend(current_platform.additional_env_vars)
 
+        # Critical env vars that MUST be copied to workers even if not in os.environ
+        # These use vLLM's default values from envs.py
+        critical_env_vars_with_defaults = {
+            'RAY_DEDUP_LOGS': '0',  # Disable Ray log deduplication for debugging
+        }
+
         # Copy existing env vars to each worker's args
         for args in all_args_to_update_environment_variables:
             # TODO: refactor platform-specific env vars
             for name in env_vars_to_copy:
                 if name in os.environ:
                     args[name] = os.environ[name]
+                elif name in critical_env_vars_with_defaults:
+                    # Use vLLM's default value for critical env vars not set in os.environ
+                    args[name] = critical_env_vars_with_defaults[name]
+
+        # Collect which env vars are actually being copied
+        copied_vars = [v for v in env_vars_to_copy if v in os.environ]
+        copied_with_defaults = [v for v in critical_env_vars_with_defaults 
+                                if v not in os.environ and v in env_vars_to_copy]
 
         logger.info("non_carry_over_env_vars from config: %s",
                     self.non_carry_over_env_vars)
         logger.info(
             "Copying the following environment variables to workers: %s",
-            [v for v in env_vars_to_copy if v in os.environ])
+            copied_vars)
+        if copied_with_defaults:
+            logger.info(
+                "Using vLLM default values for env vars not in os.environ: %s",
+                {v: critical_env_vars_with_defaults[v] for v in copied_with_defaults})
         logger.info(
             "If certain env vars should NOT be copied to workers, add them to "
             "%s file", self.non_carry_over_env_vars_file)

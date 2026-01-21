@@ -26,6 +26,7 @@ import zmq
 from bitarray import bitarray
 
 from vllm.config import ParallelConfig, VllmConfig
+from vllm import envs
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
@@ -96,7 +97,19 @@ class DynamicEngineCore(EngineCore):
 
         # TODO: Load initial configurations properly
         self.dynamic_config = dynamic_config
-        self.cur_pp_layer_config = self.dynamic_config.alternative_configs.pp_layer_configs["0"]
+        # Initialize cur_pp_layer_config from VLLM_PP_LAYER_PARTITION environment variable
+        # This is the actual initial configuration used by vLLM at startup
+        partition_list_str = envs.VLLM_PP_LAYER_PARTITION
+        if partition_list_str is None:
+            raise ValueError("VLLM_PP_LAYER_PARTITION environment variable must be set")
+        partitions = [int(layer) for layer in partition_list_str.split(",")]
+        initial_layer_configs = []
+        start_layer = 0
+        for num_layers in partitions:
+            end_layer = start_layer + num_layers - 1
+            initial_layer_configs.append((start_layer, end_layer))
+            start_layer = end_layer + 1
+        self.cur_pp_layer_config = initial_layer_configs
         self.migration_in_process = False
 
         # Setup KV Caches and update CacheConfig after profiling.
@@ -1179,7 +1192,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        engine_core: DynamicEngineCoreProc
+        engine_core: Optional[DynamicEngineCoreProc] = None
         try:
             parallel_config: ParallelConfig = kwargs[
                 "vllm_config"].parallel_config
@@ -1439,7 +1452,9 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         kv_utilizations = deque(maxlen=WINDOW)
 
         num_of_requests = 0 
-        cur_config = 1 # Start from 1, 0 is the initial config
+        # Start from 0: alternative_configs now represents migration targets only
+        # (initial config is from VLLM_PP_LAYER_PARTITION, not from alternative_configs)
+        cur_config = 0
         while True:
             num_of_requests += self.request_num_queue.get()
             logger.info("num_of_requests: " + str(num_of_requests))

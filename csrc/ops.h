@@ -140,6 +140,17 @@ void gelu_fast(torch::Tensor& out, torch::Tensor& input);
 
 void gelu_quick(torch::Tensor& out, torch::Tensor& input);
 
+// Update ptr_table from block_table using fused CUDA kernel
+// Fuses: flatten, clamp, mask creation, gather, and reshape operations
+namespace vllm {
+void update_ptr_table_from_block_table(
+    torch::Tensor& ptr_table,           // Output: (num_layers, batch_size, max_blocks_per_req), int64
+    const torch::Tensor& block_table,   // Input: (batch_size, max_blocks_per_req), int32
+    const torch::Tensor& ptr_tensors,   // Input: (num_layers, num_blocks), int64
+    int64_t num_layers,
+    int64_t batch_size);
+}  // namespace vllm
+
 void advance_step_flashattn(int64_t num_seqs, int64_t num_queries,
                             int64_t block_size, torch::Tensor& input_tokens,
                             torch::Tensor& sampled_token_ids,

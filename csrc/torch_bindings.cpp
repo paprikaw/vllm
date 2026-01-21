@@ -138,6 +138,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_quick", torch::kCUDA, &gelu_quick);
 
+  // Fused ptr_table update from block_table
+  // Used for flexi_direct attention to efficiently build ptr_table from block indices
+  ops.def(
+      "update_ptr_table_from_block_table("
+      "    Tensor! ptr_table, Tensor block_table, Tensor ptr_tensors,"
+      "    int num_layers, int batch_size) -> ()");
+  ops.impl("update_ptr_table_from_block_table", torch::kCUDA,
+           &vllm::update_ptr_table_from_block_table);
+
   // prepare_inputs advance_step
   ops.def(
       "advance_step_flashattn(int num_seqs, int num_queries, int block_size, "

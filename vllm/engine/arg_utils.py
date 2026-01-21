@@ -359,6 +359,7 @@ class EngineArgs:
     num_scheduler_steps: int = SchedulerConfig.num_scheduler_steps
     multi_step_stream_outputs: bool = SchedulerConfig.multi_step_stream_outputs
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
+    ray_rank_to_node: Optional[Dict[int, str]] = ParallelConfig.ray_rank_to_node
     num_gpu_blocks_override: Optional[
         int] = CacheConfig.num_gpu_blocks_override
     num_lookahead_slots: int = SchedulerConfig.num_lookahead_slots
@@ -632,6 +633,13 @@ class EngineArgs:
         parallel_group.add_argument(
             "--ray-workers-use-nsight",
             **parallel_kwargs["ray_workers_use_nsight"])
+        parallel_group.add_argument(
+            "--ray-rank-to-node",
+            type=json.loads,
+            default=None,
+            help='JSON string mapping rank to Ray node IP for cross-node '
+                 'worker placement. Example: \'{"0": "192.168.1.1", "1": "192.168.1.2"}\'. '
+                 'When specified, workers will be placed on the specified nodes.')
         parallel_group.add_argument(
             "--disable-custom-all-reduce",
             **parallel_kwargs["disable_custom_all_reduce"])
@@ -1081,6 +1089,7 @@ class EngineArgs:
             max_parallel_loading_workers=self.max_parallel_loading_workers,
             disable_custom_all_reduce=self.disable_custom_all_reduce,
             ray_workers_use_nsight=self.ray_workers_use_nsight,
+            ray_rank_to_node=self.ray_rank_to_node,
             placement_group=placement_group,
             distributed_executor_backend=self.distributed_executor_backend,
             worker_cls=self.worker_cls,

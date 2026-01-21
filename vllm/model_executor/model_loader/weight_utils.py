@@ -892,8 +892,16 @@ def chunked_copy_inplace(
     
     # 如果 tensor 很小或不在 CUDA 上,直接 copy
     total_bytes = src.numel() * src.element_size()
-    min_size_for_chunking = 5 * 1024 * 1024  # 5MB
+    min_size_for_chunking = 2 * chunk_size_mb * 1024 * 1024  # 两倍于所定义的size大小
     
+    if fbgate is not None:
+        with fbgate.background():
+            dst.copy_(src, non_blocking=non_blocking)
+            return dst
+    else:
+        dst.copy_(src, non_blocking=non_blocking)
+        return dst
+
     if total_bytes < min_size_for_chunking or not (dst.is_cuda and src.is_cuda):
         dst.copy_(src, non_blocking=non_blocking)
         return dst

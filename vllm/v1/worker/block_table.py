@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+
 import numpy as np
 import torch
 
@@ -137,3 +139,202 @@ class MultiGroupBlockTable:
     def __getitem__(self, idx: int) -> "BlockTable":
         """Returns the BlockTable for the i-th KV cache group."""
         return self.block_tables[idx]
+
+
+class PtrTable:
+    """
+    A table for storing KV cache pointers for flexi_direct implementation.
+    Similar to BlockTable but stores uint64 pointers instead of int32 block indices.
+    
+    For each layer, stores a mapping from (batch_idx, block_idx) to actual memory pointer.
+    Stores either K or V pointers (not both) - create two instances for K and V.
+    """
+
+    def __init__(
+        self,
+        max_num_reqs: int,
+        max_num_blocks_per_req: int,
+        num_layers: int,
+        pin_memory: bool,
+        device: torch.device,
+    ):
+        self.max_num_reqs = max_num_reqs
+        self.max_num_blocks_per_req = max_num_blocks_per_req
+        self.num_layers = num_layers
+        self.pin_memory = pin_memory
+        self.device = device
+
+        # GPU tensor: (num_layers, max_num_reqs, max_num_blocks_per_req)
+        # Use int64 internally for computation (PyTorch CUDA supports it better)
+        # then view as uint64 when returning
+        self.ptr_table = torch.zeros(
+            (num_layers, max_num_reqs, max_num_blocks_per_req),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        # CPU tensor with pinned memory for async copy (for potential future use)
+        self.ptr_table_cpu = torch.zeros(
+            (num_layers, max_num_reqs, max_num_blocks_per_req),
+            device="cpu",
+            dtype=torch.int64,
+            pin_memory=pin_memory,
+        )
+        # Cached stacked ptr_tensors to avoid repeated stacking
+        # Shape: (num_layers, num_blocks_per_layer) int64
+        self._cached_stacked_ptr_tensors: Optional[torch.Tensor] = None
+        self._cached_ptr_tensor_id: Optional[int] = None  # Use id() to detect changes
+
+    def prepare_stacked_tensors(self, ptr_tensors: list[torch.Tensor]) -> Optional[torch.Tensor]:
+        """
+        Prepare new stacked ptr_tensors without switching.
+        Use this to pre-compute the stacked tensor, then call commit_stacked_tensors()
+        to atomically switch to it.
+        
+        Args:
+            ptr_tensors: List of per-layer pointer tensors, each (num_blocks,) uint64
+        
+        Returns:
+            The prepared stacked tensor, or None if no valid layers
+        """
+        num_layers = len(ptr_tensors)
+        if num_layers == 0:
+            return None
+        
+        # Find valid layers and get max num_blocks
+        valid_layers = [(i, ptr_tensors[i]) for i in range(num_layers) if ptr_tensors[i].numel() > 0]
+        if not valid_layers:
+            return None
+        
+        max_blocks = max(t.numel() for _, t in valid_layers)
+        
+        # Pre-allocate stacked tensor: (num_layers, max_blocks)
+        stacked = torch.zeros((num_layers, max_blocks), dtype=torch.int64, device=self.device)
+        
+        # Fill in valid layers
+        for layer_idx, t in valid_layers:
+            t_int64 = t.view(torch.int64)
+            stacked[layer_idx, :t_int64.numel()] = t_int64
+        
+        return stacked
+
+    def commit_stacked_tensors(self, stacked: Optional[torch.Tensor], ptr_tensors_id: int) -> None:
+        """
+        Atomically switch to the prepared stacked tensor.
+        This is a fast pointer assignment, safe to call during inference.
+        
+        Args:
+            stacked: The prepared stacked tensor from prepare_stacked_tensors()
+            ptr_tensors_id: id(ptr_tensors) for cache invalidation check
+        """
+        self._cached_stacked_ptr_tensors = stacked
+        self._cached_ptr_tensor_id = ptr_tensors_id
+
+    def set_ptr_tensors(self, ptr_tensors: list[torch.Tensor]) -> None:
+        """
+        Pre-stack ptr_tensors for efficient reuse.
+        Call this when ptr_tensors are initialized or updated (rare).
+        
+        Args:
+            ptr_tensors: List of per-layer pointer tensors, each (num_blocks,) uint64
+        """
+        num_layers = min(self.num_layers, len(ptr_tensors))
+        if num_layers == 0:
+            self._cached_stacked_ptr_tensors = None
+            return
+        
+        # Find valid layers and get max num_blocks
+        valid_layers = [(i, ptr_tensors[i]) for i in range(num_layers) if ptr_tensors[i].numel() > 0]
+        if not valid_layers:
+            self._cached_stacked_ptr_tensors = None
+            return
+        
+        max_blocks = max(t.numel() for _, t in valid_layers)
+        
+        # Pre-allocate stacked tensor: (num_layers, max_blocks)
+        stacked = torch.zeros((num_layers, max_blocks), dtype=torch.int64, device=self.device)
+        
+        # Fill in valid layers
+        for layer_idx, t in valid_layers:
+            t_int64 = t.view(torch.int64)
+            stacked[layer_idx, :t_int64.numel()] = t_int64
+        
+        self._cached_stacked_ptr_tensors = stacked
+        self._cached_ptr_tensor_id = id(ptr_tensors)
+
+    def update_from_block_table_and_ptr_tensors(
+        self,
+        block_table: torch.Tensor,
+        ptr_tensors: list[torch.Tensor],
+        num_reqs: int,
+        use_fused_kernel: bool = True,
+    ) -> torch.Tensor:
+        """
+        Update ptr_table from block_table using efficient GPU indexing.
+        
+        Args:
+            block_table: (num_reqs, max_num_blocks_per_req), int32, block indices on GPU
+            ptr_tensors: List of per-layer pointer tensors, each (num_blocks,) uint64
+            num_reqs: Number of active requests
+            use_fused_kernel: If True, use the fused CUDA kernel (faster).
+                              If False, use PyTorch operations (for fallback/debugging).
+        
+        Returns:
+            ptr_table: (num_layers, num_reqs, max_num_blocks_per_req), uint64
+        """
+        batch_size = min(num_reqs, block_table.shape[0])
+        max_num_blocks = block_table.shape[1]
+        num_layers = min(self.num_layers, len(ptr_tensors))
+        
+        if num_layers == 0 or batch_size == 0:
+            return self.ptr_table[:num_layers, :batch_size].view(torch.uint64)
+        
+        # Use cached stacked tensors if available
+        # Note: commit_stacked_tensors() should be called explicitly after migration
+        # to update the cache. This check is just a fallback for initial setup.
+        stacked_ptr_tensors = self._cached_stacked_ptr_tensors
+        if stacked_ptr_tensors is None:
+            self.ptr_table[:num_layers, :batch_size].zero_()
+            return self.ptr_table[:num_layers, :batch_size].view(torch.uint64)
+        
+        if use_fused_kernel:
+            # Use fused CUDA kernel for maximum performance
+            from vllm._custom_ops import update_ptr_table_from_block_table
+            update_ptr_table_from_block_table(
+                self.ptr_table,
+                block_table,
+                stacked_ptr_tensors,
+                num_layers,
+                batch_size,
+            )
+        else:
+            # Fallback: use PyTorch operations
+            num_blocks = stacked_ptr_tensors.shape[1]
+            
+            # Flatten and clamp block_table: (batch_size * max_num_blocks,)
+            flat_block_table = block_table[:batch_size].flatten().long()
+            clamped_indices = flat_block_table.clamp(0, num_blocks - 1)
+            
+            # Create valid mask: (1, batch_size * max_num_blocks)
+            valid_mask = (flat_block_table >= 0).to(torch.int64).unsqueeze(0)
+            
+            # Expand indices for all layers: (num_layers, batch_size * max_num_blocks)
+            indices_expanded = clamped_indices.unsqueeze(0).expand(num_layers, -1)
+            
+            # Gather from stacked tensors: (num_layers, batch_size * max_num_blocks)
+            gathered = torch.gather(stacked_ptr_tensors[:num_layers], 1, indices_expanded)
+            
+            # Apply mask (broadcast)
+            gathered = gathered * valid_mask
+            
+            # Reshape and store: (num_layers, batch_size, max_num_blocks)
+            self.ptr_table[:num_layers, :batch_size] = gathered.view(num_layers, batch_size, max_num_blocks)
+        
+        return self.ptr_table[:num_layers, :batch_size].view(torch.uint64)
+
+    def get_device_tensor(self) -> torch.Tensor:
+        """Returns the device tensor of the ptr table as uint64."""
+        return self.ptr_table.view(torch.uint64)
+
+    def clear(self) -> None:
+        self.ptr_table.fill_(0)
+        self.ptr_table_cpu.fill_(0)

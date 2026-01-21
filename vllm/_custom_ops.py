@@ -295,6 +295,35 @@ def advance_step_flashattn(num_seqs: int, num_queries: int, block_size: int,
                                                slot_mapping, block_tables)
 
 
+# Fused ptr_table update kernel for flexi_direct attention
+def update_ptr_table_from_block_table(
+    ptr_table: torch.Tensor,
+    block_table: torch.Tensor,
+    ptr_tensors: torch.Tensor,
+    num_layers: int,
+    batch_size: int,
+) -> None:
+    """
+    Update ptr_table from block_table using fused CUDA kernel.
+    
+    This kernel fuses the following operations:
+    1. Flatten and convert block_table to long
+    2. Clamp indices to valid range
+    3. Create valid mask (block_id >= 0)
+    4. Gather from stacked_ptr_tensors for all layers
+    5. Apply mask and reshape
+    
+    Args:
+        ptr_table: Output tensor (num_layers, batch_size, max_blocks_per_req), int64
+        block_table: Input tensor (batch_size, max_blocks_per_req), int32
+        ptr_tensors: Stacked pointer tensors (num_layers, num_blocks), int64
+        num_layers: Number of layers to process
+        batch_size: Number of requests in batch
+    """
+    torch.ops._C.update_ptr_table_from_block_table(
+        ptr_table, block_table, ptr_tensors, num_layers, batch_size)
+
+
 def advance_step_flashinfer(num_seqs: int, num_queries: int, block_size: int,
                             input_tokens: torch.Tensor,
                             sampled_token_ids: torch.Tensor,

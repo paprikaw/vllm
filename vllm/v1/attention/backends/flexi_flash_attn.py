@@ -34,7 +34,7 @@ from vllm.v1.utils import human_readable_duration
 from vllm.vllm_flash_attn import (flash_attn_varlen_func,
                                   flash_attn_with_kvcache)
 from vllm.v1.attention.backends.flash_attn import (FlashAttentionBackend, FlashAttentionImpl,FlashAttentionMetadata)
-from vllm.vllm_flash_attn.flash_attn_interface import flexi_flash_attn_varlen_func, prepare_flexi_kv_ptrs
+from vllm.vllm_flash_attn.flash_attn_interface import flexi_flash_attn_varlen_func, flexi_direct_flash_attn_varlen_func, prepare_flexi_kv_ptrs
 if TYPE_CHECKING:
     from vllm.worker.model_runner import (ModelInputForGPUBuilder,
                                           ModelInputForGPUWithSamplingMetadata)
@@ -91,6 +91,9 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
         page_meta: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
         num_blocks: int,
+        k_ptr_tables: Optional[torch.Tensor] = None,
+        v_ptr_tables: Optional[torch.Tensor] = None,
+        start_layer: int = 0,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
@@ -101,6 +104,9 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
             value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache = [2, num_blocks, block_size, num_kv_heads, head_size]
             attn_metadata: Metadata for attention.
+            k_ptr_tables: (num_layers, batch_size, max_num_blocks_per_seq), uint64, optional
+            v_ptr_tables: (num_layers, batch_size, max_num_blocks_per_seq), uint64, optional
+            start_layer: Starting layer index for computing local layer index
         Returns:
             shape = [num_tokens, num_heads * head_size]
         NOTE: FP8 quantization, flash-attn expect the size of
@@ -209,58 +215,82 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
                 scheduler_metadata = attn_metadata.scheduler_metadata
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
-            # copied_output = output.clone()
-            # flash_attn_varlen_func(
-            #     q=query[:num_actual_tokens],
-            #     k=key_cache,
-            #     v=value_cache,
-            #     out=copied_output[:num_actual_tokens],
-            #     cu_seqlens_q=cu_seqlens_q,
-            #     max_seqlen_q=max_seqlen_q,
-            #     seqused_k=seqused_k,
-            #     max_seqlen_k=max_seqlen_k,
-            #     softmax_scale=self.scale,
-            #     causal=True,
-            #     alibi_slopes=self.alibi_slopes,
-            #     window_size=self.sliding_window,
-            #     block_table=block_table,
-            #     softcap=self.logits_soft_cap,
-            #     scheduler_metadata=scheduler_metadata,
-            #     fa_version=self.vllm_flash_attn_version,
-            #     q_descale=layer._q_scale.expand(descale_shape),
-            #     k_descale=layer._k_scale.expand(descale_shape),
-            #     v_descale=layer._v_scale.expand(descale_shape),
-            # )
-            # return output
+            
+            # Use flexi_direct if k_ptr_tables/v_ptr_tables are available
+            use_flexi_direct = (k_ptr_tables is not None and 
+                               v_ptr_tables is not None and 
+                               k_ptr_tables.numel() > 0)
 
             try:
-                flexi_flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
-                    k_meta=page_meta,
-                    v_meta=page_meta,
-                    num_blocks=num_blocks,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=self.sliding_window,
-                    block_table=block_table,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=scheduler_metadata,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
-                    cached_k_ptrs=k_cache_dev_ptr,
-                    cached_v_ptrs=v_cache_dev_ptr,
-                )
+                if use_flexi_direct:
+                    # Extract layer index from layer name to get the correct ptr_table
+                    from vllm.v1.utils import extract_layer_index
+                    # layer has layer_name attribute from Attention base class
+                    layer_name = getattr(layer, 'layer_name', None)
+                    if layer_name is None:
+                        # Fallback to non-direct if layer_name not available
+                        use_flexi_direct = False
+                    else:
+                        layer_idx = extract_layer_index(layer_name)
+                        # k_ptr_tables is (num_layers, batch_size, max_num_blocks_per_seq)
+                        # Convert global layer_idx to local index using start_layer
+                        local_layer_idx = layer_idx - start_layer
+                        
+                        # Validate local_layer_idx is within bounds
+                        if local_layer_idx < 0 or local_layer_idx >= k_ptr_tables.shape[0]:
+                            use_flexi_direct = False
+                        else:
+                            # Get per-batch ptr_table for this layer
+                            k_ptr_table = k_ptr_tables[local_layer_idx]  # (batch_size, max_num_blocks_per_seq)
+                            v_ptr_table = v_ptr_tables[local_layer_idx]  # (batch_size, max_num_blocks_per_seq)
+                            flexi_direct_flash_attn_varlen_func(
+                            q=query[:num_actual_tokens],
+                            k_meta=page_meta,
+                            v_meta=page_meta,
+                            num_blocks=num_blocks,
+                            k_ptr_table=k_ptr_table,
+                            v_ptr_table=v_ptr_table,
+                            max_seqlen_q=max_seqlen_q,
+                            cu_seqlens_q=cu_seqlens_q,
+                            max_seqlen_k=max_seqlen_k,
+                            seqused_k=seqused_k,
+                            softmax_scale=self.scale,
+                            causal=True,
+                            window_size=list(self.sliding_window) if self.sliding_window else None,
+                            softcap=self.logits_soft_cap,
+                            alibi_slopes=self.alibi_slopes,
+                            out=output[:num_actual_tokens],
+                        )
+                
+                if not use_flexi_direct:
+                    # Fallback to original flexi_flash_attn_varlen_func
+                    flexi_flash_attn_varlen_func(
+                        q=query[:num_actual_tokens],
+                        k_meta=page_meta,
+                        v_meta=page_meta,
+                        num_blocks=num_blocks,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=self.sliding_window,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand(descale_shape),
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                        cached_k_ptrs=k_cache_dev_ptr,
+                        cached_v_ptrs=v_cache_dev_ptr,
+                    )
 
             except Exception as e:
-                logger.info(f"Error is happening, k_meta device: {page_meta.device}, v_meta device: {page_meta.device}, query device: {query.device}, output device: {output.device}, cached_k_ptrs: {k_cache_dev_ptr}, cached_v_ptrs: {v_cache_dev_ptr}")
+                logger.info(f"Error is happening, k_meta device: {page_meta.device}, v_meta device: {page_meta.device}, query device: {query.device}, output device: {output.device}, cached_k_ptrs: {k_cache_dev_ptr}, cached_v_ptrs: {v_cache_dev_ptr}, use_flexi_direct: {use_flexi_direct}")
                 raise e
             # torch.testing.assert_close(output, copied_output, atol=2e-2, rtol=1e-2), \
             #     f"{torch.max(torch.abs(output - copied_output))}"

@@ -46,6 +46,14 @@ class ForwardContext:
     virtual_engine: int  # set dynamically for each forward pass
     # set dynamically for each forward pass
     dp_metadata: Optional[DPMetadata] = None
+    # For flexi_direct implementation: per-layer pointer tables
+    # k_ptr_tables: (num_layers, batch_size, max_num_blocks_per_seq), uint64
+    # v_ptr_tables: (num_layers, batch_size, max_num_blocks_per_seq), uint64
+    k_ptr_tables: Optional["torch.Tensor"] = None
+    v_ptr_tables: Optional["torch.Tensor"] = None
+    # Start layer index for dynamic model (used to compute local layer index)
+    # k_ptr_tables[i] corresponds to global layer index (start_layer + i)
+    start_layer: int = 0
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -63,7 +71,10 @@ def get_forward_context() -> ForwardContext:
 def set_forward_context(attn_metadata: Any,
                         vllm_config: VllmConfig,
                         virtual_engine: int = 0,
-                        num_tokens: int = 0):
+                        num_tokens: int = 0,
+                        k_ptr_tables: Optional["torch.Tensor"] = None,
+                        v_ptr_tables: Optional["torch.Tensor"] = None,
+                        start_layer: int = 0):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     Here we can inject common logic for every model forward pass.
@@ -103,7 +114,10 @@ def set_forward_context(attn_metadata: Any,
         static_forward_context,
         virtual_engine=virtual_engine,
         attn_metadata=attn_metadata,
-        dp_metadata=dp_metadata)
+        dp_metadata=dp_metadata,
+        k_ptr_tables=k_ptr_tables,
+        v_ptr_tables=v_ptr_tables,
+        start_layer=start_layer)
 
     try:
         yield

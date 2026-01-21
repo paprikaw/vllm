@@ -334,6 +334,9 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
         "--scheduler-cls", "vllm.v1.core.sched.dynamic_scheduler.DynamicScheduler",
         "--worker-cls", "vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker",
     ]
+    # Add block_size if specified
+    if cfg.vllm.block_size is not None:
+        serve_args.extend(["--block-size", str(cfg.vllm.block_size)])
     # Add dynamic config for flexi flash attention
     dynamic_cfg = json.dumps({
         "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
@@ -348,6 +351,10 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
         serve_args.append("--enforce-eager")
     if cfg.vllm.enable_nsight:
         serve_args.append("--ray-workers-use-nsight")
+    # 传递 Ray worker 节点部署映射（用于跨节点 pipeline parallelism）
+    if cfg.network.rank_to_node:
+        import json as _json
+        serve_args.extend(["--ray-rank-to-node", _json.dumps(cfg.network.rank_to_node)])
 
     metrics_path = logm.get_path_with_log_type("timestamp_metrics", "csv", vars)
     if metrics_path.exists():
@@ -420,6 +427,9 @@ def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManag
         "--scheduler-cls", "vllm.v1.core.sched.dynamic_scheduler.DynamicScheduler",
         "--worker-cls", "vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker",
     ]
+    # Add block_size if specified
+    if cfg.vllm.block_size is not None:
+        serve_args.extend(["--block-size", str(cfg.vllm.block_size)])
     dynamic_cfg = json.dumps({
         "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
         "tester_start_step": cfg.migration.tester_start_step,
@@ -433,6 +443,10 @@ def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManag
         serve_args.append("--enforce-eager")
     if cfg.vllm.enable_nsight:
         serve_args.append("--ray-workers-use-nsight")
+    # 传递 Ray worker 节点部署映射（用于跨节点 pipeline parallelism）
+    if cfg.network.rank_to_node:
+        import json as _json
+        serve_args.extend(["--ray-rank-to-node", _json.dumps(cfg.network.rank_to_node)])
 
     # Timestamp metrics: write a raw CSV, then split into warmup/main later.
     metrics_raw_path = logm.get_path_with_log_type("timestamp_metrics_raw", "csv", vars)

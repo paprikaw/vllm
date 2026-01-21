@@ -31,6 +31,7 @@ def collect_variables(cfg: Config) -> Dict[str, Any]:
         "enable_cuda_graph": cfg.vllm.enable_cuda_graph,
         "enable_nsight": cfg.vllm.enable_nsight,
         "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
+        "block_size": cfg.vllm.block_size,
         "model_name": cfg.model.name,
         "model_path": cfg.model.path,
 
@@ -59,11 +60,12 @@ class ModelCfg(BaseModel):
 class VllmCfg(BaseModel):
     pipeline_parallel_size: int = 2
     gpu_memory_utilization: float = 0.9
-    max_model_len: int = 40960
+    max_model_len: int = 8000
     chunked_prefill: bool = True
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
     enable_flexi_flash_attn: bool = False
+    block_size: Optional[int] = None  # KV cache block size (1, 8, 16, 32, 64, 128), None means use vLLM default
     head_addr: str = "head"
     port: int = 8000
     ray_port: int = 6379
@@ -162,8 +164,11 @@ class BenchCfg(BaseModel):
 
 class NetworkCfg(BaseModel):
     delays: List[float] = [0]
-    # 可选：pipeline 并行各 rank 的可达 IP，支持双向通道
+    # 可选：pipeline 并行各 rank 的可达 IP，供 KV synchronizer 双向通道使用
     rank_to_ip: Dict[int, str] = {}
+    # 可选：指定每个 rank 对应的 Ray 节点（hostname 或 IP），用于跨节点 worker 部署
+    # 示例：{0: "node1", 1: "node2"} 表示 rank 0 部署在 node1，rank 1 部署在 node2
+    rank_to_node: Dict[int, str] = {}
 
 class PathPolicy(BaseModel):
     variables: List[str] = []                   # 本轮作为“变量”的键

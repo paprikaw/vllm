@@ -342,10 +342,55 @@ def initialize_ray_cluster(
                 "The number of required %ss exceeds the total "
                 "number of available %ss in the placement group.", device_str,
                 device_str)
-        # Create a new placement group
-        placement_group_specs: List[Dict[str, float]] = ([{
-            device_str: 1.0
-        } for _ in range(parallel_config.world_size)])
+        
+        # Get available node IPs from Ray cluster for hostname resolution
+        ray_nodes = ray.nodes()
+        # Build hostname/IP to Ray node IP mapping
+        node_name_to_ip: Dict[str, str] = {}
+        for node in ray_nodes:
+            if node.get('Alive', False):
+                node_ip = node.get('NodeManagerAddress', '')
+                node_hostname = node.get('NodeManagerHostname', '')
+                if node_ip:
+                    # Map both IP and hostname to the Ray node IP
+                    node_name_to_ip[node_ip] = node_ip
+                    if node_hostname:
+                        node_name_to_ip[node_hostname] = node_ip
+                        # Also try short hostname (without domain)
+                        short_hostname = node_hostname.split('.')[0]
+                        node_name_to_ip[short_hostname] = node_ip
+        logger.info("Available Ray nodes (name -> IP): %s", node_name_to_ip)
+        
+        # Check if user specified rank-to-node mapping via ParallelConfig
+        # Format: {0: "hostname_or_ip", 1: "hostname_or_ip", ...}
+        rank_to_node: Optional[Dict[int, str]] = None
+        if parallel_config.ray_rank_to_node:
+            # Convert string keys to int if needed (from JSON parsing)
+            raw_mapping = parallel_config.ray_rank_to_node
+            rank_to_node = {int(k): v for k, v in raw_mapping.items()}
+            logger.info("Using user-specified rank-to-node mapping from config: %s", rank_to_node)
+            
+            # Resolve hostnames to IPs using Ray cluster info
+            for rank, node_name in rank_to_node.items():
+                if node_name in node_name_to_ip:
+                    resolved_ip = node_name_to_ip[node_name]
+                    if resolved_ip != node_name:
+                        logger.info("Resolved rank %d node '%s' -> IP '%s'", rank, node_name, resolved_ip)
+                    rank_to_node[rank] = resolved_ip
+                else:
+                    logger.warning("Node '%s' for rank %d not found in Ray cluster. "
+                                   "Available nodes: %s", node_name, rank, list(node_name_to_ip.keys()))
+        
+        # Create placement group specs with optional node constraints
+        placement_group_specs: List[Dict[str, float]] = []
+        for rank in range(parallel_config.world_size):
+            bundle: Dict[str, float] = {device_str: 1.0}
+            if rank_to_node and rank in rank_to_node:
+                node_ip = rank_to_node[rank]
+                # Ray uses "node:<IP>" format for node constraints
+                bundle[f"node:{node_ip}"] = 0.001
+                logger.info("Rank %d will be placed on node: %s", rank, node_ip)
+            placement_group_specs.append(bundle)
 
         # vLLM engine is also a worker to execute model with an accelerator,
         # so it requires to have the device in a current node. Check if
@@ -359,13 +404,22 @@ def initialize_ray_cluster(
                 f"{current_node_resource=}. vLLM engine cannot start without "
                 f"{device_str}. Make sure you have at least 1 {device_str} "
                 f"available in a node {current_node_id=} {current_ip=}.")
-        # This way, at least bundle is required to be created in a current
-        # node.
-        placement_group_specs[0][f"node:{current_ip}"] = 0.001
+        
+        # If no explicit rank_to_node mapping, ensure first bundle on current node
+        if not rank_to_node:
+            placement_group_specs[0][f"node:{current_ip}"] = 0.001
 
-        # By default, Ray packs resources as much as possible.
+        # Use STRICT_SPREAD when rank_to_node is specified to ensure cross-node deployment
+        # Otherwise use SPREAD for best-effort distribution
+        if rank_to_node and len(set(rank_to_node.values())) > 1:
+            strategy = "STRICT_SPREAD"
+            logger.info("Using STRICT_SPREAD strategy for cross-node deployment")
+        else:
+            strategy = "SPREAD"
+            logger.info("Using SPREAD strategy for worker placement")
+        
         current_placement_group = ray.util.placement_group(
-            placement_group_specs, strategy="PACK")
+            placement_group_specs, strategy=strategy)
         _wait_until_pg_ready(current_placement_group)
 
     assert current_placement_group is not None

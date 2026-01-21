@@ -149,6 +149,7 @@ class FlexiAttention(Attention):
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
+                assert False
                 forward_context = get_forward_context()
                 attn_metadata = forward_context.attn_metadata
                 if isinstance(attn_metadata, dict):
@@ -228,6 +229,12 @@ def flexi_unified_attention_with_output(
     self = forward_context.no_compile_layers[layer_name]
     from vllm.v1.attention.backends.flexi_flash_attn import FlexiFlashAttentionImpl
     assert isinstance(self.impl, FlexiFlashAttentionImpl)
+    
+    # Get ptr_tables and start_layer from forward_context for flexi_direct
+    k_ptr_tables = forward_context.k_ptr_tables
+    v_ptr_tables = forward_context.v_ptr_tables
+    start_layer = forward_context.start_layer
+    
     self.impl.flexi_forward(self,
                   query,
                   key,
@@ -237,6 +244,9 @@ def flexi_unified_attention_with_output(
                   self.page_meta,
                   attn_metadata,
                   self.num_blocks,
+                  k_ptr_tables=k_ptr_tables,
+                  v_ptr_tables=v_ptr_tables,
+                  start_layer=start_layer,
                   output=output)
     # maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
