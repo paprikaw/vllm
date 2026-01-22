@@ -172,11 +172,24 @@ async def build_async_engine_client_from_engine_args(
     # Create the EngineConfig (determines if we can use V1).
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
-    deployment_config_path = os.environ.get("DEPLOYMENT_CONFIG_PATH")
-    assert deployment_config_path is not None, "DEPLOYMENT_CONFIG_PATH is not set"
-
-    dynamic_config = MigrationConfig.load_config(
-        deployment_config_path)
+    
+    # Load migration config from dynamic_config fields or fallback to file
+    dc = vllm_config.dynamic_config
+    if dc.alternative_configs is not None and dc.migration_steps is not None:
+        # Use inline config from dynamic_config directly
+        dynamic_config = MigrationConfig(
+            alternative_configs=dc.alternative_configs,
+            migration_steps=dc.migration_steps,
+        )
+    else:
+        # Fallback: load from deployment_config_path file
+        deployment_config_path = dc.deployment_config_path
+        assert deployment_config_path is not None, (
+            "Either (alternative_configs, migration_steps) must be set in dynamic_config, "
+            "or deployment_config_path must be provided"
+        )
+        dynamic_config = MigrationConfig.load_config(deployment_config_path)
+    
     # V1 AsyncLLM.
     if envs.VLLM_USE_V1:
         if disable_frontend_multiprocessing:

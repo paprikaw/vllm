@@ -358,7 +358,7 @@ class OutputProcessor:
             req_state.is_prefilling = False
 
             # DEBUG: Log token processing details
-            logger.info(f"[OUTPUT_PROC] req={req_id[-8:]} new_token_ids={new_token_ids[:5] if len(new_token_ids) > 5 else new_token_ids} total_output_len={len(req_state.detokenizer.output_token_ids)}")
+            # logger.info(f"[OUTPUT_PROC] req={req_id[-8:]} new_token_ids={new_token_ids[:5] if len(new_token_ids) > 5 else new_token_ids} total_output_len={len(req_state.detokenizer.output_token_ids)}")
 
             # 2) Detokenize the token ids into text and perform stop checks.
             stop_string = req_state.detokenizer.update(
@@ -375,8 +375,8 @@ class OutputProcessor:
                     new_token_ids, finish_reason, stop_reason,
                     kv_transfer_params, num_cached_tokens):
                 # DEBUG: Log output text before sending to queue
-                output_text = request_output.outputs[0].text if request_output.outputs else ""
-                logger.info(f"[OUTPUT_SEND] req={req_id[-8:]} text_len={len(output_text)} first_chars='{output_text[:30] if output_text else '(empty)'}' finished={request_output.finished}")
+                # output_text = request_output.outputs[0].text if request_output.outputs else ""
+                # logger.info(f"[OUTPUT_SEND] req={req_id[-8:]} text_len={len(output_text)} first_chars='{output_text[:30] if output_text else '(empty)'}' finished={request_output.finished}")
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)

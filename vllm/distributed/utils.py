@@ -87,7 +87,8 @@ def split_tensor_along_last_dim(
 
 
 def get_pp_indices(num_hidden_layers: int, pp_rank: int,
-                   pp_size: int) -> tuple[int, int]:
+                   pp_size: int,
+                   pp_layer_partition: Optional[str] = None) -> tuple[int, int]:
     """Try to evenly distribute layers across partitions.
 
     If the number of layers is not divisible by the number of partitions,
@@ -100,8 +101,17 @@ def get_pp_indices(num_hidden_layers: int, pp_rank: int,
     across the middle partitions. The first and last partitions are excluded
     because they contain the input and output embeddings respectively and we
     are attempting to reduce maximum memory consumption across partitions.
+    
+    Args:
+        num_hidden_layers: Total number of hidden layers in the model.
+        pp_rank: The rank of the current pipeline parallel group.
+        pp_size: The size of the pipeline parallel group.
+        pp_layer_partition: Optional comma-separated string specifying layer
+            counts for each partition. If provided, this takes precedence over
+            the VLLM_PP_LAYER_PARTITION environment variable.
     """
-    partition_list_str = envs.VLLM_PP_LAYER_PARTITION
+    # Use provided pp_layer_partition, or fall back to environment variable
+    partition_list_str = pp_layer_partition or envs.VLLM_PP_LAYER_PARTITION
     if partition_list_str is not None:
         try:
             partitions = [

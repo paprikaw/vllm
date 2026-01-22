@@ -162,8 +162,11 @@ class DynamicScheduler(Scheduler):
 
 
         # Initialize pp layer config status
-        assert envs.VLLM_PP_LAYER_PARTITION is not None, "VLLM_PP_LAYER_PARTITION is not set"
-        partition_list_str: str = envs.VLLM_PP_LAYER_PARTITION 
+        # Use dynamic_config.pp_layer_partition, falls back to VLLM_PP_LAYER_PARTITION env var
+        partition_list_str = self.vllm_config.dynamic_config.pp_layer_partition
+        if partition_list_str is None:
+            partition_list_str = envs.VLLM_PP_LAYER_PARTITION
+        assert partition_list_str is not None, "Either dynamic_config.pp_layer_partition or VLLM_PP_LAYER_PARTITION must be set"
         partitions = [
             int(layer) for layer in partition_list_str.split(",")
         ]

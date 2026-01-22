@@ -86,11 +86,16 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, log_dir: Path, log_file_name: 
         "--scheduler-cls", "vllm.v1.core.sched.dynamic_scheduler.DynamicScheduler",
         "--worker-cls", "vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker",
     ]
-    # Add dynamic config for flexi flash attention
-    if cfg.vllm.enable_flexi_flash_attn:
-        import json
-        dynamic_cfg = json.dumps({"enable_flexi_flash_attn": True})
-        serve_args.extend(["-D", dynamic_cfg])
+    
+    # Build dynamic config - pass all parameters through -D flag (no file needed)
+    alternative_configs_dict = {"pp_layer_configs": cfg.migration.alternative_configs}
+    dynamic_cfg = json.dumps({
+        "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
+        "pp_layer_partition": spec.start_pp_layer_partition,
+        "alternative_configs": alternative_configs_dict,
+        "migration_steps": cfg.migration.migration_steps,
+    })
+    serve_args.extend(["-D", dynamic_cfg])
     
     if cfg.vllm.chunked_prefill:
         serve_args.append("--enable-chunked-prefill")
@@ -107,13 +112,7 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, log_dir: Path, log_file_name: 
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file_path = log_dir / log_file_name
     log_fd = open(log_file_path, "wb", buffering=0)
-    # Dump vllm dynamic deployment config to configuration files
-    config_file_path = cfg.envs["DEPLOYMENT_CONFIG_PATH"]
-    Path(config_file_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(config_file_path, "w") as f:
-        json.dump({
-            "alternative_configs": cfg.migration.alternative_configs
-            }, f)
+    
     proc = subprocess.Popen(
         serve_args,
         stdout=log_fd,

@@ -62,9 +62,15 @@ class LoggingStatLogger(StatLoggerBase):
         self.spec_decoding_logging = SpecDecodingLogging()
         self.last_prompt_throughput: float = 0.0
         self.last_generation_throughput: float = 0.0
-        # Optional CSV metrics output. Set path via env VLLM_METRICS_CSV_PATH.
-        # If set, on each log() we append a CSV row with timestamp and metrics.
-        self.csv_path: Optional[str] = os.getenv("VLLM_METRICS_CSV_PATH", None)
+        # Optional CSV metrics output. 
+        # First try dynamic_config.metrics_csv_path, then fall back to env var.
+        self.csv_path: Optional[str] = None
+        if (hasattr(vllm_config, 'dynamic_config') and 
+            vllm_config.dynamic_config is not None and
+            getattr(vllm_config.dynamic_config, 'metrics_csv_path', None)):
+            self.csv_path = vllm_config.dynamic_config.metrics_csv_path
+        else:
+            self.csv_path = os.getenv("VLLM_METRICS_CSV_PATH", None)
 
     def _reset(self, now):
         self.last_log_time = now

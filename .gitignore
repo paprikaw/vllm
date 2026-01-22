@@ -205,3 +205,6 @@ csrc/moe/marlin_moe_wna16/kernel_*
 
 .clangd
 logs/**
+
+
+reports/**

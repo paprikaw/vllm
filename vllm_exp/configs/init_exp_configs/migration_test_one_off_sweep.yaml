@@ -1,0 +1,96 @@
+# Sweep Test Configuration
+# Run with: python -m vllm_exp.run sweep_test --config <this_file> --log-dir <log_dir>
+
+project: "test_sweep"
+type: "sweep_test"
+
+envs:
+  NCCL_DEBUG: INFO
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+  VLLM_TORCH_PROFILER_DIR: /home/bxb1/data/vllm_workbench/profiler/
+  RAY_CGRAPH_get_timeout: "10000"
+  BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+  DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+  KV_SYNC_USE_CPU: "0"
+  VLLM_USE_CPU_MODEL: "0"
+  CUDA_LAUNCH_BLOCKING: "0"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+  VLLM_USE_RAY_COMPILED_DAG: "1"
+  NCCL_SOCKET_IFNAME: "bond0.3027"
+  GLOO_SOCKET_IFNAME: "bond0.3027"
+
+is_log_cover: true
+
+static_config:
+  model:
+    path: "/home/bxb1/data/huggingface/Qwen3-32B"
+    name: "Qwen3-32B"
+  
+  network:
+    rank_to_ip:
+      0: "spartan-gpgpu169"
+      1: "spartan-gpgpu169"
+    rank_to_node:
+      0: "spartan-gpgpu169"
+      1: "spartan-gpgpu169"
+  
+  vllm:
+    head_addr: "localhost"
+    pipeline_parallel_size: 2
+    gpu_memory_utilization: 0.75
+    max_model_len: 8000
+    chunked_prefill: true
+    enable_cuda_graph: false
+    enable_nsight: false
+    enable_flexi_flash_attn: false  # Default, can be overridden by sweep
+  
+  benchmark:
+    burstiness: 100.0
+    benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+    profile: false
+    print_outputs: true
+    pattern_batch_size: 150
+    warmup:
+      enabled: false
+      num_total_requests: 25
+      input_length: 10000
+      output_length: 50
+      request_rate: 25
+
+# Sweep configuration - generates Cartesian product of all variables
+# This config produces: 2 * 2 = 4 experiments
+sweep_config:
+  # Sweep over flexi flash attention enabled/disabled
+  enable_flexi_flash_attn: [true, false]
+  
+  # Sweep over different benchmark configurations
+  benchmark_config:
+    # # Config 1: Migration experiment (400 requests with 2 config switches)
+    # - num_total_requests: 400
+    #   pp_layer_config:
+    #     0: "32, 32"      # Start with balanced partition
+    #     100: "12, 52"    # Migrate at request 100
+    #     200: "20, 44"    # Migrate again at request 200
+    #   requests:
+    #     0: 
+    #       request_rate: 1.8
+    #       input_lens: 800
+    #       output_lens: 64
+    #     100: 1.5         # Rate for requests 100+ (inherits input_lens/output_lens)
+    
+    # Config 2: No migration experiment (200 requests, single config)
+    - num_total_requests: 100
+      repeatition: 10
+      pp_layer_config:
+        0: "32, 32"      # Only one config = no migration
+      requests:
+        0:
+          request_rate: 1.8
+          input_lens: 800
+          output_lens: 64
+        50:
+          request_rate: 1.8
+          input_lens: 800
+          output_lens: 64

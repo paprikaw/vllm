@@ -33,7 +33,8 @@ projects:
     migration:
       is_migration: false  # No migration, just run inference
       tester_start_step: 20  # Start stress tester after 20 requests
-      # alternative_configs not needed when is_migration: false
+      alternative_configs:
+        "0": [12, 52]
       memory_stress_tester:
         enabled: true
         num_tensors_per_allocation: 15000  # Allocate 10000 tensors per cycle

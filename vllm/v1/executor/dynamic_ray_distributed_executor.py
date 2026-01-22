@@ -204,11 +204,44 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                 " environment variable, make sure it is unique for"
                 " each node.")
 
+        # Build a mapping from node_id to worker IP for setting VLLM_HOST_IP per worker
+        # worker_node_and_gpu_ids contains (node_id, gpu_ids) for each worker in order
+        # We can directly map node_id -> IP using the worker_ips we collected earlier
+        node_id_to_ip: Dict[str, str] = {}
+        
+        # Collect IPs for all workers including driver
+        # For SPMD mode: self.workers contains all workers, worker_ips has their IPs
+        # For non-SPMD mode: driver_dummy_worker is separate
+        if self.use_ray_spmd_worker:
+            # worker_ips corresponds to worker_metadata (before sorting)
+            # worker_node_and_gpu_ids corresponds to self.workers (after sorting)
+            # We need to build the mapping from node_id to IP
+            for i, (node_id, _) in enumerate(worker_node_and_gpu_ids):
+                if i < len(sorted_worker_metadata):
+                    node_id_to_ip[node_id] = sorted_worker_metadata[i].ip
+        else:
+            # First worker is driver on driver_ip
+            if worker_node_and_gpu_ids:
+                node_id_to_ip[worker_node_and_gpu_ids[0][0]] = driver_ip
+            # Rest are from sorted_worker_metadata
+            for i, (node_id, _) in enumerate(worker_node_and_gpu_ids[1:], start=0):
+                if i < len(sorted_worker_metadata):
+                    node_id_to_ip[node_id] = sorted_worker_metadata[i].ip
+        
+        logger.info("Node ID to IP mapping: %s", node_id_to_ip)
+
         # Set environment variables for the driver and workers.
-        all_args_to_update_environment_variables = [{
-            current_platform.device_control_env_var:
-            ",".join(map(str, node_gpus[node_id])),
-        } for (node_id, _) in worker_node_and_gpu_ids]
+        # Include per-worker VLLM_HOST_IP based on the node's IP
+        all_args_to_update_environment_variables = []
+        for (node_id, _) in worker_node_and_gpu_ids:
+            worker_ip = node_id_to_ip.get(node_id, driver_ip)
+            args = {
+                current_platform.device_control_env_var:
+                ",".join(map(str, node_gpus[node_id])),
+                'VLLM_HOST_IP': worker_ip,  # Set per-worker IP
+            }
+            all_args_to_update_environment_variables.append(args)
+            logger.info("Worker on node %s will use VLLM_HOST_IP=%s", node_id, worker_ip)
 
         # Environment variables to copy from driver to workers
         env_vars_to_copy = [
@@ -218,6 +251,25 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         ]
 
         env_vars_to_copy.extend(current_platform.additional_env_vars)
+        
+        # Add NCCL/GLOO network interface env vars (critical for multi-node)
+        nccl_env_vars = [
+            'NCCL_SOCKET_IFNAME',
+            'GLOO_SOCKET_IFNAME', 
+            'NCCL_IB_DISABLE',
+            'NCCL_NET_GDR_LEVEL',
+            'NCCL_P2P_LEVEL',
+            'NCCL_SHM_DISABLE',
+        ]
+        for var in nccl_env_vars:
+            if var not in env_vars_to_copy:
+                env_vars_to_copy.append(var)
+
+        # Critical env vars that MUST be copied to workers even if not in os.environ
+        # These use vLLM's default values from envs.py
+        critical_env_vars_with_defaults = {
+            'RAY_DEDUP_LOGS': '0',  # Disable Ray log deduplication for debugging
+        }
 
         # Copy existing env vars to each worker's args
         for args in all_args_to_update_environment_variables:
@@ -225,12 +277,24 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             for name in env_vars_to_copy:
                 if name in os.environ:
                     args[name] = os.environ[name]
+                elif name in critical_env_vars_with_defaults:
+                    # Use vLLM's default value for critical env vars not set in os.environ
+                    args[name] = critical_env_vars_with_defaults[name]
+
+        # Collect which env vars are actually being copied
+        copied_vars = [v for v in env_vars_to_copy if v in os.environ]
+        copied_with_defaults = [v for v in critical_env_vars_with_defaults 
+                                if v not in os.environ and v in env_vars_to_copy]
 
         logger.info("non_carry_over_env_vars from config: %s",
                     self.non_carry_over_env_vars)
         logger.info(
             "Copying the following environment variables to workers: %s",
-            [v for v in env_vars_to_copy if v in os.environ])
+            copied_vars)
+        if copied_with_defaults:
+            logger.info(
+                "Using vLLM default values for env vars not in os.environ: %s",
+                {v: critical_env_vars_with_defaults[v] for v in copied_with_defaults})
         logger.info(
             "If certain env vars should NOT be copied to workers, add them to "
             "%s file", self.non_carry_over_env_vars_file)

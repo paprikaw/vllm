@@ -14,7 +14,7 @@ import csv
 from dataclasses import dataclass, asdict, field
 from hashlib import sha1
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Literal, Iterable, Callable
+from typing import Any, Dict, List, Optional, Literal, Iterable, Callable, Union
 from io import FileIO
 import requests
 from sklearn import metrics
@@ -25,13 +25,13 @@ from rich.console import Console
 from collections import OrderedDict
 
 from .data import Config, PathPolicy   
-from .log import LogManager
+from .log import LogManager, SweepLogManager
 
 app = typer.Typer(no_args_is_help=True)
 C = Console()
 
 
-def generate_analysis_report(logm: LogManager, vars: Optional[dict[str, Any]] = None):
+def generate_analysis_report(logm: Union[LogManager, SweepLogManager], vars: Optional[dict[str, Any]] = None):
     """
     Automatically generate analysis files in the log directory after experiment completes.
     Uses logm.get_path_with_log_type to construct filenames consistently.
@@ -295,31 +295,48 @@ def wait_ready(base_url: str, timeout_s: int = 180) -> bool:
     return False
 
 
+def wait_ready_or_fail(
+    base_url: str,
+    proc: subprocess.Popen,
+    log_path: Path,
+    timeout_s: int = 300,
+) -> bool:
+    """Wait for server ready, checking for early process termination.
+    
+    Returns True if server is ready, False if timeout or process died.
+    Prints error info if process dies early.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        # Check if process died
+        if proc.poll() is not None:
+            C.print(f"[red]ERROR[/] Server terminated early (exit={proc.returncode})")
+            if log_path.exists():
+                with open(log_path, "r") as f:
+                    for line in f.readlines()[-20:]:
+                        print(line.rstrip())
+            return False
+        # Check if ready
+        try:
+            if requests.get(f"{base_url}/v1/models", timeout=3).ok:
+                return True
+        except requests.RequestException:
+            pass
+        time.sleep(2)
+    C.print("[red]ERROR[/] Server not ready in time")
+    return False
+
+
 def get_path_policy_from_var_keys(var_keys: list[str]) -> PathPolicy:
     return PathPolicy(variables=var_keys)
 
 ## Functions to start vllm and benchmark ##
 def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Optional[dict[str, Any]] = None) -> subprocess.Popen:
-    extra_env = {}
-    # 配置vllm所需的环境变量
-    extra_env["VLLM_PP_LAYER_PARTITION"] = spec.start_pp_layer_partition
-    if cfg.migration.is_migration:
-        extra_env["TEST_MIGRATION"] = "1"
-        extra_env[f"PATTERN_BATCH_SIZE"] = str(cfg.benchmark.pattern_batch_size)
-    else:
-        extra_env["TEST_MIGRATION"] = "0"
-    
-    if cfg.migration.is_compact_kv:
-        extra_env["TEST_KV_COMPACT"] = "1"
-    else:
-        extra_env["TEST_KV_COMPACT"] = "0"
-
     env = os.environ.copy()
     # 传递 LayerKV 双向通道所需的 rank->ip 映射（JSON 字符串）
     if cfg.network.rank_to_ip:
         import json as _json
         env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(cfg.network.rank_to_ip)
-    env.update(extra_env)
 
     # 启动服务
     serve_args = [
@@ -337,11 +354,17 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
     # Add block_size if specified
     if cfg.vllm.block_size is not None:
         serve_args.extend(["--block-size", str(cfg.vllm.block_size)])
-    # Add dynamic config for flexi flash attention
+    
+    # Add dynamic config - pass all parameters through dynamic_cfg (no file needed)
+    alternative_configs_dict = {"pp_layer_configs": cfg.migration.alternative_configs}
     dynamic_cfg = json.dumps({
         "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
         "tester_start_step": cfg.migration.tester_start_step,
         "memory_stress_tester": cfg.migration.memory_stress_tester,
+        "pp_layer_partition": spec.start_pp_layer_partition,
+        "pattern_batch_size": cfg.benchmark.pattern_batch_size,
+        "alternative_configs": alternative_configs_dict,
+        "migration_steps": cfg.migration.migration_steps,
         })
     serve_args.extend(["-D", dynamic_cfg])
     
@@ -367,19 +390,6 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
         os.remove(path)
     log_fd = open(path, "wb", buffering=0)
 
-    # Dump vllm dynamic deployment config to configuration files (always write if path is provided)
-    deployment_config_path = os.environ.get("DEPLOYMENT_CONFIG_PATH")
-    C.print(deployment_config_path)
-    if deployment_config_path is not None:
-        config_file_path = Path(deployment_config_path)
-        config_file_path.parent.mkdir(parents=True, exist_ok=True)
-        config_dict = {
-            "alternative_configs": {"pp_layer_configs": cfg.migration.alternative_configs},
-            "migration_steps": cfg.migration.migration_steps,
-            "compact_steps": cfg.migration.compact_steps,
-        }
-        with open(config_file_path, "w") as f:
-            json.dump(config_dict, f)
     proc = subprocess.Popen(
         serve_args,
         stdout=log_fd,
@@ -396,24 +406,10 @@ def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManag
 
     Returns (proc, capture, timestamp_metrics_raw_path).
     """
-    extra_env = {}
-    extra_env["VLLM_PP_LAYER_PARTITION"] = spec.start_pp_layer_partition
-    if cfg.migration.is_migration:
-        extra_env["TEST_MIGRATION"] = "1"
-        extra_env[f"PATTERN_BATCH_SIZE"] = str(cfg.benchmark.pattern_batch_size)
-    else:
-        extra_env["TEST_MIGRATION"] = "0"
-
-    if cfg.migration.is_compact_kv:
-        extra_env["TEST_KV_COMPACT"] = "1"
-    else:
-        extra_env["TEST_KV_COMPACT"] = "0"
-
     env = os.environ.copy()
     if cfg.network.rank_to_ip:
         import json as _json
         env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(cfg.network.rank_to_ip)
-    env.update(extra_env)
 
     serve_args = [
         "vllm", "serve", cfg.model.path,
@@ -430,10 +426,17 @@ def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManag
     # Add block_size if specified
     if cfg.vllm.block_size is not None:
         serve_args.extend(["--block-size", str(cfg.vllm.block_size)])
+    
+    # Add dynamic config - pass all parameters through dynamic_cfg (no file needed)
+    alternative_configs_dict = {"pp_layer_configs": cfg.migration.alternative_configs}
     dynamic_cfg = json.dumps({
         "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
         "tester_start_step": cfg.migration.tester_start_step,
         "memory_stress_tester": cfg.migration.memory_stress_tester,
+        "pp_layer_partition": spec.start_pp_layer_partition,
+        "pattern_batch_size": cfg.benchmark.pattern_batch_size,
+        "alternative_configs": alternative_configs_dict,
+        "migration_steps": cfg.migration.migration_steps,
     })
     serve_args.extend(["-D", dynamic_cfg])
 
@@ -457,18 +460,6 @@ def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManag
     raw_log_path = logm.get_path_with_log_type("server_raw", "log", vars)
     if raw_log_path.exists():
         os.remove(raw_log_path)
-
-    deployment_config_path = os.environ.get("DEPLOYMENT_CONFIG_PATH")
-    if deployment_config_path is not None:
-        config_file_path = Path(deployment_config_path)
-        config_file_path.parent.mkdir(parents=True, exist_ok=True)
-        config_dict = {
-            "alternative_configs": {"pp_layer_configs": cfg.migration.alternative_configs},
-            "migration_steps": cfg.migration.migration_steps,
-            "compact_steps": cfg.migration.compact_steps,
-        }
-        with open(config_file_path, "w") as f:
-            json.dump(config_dict, f)
 
     proc = subprocess.Popen(
         serve_args,
@@ -783,9 +774,9 @@ def test_migration_with_different_pp(cfg: Config, logm: LogManager):
             start_tc(tc_spec)
 
             # Start vllm
-            spec = ServerRunSpec(part, cfg.migration.is_migration)
-            vars_mapping = {"start_pp_layer_partition": spec.start_pp_layer_partition}
-            proc = start_vllm(cfg=cfg, spec=spec, logm=logm, vars=vars_mapping)
+            server_spec = ServerRunSpec(part, cfg.migration.is_migration)
+            vars_mapping = {"start_pp_layer_partition": server_spec.start_pp_layer_partition}
+            proc = start_vllm(cfg=cfg, spec=server_spec, logm=logm, vars=vars_mapping)
             request_rate = cfg.benchmark.sweep_request_rates[0] 
             bench_spec = BenchmarkRunSpec(cfg.benchmark.input_output_lens, request_rate=request_rate)
 
@@ -804,3 +795,421 @@ def test_migration_with_different_pp(cfg: Config, logm: LogManager):
         C.print(f"[bold cyan] Running is finished")
         # Generate analysis report for all server logs
         generate_analysis_report(logm, None)
+
+
+# =========================
+# Sweep Test Implementation
+# =========================
+
+from .data import (
+    SweepTestConfig, SweepBenchmarkConfig, SweepConfig, StaticConfig,
+    VllmServerSpec, BenchmarkSpec, WarmupBenchCfg, extract_naming_vars
+)
+
+
+def _generate_sweep_combinations(sweep_cfg: SweepConfig) -> List[Dict[str, Any]]:
+    """Generate all combinations of sweep variables using Cartesian product."""
+    axes = sweep_cfg.get_sweep_axes()
+    if not axes:
+        return [{}]
+    
+    keys = list(axes.keys())
+    values = [axes[k] for k in keys]
+    
+    combinations = []
+    for combo in itertools.product(*values):
+        combinations.append(dict(zip(keys, combo)))
+    
+    return combinations
+
+
+# =========================
+# Spec Data Classes for Generator Results
+# =========================
+
+@dataclass
+class SweepExperimentSpec:
+    """A single experiment specification generated from sweep config.
+    
+    Contains everything needed to run one experiment.
+    """
+    vllm_spec: VllmServerSpec
+    bench_spec: BenchmarkSpec
+    vars_mapping: Dict[str, Any]
+    experiment_index: int
+    total_experiments: int
+
+
+# =========================
+# Spec Generator
+# =========================
+
+def generate_experiment_specs(
+    static_cfg: StaticConfig,
+    sweep_cfg: SweepConfig,
+    logm: SweepLogManager,
+) -> Iterable[SweepExperimentSpec]:
+    """Generate experiment specs from static and sweep config.
+    
+    This generator combines sweep combinations with static config,
+    yielding complete VllmServerSpec and BenchmarkSpec pairs.
+    
+    Args:
+        static_cfg: Static configuration shared by all experiments
+        sweep_cfg: Sweep configuration with variable axes
+        logm: Log manager for generating file paths
+    
+    Yields:
+        SweepExperimentSpec containing specs and metadata for each experiment
+    """
+    combinations = _generate_sweep_combinations(sweep_cfg)
+    total = len(combinations)
+    
+    for i, combo in enumerate(combinations):
+        # benchmark_config is required in every combination
+        bench_cfg = combo.get('benchmark_config')
+        if bench_cfg is None or not isinstance(bench_cfg, SweepBenchmarkConfig):
+            continue
+        
+        # Extract sweep variables with static_cfg as fallback
+        enable_flexi = combo.get('enable_flexi_flash_attn', static_cfg.vllm.enable_flexi_flash_attn)
+        gpu_mem = combo.get('gpu_memory_utilization', static_cfg.vllm.gpu_memory_utilization)
+        block_size = combo.get('block_size', static_cfg.vllm.block_size)
+        
+        # Get input_output_lens from bench_cfg.requests
+        io_lens = bench_cfg.get_input_output_lens()
+        
+        # Parse pp_layer_config into alternative_configs and migration_steps
+        # pp_layer_config format: {0: "32,32", 100: "12,52"}
+        # alternative_configs format: {"pp_layer_configs": {"0": [[0,31],[32,63]], ...}}
+        pp_layer_config = {k: v.replace(" ", "") for k, v in bench_cfg.pp_layer_config.items()}
+        sorted_keys = sorted(pp_layer_config.keys())
+        alternative_configs_inner = {}
+        for i, req_idx in enumerate(sorted_keys):
+            pp_str = pp_layer_config[req_idx]
+            layers = [int(x.strip()) for x in pp_str.split(",")]
+            ranges = []
+            start = 0
+            for num_layers in layers:
+                end = start + num_layers - 1
+                ranges.append([start, end])
+                start = end + 1
+            alternative_configs_inner[str(i)] = ranges
+        migration_steps = [k for k in sorted_keys if k > 0]
+
+        # Extract vars_mapping early for path generation
+        vars_mapping = extract_naming_vars(combo)
+        
+        # Generate log paths using logm
+        metrics_csv_path = str(logm.get_path_with_log_type("timestamp_metrics_raw", "csv", vars_mapping))
+        server_raw_log_path = str(logm.get_path_with_log_type("server_raw", "log", vars_mapping))
+        benchmark_log_path = str(logm.get_path_with_log_type("benchmark", "log", vars_mapping))
+        benchmark_config_path = str(logm.get_path_with_log_type("benchmark_config", "json", vars_mapping))
+        metrics_file_path = str(logm.get_path_with_log_type("request_metrics", "csv", vars_mapping))
+        
+        # Build VllmServerSpec
+        vllm_spec = VllmServerSpec(
+            model_path=static_cfg.model.path,
+            model_name=static_cfg.model.name,
+            pipeline_parallel_size=static_cfg.vllm.pipeline_parallel_size,
+            gpu_memory_utilization=gpu_mem,
+            max_model_len=static_cfg.vllm.max_model_len,
+            block_size=block_size,
+            head_addr=static_cfg.vllm.head_addr,
+            port=static_cfg.vllm.port,
+            enable_flexi_flash_attn=enable_flexi,
+            chunked_prefill=static_cfg.vllm.chunked_prefill,
+            enable_cuda_graph=static_cfg.vllm.enable_cuda_graph,
+            enable_nsight=static_cfg.vllm.enable_nsight,
+            pp_layer_partition=bench_cfg.start_pp_partition,
+            pp_layer_config=pp_layer_config,
+            alternative_configs={"pp_layer_configs": alternative_configs_inner},
+            migration_steps=migration_steps,
+            rank_to_ip=static_cfg.network.rank_to_ip,
+            rank_to_node=static_cfg.network.rank_to_node,
+            pattern_batch_size=static_cfg.benchmark.pattern_batch_size,
+            metrics_csv_path=metrics_csv_path,
+            server_raw_log_path=server_raw_log_path,
+        )
+        
+        # Build BenchmarkSpec
+        bench_spec = BenchmarkSpec(
+            base_url=f"http://{static_cfg.vllm.head_addr}:{static_cfg.vllm.port}",
+            model_path=static_cfg.model.path,
+            model_name=static_cfg.model.name,
+            benchmark_script_path=static_cfg.benchmark.benchmark_script_path,
+            benchmark_config_path=benchmark_config_path,
+            metrics_file_path=metrics_file_path,
+            benchmark_log_path=benchmark_log_path,
+            num_total_requests=bench_cfg.num_total_requests,
+            request_rate=bench_cfg.get_request_rate_dict(),
+            input_output_lens=io_lens,
+            pattern_batch_size=static_cfg.benchmark.pattern_batch_size,
+            burstiness=static_cfg.benchmark.burstiness,
+            print_outputs=static_cfg.benchmark.print_outputs,
+            profile=static_cfg.benchmark.profile,
+            warmup=static_cfg.benchmark.warmup,
+        )
+        
+        yield SweepExperimentSpec(
+            vllm_spec=vllm_spec,
+            bench_spec=bench_spec,
+            vars_mapping=vars_mapping,
+            experiment_index=i,
+            total_experiments=total,
+        )
+
+
+# =========================
+# Start Functions (Spec -> Process)
+# =========================
+
+def start_vllm_for_sweep(
+    spec: VllmServerSpec,
+) -> tuple[subprocess.Popen, _ProcStdoutCapture, Path]:
+    """Start vLLM server from spec.
+    
+    All parameters including log paths are contained in the spec.
+    No additional parsing or path generation needed.
+    
+    Args:
+        spec: VllmServerSpec with all parameters including paths
+    
+    Returns:
+        (process, stdout_capture, metrics_path)
+    
+    Raises:
+        ValueError: If metrics_csv_path or server_raw_log_path is not set in spec
+    """
+    # Validate required paths are set
+    if not spec.metrics_csv_path:
+        raise ValueError("spec.metrics_csv_path must be set before calling start_vllm_for_sweep")
+    if not spec.server_raw_log_path:
+        raise ValueError("spec.server_raw_log_path must be set before calling start_vllm_for_sweep")
+    
+    env = os.environ.copy()
+    
+    serve_args = [
+        "vllm", "serve", spec.model_path,
+        "--pipeline-parallel-size", str(spec.pipeline_parallel_size),
+        "--gpu-memory-utilization", str(spec.gpu_memory_utilization),
+        "--max-model-len", str(spec.max_model_len),
+        "--served-model-name", spec.model_name,
+        "--distributed-executor-backend", "ray",
+        "--disable-log-requests",
+        "--no-enable-prefix-caching",
+        "--scheduler-cls", "vllm.v1.core.sched.dynamic_scheduler.DynamicScheduler",
+        "--worker-cls", "vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker",
+    ]
+    
+    if spec.block_size:
+        serve_args.extend(["--block-size", str(spec.block_size)])
+    if spec.chunked_prefill:
+        serve_args.append("--enable-chunked-prefill")
+    if not spec.enable_cuda_graph:
+        serve_args.append("--enforce-eager")
+    if spec.enable_nsight:
+        serve_args.append("--ray-workers-use-nsight")
+    if spec.rank_to_node:
+        serve_args.extend(["--ray-rank-to-node", json.dumps(spec.rank_to_node)])
+    # Generate dynamic config from spec (includes all settings like rank_to_ip, metrics_csv_path, etc.)
+    dynamic_cfg = json.dumps(spec.to_dynamic_cfg())
+    serve_args.extend(["-D", dynamic_cfg])
+    
+     
+    # Clear existing metrics file
+    metrics_raw_path = Path(spec.metrics_csv_path)
+    if metrics_raw_path.exists():
+        os.remove(metrics_raw_path)
+
+    # Clear existing raw log file
+    raw_log_path = Path(spec.server_raw_log_path)
+    if raw_log_path.exists():
+        os.remove(raw_log_path)
+
+    C.print(f"[bold cyan]Starting vLLM with pp_layer_config: {spec.pp_layer_config}[/]")
+    
+    proc = subprocess.Popen(
+        serve_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        preexec_fn=os.setsid,
+        bufsize=0,
+    )
+    capture = _ProcStdoutCapture(proc, raw_log_path)
+    return proc, capture, metrics_raw_path
+
+
+def start_benchmark_for_sweep(
+    spec: BenchmarkSpec,
+) -> bool:
+    """Start benchmark from spec.
+    
+    Args:
+        spec: BenchmarkSpec with all parameters
+        logm: Log manager for file paths
+        vars: Variables for file naming
+    
+    Returns:
+        True if benchmark succeeded
+    """
+    if not wait_ready(spec.base_url, 300):
+        C.print("[red]ERROR[/] vLLM not ready in time")
+        return False
+    
+    bench_args = [
+        "python3", spec.benchmark_script_path,
+        "--request-rate", "0",  # Use config-based rates
+        "--backend", "openai-chat",
+        "--model", spec.model_path,
+        "--endpoint", "/v1/chat/completions",
+        "--base-url", spec.base_url,
+        "--dataset-name", "pattern",
+        "--served-model-name", spec.model_name,
+        "--goodput", "tpot:300", "ttft:5000",
+        "--temperature", "0",
+        "--seed", "42",
+        "--pattern-batch-size", str(spec.pattern_batch_size),
+        "--benchmark-config", str(spec.benchmark_config_path),
+    ]
+    
+    if spec.print_outputs:
+        bench_args.append("--print-outputs")
+    if spec.profile:
+        bench_args.append("--profile")
+    
+    # Write benchmark config (includes metrics path) via spec helper
+    spec.write_benchmark_config()
+    
+    C.print(f"[bold cyan]Starting benchmark with {spec.num_total_requests} requests[/]")
+    C.print(f"[bold cyan]Request rate config: {spec.request_rate}[/]")
+    
+    # Prepare metrics output path defined in spec
+    metrics_file_path = Path(spec.metrics_file_path)
+    if metrics_file_path.exists():
+        os.remove(metrics_file_path)
+    
+    log_path = Path(spec.benchmark_log_path)
+    if log_path.exists():
+        os.remove(log_path)
+    
+    bench_fd = open(log_path, "wb", buffering=0)
+    ret = subprocess.run(
+        bench_args,
+        stdout=bench_fd,
+        stderr=subprocess.STDOUT,
+        env=os.environ.copy(),
+    )
+    return ret.returncode == 0
+
+
+# =========================
+# Experiment Runner
+# =========================
+
+def _run_single_sweep_experiment(
+    vllm_spec: VllmServerSpec,
+    bench_spec: BenchmarkSpec,
+    logm: SweepLogManager,
+    vars_mapping: Dict[str, Any],
+) -> bool:
+    """Run a single sweep experiment.
+    
+    Args:
+        vllm_spec: VllmServerSpec for starting vLLM
+        bench_spec: BenchmarkSpec for running benchmark
+        logm: Log manager
+        vars_mapping: Variables for file naming
+    
+    Returns:
+        True if experiment succeeded
+    """
+    ok = False
+    proc = None
+    capture = None
+    
+    try:
+        logm.write_constants_meta(vars_mapping)
+        
+        # Start vLLM (spec contains all paths - validated in start_vllm_for_sweep)
+        proc, capture, metrics_raw_path = start_vllm_for_sweep(vllm_spec)
+        # server_raw_log_path is guaranteed non-None after start_vllm_for_sweep validation
+        assert vllm_spec.server_raw_log_path is not None
+        server_raw_path = Path(vllm_spec.server_raw_log_path)
+        
+        # Wait for server ready (with early termination detection)
+        if not wait_ready_or_fail(bench_spec.base_url, proc, server_raw_path):
+            return False
+        
+        C.print("[green]vLLM server is ready[/]")
+        
+        # Start benchmark
+        ok = start_benchmark_for_sweep(bench_spec)
+        
+        if not ok:
+            C.print("[yellow]WARNING:[/] Benchmark failed, but will process logs")
+        
+        stop_tree(proc)
+        capture.close()
+        
+        # Process logs - copy raw to main (server_raw_path already defined above)
+        server_main_path = logm.get_path_with_log_type("server", "log", vars_mapping)
+        if server_main_path.exists():
+            os.remove(server_main_path)
+        if server_raw_path.exists():
+            shutil.copyfile(server_raw_path, server_main_path)
+        
+        # Copy metrics (use path from spec)
+        ts_main_path = logm.get_path_with_log_type("timestamp_metrics", "csv", vars_mapping)
+        if ts_main_path.exists():
+            os.remove(ts_main_path)
+        if metrics_raw_path.exists():
+            shutil.copyfile(metrics_raw_path, ts_main_path)
+        
+    except Exception as e:
+        C.print(f"[red]ERROR[/] {e}")
+        import traceback
+        traceback.print_exc()
+        ok = False
+    finally:
+        if proc:
+            stop_tree(proc)
+        if capture:
+            capture.close()
+        time.sleep(3)
+        generate_analysis_report(logm, vars_mapping)
+    
+    return ok
+
+
+def sweep_test(cfg: SweepTestConfig, logm: SweepLogManager):
+    """Run sweep test experiments.
+    
+    Uses generator to produce experiment specs from config,
+    then runs each experiment sequentially.
+    """
+    all_ok = True
+    experiment_count = 0
+    
+    for exp in generate_experiment_specs(cfg.static_config, cfg.sweep_config, logm):
+        experiment_count += 1
+        C.print(f"\n[bold magenta]{'='*60}[/]")
+        C.print(f"[bold magenta]Experiment {exp.experiment_index + 1}/{exp.total_experiments}[/]")
+        C.print(f"[bold magenta]vars: {exp.vars_mapping}[/]")
+        C.print(f"[bold magenta]{'='*60}[/]\n")
+        
+        ok = _run_single_sweep_experiment(
+            exp.vllm_spec, exp.bench_spec, logm, exp.vars_mapping
+        )
+        if not ok:
+            all_ok = False
+            C.print(f"[yellow]Experiment {exp.experiment_index + 1}/{exp.total_experiments} failed, finished...[/]")
+            return
+    
+    if experiment_count == 0:
+        C.print("[red]ERROR: No valid experiments generated (benchmark_config required)[/]")
+        return
+    
+    status = "All succeeded" if all_ok else "Some failed"
+    C.print(f"\n[bold cyan]Sweep test completed: {experiment_count} experiments, {status}[/]")

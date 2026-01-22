@@ -22,7 +22,7 @@ from rich.console import Console
 from collections import OrderedDict
 
 
-from .data import Config, collect_variables, collect_aliases
+from .data import Config, collect_variables, collect_aliases, SweepTestConfig
 app = typer.Typer(no_args_is_help=True)
 C = Console()
 
@@ -300,3 +300,64 @@ class LogManager:
         log_dir.mkdir(parents=True, exist_ok=True)
 
         return log_dir / filename
+
+
+class SweepLogManager:
+    """Simplified log manager for sweep_test experiments.
+    
+    Provides a clean interface for managing log file paths based on
+    sweep variable values, without the complexity of the legacy LogManager.
+    """
+    
+    def __init__(self, base_dir: Path, cfg: SweepTestConfig):
+        self.base_dir = base_dir
+        self.cfg = cfg
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+    
+    def get_dir(self) -> Path:
+        return self.base_dir
+    
+    def write_constants_meta(self, vars_mapping: Optional[Dict[str, Any]] = None):
+        """Write metadata about the experiment constants."""
+        meta = {
+            "project": self.cfg.project,
+            "type": self.cfg.type,
+            "static_config": self.cfg.static_config.model_dump(),
+            "sweep_config": self.cfg.sweep_config.model_dump(),
+            "timestamp": datetime.datetime.now().isoformat(),
+            "experiment_vars": vars_mapping or {},
+        }
+        meta_path = self.get_path_with_log_type("constants", "json", vars_mapping)
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    
+    def get_path_with_log_type(self, basename: str, file_type: str, vars: Optional[Dict[str, Any]] = None) -> Path:
+        """Generate a log file path based on basename, type, and variables.
+        
+        Variables are used to create a subdirectory, keeping filenames clean.
+        
+        Example: get_path_with_log_type("server", "log", {"flexi": True, "pp": "32,32"})
+        Returns: base_dir / "test-{flexi=1}-{pp=32-32}" / "server.log"
+        """
+        if vars:
+            var_parts = [f"{{{k}={self._encode_val(v)}}}" for k, v in vars.items()]
+            subdir_name = f"test-{'-'.join(var_parts)}"
+            test_dir = self.base_dir / subdir_name
+            test_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{basename}.{file_type}"
+            return test_dir / filename
+        else:
+            filename = f"{basename}.{file_type}"
+            return self.base_dir / filename
+    
+    def _encode_val(self, v: Any) -> str:
+        """Encode a value as a path-safe string."""
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        if isinstance(v, (list, tuple)):
+            if all(isinstance(x, int) for x in v):
+                return "x".join(str(x) for x in v)
+            return "+".join(self._encode_val(x) for x in v)
+        return str(v).replace("/", "_").replace(" ", "").replace(",", "-")

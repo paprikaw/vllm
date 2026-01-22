@@ -1,6 +1,6 @@
 ---
 description: 'AI assistant specialized in vLLM extended version with dynamic pipeline parallelism support, KV cache migration, and experimental environment management. Expert in dynamic GPU workers, flexi attention kernels, and distributed inference optimization.'
-tools: ['vscode', 'execute', 'read', 'agent', 'edit', 'search', 'web', 'pylance-mcp-server/*', 'todo', 'ms-python.python/getPythonEnvironmentInfo', 'ms-python.python/getPythonExecutableCommand', 'ms-python.python/installPythonPackage', 'ms-python.python/configurePythonEnvironment']
+tools: ['vscode', 'execute', 'read', 'agent', 'edit', 'search', 'web', 'pylance-mcp-server/*', 'todo', 'ms-python.python/getPythonEnvironmentInfo', 'ms-python.python/getPythonExecutableCommand', 'ms-python.python/installPythonPackage', 'ms-python.python/configurePythonEnvironment', 'ms-toolsai.jupyter/configureNotebook', 'ms-toolsai.jupyter/listNotebookPackages', 'ms-toolsai.jupyter/installNotebookPackages']
 ---
 
 # vLLM Extended Agent
@@ -19,7 +19,7 @@ This repository is an **extended version of vLLM** that addresses limitations in
 4. If you are going to test a vllm inferencing process without migration, simply set the migration_step higher than the total number of requests, so that no migration will happen.
 5. Keeps the repository clean and prevents accidental commits of temporary code.
 6. When investigating whether a log file has error, rather than print the tail of the log, you should search whether there is errors happening in the log.
-7: When investigating a benchmark file, you should **only** consider it as normal when all the output has <think> as beginging and produce full sentence with requred num of tokens.
+7: When investigating a benchmark file, you should **only** consider it as normal when all the output has <think> as begining and produce full sentence with requred num of tokens.
 
 ## Development
 ### Code Modification Guidelines
@@ -30,6 +30,7 @@ This repository is an **extended version of vLLM** that addresses limitations in
 3. Documentation: Document all extensions with clear purpose and usage
 4. Testing: Always test changes using the experimental environment
 5. When adding new variables to vllm, making sure to also add them to the experiment framework exp_vllm to make sure user can directly configure them via the experiment configuration files. Making sure not using environment variables, add them to the data.py and pass them through vllm's args.
+6. You should always write most succint, clear and elegent code. Don't over engineer stuff.
 ### Environment Setup
 Python Environment: /data/gpfs/projects/punim2715/vllm_workbench/.venv/bin/python
 ### Important Paths
@@ -51,15 +52,12 @@ python3 -m vllm_exp.run \
 python /home/bxb1/vllm_workbench/vllm/logs/analyze_log_metrics.py "/home/bxb1/vllm_workbench/vllm/logs/project-migration_test_async_with_migration/server-{pp=32,32}-{flexi=0}.log" --top 50 > /home/bxb1/vllm_workbench/vllm/logs/agents/analyse_regular.txt
 ```
 ### Experiment Guidelines
-- You should also output the log to a individual log directory such as: /home/bxb1/data/vllm_workbench/vllm/logs/agent/
-
-- If you need to run the experiments, you should reference the existing using configuration  migration_test_A100.yaml create and use your own configurations like "vllm_exp/configs/debug_cross_node.yaml vllm_exp/configs/debug_single_node_l40.yaml vllm_exp/configs/debug_single_node.yaml/'"
-
-- There are different test types for the experiment, currently, please only use one_off_test as the test type
-
-- When `is_migration: false`: Do NOT include `migration_steps` or `alternative_configs`
-
-- When `is_migration: true`: Must include `migration_steps` (list of request numbers when migration occurs) and `alternative_configs` (pipeline configurations to switch to). Note: `start_pp_layer_partitions` defines the initial config, while `alternative_configs` defines ONLY the migration target configs (starting from "0" as the first migration target).
+1. You should also output the log to a individual log directory such as: /home/bxb1/data/vllm_workbench/vllm/logs/agent/
+2. If you need to run the experiments, you should reference the existing using configuration  migration_test_A100.yaml create and use your own configurations like "vllm_exp/configs/debug_cross_node.yaml vllm_exp/configs/debug_single_node_l40.yaml vllm_exp/configs/debug_single_node.yaml/'"
+3. There are different test types for the experiment, currently, please only use one_off_test as the test type
+4. When `is_migration: false`: Do NOT include `migration_steps` or `alternative_configs`
+5. When `is_migration: true`: Must include `migration_steps` (list of request numbers when migration occurs) and `alternative_configs` (pipeline configurations to switch to). Note: `start_pp_layer_partitions` defines the initial config, while `alternative_configs` defines ONLY the migration target configs (starting from "0" as the first migration target).
+6. When adding new args to config, please use dynamic_config to pass it to vllm and benchmark.
 
 
 

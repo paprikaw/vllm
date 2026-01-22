@@ -4139,6 +4139,41 @@ class DynamicConfig:
     """Configuration for the memory stress tester used to evaluate KV cache
     allocation performance. Contains parameters like num_tensors_per_allocation,
     tensor_shape, allocation_interval_ms, etc."""
+    
+    pp_layer_partition: Optional[str] = None
+    """Pipeline parallelism layer partition configuration string.
+    Format: comma-separated integers like "8,56" representing layer counts."""
+    
+    pattern_batch_size: Optional[int] = None
+    """Batch size for pattern-based benchmarking."""
+    
+    deployment_config_path: Optional[str] = None
+    """Path to the deployment configuration file for migration settings.
+    DEPRECATED: Use alternative_configs and migration_steps directly instead."""
+    
+    metrics_csv_path: Optional[str] = None
+    """Path to the metrics CSV file for timestamp metrics output."""
+
+    alternative_configs: Optional[dict[str, Any]] = None
+    """Alternative pipeline parallelism configurations for migration.
+    Format: {"pp_layer_configs": {"0": [32, 32], "1": [16, 48], ...}}
+    Each value is a list of layer counts per pipeline stage."""
+    
+    migration_steps: Optional[list[int]] = None
+    """List of request step numbers at which to trigger migration.
+    Format: [100, 200, 300] means migrate at request 100, 200, and 300.
+    If non-empty, migration is enabled."""
+
+    rank_to_ip: Optional[dict[str, str]] = None
+    """Mapping from pipeline parallel rank to reachable IP address.
+    Format: {"0": "192.168.1.1", "1": "192.168.1.2", ...}
+    Used by DynamicLayerKVConnector for bidirectional control channels.
+    This takes precedence over the VLLM_LAYERKV_RANK_TO_IP environment variable."""
+
+    @property
+    def is_migration(self) -> bool:
+        """Whether migration is enabled (derived from migration_steps)."""
+        return bool(self.migration_steps)
 
     def compute_hash(self) -> str:
         """Compute hash for dynamic config."""
@@ -4146,6 +4181,12 @@ class DynamicConfig:
         factors.append(self.enable_flexi_flash_attn)
         factors.append(self.tester_start_step)
         factors.append(self.memory_stress_tester)
+        factors.append(self.pp_layer_partition)
+        factors.append(self.pattern_batch_size)
+        factors.append(self.deployment_config_path)
+        factors.append(self.metrics_csv_path)
+        factors.append(str(self.alternative_configs) if self.alternative_configs else None)
+        factors.append(str(self.migration_steps) if self.migration_steps else None)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
 
@@ -4482,6 +4523,21 @@ class VllmConfig:
 
         if not self.instance_id:
             self.instance_id = random_uuid()[:5]
+
+        # Transfer rank_to_ip from dynamic_config to layer_kv_connector_config
+        # This allows passing rank_to_ip via -D flag instead of environment variable
+        if (self.dynamic_config is not None 
+            and self.dynamic_config.rank_to_ip
+            and self.layer_kv_connector_config is not None):
+            # Convert string keys to int keys for layer_kv_connector_config
+            rank_to_ip_int: dict[int, str] = {}
+            for k, v in self.dynamic_config.rank_to_ip.items():
+                try:
+                    rank_to_ip_int[int(k)] = str(v)
+                except (ValueError, TypeError):
+                    continue
+            if rank_to_ip_int:
+                self.layer_kv_connector_config.rank_to_ip = rank_to_ip_int
 
     def update_sizes_for_sequence_parallelism(self,
                                               possible_sizes: list) -> list:

@@ -97,11 +97,11 @@ class DynamicEngineCore(EngineCore):
 
         # TODO: Load initial configurations properly
         self.dynamic_config = dynamic_config
-        # Initialize cur_pp_layer_config from VLLM_PP_LAYER_PARTITION environment variable
+        # Initialize cur_pp_layer_config from dynamic_config.pp_layer_partition
         # This is the actual initial configuration used by vLLM at startup
-        partition_list_str = envs.VLLM_PP_LAYER_PARTITION
+        partition_list_str = self.vllm_config.dynamic_config.pp_layer_partition
         if partition_list_str is None:
-            raise ValueError("VLLM_PP_LAYER_PARTITION environment variable must be set")
+            raise ValueError("dynamic_config.pp_layer_partition must be set")
         partitions = [int(layer) for layer in partition_list_str.split(",")]
         initial_layer_configs = []
         start_layer = 0
@@ -1376,7 +1376,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
 
     def migration_thread_rr(self):
         assert False
-        if os.environ.get("TEST_MIGRATION") == "1":
+        if self.vllm_config.dynamic_config.is_migration:
             migration_interval = envs.MIGRATION_INTERVAL
             assert migration_interval > 0
             step = 0
@@ -1392,7 +1392,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                         self.output_queue.put_nowait(output)
                 step += 1
         else:
-            logger.info(f"TEST_MIGRATION is not set, skipping migration")
+            logger.info(f"is_migration is not set, skipping migration")
             return
 
     def stress_tester_thread(self):
@@ -1430,8 +1430,8 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         import os
         from collections import deque
 
-        if os.environ.get("TEST_MIGRATION") != "1":
-            logger.info("TEST_MIGRATION is not set, skipping migration")
+        if not self.vllm_config.dynamic_config.is_migration:
+            logger.info("is_migration is not set, skipping migration")
             return
 
         # --- config choices & indices ---
@@ -1471,8 +1471,8 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         return
         import os
         assert isinstance(self.scheduler, DynamicScheduler)
-        if os.environ.get("TEST_KV_COMPACT") != "1":
-            logger.info("TEST_KV_COMPACT is not set, skipping migration")
+        if not self.vllm_config.dynamic_config.is_compact_kv:
+            logger.info("is_compact_kv is not set, skipping migration")
             return
 
         compact_steps = set(self.dynamic_config.compact_steps)

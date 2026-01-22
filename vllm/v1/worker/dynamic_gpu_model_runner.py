@@ -37,9 +37,11 @@ from vllm.v1.utils import extract_layer_index
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.utils import dynamic_bind_kv_cache, dynamic_bind_single_kv_tensor
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
-from vllm.v1.outputs import ModelRunnerOutput
-from vllm.forward_context import get_forward_context
+from vllm.v1.outputs import ModelRunnerOutput, EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.block_table import PtrTable
 from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
 from vllm.model_executor.model_loader.dynamic_qwen3_loader import CustomModelLoader
 from collections import defaultdict
@@ -72,6 +74,17 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self.key_cache_ptrs: list[int] = []
         self.value_cache_ptrs: list[int] = []
         self.page_meta: Optional[torch.Tensor] = None
+        # For flexi_direct implementation: per-layer pointer tensors
+        # Each tensor has shape (num_blocks,) and dtype uint64, containing pointers to KV pages
+        self.k_ptr_tensors: list[torch.Tensor] = []
+        self.v_ptr_tensors: list[torch.Tensor] = []
+        # PtrTable instances for flexi_direct - will be lazily initialized when num_layers is known
+        self.k_ptr_table: Optional["PtrTable"] = None
+        self.v_ptr_table: Optional["PtrTable"] = None
+        # Track the start_layer that corresponds to the committed PtrTable
+        # During migration, model.start_layer changes but PtrTable stays the same,
+        # so we need to use this value for correct indexing until commit_ptr_tables() is called
+        self._ptr_table_start_layer: int = 0
         # Create CustomModelLoader for weight preloading
         self.custom_loader = CustomModelLoader(self.vllm_config.load_config)
 
@@ -172,6 +185,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
         layer_config: Tuple[int, int],
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+        """
+        Execute model with flexi_direct support.
+        Builds k_ptr_tables/v_ptr_tables from block_table and passes them to forward context.
+        """
         time_start = time.time()
         logger.info(f"getting forward lock taking {human_readable_duration(time.time() - time_start)}")
         with self.fbgate.foreground():
@@ -179,7 +196,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
             self.model.set_sched_layers(layer_config[0], layer_config[1])
             try:
-                result = super().execute_model(scheduler_output, intermediate_tensors)
+                result = self._execute_model(scheduler_output, intermediate_tensors)
             except Exception as e:
                 logger.exception(f"Error in execute_model: {e}")
                 for request in scheduler_output.scheduled_new_reqs:
@@ -188,6 +205,419 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 time.sleep(1)
                 raise
             return result
+
+    @torch.inference_mode()
+    def _execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+        start_time = time.time()
+        self._update_states(scheduler_output)
+        if not scheduler_output.total_num_scheduled_tokens:
+            if not has_kv_transfer_group():
+                # Return empty ModelRunnerOutput if there's no work to do.
+                return EMPTY_MODEL_RUNNER_OUTPUT
+
+            return self.kv_connector_no_forward(scheduler_output)
+        time_start_prepare = time.time()
+        # Prepare the decoder inputs.
+        attn_metadata, logits_indices, spec_decode_metadata = (
+            self._prepare_inputs(scheduler_output))
+        logger.info(f"prepare_inputs took {human_readable_duration(time.time() - time_start_prepare)}")
+        
+        # DEBUG: Log critical batch state for cross-node synchronization debugging
+        pp_rank = get_pp_group().rank
+        
+        # Generate same step_id as in dynamic_utils.py for correlation
+        all_sched_req_ids = sorted(scheduler_output.num_scheduled_tokens.keys())
+        step_id = hash(tuple(all_sched_req_ids)) % 100000
+        
+        # Compare scheduler_output req_ids vs input_batch req_ids
+        batch_req_ids = list(self.input_batch.req_ids)
+        num_reqs = self.input_batch.num_reqs
+        
+        # Check if batch_req_ids match scheduler req_ids (critical for PP correctness)
+        batch_req_set = set(batch_req_ids)
+        sched_req_set = set(all_sched_req_ids)
+        missing_in_batch = sched_req_set - batch_req_set  # In scheduler but not in batch
+        extra_in_batch = batch_req_set - sched_req_set    # In batch but not in scheduler
+        
+        if missing_in_batch or (extra_in_batch and scheduler_output.total_num_scheduled_tokens > 0):
+            logger.warning(f"[PP_MISMATCH] rank={pp_rank} step_id={step_id} "
+                          f"BATCH/SCHED MISMATCH! missing_in_batch={len(missing_in_batch)}, "
+                          f"extra_in_batch={len(extra_in_batch)}")
+        
+        # Log batch state for debugging
+        num_computed_tokens_first5 = self.input_batch.num_computed_tokens_cpu[:min(5, num_reqs)].tolist()
+        scheduled_tokens_per_req = [scheduler_output.num_scheduled_tokens.get(req_id, 0) 
+                                    for req_id in batch_req_ids[:5]]
+        logger.info(f"[PP_BATCH] rank={pp_rank} step_id={step_id} batch_num_reqs={num_reqs} "
+                   f"sched_num_reqs={len(all_sched_req_ids)} "
+                   f"batch_req_ids_first5={[r[-8:] for r in batch_req_ids[:5]]} "
+                   f"num_computed_first5={num_computed_tokens_first5} "
+                   f"scheduled_tokens_first5={scheduled_tokens_per_req}")
+        
+        # Update PtrTables for flexi_direct after block_table has been committed
+        # This runs asynchronously on GPU using efficient index_select operations
+        k_ptr_tables_tensor = None
+        v_ptr_tables_tensor = None
+        if self.k_ptr_tensors and self.v_ptr_tensors:
+            num_reqs = self.input_batch.num_reqs
+            
+            # PtrTable should already be initialized via commit_ptr_tables()
+            # called during dynamic_initialize_kv_cache_flexi or finish_migration
+            if self.k_ptr_table is None:
+                raise RuntimeError(
+                    f"PtrTable not initialized. "
+                    "Ensure commit_ptr_tables() is called after KV cache initialization."
+                )
+            
+            # Use the committed PtrTable's num_layers, NOT len(k_ptr_tensors)
+            # During migration, k_ptr_tensors may have been extended with new layer slots,
+            # but only the committed layers should participate in inference.
+            # The new layers will become active after commit_ptr_tables() is called
+            # at the end of migration (in finish_migration).
+            
+            # Get the block_table from input_batch (it's already on GPU after commit)
+            block_table = self.input_batch.block_table[0].get_device_tensor()
+            
+            time_start = time.time()
+            # Update ptr_tables using efficient GPU operations
+            k_ptr_tables_tensor = self.k_ptr_table.update_from_block_table_and_ptr_tensors(
+                block_table, self.k_ptr_tensors, num_reqs)
+            v_ptr_tables_tensor = self.v_ptr_table.update_from_block_table_and_ptr_tensors(
+                block_table, self.v_ptr_tensors, num_reqs)
+            logger.info(f"kv ptr_tables update took {human_readable_duration(time.time() - time_start)}")
+
+
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        if (self.use_cuda_graph
+                and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
+            # Use piecewise CUDA graphs.
+            # Add padding to the batch size.
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(
+                num_scheduled_tokens)
+        else:
+            # Eager mode.
+            # Pad tokens to multiple of tensor_parallel_size when
+            # enabled collective fusion for SP
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            if self.vllm_config.compilation_config.pass_config. \
+                enable_sequence_parallelism and tp_size > 1:
+                from vllm.utils import round_up
+                num_input_tokens = round_up(num_scheduled_tokens, tp_size)
+            else:
+                num_input_tokens = num_scheduled_tokens
+
+        # _prepare_inputs may reorder the batch, so we must gather multi
+        # modal outputs after that to ensure the correct order
+        if self.is_multimodal_model:
+            # Run the multimodal encoder if any.
+            self._execute_mm_encoder(scheduler_output)
+            mm_embeds = self._gather_mm_embeddings(scheduler_output)
+        else:
+            mm_embeds = []
+
+        if self.is_multimodal_model and get_pp_group().is_first_rank:
+            # NOTE(woosuk): To unify token ids and soft tokens (vision
+            # embeddings), we always use embeddings (rather than token ids)
+            # as input to the multimodal model, even when the input is text.
+            input_ids = self.input_ids[:num_scheduled_tokens]
+            if mm_embeds:
+                inputs_embeds = self.model.get_input_embeddings(
+                    input_ids, mm_embeds)
+            else:
+                inputs_embeds = self.model.get_input_embeddings(input_ids)
+            # TODO(woosuk): Avoid the copy. Optimize.
+            self.inputs_embeds[:num_scheduled_tokens].copy_(inputs_embeds)
+            inputs_embeds = self.inputs_embeds[:num_input_tokens]
+            input_ids = None
+        else:
+            # For text-only models, we use token ids as input.
+            # While it is possible to use embeddings as input just like the
+            # multimodal models, it is not desirable for performance since
+            # then the embedding layer is not included in the CUDA graph.
+            input_ids = self.input_ids[:num_input_tokens]
+            inputs_embeds = None
+        if self.uses_mrope:
+            positions = self.mrope_positions[:, :num_input_tokens]
+        else:
+            positions = self.positions[:num_input_tokens]
+
+        if get_pp_group().is_first_rank:
+            intermediate_tensors = None
+        else:
+            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                num_input_tokens, intermediate_tensors, True)
+        # Run the decoder.
+        # Use persistent buffers for CUDA graphs.
+        # Get start_layer for computing local layer index in flexi_direct
+        # IMPORTANT: Use _ptr_table_start_layer (not model.start_layer) because during migration,
+        # model.start_layer changes when weights are loaded but PtrTable stays the same.
+        # Using model.start_layer would cause incorrect indexing into PtrTable.
+        start_layer = self._ptr_table_start_layer
+        with set_forward_context(attn_metadata,
+                                 self.vllm_config,
+                                 num_tokens=num_input_tokens,
+                                 k_ptr_tables=k_ptr_tables_tensor,
+                                 v_ptr_tables=v_ptr_tables_tensor,
+                                 start_layer=start_layer):
+            self.maybe_setup_kv_connector(scheduler_output)
+            try:
+                model_forward_start = time.time()
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                )
+                model_forward_end = time.time()
+            except Exception as e:
+                time.sleep(2)
+                logger.info(f"Exception during model forward: {e}")
+                raise e
+
+            self.maybe_wait_for_kv_save()
+            finished_sending, finished_recving = (
+                self.get_finished_kv_transfers(scheduler_output))
+        if self.use_aux_hidden_state_outputs:
+            hidden_states, aux_hidden_states = model_output
+        else:
+            hidden_states = model_output
+        # Broadcast PP output for external_launcher (torchrun)
+        # to make sure we are synced across pp ranks
+        # TODO: Support overlapping mirco-batches
+        # https://github.com/vllm-project/vllm/issues/18019
+        broadcast_pp_output = \
+            self.parallel_config.distributed_executor_backend \
+            == "external_launcher" and len(get_pp_group().ranks) > 0
+        if not get_pp_group().is_last_rank:
+            # For mid-pipeline stages, return the hidden states.
+            if not broadcast_pp_output:
+                return hidden_states
+            assert isinstance(hidden_states, IntermediateTensors)
+            get_pp_group().send_tensor_dict(hidden_states.tensors,
+                                            all_gather_group=get_tp_group())
+            logits = None
+        else:
+            sample_hidden_states = hidden_states[logits_indices]
+            logits = self.model.compute_logits(sample_hidden_states, None)
+        if broadcast_pp_output:
+            model_output_broadcast_data = {
+                "logits": logits.contiguous(),
+            } if logits is not None else {}
+            model_output_broadcast_data = get_pp_group().broadcast_tensor_dict(
+                model_output_broadcast_data, src=len(get_pp_group().ranks) - 1)
+            assert model_output_broadcast_data is not None
+            logits = model_output_broadcast_data["logits"]
+
+        # Apply structured output bitmasks if present
+        if scheduler_output.grammar_bitmask is not None:
+            self.apply_grammar_bitmask(scheduler_output, logits)
+
+        # Sample the next token and get logprobs if needed.
+        sampling_metadata = self.input_batch.sampling_metadata
+        if spec_decode_metadata is None:
+            sampler_output = self.sampler(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+        else:
+            # When indexing with a tensor (bonus_logits_indices), PyTorch
+            # creates a new tensor with separate storage from the original
+            # logits tensor. This means any in-place operations on bonus_logits
+            # won't affect the original logits tensor.
+            assert logits is not None
+            bonus_logits = logits[spec_decode_metadata.bonus_logits_indices]
+            sampler_output = self.sampler(
+                logits=bonus_logits,
+                sampling_metadata=sampling_metadata,
+            )
+            bonus_token_ids = sampler_output.sampled_token_ids
+
+            # Just like `bonus_logits`, `target_logits` is a new tensor with
+            # separate storage from the original `logits` tensor. Therefore,
+            # it is safe to update `target_logits` in place.
+            target_logits = logits[spec_decode_metadata.target_logits_indices]
+            output_token_ids = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+            )
+            sampler_output.sampled_token_ids = output_token_ids
+
+        # TODO(woosuk): The following loop can be slow since it iterates over
+        # the requests one by one. Optimize.
+        discard_sampled_tokens_req_indices = []
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            req_state = self.requests[req_id]
+            seq_len = (req_state.num_computed_tokens +
+                       scheduler_output.num_scheduled_tokens[req_id])
+            if seq_len < req_state.num_tokens:
+                # Ignore the sampled token for partial prefills.
+                # Rewind the generator state as if the token was not sampled.
+                # This relies on cuda-specific torch-internal impl details
+                generator = self.input_batch.generators.get(i)
+                if generator is not None:
+                    generator.set_offset(generator.get_offset() - 4)
+                # Record the index of the request that should not be sampled,
+                # so that we could clear the sampled tokens before returning.
+                discard_sampled_tokens_req_indices.append(i)
+        # NOTE: GPU -> CPU Sync happens here.
+        # Move as many CPU operations as possible before this sync point.
+        logprobs_tensors = sampler_output.logprobs_tensors
+        logprobs_lists = logprobs_tensors.tolists() \
+            if logprobs_tensors is not None else None
+
+        # Compute prompt logprobs if needed.
+        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+            hidden_states[:num_scheduled_tokens],
+            scheduler_output,
+        )
+        # Get the valid generated tokens.
+        sampled_token_ids = sampler_output.sampled_token_ids
+        max_gen_len = sampled_token_ids.shape[-1]
+        if max_gen_len == 1:
+            # No spec decode tokens.
+            valid_sampled_token_ids = sampled_token_ids.tolist()
+        else:
+            # Includes spec decode tokens.
+            valid_sampled_token_ids = self.rejection_sampler.parse_output(
+                sampled_token_ids,
+                self.input_batch.vocab_size,
+            )
+        # Mask out the sampled tokens that should not be sampled.
+        for i in discard_sampled_tokens_req_indices:
+            valid_sampled_token_ids[i].clear()
+        if not self.use_spec_decode:
+            # Speculative decoding is not enabled.
+            spec_token_ids = None
+        elif self.speculative_config.method == "ngram":
+            assert isinstance(self.drafter, NgramProposer)
+            spec_token_ids = self.generate_draft_token_ids(
+                valid_sampled_token_ids, sampling_metadata)
+        elif self.speculative_config.method == "medusa":
+
+            assert isinstance(self.drafter, MedusaProposer)
+            if max_gen_len == 1:
+                hidden_states = sample_hidden_states
+            else:
+                indices = []
+                offset = 0
+                for num_draft, tokens in zip(
+                        spec_decode_metadata.num_draft_tokens,
+                        valid_sampled_token_ids):
+                    indices.append(offset + len(tokens) - 1)
+                    offset += num_draft + 1
+
+                indices = torch.tensor(indices,
+                                       device=sample_hidden_states.device)
+                hidden_states = sample_hidden_states[indices]
+
+            spec_token_ids = self.drafter.propose(
+                target_hidden_states=hidden_states,
+                sampling_metadata=sampling_metadata,
+            )
+        elif self.speculative_config.use_eagle():
+            assert isinstance(self.drafter, EagleProposer)
+            # TODO(woosuk): Refactor the loop.
+            next_token_ids: list[int] = []
+            for i, token_ids in enumerate(valid_sampled_token_ids):
+                if token_ids:
+                    # Common case.
+                    next_token_id = token_ids[-1]
+                else:
+                    # Partial prefill (rare case).
+                    # Get the next token id from the request state.
+                    req_id = self.input_batch.req_ids[i]
+                    req_state = self.requests[req_id]
+                    seq_len = (req_state.num_computed_tokens +
+                               scheduler_output.num_scheduled_tokens[req_id])
+                    next_token_id = req_state.get_token_id(seq_len)
+                next_token_ids.append(next_token_id)
+            next_token_ids = torch.tensor(next_token_ids,
+                                          dtype=torch.int32,
+                                          device=self.device)
+            # At this moment, we assume all eagle layers belong to the same KV
+            # cache group, thus using the same attention metadata.
+            eagle_attn_metadata = attn_metadata[
+                self.drafter.attn_layer_names[0]]
+
+
+            # NOTE: deepseek_mtp uses MLA which does not have `block_table`
+            if hasattr(eagle_attn_metadata, "block_table"):
+                block_table = eagle_attn_metadata.block_table
+            else:
+                block_table = None
+
+            if spec_decode_metadata is None:
+                # input_ids can be None for multimodal models.
+                target_token_ids = self.input_ids[:num_scheduled_tokens]
+                target_positions = positions[:num_scheduled_tokens]
+                if self.use_aux_hidden_state_outputs:
+                    target_hidden_states = torch.cat(
+                        [h[:num_scheduled_tokens] for h in aux_hidden_states],
+                        dim=-1)
+                else:
+                    target_hidden_states = hidden_states[:num_scheduled_tokens]
+                target_slot_mapping = eagle_attn_metadata.slot_mapping
+                cu_num_tokens = eagle_attn_metadata.query_start_loc
+            else:
+                # TODO(woosuk): Refactor this.
+                num_draft_tokens = spec_decode_metadata.num_draft_tokens
+                num_rejected_tokens = [
+                    n + 1 - len(valid_sampled_token_ids[i]) if n > 0 else 0
+                    for i, n in enumerate(num_draft_tokens)
+                ]
+                num_rejected_tokens_tensor = async_tensor_h2d(
+                    num_rejected_tokens,
+                    dtype=torch.int32,
+                    target_device=self.device,
+                    pin_memory=True)
+                num_tokens = num_scheduled_tokens - sum(num_rejected_tokens)
+                cu_num_tokens, token_indices = self.drafter.prepare_inputs(
+                    eagle_attn_metadata.query_start_loc,
+                    num_rejected_tokens_tensor,
+                    num_tokens,
+                )
+                target_token_ids = self.input_ids[token_indices]
+                target_positions = positions[token_indices]
+                if self.use_aux_hidden_state_outputs:
+                    target_hidden_states = torch.cat(
+                        [h[token_indices] for h in aux_hidden_states], dim=-1)
+                else:
+                    target_hidden_states = hidden_states[token_indices]
+                target_slot_mapping = eagle_attn_metadata.slot_mapping[
+                    token_indices]
+            draft_token_ids = self.drafter.propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                target_slot_mapping=target_slot_mapping,
+                next_token_ids=next_token_ids,
+                cu_num_tokens=cu_num_tokens,
+                block_table=block_table,
+                sampling_metadata=sampling_metadata,
+            )
+            spec_token_ids = draft_token_ids.tolist()
+
+        # Clear KVConnector state after all KVs are generated.
+        if has_kv_transfer_group():
+            get_kv_transfer_group().clear_connector_metadata()
+
+        return ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids,
+            req_id_to_index=self.input_batch.req_id_to_index,
+            sampled_token_ids=valid_sampled_token_ids,
+            spec_token_ids=spec_token_ids,
+            logprobs=logprobs_lists,
+            prompt_logprobs_dict=prompt_logprobs_dict,
+            finished_sending=finished_sending,
+            finished_recving=finished_recving,
+        )
 
     def profile_run(self) -> None: 
         """
@@ -621,12 +1051,130 @@ class DynamicGPUModelRunner(GPUModelRunner):
             self.value_caches,
             self.key_cache_ptrs,
             self.value_cache_ptrs,
-            self.page_meta
+            self.page_meta,
+            self.k_ptr_tensors,
+            self.v_ptr_tensors,
         )
+        # Initialize PtrTable stacked tensors after binding all KV caches
+        self.commit_ptr_tables()
+        
         del kv_caches
         if has_kv_transfer_group():
             assert False
             get_kv_transfer_group().register_kv_caches(kv_caches)
+
+    def prepare_ptr_tables(self) -> None:
+        """
+        Prepare new stacked tensors and store them for later commit.
+        
+        Call this immediately after KV cache binding completes (e.g., after migration
+        binding loop finishes). This does the expensive work of building stacked tensors
+        and stores them in _pending_k_stacked/_pending_v_stacked.
+        
+        IMPORTANT: This does NOT replace the current PtrTable. The current PtrTable
+        continues to be used for inference. Only commit_ptr_tables() will switch
+        to the new PtrTable atomically.
+        
+        The prepared tensors can then be atomically committed via commit_ptr_tables().
+        """
+        if not self.k_ptr_tensors or not self.v_ptr_tensors:
+            self._pending_k_stacked = None
+            self._pending_v_stacked = None
+            self._pending_k_ptr_table = None
+            self._pending_v_ptr_table = None
+            return
+        
+        num_layers = len(self.k_ptr_tensors)
+        
+        # Create new PtrTable instances for the new layer count, but do NOT replace
+        # the current ones yet. They are stored as pending and will be committed later.
+        from vllm.utils import cdiv
+        max_num_blocks_per_req = cdiv(self.max_model_len, 
+                                      self.cache_config.block_size)
+        
+        # Create pending PtrTables (these will replace current ones on commit)
+        self._pending_k_ptr_table = PtrTable(
+            max_num_reqs=self.max_num_reqs,
+            max_num_blocks_per_req=max_num_blocks_per_req,
+            num_layers=num_layers,
+            pin_memory=self.pin_memory,
+            device=self.device,
+        )
+        self._pending_v_ptr_table = PtrTable(
+            max_num_reqs=self.max_num_reqs,
+            max_num_blocks_per_req=max_num_blocks_per_req,
+            num_layers=num_layers,
+            pin_memory=self.pin_memory,
+            device=self.device,
+        )
+        
+        # Prepare new stacked tensors using the pending PtrTables
+        self._pending_k_stacked = self._pending_k_ptr_table.prepare_stacked_tensors(self.k_ptr_tensors)
+        self._pending_v_stacked = self._pending_v_ptr_table.prepare_stacked_tensors(self.v_ptr_tensors)
+        
+        logger.info(f"prepare_ptr_tables: prepared stacked tensors for {num_layers} layers")
+
+    def commit_ptr_tables(self) -> None:
+        """
+        Atomically switch to the prepared PtrTables and stacked tensors.
+        
+        Call this after prepare_ptr_tables() to atomically commit the prepared
+        PtrTables and stacked tensors. This is a fast pointer assignment operation.
+        
+        If prepare_ptr_tables() was not called, this will call it first.
+        
+        This method:
+        1. Replaces k_ptr_table/v_ptr_table with the pending ones
+        2. Commits the pending stacked tensors to the new PtrTables
+        """
+        # If no pending PtrTables, prepare them first
+        if not hasattr(self, '_pending_k_ptr_table') or self._pending_k_ptr_table is None:
+            self.prepare_ptr_tables()
+        
+        # If still no pending (e.g., no ptr_tensors), nothing to do
+        if not hasattr(self, '_pending_k_ptr_table') or self._pending_k_ptr_table is None:
+            return
+        
+        # Atomic switch: replace current PtrTables with pending ones
+        self.k_ptr_table = self._pending_k_ptr_table
+        self.v_ptr_table = self._pending_v_ptr_table
+        
+        # Update start_layer to match the new PtrTable
+        # This is critical: the new PtrTable corresponds to the current model.start_layer
+        self._ptr_table_start_layer = getattr(self.model.model, 'start_layer', 0)
+        
+        # Commit the stacked tensors to the new PtrTables
+        self.k_ptr_table.commit_stacked_tensors(self._pending_k_stacked, id(self.k_ptr_tensors))
+        self.v_ptr_table.commit_stacked_tensors(self._pending_v_stacked, id(self.v_ptr_tensors))
+        
+        # Clear pending state
+        self._pending_k_stacked = None
+        self._pending_v_stacked = None
+        self._pending_k_ptr_table = None
+        self._pending_v_ptr_table = None
+        
+        logger.info(f"commit_ptr_tables: committed stacked tensors with {self.k_ptr_table.num_layers} layers, "
+                    f"_ptr_table_start_layer updated to {self._ptr_table_start_layer}")
+
+    def refresh_ptr_tensors_cache(self) -> None:
+        """
+        Update the cached stacked tensors to reflect current k_ptr_tensors/v_ptr_tensors.
+        
+        Use this after resize/compact operations where the ptr_tensors content changes
+        (different pointer values or different num_blocks) but num_layers stays the same.
+        
+        This is a lightweight operation that does NOT:
+        - Recreate the PtrTable instances
+        - Change _ptr_table_start_layer
+        
+        It only updates _cached_stacked_ptr_tensors to match the current ptr_tensors.
+        """
+        time_start = time.time()
+        if self.k_ptr_table is not None and self.k_ptr_tensors:
+            self.k_ptr_table.set_ptr_tensors(self.k_ptr_tensors)
+        if self.v_ptr_table is not None and self.v_ptr_tensors:
+            self.v_ptr_table.set_ptr_tensors(self.v_ptr_tensors)
+        logger.info(f"refresh_ptr_tensors_cache: updated stacked tensors cache in {human_readable_duration(time.time() - time_start)}")
 
     def flexi_release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         '''
@@ -654,6 +1202,18 @@ class DynamicGPUModelRunner(GPUModelRunner):
             ptr for idx, ptr in enumerate(self.value_cache_ptrs)
             if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
         ]
+        
+        # Also update k_ptr_tensors and v_ptr_tensors for flexi_direct
+        self.k_ptr_tensors = [
+            ptr_tensor for idx, ptr_tensor in enumerate(self.k_ptr_tensors)
+            if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+        ]
+        self.v_ptr_tensors = [
+            ptr_tensor for idx, ptr_tensor in enumerate(self.v_ptr_tensors)
+            if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+        ]
+        # Note: PtrTable stacked tensors will be rebuilt atomically after migration completes
+        # via commit_ptr_tables() to ensure atomic switch during inference
 
         # Delete layer name from kv_cache_config
         deleted_layers = set(layer for layers in layers_list for layer in range(layers[0], layers[1]+1))

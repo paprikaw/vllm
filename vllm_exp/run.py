@@ -1,28 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import atexit
-import datetime
-import itertools
-import json
 import os
-import signal
-import shutil
-import subprocess
-import time
-import traceback
-from dataclasses import dataclass, asdict
-from hashlib import sha1
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Literal, Iterable, Callable
-from io import FileIO
-import requests
 import typer
 import yaml
-from pydantic import BaseModel
 from rich.console import Console
-from collections import OrderedDict
 
-from .data import Config
+from .data import Config, SweepTestConfig
 from .log import LogManager
 from .utils import load_config, clean_metrics_directory
 
@@ -30,8 +14,15 @@ from .utils import load_config, clean_metrics_directory
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False, pretty_exceptions_show_locals=False)
 C = Console()
 
+
+def load_sweep_test_config(path: str) -> SweepTestConfig:
+    """Load sweep test configuration from YAML file."""
+    with open(path, "r") as f:
+        return SweepTestConfig.model_validate(yaml.safe_load(f))
+
+
 # =========================
-# CLI: sweep over multiple projects
+# CLI: Legacy multi-project sweep
 # =========================
 
 @app.command()
@@ -39,10 +30,9 @@ def sweep(
     config: str = typer.Option(..., help="Path to config.yaml (supports multiple projects)"),
     log_dir: str = typer.Option("/root/vllm_workbench/logs", help="Base log dir"),
 ):
+    """Run legacy multi-project experiments."""
     multi_cfg = load_config(config)
     C.print(multi_cfg)
-
-    # 清理metrics目录
 
     os.environ.update(multi_cfg.envs)
     for cfg in multi_cfg.projects:
@@ -50,7 +40,6 @@ def sweep(
         base_dir = Path(log_dir)
         base_dir.mkdir(parents=True, exist_ok=True)
         logm = LogManager(base_dir, cfg)
-        # clean_metrics_directory(logm.get_dir())
 
         os.environ.update(cfg.envs)
 
@@ -65,6 +54,40 @@ def sweep(
             one_off_test(cfg, logm)
         else:
             raise ValueError(f"Unknown project type: {cfg.type}")
+
+
+# =========================
+# CLI: New sweep_test (single project)
+# =========================
+
+@app.command()
+def sweep_test(
+    config: str = typer.Option(..., help="Path to sweep_test config.yaml"),
+    log_dir: str = typer.Option("/root/vllm_workbench/logs", help="Base log dir"),
+):
+    """Run sweep test experiment with the new unified configuration format.
+    
+    This is the recommended way to run parametric experiments.
+    One config file = one project with sweep variables.
+    """
+    cfg = load_sweep_test_config(config)
+    C.rule(f"[bold green]Sweep Test: {cfg.project}[/]")
+    
+    # Set environment variables
+    os.environ.update(cfg.envs)
+    
+    # Create log manager
+    base_dir = Path(log_dir) / f"project-{cfg.project}"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Use a simple log manager for sweep tests
+    from .log import SweepLogManager
+    logm = SweepLogManager(base_dir, cfg)
+    
+    # Run sweep test
+    from .experiments import sweep_test as run_sweep_test
+    run_sweep_test(cfg, logm)
+
 
 if __name__ == "__main__":
     app()

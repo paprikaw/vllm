@@ -1,0 +1,55 @@
+envs:
+  NCCL_DEBUG: INFO
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+  VLLM_TORCH_PROFILER_DIR: /home/bxb1/data/vllm_workbench/profiler/
+  RAY_CGRAPH_get_timeout: "10000"
+  BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+  DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+  KV_SYNC_USE_CPU: "0"
+  VLLM_USE_CPU_MODEL: "0"
+  CUDA_LAUNCH_BLOCKING: "0"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+  VLLM_USE_RAY_COMPILED_DAG: "1"
+  RAY_DEDUP_LOGS: "0"
+  NCCL_SOCKET_IFNAME: "bond0.3027"
+  GLOO_SOCKET_IFNAME: "bond0.3027"
+
+projects:
+  # This config runs L40 (rank 0) -> A100 (rank 1)
+  # MUST be launched from L40 node (spartan-gpgpu003) for correct rank assignment!
+  - project: "single_req_trace_cross_l40_first"
+
+    type: "one_off_test"
+    model:
+      path: "/home/bxb1/data/huggingface/Qwen3-32B"
+    network:
+      delays: [0]
+      rank_to_ip:
+        0: "spartan-gpgpu003"
+        1: "spartan-gpgpu169"
+      rank_to_node:
+        0: "spartan-gpgpu003"
+        1: "spartan-gpgpu169"
+    vllm:
+      head_addr: "localhost"
+      pipeline_parallel_size: 2
+      enable_flexi_flash_attn: false
+      gpu_memory_utilization: 0.75
+      start_pp_layer_partitions:
+        - "32,32"
+    migration:
+      is_migration: false
+    benchmark:
+      benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+      profile: false
+      print_outputs: true
+      data_num_requests: [1]
+      input_output_lens: [[128, 32]]
+      running_num_requests: [1]
+      running_request_rates: [1.0]
+      burstiness: 100.0
+      warmup:
+        enabled: false
+        data_num_requests: [1]

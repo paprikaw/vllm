@@ -70,7 +70,27 @@ try:
                 else:
                     scheduler_output, intermediate_tensors = scheduler_output, None
 
-    
+                # DEBUG: Generate unique step_id for cross-rank tracking
+                # Use sorted req_ids to ensure deterministic step_id
+                # all_sched_req_ids = sorted(scheduler_output.num_scheduled_tokens.keys())
+                # step_id = hash(tuple(all_sched_req_ids)) % 100000  # Short hash for readability
+                # total_tokens = scheduler_output.total_num_scheduled_tokens
+                # new_req_ids = [r.request_id for r in scheduler_output.scheduled_new_reqs]
+                # cached_req_ids = [r.req_id for r in scheduler_output.scheduled_cached_reqs]
+                # finished_req_ids = list(scheduler_output.finished_req_ids)
+                
+                # # Log comprehensive info for step tracking
+                # logger.info(f"[PP_STEP] rank={self.rpc_rank} step_id={step_id} "
+                #            f"total_tokens={total_tokens} num_reqs={len(all_sched_req_ids)} "
+                #            f"new_reqs={len(new_req_ids)} cached_reqs={len(cached_req_ids)} "
+                #            f"finished_reqs={len(finished_req_ids)} "
+                #            f"has_intermediate={intermediate_tensors is not None}")
+                # # Log per-request token counts for detailed tracking
+                # req_token_summary = [(req_id[-8:], scheduler_output.num_scheduled_tokens[req_id]) 
+                #                      for req_id in all_sched_req_ids[:10]]
+                # logger.info(f"[PP_STEP] rank={self.rpc_rank} step_id={step_id} "
+                #            f"req_tokens(last8chars,tokens)={req_token_summary}")
+
                 with self.worker.model_runner.forward_lock:
                     assert isinstance(scheduler_output, DynamicSchedulerOutput), f"Scheduler output is not a DynamicSchedulerOutput:{type(scheduler_output)}"
                     # 计算通信时间（如果有上游数据）
@@ -86,21 +106,21 @@ try:
                     # logger.info(f"[perf_analysis] rank {self.rpc_rank}: About to execute_model()")
                     exec_start = time.time()
                     assert self.worker.inference_stream is not None, "high_priority_stream is not initialized"
-                    with torch.cuda.stream(self.worker.inference_stream):
-                        try:
-                            model_exec_start = time.time()
-                            output = self.worker.model_runner.execute_model(
-                            create_from_dynamic_scheduler_output(scheduler_output), 
-                            scheduler_output.pp_layer_config[self.rpc_rank],
-                            intermediate_tensors)
-                            model_exec_end = time.time()
-                            model_exec_cpu_time = model_exec_end - model_exec_start
-                        except Exception as e:
-                            print(traceback.format_exc())
-                            print(f"scheduler_output: {scheduler_output}")
-                            print(f"error is raised within the compiled ray DAG graph, error: {e}")
-                            time.sleep(1)
-                            raise e
+                    # with torch.cuda.stream(self.worker.inference_stream):
+                    try:
+                        model_exec_start = time.time()
+                        output = self.worker.model_runner.execute_model(
+                        create_from_dynamic_scheduler_output(scheduler_output), 
+                        scheduler_output.pp_layer_config[self.rpc_rank],
+                        intermediate_tensors)
+                        model_exec_end = time.time()
+                        model_exec_cpu_time = model_exec_end - model_exec_start
+                    except Exception as e:
+                        print(traceback.format_exc())
+                        print(f"scheduler_output: {scheduler_output}")
+                        print(f"error is raised within the compiled ray DAG graph, error: {e}")
+                        time.sleep(1)
+                        raise e
                 
                 # CRITICAL: Synchronize the high priority stream before using results
                 # This ensures all computations are complete before we access the output tensors
@@ -134,11 +154,17 @@ try:
                         residual_size_mb = residual.numel() * residual.element_size() / 1024 / 1024
                         total_size_mb = hidden_size_mb + residual_size_mb
 
+                        # Avoid division by zero when comm_time is too small
+                        if comm_time > 0.001:  # > 1 microsecond
+                            bandwidth_str = f"{total_size_mb / (comm_time / 1000):.2f} MB/s"
+                        else:
+                            bandwidth_str = "N/A (comm_time too small)"
+                        
                         logger.info(f"[forward]: rank {self.rpc_rank} Communication time from upstream: {comm_time:.2f} ms, "
                                    f"hidden_states dtype: {hidden_states.dtype}, shape: {hidden_states.shape}, size: {hidden_size_mb:.2f} MB, "
                                    f"residual dtype: {residual.dtype}, shape: {residual.shape}, size: {residual_size_mb:.2f} MB, "
                                    f"total data volume: {total_size_mb:.2f} MB, "
-                                   f"bandwidth: {total_size_mb / (comm_time / 1000):.2f} MB/s")
+                                   f"bandwidth: {bandwidth_str}")
                     else:
                         logger.info(f"[forward]: rank {self.rpc_rank} Communication time from upstream: {comm_time:.2f} ms, no received data")
                 logger.info(f"""

@@ -19,38 +19,32 @@ envs:
   GLOO_SOCKET_IFNAME: "bond0.3027"
   # Note: VLLM_HOST_IP is now set automatically per-worker in dynamic_ray_distributed_executor.py
 projects:
-  - project: "hete_migration_test_with_no_migration"
-
+  - project: "hete_single_node_migration_test_with_migration"
     type: "one_off_test"
     model:
       path: "/home/bxb1/data/huggingface/Qwen3-32B"
-    #   name: ""
     network:
       delays: [0]
       # 每个 pipeline 并行 rank 的可达 IP（供 KV synchronizer 双向通道使用）
       rank_to_ip:
         0: "spartan-gpgpu169"
         # 1: "spartan-gpgpu003"
-        1: "spartan-gpgpu003"
+        1: "spartan-gpgpu169"
       # 指定每个 rank 应该部署在哪个 Ray 节点上（用于跨节点 pipeline parallelism）
       # 格式：rank -> Ray 节点的 IP 地址
       rank_to_node:
         0: "spartan-gpgpu169"    # spartan-gpgpu169 (Node 1)
-        1: "spartan-gpgpu003"     # spartan-gpgpu003 (Node 2)
+        1: "spartan-gpgpu169"     # spartan-gpgpu003 (Node 2)
     vllm:
       head_addr: "localhost"
       pipeline_parallel_size: 2
-      enable_flexi_flash_attn: false # Set to true to enable Flexi Flash Attention
+      enable_flexi_flash_attn: false
       gpu_memory_utilization: 0.75
       start_pp_layer_partitions:
         - "32,32"
     migration:
       is_migration: true
       migration_steps: [1000]
-      # migration_steps: [100]
-      # alternative_configs now represents ONLY migration target configs (not initial config)
-      # The initial config is taken from start_pp_layer_partitions above
-      # "0" = first migration target, "1" = second migration target, etc.
       alternative_configs:
         "0": [12, 52]
         "1": [32, 32]
@@ -59,13 +53,9 @@ projects:
       benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
       profile: false
       print_outputs: true
-      # data_num_requests: [40, 160]
-      # input_output_lens: [[1024, 32], [512, 128]]
-      # running_num_requests: [40, 160]
-      # running_request_rates: [40, 2]
-      data_num_requests: [100]
+      data_num_requests: [200]
       input_output_lens: [[800, 64]]
-      running_num_requests: [100]
+      running_num_requests: [200]
       running_request_rates: [1.8]
       burstiness: 100.0  # Higher value = more uniform rate (匀速发送)
       warmup:
@@ -75,41 +65,3 @@ projects:
         running_request_rates: [25]
         running_num_requests: [25]
 is_log_cover: true
-
-# projects:
-#   - project: "migration_test_async_with_migration"
-#     type: "one_off_test"
-#     model:
-#       path: "/home/bxb1/data/huggingface/Qwen3-32B-AWQ"
-#     #   name: ""
-#     network:
-#       delays: [0]
-#       # 每个 pipeline 并行 rank 的可达 IP（请根据实际机器 IP 修改）
-#       rank_to_ip:
-#         0: "spartan-gpgpu143"
-#         1: "spartan-gpgpu143"
-#     vllm:
-#       head_addr: "localhost"
-#       pipeline_parallel_size: 2
-#       enable_flexi_flash_attn: false  # Set to true to enable Flexi Flash Attention
-#       gpu_memory_utilization: 0.75
-#       start_pp_layer_partitions:
-#         - "32,32"
-#     migration:
-#       is_migration: true
-#       migration_steps: [50]
-#       # migration_steps: [100]
-#       alternative_configs:
-#         "0": [32, 32]
-#         "1": [28, 36]
-#         "2": [32, 32]
-#         "3": [20, 44]
-#     benchmark:
-#       benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
-#       profile: false
-#       print_outputs: true
-#       data_num_requests: [100]
-#       input_output_lens: [[512, 128]]
-#       running_num_requests: [100]
-#       running_request_rates: [2]
-# is_log_cover: true

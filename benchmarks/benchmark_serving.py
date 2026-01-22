@@ -1097,6 +1097,9 @@ def main(args: argparse.Namespace):
             raise ValueError(f"Benchmark config file not found: {args.benchmark_config}")
         with open(args.benchmark_config, 'r') as f:
             benchmark_config = BenchCfg.model_validate(json.load(f))
+        # Propagate metrics output path from config if provided (for vllm_exp integration)
+        if getattr(benchmark_config, "metrics_file_name", None):
+            os.environ["METRICS_FILE_NAME"] = benchmark_config.metrics_file_name
         
         # Override args.burstiness with value from config file if present
         if hasattr(benchmark_config, 'burstiness'):
