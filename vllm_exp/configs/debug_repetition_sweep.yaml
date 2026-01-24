@@ -26,7 +26,7 @@ is_log_cover: true
 
 static_config:
   model:
-    path: "/home/bxb1/dachange model configuration to config ita/huggingface/Qwen3-32B"
+    path: "/home/bxb1/data/huggingface/Qwen3-32B"
     name: "Qwen3-32B"
   
   network:

@@ -803,24 +803,9 @@ def test_migration_with_different_pp(cfg: Config, logm: LogManager):
 
 from .data import (
     SweepTestConfig, SweepBenchmarkConfig, SweepConfig, StaticConfig,
-    VllmServerSpec, BenchmarkSpec, WarmupBenchCfg, extract_naming_vars
+    VllmServerSpec, BenchmarkSpec, WarmupBenchCfg, extract_naming_vars,
+    ExperimentConfig,
 )
-
-
-def _generate_sweep_combinations(sweep_cfg: SweepConfig) -> List[Dict[str, Any]]:
-    """Generate all combinations of sweep variables using Cartesian product."""
-    axes = sweep_cfg.get_sweep_axes()
-    if not axes:
-        return [{}]
-    
-    keys = list(axes.keys())
-    values = [axes[k] for k in keys]
-    
-    combinations = []
-    for combo in itertools.product(*values):
-        combinations.append(dict(zip(keys, combo)))
-    
-    return combinations
 
 
 # =========================
@@ -835,6 +820,7 @@ class SweepExperimentSpec:
     """
     vllm_spec: VllmServerSpec
     bench_spec: BenchmarkSpec
+    exp_config: ExperimentConfig  # The merged experiment config
     vars_mapping: Dict[str, Any]
     experiment_index: int
     total_experiments: int
@@ -845,60 +831,29 @@ class SweepExperimentSpec:
 # =========================
 
 def generate_experiment_specs(
-    static_cfg: StaticConfig,
-    sweep_cfg: SweepConfig,
+    sweep_test_cfg: SweepTestConfig,
     logm: SweepLogManager,
 ) -> Iterable[SweepExperimentSpec]:
-    """Generate experiment specs from static and sweep config.
+    """Generate experiment specs from SweepTestConfig.
     
-    This generator combines sweep combinations with static config,
-    yielding complete VllmServerSpec and BenchmarkSpec pairs.
+    Uses ExperimentConfig.iter_from_sweep_test_config() to iterate over
+    all combinations of static_config × sweep_config, then generates
+    VllmServerSpec and BenchmarkSpec from each ExperimentConfig.
     
     Args:
-        static_cfg: Static configuration shared by all experiments
-        sweep_cfg: Sweep configuration with variable axes
+        sweep_test_cfg: Complete sweep test configuration
         logm: Log manager for generating file paths
     
     Yields:
         SweepExperimentSpec containing specs and metadata for each experiment
     """
-    combinations = _generate_sweep_combinations(sweep_cfg)
-    total = len(combinations)
+    # First pass to count total experiments
+    exp_configs = list(ExperimentConfig.iter_from_sweep_test_config(sweep_test_cfg))
+    total = len(exp_configs)
     
-    for i, combo in enumerate(combinations):
-        # benchmark_config is required in every combination
-        bench_cfg = combo.get('benchmark_config')
-        if bench_cfg is None or not isinstance(bench_cfg, SweepBenchmarkConfig):
-            continue
-        
-        # Extract sweep variables with static_cfg as fallback
-        enable_flexi = combo.get('enable_flexi_flash_attn', static_cfg.vllm.enable_flexi_flash_attn)
-        gpu_mem = combo.get('gpu_memory_utilization', static_cfg.vllm.gpu_memory_utilization)
-        block_size = combo.get('block_size', static_cfg.vllm.block_size)
-        
-        # Get input_output_lens from bench_cfg.requests
-        io_lens = bench_cfg.get_input_output_lens()
-        
-        # Parse pp_layer_config into alternative_configs and migration_steps
-        # pp_layer_config format: {0: "32,32", 100: "12,52"}
-        # alternative_configs format: {"pp_layer_configs": {"0": [[0,31],[32,63]], ...}}
-        pp_layer_config = {k: v.replace(" ", "") for k, v in bench_cfg.pp_layer_config.items()}
-        sorted_keys = sorted(pp_layer_config.keys())
-        alternative_configs_inner = {}
-        for i, req_idx in enumerate(sorted_keys):
-            pp_str = pp_layer_config[req_idx]
-            layers = [int(x.strip()) for x in pp_str.split(",")]
-            ranges = []
-            start = 0
-            for num_layers in layers:
-                end = start + num_layers - 1
-                ranges.append([start, end])
-                start = end + 1
-            alternative_configs_inner[str(i)] = ranges
-        migration_steps = [k for k in sorted_keys if k > 0]
-
-        # Extract vars_mapping early for path generation
-        vars_mapping = extract_naming_vars(combo)
+    for i, exp_cfg in enumerate(exp_configs):
+        # Get vars_mapping from ExperimentConfig
+        vars_mapping = exp_cfg.get_naming_vars()
         
         # Generate log paths using logm
         metrics_csv_path = str(logm.get_path_with_log_type("timestamp_metrics_raw", "csv", vars_mapping))
@@ -907,54 +862,55 @@ def generate_experiment_specs(
         benchmark_config_path = str(logm.get_path_with_log_type("benchmark_config", "json", vars_mapping))
         metrics_file_path = str(logm.get_path_with_log_type("request_metrics", "csv", vars_mapping))
         
-        # Build VllmServerSpec
+        # Build VllmServerSpec from ExperimentConfig
         vllm_spec = VllmServerSpec(
-            model_path=static_cfg.model.path,
-            model_name=static_cfg.model.name,
-            pipeline_parallel_size=static_cfg.vllm.pipeline_parallel_size,
-            gpu_memory_utilization=gpu_mem,
-            max_model_len=static_cfg.vllm.max_model_len,
-            block_size=block_size,
-            head_addr=static_cfg.vllm.head_addr,
-            port=static_cfg.vllm.port,
-            enable_flexi_flash_attn=enable_flexi,
-            chunked_prefill=static_cfg.vllm.chunked_prefill,
-            enable_cuda_graph=static_cfg.vllm.enable_cuda_graph,
-            enable_nsight=static_cfg.vllm.enable_nsight,
-            pp_layer_partition=bench_cfg.start_pp_partition,
-            pp_layer_config=pp_layer_config,
-            alternative_configs={"pp_layer_configs": alternative_configs_inner},
-            migration_steps=migration_steps,
-            rank_to_ip=static_cfg.network.rank_to_ip,
-            rank_to_node=static_cfg.network.rank_to_node,
-            pattern_batch_size=static_cfg.benchmark.pattern_batch_size,
+            model_path=exp_cfg.model.path,
+            model_name=exp_cfg.model.name,
+            pipeline_parallel_size=exp_cfg.vllm.pipeline_parallel_size,
+            gpu_memory_utilization=exp_cfg.vllm.gpu_memory_utilization,
+            max_model_len=exp_cfg.vllm.max_model_len,
+            block_size=exp_cfg.vllm.block_size,
+            head_addr=exp_cfg.vllm.head_addr,
+            port=exp_cfg.vllm.port,
+            enable_flexi_flash_attn=exp_cfg.vllm.enable_flexi_flash_attn,
+            chunked_prefill=exp_cfg.vllm.chunked_prefill,
+            enable_cuda_graph=exp_cfg.vllm.enable_cuda_graph,
+            enable_nsight=exp_cfg.vllm.enable_nsight,
+            pp_layer_partition=exp_cfg.vllm.pp_layer_partition,
+            pp_layer_config=exp_cfg.vllm.pp_layer_config,
+            alternative_configs=exp_cfg.vllm.get_alternative_configs(),
+            migration_steps=exp_cfg.vllm.get_migration_steps(),
+            rank_to_ip=exp_cfg.network.rank_to_ip,
+            rank_to_node=exp_cfg.network.rank_to_node,
+            pattern_batch_size=exp_cfg.benchmark.pattern_batch_size,
             metrics_csv_path=metrics_csv_path,
             server_raw_log_path=server_raw_log_path,
         )
         
-        # Build BenchmarkSpec
+        # Build BenchmarkSpec from ExperimentConfig
         bench_spec = BenchmarkSpec(
-            base_url=f"http://{static_cfg.vllm.head_addr}:{static_cfg.vllm.port}",
-            model_path=static_cfg.model.path,
-            model_name=static_cfg.model.name,
-            benchmark_script_path=static_cfg.benchmark.benchmark_script_path,
+            base_url=exp_cfg.vllm.base_url,
+            model_path=exp_cfg.model.path,
+            model_name=exp_cfg.model.name,
+            benchmark_script_path=exp_cfg.benchmark.benchmark_script_path,
             benchmark_config_path=benchmark_config_path,
             metrics_file_path=metrics_file_path,
             benchmark_log_path=benchmark_log_path,
-            num_total_requests=bench_cfg.num_total_requests,
-            request_rate=bench_cfg.get_request_rate_dict(),
-            input_output_lens=io_lens,
-            pattern_batch_size=static_cfg.benchmark.pattern_batch_size,
-            burstiness=static_cfg.benchmark.burstiness,
-            repetition=bench_cfg.repetition,
-            print_outputs=static_cfg.benchmark.print_outputs,
-            profile=static_cfg.benchmark.profile,
-            warmup=static_cfg.benchmark.warmup,
+            num_total_requests=exp_cfg.benchmark.num_total_requests,
+            request_rate=exp_cfg.benchmark.request_rate_dict,
+            input_output_lens=exp_cfg.benchmark.input_output_lens,
+            pattern_batch_size=exp_cfg.benchmark.pattern_batch_size,
+            burstiness=exp_cfg.benchmark.burstiness,
+            repetition=exp_cfg.benchmark.repetition,
+            print_outputs=exp_cfg.benchmark.print_outputs,
+            profile=exp_cfg.benchmark.profile,
+            warmup=exp_cfg.benchmark.warmup,
         )
         
         yield SweepExperimentSpec(
             vllm_spec=vllm_spec,
             bench_spec=bench_spec,
+            exp_config=exp_cfg,
             vars_mapping=vars_mapping,
             experiment_index=i,
             total_experiments=total,
@@ -1193,7 +1149,7 @@ def sweep_test(cfg: SweepTestConfig, logm: SweepLogManager):
     all_ok = True
     experiment_count = 0
     
-    for exp in generate_experiment_specs(cfg.static_config, cfg.sweep_config, logm):
+    for exp in generate_experiment_specs(cfg, logm):
         experiment_count += 1
         C.print(f"\n[bold magenta]{'='*60}[/]")
         C.print(f"[bold magenta]Experiment {exp.experiment_index + 1}/{exp.total_experiments}[/]")

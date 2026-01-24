@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Iterator
 from pathlib import Path
 import json
 import typer
@@ -304,37 +304,184 @@ class SweepBenchmarkConfig(BaseModel):
                 for idx in sorted_keys]
 
 
+class SweepBenchmarkParams(BaseModel):
+    """Individual benchmark parameters for parameter-sweep mode.
+    
+    All parameters here are lists for sweeping. Shared parameters like
+    num_total_requests and repetition should be defined in static_config.benchmark.
+    
+    Example:
+        sweep_config:
+          benchmark:
+            pp_layer_configs: ["32, 32", "20, 44"]
+            request_rates: [1.0, 2.0]
+            input_lens: [500, 800]
+            output_lens: [100, 200]
+        
+        static_config:
+          benchmark:
+            num_total_requests: 100
+            repetition: 2
+    """
+    pp_layer_configs: Optional[List[str]] = None
+    """List of pp_layer_partition strings. Each becomes a separate experiment."""
+    
+    request_rates: Optional[List[float]] = None
+    """List of request rates to sweep."""
+    
+    input_lens: Optional[List[int]] = None
+    """List of input lengths to sweep."""
+    
+    output_lens: Optional[List[int]] = None
+    """List of output lengths to sweep."""
+
+
+class SweepVllmParams(BaseModel):
+    """Individual vLLM parameters for parameter-sweep mode."""
+    enable_flexi_flash_attn: Optional[List[bool]] = None
+
+
 class SweepConfig(BaseModel):
     """Configuration for sweep variables.
     
-    All fields are lists. The experiment framework generates
-    Cartesian product of all non-None variables.
+    Supports two modes:
+    1. benchmark_config mode: Provide complete SweepBenchmarkConfig list
+    2. Parameter sweep mode: Provide individual parameters via 'benchmark' and 'vllm'
+       which will be combined via Cartesian product
+    
+    Example (benchmark_config mode):
+        sweep_config:
+          benchmark_config:
+            - num_total_requests: 100
+              pp_layer_config: {0: "32, 32"}
+              requests: {0: {request_rate: 1.0, input_lens: 500, output_lens: 100}}
+    
+    Example (parameter sweep mode):
+        sweep_config:
+          vllm:
+            enable_flexi_flash_attn: [true, false]
+          benchmark:
+            pp_layer_configs: ["32, 32", "20, 44"]
+            request_rates: [1.0, 2.0]
+            input_lens: [500, 800]
+            output_lens: [100, 200]
     """
     
-    # Naming aliases for file naming - defined at Config level
+    # Naming aliases for file naming - only for actual sweep parameters
     NAMING_ALIASES: ClassVar[Dict[str, str]] = {
         "enable_flexi_flash_attn": "flexi",
-        "gpu_memory_utilization": "gpu_util",
-        "block_size": "blk",
     }
     
-    enable_flexi_flash_attn: Optional[List[bool]] = None
+    # Mode 1: Complete benchmark_config list
     benchmark_config: Optional[List[SweepBenchmarkConfig]] = None
-    gpu_memory_utilization: Optional[List[float]] = None
-    block_size: Optional[List[Optional[int]]] = None
     
-    def get_sweep_axes(self) -> Dict[str, List[Any]]:
-        """Return all non-None sweep axes for Cartesian product."""
+    # Mode 2: Individual sweep parameters
+    vllm: Optional[SweepVllmParams] = None
+    benchmark: Optional[SweepBenchmarkParams] = None
+    
+    # Note: gpu_memory_utilization and block_size are NOT sweep parameters.
+    # They should only be defined in static_config.vllm.
+    # Only enable_flexi_flash_attn can be swept via sweep_config.vllm.
+    
+    def get_sweep_axes(
+        self,
+        static_benchmark_cfg: Optional['StaticBenchCfg'] = None
+    ) -> Dict[str, List[Any]]:
+        """Return all non-None sweep axes for Cartesian product.
+        
+        Handles both benchmark_config mode and parameter sweep mode.
+        
+        Args:
+            static_benchmark_cfg: Static benchmark config for shared parameters
+                                  (num_total_requests, repetition) in parameter-sweep mode.
+        """
         axes = {}
-        if self.enable_flexi_flash_attn is not None:
-            axes['enable_flexi_flash_attn'] = self.enable_flexi_flash_attn
+        
+        # enable_flexi_flash_attn can only come from sweep_config.vllm
+        if self.vllm is not None and self.vllm.enable_flexi_flash_attn is not None:
+            axes['enable_flexi_flash_attn'] = self.vllm.enable_flexi_flash_attn
+        
+        # Mode 1: benchmark_config provided directly
         if self.benchmark_config is not None:
             axes['benchmark_config'] = self.benchmark_config
-        if self.gpu_memory_utilization is not None:
-            axes['gpu_memory_utilization'] = self.gpu_memory_utilization
-        if self.block_size is not None:
-            axes['block_size'] = self.block_size
+        # Mode 2: Generate benchmark_config from individual parameters
+        elif self.benchmark is not None:
+            assert static_benchmark_cfg is not None
+            num_requests = static_benchmark_cfg.num_total_requests
+            repetition = static_benchmark_cfg.repetition
+            axes['benchmark_config'] = self._generate_benchmark_configs_from_params(
+                num_total_requests=num_requests,
+                repetition=repetition
+            )
+        
         return axes
+    
+    def _generate_benchmark_configs_from_params(
+        self,
+        num_total_requests: int = 100,
+        repetition: int = 1
+    ) -> List[SweepBenchmarkConfig]:
+        """Generate SweepBenchmarkConfig list from individual benchmark parameters.
+        
+        Creates Cartesian product of pp_layer_configs, request_rates, input_lens, output_lens.
+        num_total_requests and repetition are passed from static_config.benchmark.
+        
+        Args:
+            num_total_requests: Shared across all combinations (from static_config.benchmark)
+            repetition: Shared across all combinations (from static_config.benchmark)
+        """
+        import itertools
+        
+        if self.benchmark is None:
+            return []
+        
+        params = self.benchmark
+        
+        # Validate required parameters - all must be explicitly provided
+        missing_params = []
+        if not params.pp_layer_configs:
+            missing_params.append("pp_layer_configs")
+        if not params.request_rates:
+            missing_params.append("request_rates")
+        if not params.input_lens:
+            missing_params.append("input_lens")
+        if not params.output_lens:
+            missing_params.append("output_lens")
+        
+        if missing_params:
+            raise ValueError(
+                f"Missing required sweep_config.benchmark parameters: {missing_params}. "
+                "All parameters must be explicitly provided as lists."
+            )
+        
+        # At this point all params are guaranteed to be non-None
+        pp_configs: List[str] = params.pp_layer_configs  # type: ignore[assignment]
+        request_rates: List[float] = params.request_rates  # type: ignore[assignment]
+        input_lens: List[int] = params.input_lens  # type: ignore[assignment]
+        output_lens: List[int] = params.output_lens  # type: ignore[assignment]
+        
+        configs = []
+        
+        # Generate Cartesian product
+        for pp_config, rr, in_len, out_len in itertools.product(
+            pp_configs, request_rates, input_lens, output_lens
+        ):
+            # Build SweepBenchmarkConfig
+            config = SweepBenchmarkConfig(
+                num_total_requests=num_total_requests,
+                repetition=repetition,
+                pp_layer_config={0: pp_config.replace(" ", "")},
+                requests={
+                    0: RequestStageConfig(
+                        request_rate=rr,
+                        input_lens=in_len,
+                        output_lens=out_len,
+                    )
+                }
+            )
+            configs.append(config)
+        
+        return configs
 
 
 class StaticVllmCfg(BaseModel):
@@ -352,13 +499,24 @@ class StaticVllmCfg(BaseModel):
 
 
 class StaticBenchCfg(BaseModel):
-    """Static benchmark configuration (non-sweep parameters)."""
+    """Static benchmark configuration (non-sweep parameters).
+    
+    Contains shared parameters that apply to all sweep combinations.
+    These should NOT be redefined in sweep_config to avoid conflicts.
+    """
     pattern_batch_size: int = 150
     profile: bool = False
     print_outputs: bool = False
     benchmark_script_path: str = "/root/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     burstiness: float = 100.0
     warmup: Optional[WarmupBenchCfg] = None
+    
+    # Shared parameters for parameter-sweep mode
+    num_total_requests: int = 100
+    """Number of total requests (shared across all sweep combinations)."""
+    
+    repetition: int = 1
+    """Number of repetitions per experiment (shared across all sweep combinations)."""
 
 
 class StaticConfig(BaseModel):
@@ -374,6 +532,13 @@ class SweepTestConfig(BaseModel):
     
     This is the top-level config for sweep_test experiments.
     No multi-project support - one config file = one project.
+    
+    Configuration Conflict Rules:
+    1. If using parameter-sweep mode (sweep_config.benchmark), shared params
+       like num_total_requests and repetition must come from static_config.benchmark
+    2. If using benchmark_config mode, repetition/num_total_requests are per-config
+    3. vLLM params: if defined in sweep_config, they become sweep axes;
+       static_config provides fallback values
     """
     project: str
     type: str = "sweep_test"
@@ -381,10 +546,317 @@ class SweepTestConfig(BaseModel):
     sweep_config: SweepConfig
     envs: Dict[str, str] = {}
     is_log_cover: bool = False
+    
+    @model_validator(mode='after')
+    def validate_no_conflicts(self) -> 'SweepTestConfig':
+        """Validate that there are no configuration conflicts between modes."""
+        errors = []
+        
+        # Check for mode conflicts: benchmark_config and benchmark should be mutually exclusive
+        if (self.sweep_config.benchmark_config is not None 
+            and self.sweep_config.benchmark is not None):
+            errors.append(
+                "Configuration conflict: 'sweep_config.benchmark_config' and "
+                "'sweep_config.benchmark' are mutually exclusive. "
+                "Use benchmark_config for complete configs or benchmark for parameter sweep."
+            )
+        
+        # Note: enable_flexi_flash_attn can appear in:
+        # - static_config.vllm.enable_flexi_flash_attn (single value, fallback)
+        # - sweep_config.vllm.enable_flexi_flash_attn (list for sweeping)
+        # When sweep_config.vllm.enable_flexi_flash_attn is provided, it overrides static_config.
+        # No conflict check needed - sweep takes precedence over static.
+        
+        # Note: gpu_memory_utilization and block_size can ONLY appear in static_config.vllm
+        # They are not sweep parameters.
+        
+        if errors:
+            raise ValueError("\n".join(errors))
+        
+        return self
+    
+    def get_sweep_axes(self) -> Dict[str, List[Any]]:
+        """Convenience method to get sweep axes with static config applied."""
+        return self.sweep_config.get_sweep_axes(
+            static_benchmark_cfg=self.static_config.benchmark
+        )
 
 
 # =========================
-# Spec Data Types (for passing to vLLM/benchmark)
+# Experiment Config (merged from static + sweep via Cartesian product)
+# =========================
+
+@dataclass
+class ExpModelConfig:
+    """Model configuration for a single experiment."""
+    path: str
+    name: str
+
+
+@dataclass
+class ExpNetworkConfig:
+    """Network configuration for a single experiment."""
+    rank_to_ip: Dict[int, str] = field(default_factory=dict)
+    rank_to_node: Dict[int, str] = field(default_factory=dict)
+
+
+@dataclass
+class ExpVllmConfig:
+    """vLLM server configuration for a single experiment.
+    
+    Merged from:
+    - static_config.vllm (base values)
+    - sweep_config.vllm (overrides like enable_flexi_flash_attn)
+    """
+    pipeline_parallel_size: int
+    gpu_memory_utilization: float
+    max_model_len: int
+    block_size: Optional[int]
+    head_addr: str
+    port: int
+    enable_flexi_flash_attn: bool
+    chunked_prefill: bool
+    enable_cuda_graph: bool
+    enable_nsight: bool
+    
+    # Pipeline partition (from sweep benchmark_config)
+    pp_layer_partition: str  # Initial partition, e.g. "32,32"
+    pp_layer_config: Dict[int, str] = field(default_factory=dict)  # {0: "32,32", 100: "20,44"}
+    
+    @property
+    def has_migration(self) -> bool:
+        """Returns True if there are multiple pp_layer_config entries."""
+        return len(self.pp_layer_config) > 1
+    
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.head_addr}:{self.port}"
+    
+    def get_alternative_configs(self) -> Dict[str, Any]:
+        """Parse pp_layer_config into alternative_configs format.
+        
+        Input format: {0: "32,32", 100: "12,52"}
+        Output format: {"pp_layer_configs": {"0": [[0,31],[32,63]], ...}}
+        """
+        sorted_keys = sorted(self.pp_layer_config.keys())
+        alternative_configs_inner = {}
+        
+        for i, req_idx in enumerate(sorted_keys):
+            pp_str = self.pp_layer_config[req_idx].replace(" ", "")
+            layers = [int(x.strip()) for x in pp_str.split(",")]
+            ranges = []
+            start = 0
+            for num_layers in layers:
+                end = start + num_layers - 1
+                ranges.append([start, end])
+                start = end + 1
+            alternative_configs_inner[str(i)] = ranges
+        
+        return {"pp_layer_configs": alternative_configs_inner}
+    
+    def get_migration_steps(self) -> List[int]:
+        """Get request indices where configuration changes."""
+        return [k for k in sorted(self.pp_layer_config.keys()) if k > 0]
+
+
+@dataclass
+class ExpBenchmarkConfig:
+    """Benchmark configuration for a single experiment.
+    
+    Merged from:
+    - static_config.benchmark (shared params like pattern_batch_size, burstiness)
+    - sweep benchmark_config (experiment-specific params like num_total_requests, request_rate)
+    """
+    # From sweep benchmark_config (required fields)
+    num_total_requests: int
+    repetition: int
+    request_rate: float  # Initial request rate
+    input_lens: int  # Initial input length
+    output_lens: int  # Initial output length
+    
+    # From sweep benchmark_config (with defaults)
+    request_rate_dict: Dict[int, float] = field(default_factory=dict)  # {0: 1.0, 100: 2.0}
+    input_output_lens: List[List[int]] = field(default_factory=list)  # [[500, 100], [800, 200]]
+    
+    # From static_config.benchmark
+    pattern_batch_size: int = 150
+    burstiness: float = 100.0
+    print_outputs: bool = False
+    profile: bool = False
+    benchmark_script_path: str = ""
+    warmup: Optional[WarmupBenchCfg] = None
+
+
+@dataclass
+class ExperimentConfig:
+    """A complete experiment configuration merged from static and sweep configs.
+    
+    This class represents a single experiment from the Cartesian product of
+    static_config × sweep_config. It contains nested sub-configs for clarity.
+    
+    Structure:
+    - model: ExpModelConfig (from static_config.model)
+    - network: ExpNetworkConfig (from static_config.network)
+    - vllm: ExpVllmConfig (merged from static_config.vllm + sweep_config.vllm + sweep benchmark_config.pp_layer_config)
+    - benchmark: ExpBenchmarkConfig (merged from static_config.benchmark + sweep benchmark_config)
+    """
+    
+    # Naming aliases for file naming
+    NAMING_ALIASES: ClassVar[Dict[str, str]] = {
+        "enable_flexi_flash_attn": "flexi",
+        "pp_layer_partition": "pp",
+        "request_rate": "rr",
+        "has_migration": "mig",
+        "input_lens": "in",
+        "output_lens": "out",
+        "num_total_requests": "n_req",
+        "repetition": "rep",
+    }
+    
+    model: ExpModelConfig
+    network: ExpNetworkConfig
+    vllm: ExpVllmConfig
+    benchmark: ExpBenchmarkConfig
+    
+    def get_naming_vars(self) -> Dict[str, Any]:
+        """Generate vars_mapping for file naming using NAMING_ALIASES."""
+        return {
+            "flexi": self.vllm.enable_flexi_flash_attn,
+            "pp": self.vllm.pp_layer_partition,
+            "rr": self.benchmark.request_rate,
+            "mig": self.vllm.has_migration,
+            "in": self.benchmark.input_lens,
+            "out": self.benchmark.output_lens,
+            "n_req": self.benchmark.num_total_requests,
+            "rep": self.benchmark.repetition,
+        }
+    
+    @classmethod
+    def iter_from_sweep_test_config(
+        cls,
+        sweep_test_cfg: 'SweepTestConfig',
+    ) -> 'Iterator[ExperimentConfig]':
+        """Iterate over all ExperimentConfigs from Cartesian product of sweep axes.
+        
+        This is the main entry point for generating experiment configurations.
+        It combines static_config with each sweep combination to produce
+        ExperimentConfig instances.
+        
+        Args:
+            sweep_test_cfg: The complete sweep test configuration containing
+                           static_config and sweep_config
+        
+        Yields:
+            ExperimentConfig for each combination in the Cartesian product
+        
+        Example:
+            for exp_cfg in ExperimentConfig.iter_from_sweep_test_config(sweep_test_cfg):
+                # exp_cfg is a complete ExperimentConfig ready for execution
+                server_spec = exp_cfg.to_vllm_server_spec()
+                bench_spec = exp_cfg.to_benchmark_spec(...)
+        """
+        import itertools
+        
+        static_cfg = sweep_test_cfg.static_config
+        sweep_axes = sweep_test_cfg.get_sweep_axes()
+        
+        if not sweep_axes:
+            return
+        
+        # Build Cartesian product of all sweep axes
+        # sweep_axes: {"enable_flexi_flash_attn": [True, False], "benchmark_config": [cfg1, cfg2, ...]}
+        axis_names = list(sweep_axes.keys())
+        axis_values = [sweep_axes[name] for name in axis_names]
+        
+        for combo in itertools.product(*axis_values):
+            # combo is a tuple of values, one per axis
+            combo_dict = dict(zip(axis_names, combo))
+            
+            # Extract sweep parameters from combination
+            bench_cfg: SweepBenchmarkConfig = combo_dict['benchmark_config']
+            enable_flexi: Optional[bool] = combo_dict.get('enable_flexi_flash_attn')
+            
+            # Create ExperimentConfig from this combination
+            yield cls._create_from_combo(static_cfg, bench_cfg, enable_flexi)
+    
+    @classmethod
+    def _create_from_combo(
+        cls,
+        static_cfg: 'StaticConfig',
+        bench_cfg: SweepBenchmarkConfig,
+        enable_flexi_flash_attn: Optional[bool] = None,
+    ) -> 'ExperimentConfig':
+        """Create a single ExperimentConfig from static config and one sweep combination.
+        
+        Internal method used by iter_from_sweep_test_config.
+        
+        Args:
+            static_cfg: Static configuration
+            bench_cfg: Sweep benchmark configuration (from sweep axes)
+            enable_flexi_flash_attn: Override from sweep axis (if sweeping), otherwise use static
+        """
+        # Resolve enable_flexi_flash_attn: sweep overrides static
+        flexi = enable_flexi_flash_attn if enable_flexi_flash_attn is not None else static_cfg.vllm.enable_flexi_flash_attn
+        
+        # Get initial values from bench_cfg
+        sorted_pp_keys = sorted(bench_cfg.pp_layer_config.keys())
+        sorted_req_keys = sorted(bench_cfg.requests.keys())
+        
+        initial_pp = bench_cfg.pp_layer_config[sorted_pp_keys[0]].replace(" ", "")
+        initial_req_cfg = bench_cfg.requests[sorted_req_keys[0]]
+        
+        # Build sub-configs
+        model_cfg = ExpModelConfig(
+            path=static_cfg.model.path,
+            name=static_cfg.model.name,
+        )
+        
+        network_cfg = ExpNetworkConfig(
+            rank_to_ip=static_cfg.network.rank_to_ip,
+            rank_to_node=static_cfg.network.rank_to_node,
+        )
+        
+        vllm_cfg = ExpVllmConfig(
+            pipeline_parallel_size=static_cfg.vllm.pipeline_parallel_size,
+            gpu_memory_utilization=static_cfg.vllm.gpu_memory_utilization,
+            max_model_len=static_cfg.vllm.max_model_len,
+            block_size=static_cfg.vllm.block_size,
+            head_addr=static_cfg.vllm.head_addr,
+            port=static_cfg.vllm.port,
+            enable_flexi_flash_attn=flexi,
+            chunked_prefill=static_cfg.vllm.chunked_prefill,
+            enable_cuda_graph=static_cfg.vllm.enable_cuda_graph,
+            enable_nsight=static_cfg.vllm.enable_nsight,
+            pp_layer_partition=initial_pp,
+            pp_layer_config={k: v.replace(" ", "") for k, v in bench_cfg.pp_layer_config.items()},
+        )
+        
+        benchmark_cfg = ExpBenchmarkConfig(
+            num_total_requests=bench_cfg.num_total_requests,
+            repetition=bench_cfg.repetition,
+            request_rate=initial_req_cfg.request_rate,
+            request_rate_dict={idx: cfg.request_rate for idx, cfg in bench_cfg.requests.items()},
+            input_lens=initial_req_cfg.input_lens,
+            output_lens=initial_req_cfg.output_lens,
+            input_output_lens=bench_cfg.get_input_output_lens(),
+            pattern_batch_size=static_cfg.benchmark.pattern_batch_size,
+            burstiness=static_cfg.benchmark.burstiness,
+            print_outputs=static_cfg.benchmark.print_outputs,
+            profile=static_cfg.benchmark.profile,
+            benchmark_script_path=static_cfg.benchmark.benchmark_script_path,
+            warmup=static_cfg.benchmark.warmup,
+        )
+        
+        return cls(
+            model=model_cfg,
+            network=network_cfg,
+            vllm=vllm_cfg,
+            benchmark=benchmark_cfg,
+        )
+
+
+# =========================
+# Spec Data Types (for passing to vLLM/benchmark processes)
 # =========================
 
 def extract_naming_vars(sweep_combo: Dict[str, Any]) -> Dict[str, Any]:

@@ -548,7 +548,7 @@ class DynamicGPUWorker(Worker):
         vllm_config = get_current_vllm_config()
         is_flexi = vllm_config.dynamic_config.enable_flexi_flash_attn
         start_layer = self.model_runner.model.model.start_layer
-
+        logger.info(f"before release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
         if is_flexi:
             self.model_runner.flexi_release_kv_cache_for_layers(layers_list)
             
@@ -575,6 +575,9 @@ class DynamicGPUWorker(Worker):
                 kv_cache for idx, kv_cache in enumerate(self.dynamic_kv_synchronizer.kv_caches) 
                 if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
             ]
+
+        torch.cuda.empty_cache()
+        logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.kv_caches)}")
 
     def release_kv_cache(self) -> None:
         self.model_runner.release_kv_cache()
@@ -1205,7 +1208,7 @@ class DynamicGPUWorker(Worker):
             self.release_kv_cache_for_layers(self.rank, layer_ranges)
             self.remove_layers(self.rank, layer_ranges)
 
-        logger.info(f"-------------启动 KV cache 迁移所用时间: {time.time() - time_start:.2f} 秒")
+        logger.info(f"finish sync migration in {time.time() - time_start:.2f}")
         return None
 
     # ####################################### #

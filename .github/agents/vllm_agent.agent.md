@@ -20,6 +20,7 @@ This repository is an **extended version of vLLM** that addresses limitations in
 5. Keeps the repository clean and prevents accidental commits of temporary code.
 6. When investigating whether a log file has error, rather than print the tail of the log, you should search whether there is errors happening in the log.
 7: When investigating a benchmark file, you should **only** consider it as normal when all the output has <think> as begining and produce full sentence with requred num of tokens.
+8: When running any commands, you should always try to add | head at the end to prevent copilot from interupting your commands.
 
 ## Development
 ### Code Modification Guidelines

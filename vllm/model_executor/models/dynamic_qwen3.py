@@ -208,6 +208,8 @@ class DynamicQwen3Model(Qwen3Model):
 
     def delete_layers(self, layers: Tuple[int, int]):
         """Delete the layer module and its parameters at the given index."""
+        import gc
+        import torch
 
         # Adapt input layers to the model's layers open internal representation
         deleted_start_layer, deleted_end_layer = layers[0], layers[1] + 1
@@ -217,7 +219,6 @@ class DynamicQwen3Model(Qwen3Model):
         assert deleted_start_layer >= old_start_layer and deleted_end_layer <= old_end_layer, f"layers must be in the range of start_layer and end_layer, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
         assert deleted_start_layer == old_start_layer or deleted_end_layer == old_end_layer, f"model layers must be continuous after delete layers, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
 
-        tmp_layer_dict = []
         with self.model_lock:
             time_start = time.time()
             for layer_idx in range(deleted_start_layer, deleted_end_layer):
@@ -225,25 +226,16 @@ class DynamicQwen3Model(Qwen3Model):
                 layer = self.layers[layer_idx]
                 assert layer is not None, "Layer is None"
                 assert layer is not PPMissingLayer, "Layer is PPMissingLayer"
-                # for name, _ in list(layer.named_parameters(recurse=True)):
-                #     # 删除每个参数
-                #     delattr(layer, name.split(".")[-1])
-                # for name, _ in list(layer.named_children()):
-                #     delattr(layer, name)
                 self.layers[layer_idx] = PPMissingLayer()  # 占位符
+                # Explicitly delete the layer to release GPU memory
+                del layer
                 logger.info(f"Layer {layer_idx} deleted successfully.")
-                tmp_layer_dict.append(layer)
-                # 2. 显式从 _modules 中删除（可选但更保险）
-                # 由于 nn.ModuleList 自动注册子模块，这一步确保彻底清除
-                # prefix = f"layers.{layer_idx}"
-                # keys_to_delete = (k for k in self._modules if k.startswith(prefix))
-                # for key in keys_to_delete:
-                #     self._modules.pop(key)
-            # gc.collect()
-            # torch.cuda.empty_cache()
+            
+            # Force garbage collection and release CUDA memory
+            gc.collect()
+            torch.cuda.empty_cache()
             
             logger.info(f"Deleted layers took {human_readable_duration(time.time() - time_start)}")
-        tmp_layer_dict = []
 
         # Update the start_layer and end_layer
         if deleted_start_layer == old_start_layer:

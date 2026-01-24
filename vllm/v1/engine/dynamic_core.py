@@ -820,12 +820,11 @@ class DynamicEngineCore(EngineCore):
         """
         logger.info(f"Start migrating to new configuration {pp_layer_config}")
         assert isinstance(self.scheduler, DynamicScheduler)
-
+        time_start = time.time()
         engine_core_outputs = []
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         with self.engine_lock:
-            time_start = time.time()
             # 先获取一次内存快照
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
             mem_infos = self.model_executor.get_workers_mem_info()
@@ -951,6 +950,8 @@ class DynamicEngineCore(EngineCore):
                 self.scheduler.sync_change_configuration(pp_layer_config)
                 # self.scheduler.update_layer_config([(0, 23), (24, 63)])
                 self.model_executor.resize_kv_cache(resized_block_num)
+            self.cur_pp_layer_config = pp_layer_config
+            logger.info(f"[sync_migration]: updated cur_pp_layer_config to {self.cur_pp_layer_config}, time taken: {human_readable_duration(time.time() - time_start)}")
 
             return engine_core_outputs
 

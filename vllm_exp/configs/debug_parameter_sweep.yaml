@@ -1,7 +1,7 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "debug_repetition_sweep"
+project: "debug_parameter_sweep"
 type: "sweep_test"
 
 envs:
@@ -50,20 +50,20 @@ static_config:
     profile: false
     print_outputs: true
     pattern_batch_size: 150
-    repetition: 3
+    num_total_requests: 100  # Shared across all sweep combinations
+    repetition: 1  # Shared across all sweep combinations
     warmup:
       enabled: false
       num_total_requests: 25
       input_length: 10000
       output_length: 50
       request_rate: 25
-
-# No sweep variables - single experiment with benchmark_config inside sweep_config
+# Parameter sweep mode - individual parameters are combined via Cartesian product
 sweep_config:
   vllm:
     enable_flexi_flash_attn: [true, false]
   benchmark:
-    pp_layer_configs: ["32, 32", "20, 44"]  # For sweep 
-    request_rates: ["1.0", "2.0"]
-    input_lens: ["500", "800"]
-    output_lens: ["100", "200"]
+    pp_layer_configs: ["32, 32", "20, 44"]  # pp_layer_partition strings
+    request_rates: [1.0]  # float values
+    input_lens: [500]  # int values  
+    output_lens: [100]  # int values

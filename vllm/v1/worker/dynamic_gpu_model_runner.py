@@ -1227,7 +1227,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
         for layer_name in deleted_layer_names:
             del forward_context[layer_name]
-        logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.kv_caches)}")
 
     def release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         '''
@@ -1235,7 +1234,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
         因此只能先release kv cache再删除layers
         '''
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
-        logger.info(f"before release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
         # Delete the kv cache from kv_cache list
         start_layer = self.model.model.start_layer
@@ -1243,7 +1241,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
             kv_cache for idx, kv_cache in enumerate(self.kv_caches) 
             if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
         ]
-
         # Delete layer name from kv_cache_config
         deleted_layers = set(layer for layers in layers_list for layer in range(layers[0], layers[1]+1))
         group = self.kv_cache_config.kv_cache_groups[0]
@@ -1257,7 +1254,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
             if extract_layer_index(layer_name) in deleted_layers:
                 deleted_layer_names.append(layer_name)
                 attn_module.kv_cache = [torch.tensor([])]
-
         for layer_name in deleted_layer_names:
             del forward_context[layer_name]
         logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.kv_caches)}")
