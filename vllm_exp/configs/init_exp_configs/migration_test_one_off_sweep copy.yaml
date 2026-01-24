@@ -52,6 +52,7 @@ static_config:
     profile: false
     print_outputs: true
     pattern_batch_size: 150
+    num_total_requests: 100
     warmup:
       enabled: false
       num_total_requests: 25
@@ -64,25 +65,15 @@ static_config:
 sweep_config:
   # Sweep over flexi flash attention enabled/disabled
   enable_flexi_flash_attn: [true, false]
-  
+  pp_layer_config: 
+    - "16, 48"  # Migration from 16-48 to 48-16
+    - "32, 32"  # Migration from 16-48 to 48-16
+    - "48, 16"  # Migration from 48-16 to 16
+
   # Sweep over different benchmark configurations
   benchmark_config:
-    # # Config 1: Migration experiment (400 requests with 2 config switches)
-    # - num_total_requests: 400
-    #   pp_layer_config:
-    #     0: "32, 32"      # Start with balanced partition
-    #     100: "12, 52"    # Migrate at request 100
-    #     200: "20, 44"    # Migrate again at request 200
-    #   requests:
-    #     0: 
-    #       request_rate: 1.8
-    #       input_lens: 800
-    #       output_lens: 64
-    #     100: 1.5         # Rate for requests 100+ (inherits input_lens/output_lens)
-    
     # Config 2: No migration experiment (200 requests, single config)
-    - num_total_requests: 100
-      repetition: 10
+    - repetition: 10
       pp_layer_config:
         0: "32, 32"      # Only one config = no migration
       requests:

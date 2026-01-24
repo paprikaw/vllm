@@ -486,51 +486,99 @@ class DynamicKVSynchronizer():
     # ########################################## #
     # Sender side functions                      #
     # ########################################## #
-    def start_kv_tensor_transfer_sync(self, rank_to_layers_ids: dict[int, list[int]], kv_caches: list[torch.Tensor],
-                              start_layer_id: int) -> None:
-        """Send layers' KV cache to a peer rank.
+    def send_kv_tensor_sync(self, rank_to_layers_ids: dict[int, list[int]], kv_caches: list[torch.Tensor],
+                              start_layer_id: int, slot_mapping: Optional[torch.Tensor] = None) -> None:
+        """Send layers' KV cache to a peer rank (synchronous version).
             In each of the migration process, this function should only be called once.
+            
+            This function supports both regular and flexi KV cache formats.
+            For flexi format, slot_mapping is required to gather KV data from pointer-based storage.
+            
         Args:
-            rank: peer global rank to send to.
-            kv_cache: tensor to send (GPU or CPU tensor; will be moved to local GPU).
+            rank_to_layers_ids: Mapping of target rank to layer IDs to send.
+            kv_caches: list of KV cache tensors (used for regular format).
             start_layer_id: which layer this KV cache belongs to (for receiver to demux).
-            layer_ids: which layers this KV cache belongs to (for receiver to demux).
+            slot_mapping: Optional tensor of slot indices. Required for flexi format.
+                         If None for flexi format, no data is transferred (only signals are sent).
         """
         assert all(transfer_in_process == False for transfer_in_process in self.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
         assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
-        logger.info(f"[debug]: rank_to_layers_ids: {rank_to_layers_ids}")
+        
+        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         torch.cuda.synchronize()
+        
         for rank, layer_ids in rank_to_layers_ids.items():
-            for layer_id in layer_ids:
-                logger.info(f"[debug]: rank {self.rank} send kv cache to rank {rank} for layer {layer_id}")
-                local_layer_id = layer_id - start_layer_id
-                logger.info(f"[debug]:rank {self.rank} local_layer_id: {local_layer_id}")
-                kv_cache = kv_caches[local_layer_id]
-                # 第一次访问时默认置为 False，避免 KeyError
-                logger.info(f"[debug]: rank {self.rank} send kv tensor meta to rank {rank} for layer {layer_id}")
-                self._send_meta_to_rank(rank, KVTensorMeta(
-                    type='kv_tensor',
-                    layer_to_be_received=set(layer_ids),
-                    layer_id=int(layer_id),
-                    num_tokens=int(kv_cache.size(0)),
-                    dtype=kv_cache.dtype,
-                    shape=kv_cache.shape))
-                logger.info(f"[debug]: rank {self.rank} send kv tensor data to rank {rank} for layer {layer_id}")
-                self._send_data_to_rank(rank, kv_cache, synchronize=False, wait_for_ack=False)
-                self.kv_cache_transfer_in_process[rank] = True
-            # Only to tell the receiver the kv patch have been
-            self._send_meta_to_rank(rank, KVPatchMeta(
-                type='kv_patch_meta',
-                id=0,
-                layer_ids=layer_ids,
-                num_tokens=int(kv_caches[0].size(0)),
-                slot_mapping_dtype=torch.int64,
-                slot_mapping_shape=torch.Size([]),
-                kv_payload_dtype=torch.int64,
-                kv_payload_shape=torch.Size([]))
-            )
+            if is_flexi:
+                self._flexi_send_kv_tensors_sync(rank, layer_ids, start_layer_id, slot_mapping)
+            else:
+                self._regular_send_kv_tensors_sync(rank, layer_ids, kv_caches, start_layer_id)
 
         return None
+
+    def _regular_send_kv_tensors_sync(self, rank: int, layer_ids: list[int], 
+                                       kv_caches: list[torch.Tensor], start_layer_id: int) -> None:
+        """Send KV tensors using regular (non-flexi) format."""
+        for layer_id in layer_ids:
+            logger.info(f"[debug]: rank {self.rank} send kv cache to rank {rank} for layer {layer_id}")
+            local_layer_id = layer_id - start_layer_id
+            logger.info(f"[debug]:rank {self.rank} local_layer_id: {local_layer_id}")
+            kv_cache = kv_caches[local_layer_id]
+            logger.info(f"[debug]: rank {self.rank} send kv tensor meta to rank {rank} for layer {layer_id}")
+            self._send_meta_to_rank(rank, KVTensorMeta(
+                type='kv_tensor',
+                layer_to_be_received=set(layer_ids),
+                layer_id=int(layer_id),
+                num_tokens=int(kv_cache.size(0)),
+                dtype=kv_cache.dtype,
+                shape=kv_cache.shape))
+            logger.info(f"[debug]: rank {self.rank} send kv tensor data to rank {rank} for layer {layer_id}")
+            self._send_data_to_rank(rank, kv_cache, synchronize=False, wait_for_ack=False)
+            self.kv_cache_transfer_in_process[rank] = True
+        # Send sync_finished signal
+        self.send_sync_finished_to_rank(rank, layer_ids)
+
+    def _flexi_send_kv_tensors_sync(self, rank: int, layer_ids: list[int], 
+                                     start_layer_id: int, slot_mapping: Optional[torch.Tensor]) -> None:
+        """Send KV tensors using flexi format with pointer-based storage.
+        
+        For sync migration (e.g., reset_pipeline), slot_mapping is empty because
+        there are no running requests. We send empty KV tensors and the receiver
+        will create fresh, empty KV caches for the new layers.
+        """
+        # Get page metadata for gathering KV data
+        assert len(self.key_cache_ptrs) > 0, "key_cache_ptrs not initialized for flexi mode"
+        assert len(self.value_cache_ptrs) > 0, "value_cache_ptrs not initialized for flexi mode"
+        
+        # Get dimensions from config
+        num_heads = self.num_heads
+        head_dim = self.head_size
+        
+        # For sync migration, slot_mapping should be empty (no running requests)
+        # We send empty tensors and receiver will create fresh KV caches
+        slot_mapping_tensor = torch.empty(0, dtype=torch.int64, device='cuda')
+        
+        logger.info(f"[flexi sync]: rank {self.rank} sending to rank {rank}, layers={layer_ids}, num_tokens=0 (empty KV for sync)")
+        
+        for layer_id in layer_ids:
+            # Create empty KV tensor - receiver will create fresh KV cache
+            kv_out = torch.empty(2, 0, num_heads, head_dim, dtype=torch.float16, device='cuda')
+            
+            kv_tensor_meta = FlexiKVTensorMeta(
+                type='kv_tensor',
+                layer_to_be_received=set(layer_ids),
+                layer_id=int(layer_id),
+                num_tokens=0,
+                slot_mapping_dtype=slot_mapping_tensor.dtype,
+                slot_mapping_shape=slot_mapping_tensor.shape,
+                kv_payload_dtype=kv_out.dtype,
+                kv_payload_shape=kv_out.shape)
+            
+            # Use send_kv_tensor_to_rank interface
+            self.send_kv_tensor_to_rank(rank, kv_tensor_meta, kv_out, slot_mapping_tensor)
+        
+        # Send sync_finished signal
+        self.send_sync_finished_to_rank(rank, layer_ids)
+
 
     # ########################################## #
     # Sender side functions                      #
@@ -686,6 +734,31 @@ class DynamicKVSynchronizer():
             slot_mapping_dtype=slot_mapping.dtype,
             slot_mapping_shape=slot_mapping.shape), kv_out
 
+
+
+    def send_sync_finished_to_rank(self, rank: int, layer_ids: list[int]) -> None:
+        """Send sync_finished signal to receiver indicating sync migration is complete.
+        
+        This signal tells the receiver to skip the kv_patch receiving phase
+        and complete the migration immediately after binding KV tensors.
+        
+        Args:
+            rank: Target rank to send the signal to.
+            layer_ids: List of layer IDs that were transferred.
+        """
+        logger.info(f"[sync]: rank {self.rank} sending sync_finished to rank {rank}")
+        self._send_meta_to_rank(rank, KVPatchMeta(
+            type='sync_finished',
+            id=0,
+            layer_ids=layer_ids,
+            num_tokens=0,
+            slot_mapping_dtype=torch.int64,
+            slot_mapping_shape=torch.Size([0]),
+            kv_payload_dtype=torch.int64,
+            kv_payload_shape=torch.Size([0]))
+        )
+        # Mark transfer as complete
+        self.kv_cache_transfer_in_process[rank] = False
 
     def send_kv_tensor_to_rank(self, rank: int, kv_tensor_meta: Union[KVTensorMeta, FlexiKVTensorMeta], kv_tensor: torch.Tensor, slot_mapping: Optional[torch.Tensor] = None) -> None:
         """Send a single KV tensor to a peer rank.
@@ -938,6 +1011,12 @@ class DynamicKVSynchronizer():
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
         slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape, True)
         kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape, True)
+        
+        # For kv_patch_finished with empty data, skip the dimension assertion
+        if meta.type == 'kv_patch_finished' and kv_payload.numel() == 0:
+            logger.info(f"[recv_kv_patch]: received empty kv_patch_finished from rank {from_rank}")
+            return slot_mapping, kv_payload
+        
         if is_flexi:
             assert kv_payload.dim() == 5 and kv_payload.size(0) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
         else:

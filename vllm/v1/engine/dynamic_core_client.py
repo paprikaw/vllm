@@ -290,6 +290,9 @@ class DynamicAsyncMPClient(DynamicMPClient):
     async def reset_prefix_cache_async(self) -> None:
         await self.call_utility_async("reset_prefix_cache")
 
+    async def reset_pipeline_async(self) -> None:
+        await self.call_utility_async("reset_pipeline")
+
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)
 

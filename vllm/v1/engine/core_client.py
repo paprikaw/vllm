@@ -95,6 +95,9 @@ class EngineCoreClient(ABC):
     def reset_prefix_cache(self) -> None:
         raise NotImplementedError
 
+    def reset_pipeline(self) -> None:
+        raise NotImplementedError
+
     def sleep(self, level: int = 1) -> None:
         raise NotImplementedError
 
@@ -151,6 +154,9 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def reset_prefix_cache_async(self) -> None:
+        raise NotImplementedError
+
+    async def reset_pipeline_async(self) -> None:
         raise NotImplementedError
 
     async def sleep_async(self, level: int = 1) -> None:
@@ -226,6 +232,9 @@ class InprocClient(EngineCoreClient):
 
     def reset_prefix_cache(self) -> None:
         self.engine_core.reset_prefix_cache()
+
+    def reset_pipeline(self) -> None:
+        self.engine_core.reset_pipeline()
 
     def sleep(self, level: int = 1) -> None:
         self.engine_core.sleep(level)
@@ -687,6 +696,9 @@ class SyncMPClient(MPClient):
     def reset_prefix_cache(self) -> None:
         self.call_utility("reset_prefix_cache")
 
+    def reset_pipeline(self) -> None:
+        self.call_utility("reset_pipeline")
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -874,6 +886,9 @@ class AsyncMPClient(MPClient):
 
     async def reset_prefix_cache_async(self) -> None:
         await self.call_utility_async("reset_prefix_cache")
+
+    async def reset_pipeline_async(self) -> None:
+        await self.call_utility_async("reset_pipeline")
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)

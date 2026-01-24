@@ -1,0 +1,82 @@
+# Debug Repetition Test Configuration
+# Run with: python -m vllm_exp.run sweep --config vllm_exp/configs/debug_repetition_test.yaml --log-dir logs/agent/
+
+envs:
+  NCCL_DEBUG: INFO
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+  VLLM_TORCH_PROFILER_DIR: /home/bxb1/data/vllm_workbench/profiler/
+  RAY_CGRAPH_get_timeout: "10000"
+  BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+  DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+  KV_SYNC_USE_CPU: "0"
+  VLLM_USE_CPU_MODEL: "0"
+  CUDA_LAUNCH_BLOCKING: "0"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+  VLLM_USE_RAY_COMPILED_DAG: "1"
+  NCCL_SOCKET_IFNAME: "bond0.3027"
+  GLOO_SOCKET_IFNAME: "bond0.3027"
+  VLLM_SERVER_DEV_MODE: "1"  # Enable /reset_pipeline endpoint
+
+is_log_cover: true
+
+projects:
+  - project: "debug_repetition"
+    type: "one_off_test"
+    
+    envs: {}
+    
+    model:
+      path: "/home/bxb1/data/huggingface/Qwen3-32B"
+      name: "Qwen3-32B"
+    
+    network:
+      rank_to_ip:
+        0: "spartan-gpgpu169"
+        1: "spartan-gpgpu169"
+      rank_to_node:
+        0: "spartan-gpgpu169"
+        1: "spartan-gpgpu169"
+    
+    vllm:
+      head_addr: "localhost"
+      pipeline_parallel_size: 2
+      gpu_memory_utilization: 0.75
+      max_model_len: 8000
+      chunked_prefill: true
+      enable_cuda_graph: false
+      enable_nsight: false
+      enable_flexi_flash_attn: false
+      start_pp_layer_partitions:
+        - "32, 32"  # Balanced partition
+    
+    benchmark:
+      burstiness: 100.0
+      benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+      profile: false
+      print_outputs: true
+      pattern_batch_size: 150
+      input_output_lens: [[500, 32]]  # Input/output length pairs
+      data_num_requests: [20]         # Number of requests per input_output_lens pair
+      warmup:
+        enabled: false
+        num_total_requests: 25
+        input_length: 10000
+        output_length: 50
+        request_rate: 25
+    
+    # Test repetition with 3 repetitions, no migration
+    benchmark_config:
+      - num_total_requests: 20  # Small number for quick testing
+        repetition: 3           # 3 repetitions to test the feature
+        pp_layer_config:
+          0: "32, 32"           # Single config = no migration, only reset between reps
+        requests:
+          0:
+            request_rate: 2.0
+            input_lens: 500
+            output_lens: 32
+    
+    migration:
+      is_migration: false

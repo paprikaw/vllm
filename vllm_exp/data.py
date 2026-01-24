@@ -137,6 +137,9 @@ class BenchCfg(BaseModel):
     burstiness: float = 100.0
     # Optional metrics output path when running via vllm_exp
     metrics_file_name: Optional[str] = None
+    # Number of times to repeat the benchmark (default 1 = single run)
+    # After each repetition, reset_pipeline is called to restore initial config
+    repetition: int = 1
 
     # Optional warmup stage (separate logs + metrics)
     warmup: Optional[WarmupBenchCfg] = None
@@ -242,10 +245,15 @@ class SweepBenchmarkConfig(BaseModel):
         "has_migration": "mig",
         "start_input_lens": "in",
         "start_output_lens": "out",
+        "repetition": "rep",
     }
     
     num_total_requests: int
     """Total number of requests for this benchmark configuration."""
+    
+    repetition: int = 1
+    """Number of times to repeat the benchmark. After each repetition,
+    reset_pipeline is called to return to the initial pp configuration."""
     
     pp_layer_config: Dict[int, str]
     """Pipeline layer partition configs indexed by request number.
@@ -494,6 +502,11 @@ class BenchmarkSpec:
     pattern_batch_size: int = 150
     burstiness: float = 100.0
     
+    # Repetition config
+    repetition: int = 1
+    """Number of times to repeat the benchmark. After each repetition,
+    reset_pipeline is called to return to the initial pp configuration."""
+    
     # Features
     print_outputs: bool = False
     profile: bool = False
@@ -537,6 +550,7 @@ class BenchmarkSpec:
             "burstiness": self.burstiness,
             "warmup": self.warmup.model_dump() if self.warmup else None,
             "metrics_file_name": self.metrics_file_path,
+            "repetition": self.repetition,
         }
 
     def write_benchmark_config(self) -> None:

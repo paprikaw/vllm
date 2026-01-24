@@ -110,7 +110,13 @@ class DynamicEngineCore(EngineCore):
             initial_layer_configs.append((start_layer, end_layer))
             start_layer = end_layer + 1
         self.cur_pp_layer_config = initial_layer_configs
+        # Store initial config for reset_pipeline
+        self.initial_pp_layer_config = list(initial_layer_configs)
         self.migration_in_process = False
+        
+        # Event to signal migration_thread to reset its request counter
+        # This is triggered by reset_pipeline between benchmark repetitions
+        self._migration_reset_event = threading.Event()
 
         # Setup KV Caches and update CacheConfig after profiling.
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
@@ -726,12 +732,25 @@ class DynamicEngineCore(EngineCore):
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor) 
             assert isinstance(self.scheduler, DynamicScheduler)
             receiver_list = list(adding_per_rank.keys())
+            
+            # If no receivers (no layers being added), we can sync immediately
+            if not receiver_list:
+                logger.info("No receivers in migration, can sync immediately")
+                return True
+            
             applied_token_list = self.model_executor.get_applied_token_num(receiver_list)
             logger.info(f"applied_token_list: {applied_token_list}")
             logger.info(f"num of tokens for migration: {self.scheduler.num_tokens_for_migration}")
-            min_applied_token = min([min(applied_tokens) for applied_tokens in applied_token_list if applied_tokens is not None])
+            
+            # Filter out None values
+            valid_applied_tokens = [applied_tokens for applied_tokens in applied_token_list if applied_tokens is not None]
+            if not valid_applied_tokens:
+                logger.info("No valid applied tokens yet, waiting...")
+                return False
+            
+            min_applied_token = min([min(applied_tokens) for applied_tokens in valid_applied_tokens])
 
-            lag = [self.scheduler.num_tokens_for_migration - min(applied_tokens) for applied_tokens in applied_token_list if applied_tokens is not None]
+            lag = [self.scheduler.num_tokens_for_migration - min(applied_tokens) for applied_tokens in valid_applied_tokens]
             logger.info(f"lag between sent and applied tokens: {lag}")
             return min_applied_token > 0 and max(lag) < token_to_send_threshold
 
@@ -848,6 +867,8 @@ class DynamicEngineCore(EngineCore):
                             rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
                         return []
 
+            # For sync migration, running queue should be empty after drain
+            # No slot_mapping is needed - receiver will create fresh empty KV caches
 
             outputs = self._drain_out_running_queue()
             engine_core_outputs.extend(outputs)
@@ -868,11 +889,13 @@ class DynamicEngineCore(EngineCore):
                 logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
             else:
                 logger.info(f"[debug]: no need to compact kv cache")
-            # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
+            # 对所有需要新增层的 rank 执行 add_layers
+            # 注意：在 sync migration 中必须使用同步的 add_layers，
+            # 否则 _listen_loop 在绑定 KV cache 时会等待 _layer_loaded_cv 锁，
+            # 但该锁被 async_add_layers 线程持有，导致死锁。
             for r, add_list in adding_per_rank.items():
-                self.model_executor.async_add_layers(r, add_list)
+                self.model_executor.add_layers(r, add_list)
             time_kv_compact_end = time.time()
-            time.sleep(10)
             logger.info(f"[timeline]: before start actual kv cache migration, time taken to add weights, compact, resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
 
 
@@ -897,12 +920,12 @@ class DynamicEngineCore(EngineCore):
                     layer_ranges = plan.setdefault(dst_rank, [])
                     layer_ranges.extend([(lo, hi)])
 
-            self.model_executor.start_kv_cache_migration_sync(sending_plan_for_ranks, adding_per_rank)
+            # For sync migration, slot_mapping is None - receiver creates fresh empty KV caches
+            self.model_executor.start_kv_cache_migration_sync(sending_plan_for_ranks, adding_per_rank, None)
             time_kv_migration_end = time.time()
             logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
             time_kv_migration_end = time.time()
             logger.info(f"time taken to start kv cache migration: {human_readable_duration(time_kv_migration_end - time_start)}")
-            logger.info(f"[cur]compact length: {compacted_length}")
             final_pp_layer_config = deepcopy(tmp_pp_layer_config)
             deleting_layer_assesses: list[int] = []
             for rank, layers in enumerate(pp_layer_config):
@@ -930,6 +953,39 @@ class DynamicEngineCore(EngineCore):
                 self.model_executor.resize_kv_cache(resized_block_num)
 
             return engine_core_outputs
+
+    def reset_pipeline(self) -> list[EngineCoreOutputs]:
+        """Reset pipeline configuration to the initial state.
+        
+        This is a synchronous operation that:
+        1. Waits for all running requests to complete
+        2. Drains all running requests
+        3. Migrates layers back to initial configuration
+        4. Resets migration thread state for next repetition
+        
+        Called between benchmark repetitions to restore initial configuration.
+        """
+        outputs = []  # Initialize outputs
+        
+        # Check if already at initial configuration
+        if self.cur_pp_layer_config == self.initial_pp_layer_config:
+            logger.info("Already at initial configuration, skipping layer migration")
+        else:
+            logger.info(f"reset_pipeline: resetting from {self.cur_pp_layer_config} to {self.initial_pp_layer_config}")
+            
+            # Convert initial config to list of tuples format expected by change_model_configuration_by_kv_transfer_sync
+            target_config = [(start, end) for start, end in self.initial_pp_layer_config]
+            
+            # Use sync migration to reset to initial configuration
+            outputs.extend(self.change_model_configuration_by_kv_transfer_sync(target_config))
+        
+        # Signal migration_thread to reset its request counter for next repetition
+        logger.info("Signaling migration_thread to reset request counter")
+        self._migration_reset_event.set()
+        
+        logger.info(f"reset_pipeline completed, now at {self.cur_pp_layer_config}")
+        return outputs
+
     def migrate_layer_v1(self, rank_from: int, rank_to: int, num_layers: int) -> list[EngineCoreOutputs]:
         with self.engine_lock:
             logger.info(f"migrating layer from {rank_from} to {rank_to} with {num_layers} layers")
@@ -1456,12 +1512,21 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         # (initial config is from VLLM_PP_LAYER_PARTITION, not from alternative_configs)
         cur_config = 0
         while True:
+            # Check if reset was requested (between benchmark repetitions)
+            if self._migration_reset_event.is_set():
+                logger.info(f"migration_thread: resetting request counter from {num_of_requests} to 0, cur_config from {cur_config} to 0")
+                num_of_requests = 0
+                cur_config = 0
+                self._migration_reset_event.clear()
+            
             num_of_requests += self.request_num_queue.get()
             logger.info("num_of_requests: " + str(num_of_requests))
             if num_of_requests in migration_steps:
-                logger.info("change model configuration")
-                self.change_model_configuration_by_kv_transfer_async(alternative_configs[cur_config])
+                # First increment cur_config to get the target configuration
+                # (cur_config=0 is initial config, cur_config=1 is first migration target, etc.)
                 cur_config += 1
+                logger.info(f"change model configuration to config index {cur_config}")
+                self.change_model_configuration_by_kv_transfer_async(alternative_configs[cur_config])
                 # outputs = self.migrate_layer_v1(1, 0, 24)
                 # logger.info("debug-------- engineoutput when migration: " + str(outputs))
                 # for output in outputs:

@@ -29,8 +29,9 @@ class KVPatchMeta(BaseModel):
     # 注意，这里的num_tokens和slot_mapping_shape[0]可能不一样，
     # 因为slot_mapping使用dirty标记无效位置，而num_tokens中有可能包括duplicate的位置。
     # 我们需要num_tokens来知道实际有效的token数量，以便正确统计当前receiver已经apply的token数目。
+    # 'sync_finished' is used for sync migration to signal early exit from listen_loop
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    type: Literal['kv_patch_meta', 'kv_patch_finished']
+    type: Literal['kv_patch_meta', 'kv_patch_finished', 'sync_finished']
     id: int
     layer_ids: List[int]
     num_tokens: int

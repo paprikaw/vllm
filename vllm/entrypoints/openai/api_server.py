@@ -933,6 +933,28 @@ if envs.VLLM_SERVER_DEV_MODE:
         await engine_client(raw_request).reset_prefix_cache(device)
         return Response(status_code=200)
 
+    @router.post("/reset_pipeline")
+    async def reset_pipeline(raw_request: Request):
+        """
+        Reset pipeline configuration to initial state.
+        
+        This is called between benchmark repetitions to restore the initial
+        pipeline parallel configuration. It performs a synchronous migration
+        back to the initial pp_layer_partition and resets the migration
+        thread counters.
+        """
+        try:
+            logger.info("Resetting pipeline configuration to initial state...")
+            await engine_client(raw_request).reset_pipeline()
+            logger.info("Pipeline reset completed successfully")
+            return Response(status_code=200)
+        except Exception as e:
+            logger.error("Failed to reset pipeline: %s", str(e), exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={"error": str(e)}
+            )
+
     @router.post("/sleep")
     async def sleep(raw_request: Request):
         # get POST params

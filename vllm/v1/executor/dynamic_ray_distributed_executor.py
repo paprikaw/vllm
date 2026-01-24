@@ -507,9 +507,11 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         """
         return self.collective_rpc("get_applied_token_num", args=(receiver_list,))
 
-    def start_kv_cache_migration_sync(self, src_to_plan: dict[int, dict[int, list[Tuple[int, int]]]], dst_to_layer_ids: dict[int, list[Tuple[int, int]]]):
+    def start_kv_cache_migration_sync(self, src_to_plan: dict[int, dict[int, list[Tuple[int, int]]]], 
+                                       dst_to_layer_ids: dict[int, list[Tuple[int, int]]],
+                                       slot_mapping: Optional[list[int]] = None):
         # 调用 worker 侧的同名方法，仅在 source_rank 上发送，其余 rank 不做事
-        self.collective_rpc("start_kv_cache_migration_sync", args=(src_to_plan, dst_to_layer_ids,))
+        self.collective_rpc("start_kv_cache_migration_sync", args=(src_to_plan, dst_to_layer_ids, slot_mapping))
 
     def get_kv_buffer_status(self) -> list[KVBufferStatus]:
         output = self.collective_rpc("get_kv_buffer_status")

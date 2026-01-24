@@ -1,7 +1,7 @@
-# Sweep Test Configuration
-# Run with: python -m vllm_exp.run sweep_test --config <this_file> --log-dir <log_dir>
+# Debug Repetition Test Configuration (sweep_test format)
+# Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "test_sweep"
+project: "debug_repetition_sweep"
 type: "sweep_test"
 
 envs:
@@ -20,6 +20,7 @@ envs:
   VLLM_USE_RAY_COMPILED_DAG: "1"
   NCCL_SOCKET_IFNAME: "bond0.3027"
   GLOO_SOCKET_IFNAME: "bond0.3027"
+  VLLM_SERVER_DEV_MODE: "1"  # Enable /reset_pipeline endpoint
 
 is_log_cover: true
 
@@ -35,7 +36,6 @@ static_config:
     rank_to_node:
       0: "spartan-gpgpu169"
       1: "spartan-gpgpu169"
-  
   vllm:
     head_addr: "localhost"
     pipeline_parallel_size: 2
@@ -44,14 +44,13 @@ static_config:
     chunked_prefill: true
     enable_cuda_graph: false
     enable_nsight: false
-    enable_flexi_flash_attn: false  # Default, can be overridden by sweep
-  
   benchmark:
     burstiness: 100.0
     benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     profile: false
     print_outputs: true
     pattern_batch_size: 150
+    repetition: 3
     warmup:
       enabled: false
       num_total_requests: 25
@@ -59,38 +58,12 @@ static_config:
       output_length: 50
       request_rate: 25
 
-# Sweep configuration - generates Cartesian product of all variables
-# This config produces: 2 * 2 = 4 experiments
+# No sweep variables - single experiment with benchmark_config inside sweep_config
 sweep_config:
-  # Sweep over flexi flash attention enabled/disabled
-  enable_flexi_flash_attn: [true, false]
-  
-  # Sweep over different benchmark configurations
-  benchmark_config:
-    # # Config 1: Migration experiment (400 requests with 2 config switches)
-    # - num_total_requests: 400
-    #   pp_layer_config:
-    #     0: "32, 32"      # Start with balanced partition
-    #     100: "12, 52"    # Migrate at request 100
-    #     200: "20, 44"    # Migrate again at request 200
-    #   requests:
-    #     0: 
-    #       request_rate: 1.8
-    #       input_lens: 800
-    #       output_lens: 64
-    #     100: 1.5         # Rate for requests 100+ (inherits input_lens/output_lens)
-    
-    # Config 2: No migration experiment (200 requests, single config)
-    - num_total_requests: 100
-      repetition: 10
-      pp_layer_config:
-        0: "32, 32"      # Only one config = no migration
-      requests:
-        0:
-          request_rate: 1.8
-          input_lens: 800
-          output_lens: 64
-        50:
-          request_rate: 1.8
-          input_lens: 800
-          output_lens: 64
+  vllm:
+    enable_flexi_flash_attn: [true, false]
+  benchmark:
+    pp_layer_configs: ["32, 32", "20, 44"]  # For sweep 
+    request_rates: ["1.0", "2.0"]
+    input_lens: ["500", "800"]
+    output_lens: ["100", "200"]

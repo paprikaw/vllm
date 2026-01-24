@@ -946,6 +946,7 @@ def generate_experiment_specs(
             input_output_lens=io_lens,
             pattern_batch_size=static_cfg.benchmark.pattern_batch_size,
             burstiness=static_cfg.benchmark.burstiness,
+            repetition=bench_cfg.repetition,
             print_outputs=static_cfg.benchmark.print_outputs,
             profile=static_cfg.benchmark.profile,
             warmup=static_cfg.benchmark.warmup,

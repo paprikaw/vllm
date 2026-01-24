@@ -309,6 +309,282 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+async def reset_pipeline(base_url: str, timeout: float = 120.0) -> bool:
+    """Call reset_pipeline API to restore initial pipeline configuration.
+    
+    Args:
+        base_url: Base URL of the vLLM server (e.g., http://localhost:8000)
+        timeout: Request timeout in seconds
+    
+    Returns:
+        True if reset was successful, False otherwise
+    """
+    import aiohttp
+    reset_url = f"{base_url}/reset_pipeline"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(reset_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                if response.status == 200:
+                    print("  Pipeline reset successful")
+                    return True
+                else:
+                    # Try to get error details from response body
+                    try:
+                        error_body = await response.json()
+                        error_msg = error_body.get('error', 'Unknown error')
+                    except Exception:
+                        error_msg = await response.text()
+                    print(f"  Warning: Pipeline reset failed with status {response.status}")
+                    print(f"  Error details: {error_msg}")
+                    return False
+    except Exception as e:
+        print(f"  Warning: Failed to reset pipeline: {e}")
+        return False
+
+
+def _print_repetition_summary(rep: int, metrics: BenchmarkMetrics) -> None:
+    """Print detailed summary for a single repetition."""
+    duration = metrics.completed / metrics.request_throughput if metrics.request_throughput > 0 else 0
+    
+    print(f"\n{'─' * 60}")
+    print(f"REPETITION {rep} SUMMARY")
+    print(f"{'─' * 60}")
+    print(f"  Requests:           {metrics.completed} completed")
+    print(f"  Duration:           {duration:.2f}s")
+    print(f"  Total Input:        {metrics.total_input} tokens")
+    print(f"  Total Output:       {metrics.total_output} tokens")
+    print()
+    print(f"  Throughput:")
+    print(f"    Request:          {metrics.request_throughput:.2f} req/s")
+    print(f"    Output:           {metrics.output_throughput:.2f} tokens/s")
+    print(f"    Total Token:      {metrics.total_token_throughput:.2f} tokens/s")
+    print()
+    print(f"  TTFT (Time To First Token):")
+    print(f"    Mean:             {metrics.mean_ttft_ms:.2f} ms")
+    print(f"    Median:           {metrics.median_ttft_ms:.2f} ms")
+    print(f"    Std Dev:          {metrics.std_ttft_ms:.2f} ms")
+    print()
+    print(f"  TPOT (Time Per Output Token):")
+    print(f"    Mean:             {metrics.mean_tpot_ms:.2f} ms")
+    print(f"    Median:           {metrics.median_tpot_ms:.2f} ms")
+    print(f"    Std Dev:          {metrics.std_tpot_ms:.2f} ms")
+    print()
+    print(f"  ITL (Inter-Token Latency):")
+    print(f"    Mean:             {metrics.mean_itl_ms:.2f} ms")
+    print(f"    Median:           {metrics.median_itl_ms:.2f} ms")
+    print(f"    Std Dev:          {metrics.std_itl_ms:.2f} ms")
+    print()
+    print(f"  E2EL (End-to-End Latency):")
+    print(f"    Mean:             {metrics.mean_e2el_ms:.2f} ms")
+    print(f"    Median:           {metrics.median_e2el_ms:.2f} ms")
+    print(f"    Std Dev:          {metrics.std_e2el_ms:.2f} ms")
+
+
+def _print_final_summary(repetition: int, all_metrics_list: list[BenchmarkMetrics]) -> None:
+    """Print final summary with avg, median, std dev across all repetitions."""
+    n = len(all_metrics_list)
+    
+    # Extract metrics arrays
+    throughputs = [m.request_throughput for m in all_metrics_list]
+    output_throughputs = [m.output_throughput for m in all_metrics_list]
+    total_token_throughputs = [m.total_token_throughput for m in all_metrics_list]
+    
+    mean_ttfts = [m.mean_ttft_ms for m in all_metrics_list]
+    mean_tpots = [m.mean_tpot_ms for m in all_metrics_list]
+    mean_itls = [m.mean_itl_ms for m in all_metrics_list]
+    mean_e2els = [m.mean_e2el_ms for m in all_metrics_list]
+    
+    total_completed = sum(m.completed for m in all_metrics_list)
+    total_input = sum(m.total_input for m in all_metrics_list)
+    total_output = sum(m.total_output for m in all_metrics_list)
+    
+    print(f"\n{'═' * 70}")
+    print(f"{'═' * 70}")
+    print(f"  FINAL SUMMARY: {repetition} REPETITIONS COMPLETED")
+    print(f"{'═' * 70}")
+    print(f"{'═' * 70}")
+    
+    # Per-repetition breakdown
+    print(f"\n┌{'─' * 68}┐")
+    print(f"│ {'Rep':>4} │ {'Completed':>10} │ {'Throughput':>12} │ {'Mean TTFT':>12} │ {'Mean TPOT':>12} │")
+    print(f"├{'─' * 68}┤")
+    for i, m in enumerate(all_metrics_list, 1):
+        print(f"│ {i:>4} │ {m.completed:>10} │ {m.request_throughput:>10.2f}/s │ {m.mean_ttft_ms:>10.2f}ms │ {m.mean_tpot_ms:>10.2f}ms │")
+    print(f"└{'─' * 68}┘")
+    
+    # Aggregate statistics
+    print(f"\n{'─' * 70}")
+    print(f"  AGGREGATE STATISTICS ACROSS {repetition} REPETITIONS")
+    print(f"{'─' * 70}")
+    print(f"  Total Requests:     {total_completed}")
+    print(f"  Total Input:        {total_input} tokens")
+    print(f"  Total Output:       {total_output} tokens")
+    
+    # Throughput statistics
+    print(f"\n  REQUEST THROUGHPUT (req/s):")
+    print(f"    Average:          {np.mean(throughputs):.2f}")
+    print(f"    Median:           {np.median(throughputs):.2f}")
+    print(f"    Std Dev:          {np.std(throughputs):.2f}")
+    print(f"    Min:              {np.min(throughputs):.2f}")
+    print(f"    Max:              {np.max(throughputs):.2f}")
+    
+    print(f"\n  OUTPUT THROUGHPUT (tokens/s):")
+    print(f"    Average:          {np.mean(output_throughputs):.2f}")
+    print(f"    Median:           {np.median(output_throughputs):.2f}")
+    print(f"    Std Dev:          {np.std(output_throughputs):.2f}")
+    
+    print(f"\n  TOTAL TOKEN THROUGHPUT (tokens/s):")
+    print(f"    Average:          {np.mean(total_token_throughputs):.2f}")
+    print(f"    Median:           {np.median(total_token_throughputs):.2f}")
+    print(f"    Std Dev:          {np.std(total_token_throughputs):.2f}")
+    
+    # Latency statistics
+    print(f"\n  MEAN TTFT ACROSS REPETITIONS (ms):")
+    print(f"    Average:          {np.mean(mean_ttfts):.2f}")
+    print(f"    Median:           {np.median(mean_ttfts):.2f}")
+    print(f"    Std Dev:          {np.std(mean_ttfts):.2f}")
+    print(f"    Min:              {np.min(mean_ttfts):.2f}")
+    print(f"    Max:              {np.max(mean_ttfts):.2f}")
+    
+    print(f"\n  MEAN TPOT ACROSS REPETITIONS (ms):")
+    print(f"    Average:          {np.mean(mean_tpots):.2f}")
+    print(f"    Median:           {np.median(mean_tpots):.2f}")
+    print(f"    Std Dev:          {np.std(mean_tpots):.2f}")
+    print(f"    Min:              {np.min(mean_tpots):.2f}")
+    print(f"    Max:              {np.max(mean_tpots):.2f}")
+    
+    print(f"\n  MEAN ITL ACROSS REPETITIONS (ms):")
+    print(f"    Average:          {np.mean(mean_itls):.2f}")
+    print(f"    Median:           {np.median(mean_itls):.2f}")
+    print(f"    Std Dev:          {np.std(mean_itls):.2f}")
+    
+    print(f"\n  MEAN E2EL ACROSS REPETITIONS (ms):")
+    print(f"    Average:          {np.mean(mean_e2els):.2f}")
+    print(f"    Median:           {np.median(mean_e2els):.2f}")
+    print(f"    Std Dev:          {np.std(mean_e2els):.2f}")
+    
+    print(f"\n{'═' * 70}")
+
+
+async def run_repetition_benchmark(
+    repetition: int,
+    base_url: str,
+    run_single_benchmark_func,
+    **kwargs
+) -> tuple[BenchmarkMetrics, list[int]]:
+    """Run benchmark multiple times with pipeline reset between repetitions.
+    
+    Args:
+        repetition: Number of times to repeat the benchmark
+        base_url: Base URL of the vLLM server for reset_pipeline API
+        run_single_benchmark_func: Function that runs a single benchmark iteration
+        **kwargs: Arguments to pass to run_single_benchmark_func
+    
+    Returns:
+        Aggregated metrics from all repetitions and output lens
+    """
+    print(f"\n{'═' * 70}")
+    print(f"  STARTING BENCHMARK WITH {repetition} REPETITIONS")
+    print(f"{'═' * 70}")
+    
+    all_metrics_list = []
+    all_output_lens = []
+    
+    for rep in range(1, repetition + 1):
+        print(f"\n{'#' * 70}")
+        print(f"###################### REPETITION {rep}/{repetition} ######################")
+        print(f"{'#' * 70}")
+        
+        # Run single benchmark (add base_url to kwargs for run_multi_stage_benchmark)
+        kwargs_with_base_url = {**kwargs, 'base_url': base_url}
+        metrics, output_lens = await run_single_benchmark_func(**kwargs_with_base_url)
+        all_metrics_list.append(metrics)
+        all_output_lens.extend(output_lens)
+        
+        # Print detailed summary for this repetition
+        _print_repetition_summary(rep, metrics)
+        
+        # Reset pipeline if not the last repetition
+        if rep < repetition:
+            print(f"\n  Resetting pipeline configuration for next repetition...")
+            await reset_pipeline(base_url)
+            # Small delay after reset to ensure server is ready
+            await asyncio.sleep(1.0)
+    
+    # Print final summary with statistics across all repetitions
+    _print_final_summary(repetition, all_metrics_list)
+    
+    # Aggregate metrics from all repetitions
+    if len(all_metrics_list) == 1:
+        return all_metrics_list[0], all_output_lens
+    
+    # Calculate aggregated metrics
+    total_completed = sum(m.completed for m in all_metrics_list)
+    total_input = sum(m.total_input for m in all_metrics_list)
+    total_output = sum(m.total_output for m in all_metrics_list)
+    
+    # Use average for rate metrics
+    avg_request_throughput = np.mean([m.request_throughput for m in all_metrics_list])
+    avg_request_goodput = np.mean([m.request_goodput for m in all_metrics_list])
+    avg_output_throughput = np.mean([m.output_throughput for m in all_metrics_list])
+    avg_total_token_throughput = np.mean([m.total_token_throughput for m in all_metrics_list])
+    
+    # For latency metrics, compute proper statistics across all repetitions
+    avg_mean_ttft = np.mean([m.mean_ttft_ms for m in all_metrics_list])
+    avg_median_ttft = np.median([m.mean_ttft_ms for m in all_metrics_list])
+    avg_std_ttft = np.std([m.mean_ttft_ms for m in all_metrics_list])
+    
+    avg_mean_tpot = np.mean([m.mean_tpot_ms for m in all_metrics_list])
+    avg_median_tpot = np.median([m.mean_tpot_ms for m in all_metrics_list])
+    avg_std_tpot = np.std([m.mean_tpot_ms for m in all_metrics_list])
+    
+    avg_mean_itl = np.mean([m.mean_itl_ms for m in all_metrics_list])
+    avg_median_itl = np.median([m.mean_itl_ms for m in all_metrics_list])
+    avg_std_itl = np.std([m.mean_itl_ms for m in all_metrics_list])
+    
+    avg_mean_e2el = np.mean([m.mean_e2el_ms for m in all_metrics_list])
+    avg_median_e2el = np.median([m.mean_e2el_ms for m in all_metrics_list])
+    avg_std_e2el = np.std([m.mean_e2el_ms for m in all_metrics_list])
+    
+    # For percentiles, take the average across repetitions
+    avg_percentiles_ttft = [(p, np.mean([m.percentiles_ttft_ms[i][1] for m in all_metrics_list])) 
+                           for i, (p, _) in enumerate(all_metrics_list[0].percentiles_ttft_ms)]
+    avg_percentiles_tpot = [(p, np.mean([m.percentiles_tpot_ms[i][1] for m in all_metrics_list])) 
+                           for i, (p, _) in enumerate(all_metrics_list[0].percentiles_tpot_ms)]
+    avg_percentiles_itl = [(p, np.mean([m.percentiles_itl_ms[i][1] for m in all_metrics_list])) 
+                          for i, (p, _) in enumerate(all_metrics_list[0].percentiles_itl_ms)]
+    avg_percentiles_e2el = [(p, np.mean([m.percentiles_e2el_ms[i][1] for m in all_metrics_list])) 
+                           for i, (p, _) in enumerate(all_metrics_list[0].percentiles_e2el_ms)]
+    
+    aggregated_metrics = BenchmarkMetrics(
+        completed=total_completed,
+        total_input=total_input,
+        total_output=total_output,
+        request_throughput=float(avg_request_throughput),
+        request_goodput=float(avg_request_goodput),
+        output_throughput=float(avg_output_throughput),
+        total_token_throughput=float(avg_total_token_throughput),
+        mean_ttft_ms=float(avg_mean_ttft),
+        median_ttft_ms=float(avg_median_ttft),
+        std_ttft_ms=float(avg_std_ttft),
+        percentiles_ttft_ms=avg_percentiles_ttft,
+        mean_tpot_ms=float(avg_mean_tpot),
+        median_tpot_ms=float(avg_median_tpot),
+        std_tpot_ms=float(avg_std_tpot),
+        percentiles_tpot_ms=avg_percentiles_tpot,
+        mean_itl_ms=float(avg_mean_itl),
+        median_itl_ms=float(avg_median_itl),
+        std_itl_ms=float(avg_std_itl),
+        percentiles_itl_ms=avg_percentiles_itl,
+        mean_e2el_ms=float(avg_mean_e2el),
+        median_e2el_ms=float(avg_median_e2el),
+        std_e2el_ms=float(avg_std_e2el),
+        percentiles_e2el_ms=avg_percentiles_e2el,
+    )
+    
+    return aggregated_metrics, all_output_lens
+
+
 async def run_multi_stage_benchmark(
     request_func,
     input_requests: list[SampleRequest],
@@ -671,7 +947,7 @@ async def run_multi_stage_benchmark(
     
     # 返回总体结果
     
-    return result
+    return metrics, actual_output_lens
 
 
 async def benchmark(
@@ -698,6 +974,7 @@ async def benchmark(
     extra_body: Optional[dict],
     print_outputs: bool,
     warmup_stage_count: int = 0,
+    repetition: int = 1,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -767,7 +1044,40 @@ async def benchmark(
         for i, (rate, num_req) in enumerate(zip(compact_kv_request_rate_list, running_num_requests)):
             print(f"  Stage {i+1}: {num_req} requests at {rate} req/s")
         
-        # 执行多阶段基准测试
+        # If repetition > 1, wrap in run_repetition_benchmark
+        if repetition > 1:
+            return await run_repetition_benchmark(
+                repetition=repetition,
+                base_url=base_url,
+                run_single_benchmark_func=run_multi_stage_benchmark,
+                request_func=request_func,
+                input_requests=input_requests,
+                request_rate_list=compact_kv_request_rate_list,
+                running_num_requests=running_num_requests,
+                burstiness=burstiness,
+                disable_tqdm=disable_tqdm,
+                max_concurrency=max_concurrency,
+                lora_modules=lora_modules,
+                model_id=model_id,
+                model_name=model_name,
+                api_url=api_url,
+                logprobs=logprobs,
+                ignore_eos=ignore_eos,
+                extra_body=extra_body,
+                profile=profile,
+                test_prompt=test_prompt,
+                test_prompt_len=test_prompt_len,
+                test_output_len=test_output_len,
+                test_mm_content=test_mm_content,
+                tokenizer=tokenizer,
+                selected_percentile_metrics=selected_percentile_metrics,
+                selected_percentiles=selected_percentiles,
+                goodput_config_dict=goodput_config_dict,
+                print_outputs=print_outputs,
+                warmup_stage_count=warmup_stage_count,
+            )
+        
+        # 执行多阶段基准测试 (single run)
         return await run_multi_stage_benchmark(
             request_func=request_func,
             input_requests=input_requests,
@@ -1300,6 +1610,7 @@ def main(args: argparse.Namespace):
     compact_rates = benchmark_config.running_request_rates
     running_nums = benchmark_config.running_num_requests
     warmup_stage_count = 0
+    repetition = getattr(benchmark_config, "repetition", 1)
     if getattr(benchmark_config, "warmup", None) is not None and benchmark_config.warmup.enabled:
         warm = benchmark_config.warmup
         warmup_stage_count = len(warm.running_num_requests)
@@ -1334,6 +1645,7 @@ def main(args: argparse.Namespace):
             extra_body=sampling_params,
             print_outputs=args.print_outputs,
             warmup_stage_count=warmup_stage_count,
+            repetition=repetition,
         )
     )
 
