@@ -937,10 +937,16 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
         kv_caches: dict[str, torch.Tensor] = {}
 
+        # Verify kv_cache_config.num_blocks matches the passed num_blocks
+        # Both should be set by dynamic_core to the same value
+        assert num_blocks == kv_cache_config.num_blocks, (
+            f"num_blocks mismatch: passed={num_blocks}, config={kv_cache_config.num_blocks}. "
+            "dynamic_core should update kv_cache_configs before calling dynamic_initialize_from_config"
+        )
+
         for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             kv_cache_spec = kv_cache_group.kv_cache_spec
             for layer_name in kv_cache_group.layer_names:
-                assert num_blocks >= kv_cache_config.num_blocks
                 if isinstance(kv_cache_spec, AttentionSpec):
                     kv_cache_shape = self.attn_backends[i].get_kv_cache_shape(
                         num_blocks, kv_cache_spec.block_size,
@@ -1003,7 +1009,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
             num_blocks, kv_cache_spec.block_size,
             kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
         self.kv_cache_shape = kv_cache_shape
-        assert num_blocks >= kv_cache_config.num_blocks, f"num_blocks {num_blocks} is less than kv_cache_config.num_blocks {kv_cache_config.num_blocks}"
+        # Verify kv_cache_config.num_blocks matches the passed num_blocks
+        # Both should be set by dynamic_core to the same value
+        assert num_blocks == kv_cache_config.num_blocks, (
+            f"num_blocks mismatch: passed={num_blocks}, config={kv_cache_config.num_blocks}. "
+            "dynamic_core should update kv_cache_configs before calling dynamic_initialize_from_config"
+        )
         assert len(kv_cache_shape) == 5 # (2, nkvblocks, blockdim, n_head, headdim)
         block_shape = kv_cache_shape[2:]
         # Create page_meta tensor with correct shape [block_size, num_heads]

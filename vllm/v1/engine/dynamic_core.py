@@ -350,6 +350,12 @@ class DynamicEngineCore(EngineCore):
             num_layers_on_rank = self.cur_pp_layer_config[rank][1] - self.cur_pp_layer_config[rank][0] + 1
             max_blocks_per_layer = min(max_blocks_per_layer, self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes, num_layers_on_rank))
         logger.info(f"[operation]: initialize kv cache with max blocks per layer: {max_blocks_per_layer}")
+        
+        # Update kv_cache_configs with the calculated max_blocks_per_layer
+        # This is necessary because unify_kv_cache_configs doesn't consider layer count differences
+        for cfg in kv_cache_configs:
+            cfg.num_blocks = max_blocks_per_layer
+        
         self.model_executor.dynamic_initialize_from_config(kv_cache_configs, max_blocks_per_layer)
 
 

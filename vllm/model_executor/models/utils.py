@@ -616,11 +616,23 @@ def make_layers(
     """Make a list of layers with the given layer function, taking
     pipeline parallelism into account.
     """
+    from vllm.config import get_current_vllm_config
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
+    
+    # Try to get pp_layer_partition from dynamic_config if available
+    pp_layer_partition = None
+    try:
+        vllm_config = get_current_vllm_config()
+        if vllm_config is not None and hasattr(vllm_config, 'dynamic_config') and vllm_config.dynamic_config is not None:
+            pp_layer_partition = vllm_config.dynamic_config.pp_layer_partition
+    except Exception:
+        pass
+    
     start_layer, end_layer = get_pp_indices(num_hidden_layers,
                                             get_pp_group().rank_in_group,
-                                            get_pp_group().world_size)
+                                            get_pp_group().world_size,
+                                            pp_layer_partition)
     logger.info(f"start_layer: {start_layer}, end_layer: {end_layer}")
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)] + [

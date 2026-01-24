@@ -1058,7 +1058,39 @@ def start_benchmark_for_sweep(
         stderr=subprocess.STDOUT,
         env=os.environ.copy(),
     )
-    return ret.returncode == 0
+    bench_fd.close()
+    
+    # Validate benchmark results beyond just exit code
+    if ret.returncode != 0:
+        C.print(f"[red]ERROR[/] Benchmark exited with code {ret.returncode}")
+        return False
+    
+    # Check if benchmark actually completed any requests successfully
+    try:
+        with open(log_path, 'r') as f:
+            log_content = f.read()
+        
+        # Look for "Successful requests:" line
+        import re
+        match = re.search(r'Successful requests:\s+(\d+)', log_content)
+        if match:
+            successful_requests = int(match.group(1))
+            if successful_requests == 0:
+                C.print("[red]ERROR[/] Benchmark completed 0 successful requests")
+                return False
+            C.print(f"[green]Benchmark completed with {successful_requests} successful requests[/]")
+        else:
+            C.print("[yellow]WARNING[/] Could not parse successful requests count from benchmark log")
+            
+        # Check for fatal errors in log
+        if "Cannot connect to host" in log_content or "Connection refused" in log_content:
+            C.print("[red]ERROR[/] Benchmark failed to connect to server")
+            return False
+            
+    except Exception as e:
+        C.print(f"[yellow]WARNING[/] Could not validate benchmark log: {e}")
+    
+    return True
 
 
 # =========================
