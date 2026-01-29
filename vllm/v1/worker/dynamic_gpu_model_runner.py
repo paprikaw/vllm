@@ -7,6 +7,7 @@ import time
 import weakref
 from typing import TYPE_CHECKING, Optional, Union, Tuple
 import sys
+from compressed_tensors import Tensor
 import humanize
 from matplotlib.pylab import dtype
 import numpy as np
@@ -89,6 +90,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self.custom_loader = CustomModelLoader(self.vllm_config.load_config)
         # Inference stream for stream-specific synchronization (set by worker)
         self.inference_stream: Optional[torch.cuda.Stream] = None
+        self._pending_k_ptr_table: Optional["PtrTable"] = None
+        self._pending_v_ptr_table: Optional["PtrTable"] = None
     
     def set_inference_stream(self, stream: torch.cuda.Stream) -> None:
         """Set the inference stream for stream-specific synchronization."""
@@ -1133,14 +1136,14 @@ class DynamicGPUModelRunner(GPUModelRunner):
             self.v_ptr_tensors,
         )
         # Initialize PtrTable stacked tensors after binding all KV caches
-        self.commit_ptr_tables()
+        self.commit_ptr_tables(self.k_ptr_tensors, self.v_ptr_tensors, is_first_time=True)
         
         del kv_caches
         if has_kv_transfer_group():
             assert False
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
-    def prepare_ptr_tables(self) -> None:
+    def prepare_ptr_tables(self, num_layers: int) -> None:
         """
         Prepare new stacked tensors and store them for later commit.
         
@@ -1154,14 +1157,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         
         The prepared tensors can then be atomically committed via commit_ptr_tables().
         """
-        if not self.k_ptr_tensors or not self.v_ptr_tensors:
-            self._pending_k_stacked = None
-            self._pending_v_stacked = None
-            self._pending_k_ptr_table = None
-            self._pending_v_ptr_table = None
-            return
+        assert self.k_ptr_tensors and  self.v_ptr_tensors
         
-        num_layers = len(self.k_ptr_tensors)
         
         # Create new PtrTable instances for the new layer count, but do NOT replace
         # the current ones yet. They are stored as pending and will be committed later.
@@ -1186,12 +1183,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
         )
         
         # Prepare new stacked tensors using the pending PtrTables
-        self._pending_k_stacked = self._pending_k_ptr_table.prepare_stacked_tensors(self.k_ptr_tensors)
-        self._pending_v_stacked = self._pending_v_ptr_table.prepare_stacked_tensors(self.v_ptr_tensors)
+        # self._pending_k_stacked = self._pending_k_ptr_table.prepare_stacked_tensors(self.k_ptr_tensors)
+        # self._pending_v_stacked = self._pending_v_ptr_table.prepare_stacked_tensors(self.v_ptr_tensors)
         
         logger.info(f"prepare_ptr_tables: prepared stacked tensors for {num_layers} layers")
 
-    def commit_ptr_tables(self) -> None:
+    def commit_ptr_tables(self, k_ptr_tensor_list: list[Tensor], v_ptr_tensor_list: list[Tensor], is_first_time: Optional[bool] = False, target_start_layer: Optional[int] = None) -> None:
         """
         Atomically switch to the prepared PtrTables and stacked tensors.
         
@@ -1203,37 +1200,49 @@ class DynamicGPUModelRunner(GPUModelRunner):
         This method:
         1. Replaces k_ptr_table/v_ptr_table with the pending ones
         2. Commits the pending stacked tensors to the new PtrTables
+        
+        Args:
+            target_start_layer: If provided, use this as the start_layer for PtrTable indexing.
+                               This is critical during migration when the model's start_layer
+                               will change AFTER this commit (e.g., after delete_layers).
+                               If None, uses current model.start_layer.
         """
-        # If no pending PtrTables, prepare them first
-        if not hasattr(self, '_pending_k_ptr_table') or self._pending_k_ptr_table is None:
-            self.prepare_ptr_tables()
+        # This can happen for:
+        # 1. is_first_time=True (initial setup)
+        # 2. Sender calling commit after deleting layers (never called prepare)
+        if self._pending_k_ptr_table is None:
+            self.prepare_ptr_tables(len(k_ptr_tensor_list))
         
-        # If still no pending (e.g., no ptr_tensors), nothing to do
-        if not hasattr(self, '_pending_k_ptr_table') or self._pending_k_ptr_table is None:
-            return
-        
+        # Verify layer counts match
+        assert len(k_ptr_tensor_list) == self._pending_k_ptr_table.num_layers, \
+            f"k_ptr_tensor_list length {len(k_ptr_tensor_list)} != pending k_ptr_table num_layers {self._pending_k_ptr_table.num_layers}"
+        assert len(v_ptr_tensor_list) == self._pending_v_ptr_table.num_layers, \
+            f"v_ptr_tensor_list length {len(v_ptr_tensor_list)} != pending v_ptr_table num_layers {self._pending_v_ptr_table.num_layers}" 
+        # Update start_layer to match target configuration (not current model state)
+        # This is critical during migration when model.start_layer will change AFTER this commit
+        old_start_layer = self._ptr_table_start_layer
+        if target_start_layer is not None:
+            self._ptr_table_start_layer = target_start_layer
+        else:
+            self._ptr_table_start_layer = getattr(self.model.model, 'start_layer', 0)
+        logger.info(f"commit_ptr_tables: updating _ptr_table_start_layer from {old_start_layer} to {self._ptr_table_start_layer}")
+
         # Atomic switch: replace current PtrTables with pending ones
         self.k_ptr_table = self._pending_k_ptr_table
         self.v_ptr_table = self._pending_v_ptr_table
         
-        # Update start_layer to match the new PtrTable
-        # This is critical: the new PtrTable corresponds to the current model.start_layer
-        self._ptr_table_start_layer = getattr(self.model.model, 'start_layer', 0)
-        
         # Commit the stacked tensors to the new PtrTables
-        self.k_ptr_table.commit_stacked_tensors(self._pending_k_stacked, id(self.k_ptr_tensors))
-        self.v_ptr_table.commit_stacked_tensors(self._pending_v_stacked, id(self.v_ptr_tensors))
+        self.k_ptr_table.set_ptr_tensors(k_ptr_tensor_list)
+        self.v_ptr_table.set_ptr_tensors(v_ptr_tensor_list)
         
         # Clear pending state
-        self._pending_k_stacked = None
-        self._pending_v_stacked = None
         self._pending_k_ptr_table = None
         self._pending_v_ptr_table = None
         
         logger.info(f"commit_ptr_tables: committed stacked tensors with {self.k_ptr_table.num_layers} layers, "
                     f"_ptr_table_start_layer updated to {self._ptr_table_start_layer}")
 
-    def update_internal_kv_ptr_tensor(self) -> None:
+    def update_kv_ptr_tensor(self, k_ptr_tensor_list, v_ptr_tensor_list) -> None:
         """
         Update the cached stacked tensors to reflect current k_ptr_tensors/v_ptr_tensors.
         
@@ -1244,19 +1253,15 @@ class DynamicGPUModelRunner(GPUModelRunner):
         which is critical after layer deletion/addition.
         """
         time_start = time.time()
+        assert self.k_ptr_table is not None and self.k_ptr_tensors
+        assert self.v_ptr_table is not None and self.v_ptr_tensors
+        assert len(k_ptr_tensor_list) == self.k_ptr_table.num_layers
+        assert len(v_ptr_tensor_list) == self.v_ptr_table.num_layers
+
         
-        # Update start_layer to match current model state
-        # This is critical after layer deletion when model.start_layer changes
-        old_start_layer = self._ptr_table_start_layer
-        self._ptr_table_start_layer = getattr(self.model.model, 'start_layer', 0)
+        self.k_ptr_table.set_ptr_tensors(k_ptr_tensor_list)
+        self.v_ptr_table.set_ptr_tensors(v_ptr_tensor_list)
         
-        if self.k_ptr_table is not None and self.k_ptr_tensors:
-            self.k_ptr_table.set_ptr_tensors(self.k_ptr_tensors)
-        if self.v_ptr_table is not None and self.v_ptr_tensors:
-            self.v_ptr_table.set_ptr_tensors(self.v_ptr_tensors)
-        
-        if old_start_layer != self._ptr_table_start_layer:
-            logger.info(f"refresh_ptr_tensors_cache: updated _ptr_table_start_layer from {old_start_layer} to {self._ptr_table_start_layer}")
         logger.info(f"refresh_ptr_tensors_cache: updated stacked tensors cache in {human_readable_duration(time.time() - time_start)}")
 
     def flexi_atomic_switch_kv_cache_config_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
@@ -1315,15 +1320,28 @@ class DynamicGPUModelRunner(GPUModelRunner):
         '''
         目前release_kv_cache依赖于model.start_layers来进行kv cache list的删除。
         因此只能先release kv cache再删除layers
+        
+        NOTE: This function is used in non-flexi mode. Unlike flexi mode where
+        the caller explicitly frees KV cache tensors, this function must release
+        the GPU memory by removing references and calling gc.collect() + empty_cache().
         '''
         assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        
+        logger.info(f"before atomic_switch_kv_cache_config_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, kv_caches length: {len(self.kv_caches)}")
 
         # Delete the kv cache from kv_cache list
         start_layer = self.model.model.start_layer
-        self.kv_caches = [
-            kv_cache for idx, kv_cache in enumerate(self.kv_caches) 
-            if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
-        ]
+        # First, explicitly delete the tensors to be removed
+        indices_to_remove = set()
+        for idx in range(len(self.kv_caches)):
+            if any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list):
+                indices_to_remove.add(idx)
+        
+        # Explicitly delete the KV cache tensors before filtering
+        for idx in sorted(indices_to_remove, reverse=True):
+            if idx < len(self.kv_caches):
+                del self.kv_caches[idx]
+        
         # Delete layer name from kv_cache_config
         deleted_layers = set(layer for layers in layers_list for layer in range(layers[0], layers[1]+1))
         group = self.kv_cache_config.kv_cache_groups[0]
@@ -1339,7 +1357,13 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 attn_module.kv_cache = [torch.tensor([])]
         for layer_name in deleted_layer_names:
             del forward_context[layer_name]
-        logger.info(f"after release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.kv_caches)}")
+        
+        # Force garbage collection and clear CUDA cache to release GPU memory
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        logger.info(f"after atomic_switch_kv_cache_config_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.kv_caches)}")
 
     def release_kv_cache(self) -> None:
         assert isinstance(self.model, DynamicQwen3ForCausalLM)

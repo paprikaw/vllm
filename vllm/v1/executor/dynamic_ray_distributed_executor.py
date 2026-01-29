@@ -495,9 +495,9 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         # fire-and-forget 异步发起，每个 worker 内部用线程执行
         self.collective_rpc("async_add_layers", args=(rank, layers_list))
     
-    def start_kv_cache_migration_async(self, src_to_plan: dict[int, dict[int, list[int]]], slot_mapping: Optional[list[int]]):
+    def start_kv_cache_migration_async(self, pp_layer_config: list[Tuple[int, int]], src_to_plan: dict[int, dict[int, list[int]]], slot_mapping: Optional[list[int]]):
         # 调用 worker 侧的同名方法，仅在 source_rank 上发送，其余 rank 不做事
-        self.collective_rpc("start_kv_cache_migration_async", args=(src_to_plan,slot_mapping))
+        self.collective_rpc("start_kv_cache_migration_async", args=(pp_layer_config, src_to_plan,slot_mapping))
 
     def get_is_kv_resizing_done(self) -> list[bool]:
         return self.collective_rpc("get_is_kv_resizing_done")
@@ -507,12 +507,11 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         """
         return self.collective_rpc("get_applied_token_num", args=(receiver_list,))
 
-    def start_kv_cache_migration_sync(self, src_to_plan: dict[int, dict[int, list[Tuple[int, int]]]], 
+    def start_kv_cache_migration_sync(self, pp_layer_config: list[Tuple[int, int]], src_to_plan: dict[int, dict[int, list[Tuple[int, int]]]], 
                                        dst_to_layer_ids: dict[int, list[Tuple[int, int]]],
                                        slot_mapping: Optional[list[int]] = None):
         # 调用 worker 侧的同名方法，仅在 source_rank 上发送，其余 rank 不做事
-        self.collective_rpc("start_kv_cache_migration_sync", args=(src_to_plan, dst_to_layer_ids, slot_mapping))
-
+        self.collective_rpc("start_kv_cache_migration_sync", args=(pp_layer_config, src_to_plan, dst_to_layer_ids, slot_mapping))
     def get_kv_buffer_status(self) -> list[KVBufferStatus]:
         output = self.collective_rpc("get_kv_buffer_status")
         return output

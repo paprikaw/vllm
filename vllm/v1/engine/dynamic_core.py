@@ -727,7 +727,7 @@ class DynamicEngineCore(EngineCore):
         receiver_list = list(adding_per_rank.keys())
         slot_mapping = self.scheduler.start_migration(sender_list, receiver_list, compacted_length != original_length)
         assert slot_mapping is not None if is_flexi else True
-        self.model_executor.start_kv_cache_migration_async(src_to_plan, slot_mapping)
+        self.model_executor.start_kv_cache_migration_async(pp_layer_config, src_to_plan, slot_mapping)
 
         time_kv_migration_end = time.time()
 
@@ -954,7 +954,7 @@ class DynamicEngineCore(EngineCore):
                     layer_ranges.extend([(lo, hi)])
 
             # For sync migration, slot_mapping is None - receiver creates fresh empty KV caches
-            self.model_executor.start_kv_cache_migration_sync(sending_plan_for_ranks, adding_per_rank, None)
+            self.model_executor.start_kv_cache_migration_sync(pp_layer_config, sending_plan_for_ranks, adding_per_rank, None)
             time_kv_migration_end = time.time()
             logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
             time_kv_migration_end = time.time()

@@ -311,10 +311,30 @@ class DynamicQwen3Model(Qwen3Model):
                 #     end = 41
 
                 logger.debug(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
+                
+                # 🔴 诊断日志：检查 layer 配置一致性
+                logger.info(f"[LAYER_CHECK] model.start_layer={self.start_layer}, model.end_layer={self.end_layer}, "
+                           f"sched_start_layer={self.sched_start_layer}, sched_end_layer={self.sched_end_layer}, "
+                           f"len(self.layers)={len(self.layers)}")
+                
+                # 检查要 forward 的 layers 是否是真实的层（不是 PPMissingLayer）
+                missing_layers = []
+                for idx in range(self.sched_start_layer, self.sched_end_layer):
+                    if idx < len(self.layers):
+                        layer_obj = self.layers[idx]
+                        if isinstance(layer_obj, PPMissingLayer):
+                            missing_layers.append(idx)
+                if missing_layers:
+                    logger.error(f"[LAYER_CHECK] ERROR: Trying to forward through PPMissingLayers at indices: {missing_layers}")
+                
                 forwarding_start_time = time.time()
                 for layer_idx, layer in enumerate(self.layers[self.sched_start_layer:self.sched_end_layer], start=self.sched_start_layer):
                     layer_start_time = time.time()
                     try:
+                        # 检查是否是 PPMissingLayer
+                        if isinstance(layer, PPMissingLayer):
+                            logger.error(f"[LAYER_CHECK] CRITICAL: Forwarding through PPMissingLayer at layer_idx={layer_idx}")
+                        
                         # 使用 threading.Timer 实现超时检测
                         result = [None, None]  # 用于存储结果
                         

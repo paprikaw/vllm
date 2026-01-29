@@ -238,6 +238,12 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
                         
                         # Validate local_layer_idx is within bounds
                         if local_layer_idx < 0 or local_layer_idx >= k_ptr_tables.shape[0]:
+                            # [LAYER_MISMATCH] Critical: layer index out of bounds for ptr_table
+                            from vllm.logger import init_logger
+                            _mismatch_logger = init_logger(__name__)
+                            _mismatch_logger.error(f"[LAYER_MISMATCH] layer_idx={layer_idx}, start_layer={start_layer}, "
+                                                  f"local_layer_idx={local_layer_idx}, k_ptr_tables.shape={k_ptr_tables.shape}, "
+                                                  f"layer_name={layer_name}. Falling back to non-direct mode!")
                             use_flexi_direct = False
                         else:
                             # Get per-batch ptr_table for this layer

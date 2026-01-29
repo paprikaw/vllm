@@ -237,24 +237,19 @@ class PtrTable:
         Args:
             ptr_tensors: List of per-layer pointer tensors, each (num_blocks,) uint64
         """
-        num_layers = min(self.num_layers, len(ptr_tensors))
-        if num_layers == 0:
-            self._cached_stacked_ptr_tensors = None
-            return
+        assert self.num_layers == len(ptr_tensors)
         
         # Find valid layers and get max num_blocks
-        valid_layers = [(i, ptr_tensors[i]) for i in range(num_layers) if ptr_tensors[i].numel() > 0]
-        if not valid_layers:
-            self._cached_stacked_ptr_tensors = None
-            return
+        not_valid_layers = [(i, ptr_tensors[i]) for i in range(self.num_layers) if ptr_tensors[i].numel() == 0]
+        assert not not_valid_layers
         
-        max_blocks = max(t.numel() for _, t in valid_layers)
+        max_blocks = max(t.numel() for t in ptr_tensors)
         
         # Pre-allocate stacked tensor: (num_layers, max_blocks)
-        stacked = torch.zeros((num_layers, max_blocks), dtype=torch.int64, device=self.device)
+        stacked = torch.zeros((self.num_layers, max_blocks), dtype=torch.int64, device=self.device)
         
         # Fill in valid layers
-        for layer_idx, t in valid_layers:
+        for layer_idx, t in enumerate(ptr_tensors):
             t_int64 = t.view(torch.int64)
             stacked[layer_idx, :t_int64.numel()] = t_int64
         
@@ -292,9 +287,7 @@ class PtrTable:
         # Note: commit_stacked_tensors() should be called explicitly after migration
         # to update the cache. This check is just a fallback for initial setup.
         stacked_ptr_tensors = self._cached_stacked_ptr_tensors
-        if stacked_ptr_tensors is None:
-            self.ptr_table[:num_layers, :batch_size].zero_()
-            return self.ptr_table[:num_layers, :batch_size].view(torch.uint64)
+        assert stacked_ptr_tensors is not None
         
         if use_fused_kernel:
             # Use fused CUDA kernel for maximum performance

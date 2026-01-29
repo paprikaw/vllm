@@ -64,7 +64,7 @@ static_config:
 sweep_config:
   # Test repetition with 3 repetitions, no migration
   vllm:
-    enable_flexi_flash_attn: [true, false]
+    enable_flexi_flash_attn: [true]
   benchmark_config:
     - num_total_requests: 100  # Small number for quick testing
       repetition: 3           # 3 repetitions to test the feature
