@@ -309,36 +309,51 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
-async def reset_pipeline(base_url: str, timeout: float = 120.0) -> bool:
-    """Call reset_pipeline API to restore initial pipeline configuration.
+async def set_pp_config(
+    base_url: str,
+    pp_layer_config: list,
+    alternative_configs: Optional[dict] = None,
+    migration_steps: Optional[list] = None,
+    timeout: float = 120.0
+) -> bool:
+    """Set pipeline configuration to a specific target config.
+    
+    The server will skip if already at the target configuration.
     
     Args:
         base_url: Base URL of the vLLM server (e.g., http://localhost:8000)
+        pp_layer_config: Target configuration as list of [start, end] pairs per rank.
+                         Example: [[0, 39], [40, 63]] for 2 ranks.
         timeout: Request timeout in seconds
     
     Returns:
-        True if reset was successful, False otherwise
+        True if set was successful, False otherwise
     """
     import aiohttp
-    reset_url = f"{base_url}/reset_pipeline"
+    set_url = f"{base_url}/set_pp_config"
+    payload = {"pp_layer_config": pp_layer_config}
+    if alternative_configs is not None:
+        payload["alternative_configs"] = alternative_configs
+    if migration_steps is not None:
+        payload["migration_steps"] = migration_steps
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(reset_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+            async with session.post(set_url, json=payload, 
+                                    timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                 if response.status == 200:
-                    print("  Pipeline reset successful")
+                    print(f"  PP config set successfully to {pp_layer_config}")
                     return True
                 else:
-                    # Try to get error details from response body
                     try:
                         error_body = await response.json()
                         error_msg = error_body.get('error', 'Unknown error')
                     except Exception:
                         error_msg = await response.text()
-                    print(f"  Warning: Pipeline reset failed with status {response.status}")
+                    print(f"  Warning: set_pp_config failed with status {response.status}")
                     print(f"  Error details: {error_msg}")
                     return False
     except Exception as e:
-        print(f"  Warning: Failed to reset pipeline: {e}")
+        print(f"  Warning: Failed to set pp config: {e}")
         return False
 
 
@@ -470,14 +485,21 @@ async def run_repetition_benchmark(
     repetition: int,
     base_url: str,
     run_single_benchmark_func,
+    initial_pp_config: Optional[list] = None,
+    alternative_configs: Optional[dict] = None,
+    migration_steps: Optional[list] = None,
     **kwargs
 ) -> tuple[BenchmarkMetrics, list[int]]:
-    """Run benchmark multiple times with pipeline reset between repetitions.
+    """Run benchmark multiple times with pipeline config reset between repetitions.
     
     Args:
         repetition: Number of times to repeat the benchmark
-        base_url: Base URL of the vLLM server for reset_pipeline API
+        base_url: Base URL of the vLLM server for set_pp_config API
         run_single_benchmark_func: Function that runs a single benchmark iteration
+        initial_pp_config: Initial pipeline config to restore between repetitions.
+                          If None, skip the reset (server will handle same-config skip).
+        alternative_configs: Optional migration target configs for set_pp_config.
+        migration_steps: Optional migration trigger points (request indices).
         **kwargs: Arguments to pass to run_single_benchmark_func
     
     Returns:
@@ -504,12 +526,22 @@ async def run_repetition_benchmark(
         # Print detailed summary for this repetition
         _print_repetition_summary(rep, metrics)
         
-        # Reset pipeline if not the last repetition
+        # Reset pipeline config if not the last repetition
         if rep < repetition:
-            print(f"\n  Resetting pipeline configuration for next repetition...")
-            await reset_pipeline(base_url)
-            # Small delay after reset to ensure server is ready
-            await asyncio.sleep(1.0)
+            if initial_pp_config is not None:
+                print(f"\n  Resetting pipeline configuration to {initial_pp_config} for next repetition...")
+                success = await set_pp_config(
+                    base_url,
+                    initial_pp_config,
+                    alternative_configs=alternative_configs,
+                    migration_steps=migration_steps
+                )
+                if not success:
+                    print(f"  Warning: Pipeline config reset failed, continuing anyway...")
+                # Small delay after reset to ensure server is ready
+                await asyncio.sleep(1.0)
+            else:
+                print(f"\n  No initial_pp_config provided, skipping pipeline reset...")
     
     # Print final summary with statistics across all repetitions
     _print_final_summary(repetition, all_metrics_list)
@@ -975,6 +1007,9 @@ async def benchmark(
     print_outputs: bool,
     warmup_stage_count: int = 0,
     repetition: int = 1,
+    initial_pp_config: Optional[list] = None,
+    alternative_configs: Optional[dict] = None,
+    migration_steps: Optional[list] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1050,6 +1085,9 @@ async def benchmark(
                 repetition=repetition,
                 base_url=base_url,
                 run_single_benchmark_func=run_multi_stage_benchmark,
+                initial_pp_config=initial_pp_config,
+                alternative_configs=alternative_configs,
+                migration_steps=migration_steps,
                 request_func=request_func,
                 input_requests=input_requests,
                 request_rate_list=compact_kv_request_rate_list,
@@ -1611,6 +1649,12 @@ def main(args: argparse.Namespace):
     running_nums = benchmark_config.running_num_requests
     warmup_stage_count = 0
     repetition = getattr(benchmark_config, "repetition", 1)
+    
+    # Get pipeline config for repetition reset
+    initial_pp_config = getattr(benchmark_config, "initial_pp_config", None)
+    alternative_configs = getattr(benchmark_config, "alternative_configs", None)
+    migration_steps = getattr(benchmark_config, "migration_steps", None)
+    
     if getattr(benchmark_config, "warmup", None) is not None and benchmark_config.warmup.enabled:
         warm = benchmark_config.warmup
         warmup_stage_count = len(warm.running_num_requests)
@@ -1646,6 +1690,9 @@ def main(args: argparse.Namespace):
             print_outputs=args.print_outputs,
             warmup_stage_count=warmup_stage_count,
             repetition=repetition,
+            initial_pp_config=initial_pp_config,
+            alternative_configs=alternative_configs,
+            migration_steps=migration_steps,
         )
     )
 

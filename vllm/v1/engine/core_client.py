@@ -95,7 +95,12 @@ class EngineCoreClient(ABC):
     def reset_prefix_cache(self) -> None:
         raise NotImplementedError
 
-    def reset_pipeline(self) -> None:
+    def set_pp_config(
+        self,
+        pp_layer_config: list,
+        alternative_configs: Optional[dict] = None,
+        migration_steps: Optional[list[int]] = None
+    ) -> None:
         raise NotImplementedError
 
     def sleep(self, level: int = 1) -> None:
@@ -156,7 +161,12 @@ class EngineCoreClient(ABC):
     async def reset_prefix_cache_async(self) -> None:
         raise NotImplementedError
 
-    async def reset_pipeline_async(self) -> None:
+    async def set_pp_config_async(
+        self,
+        pp_layer_config: list,
+        alternative_configs: Optional[dict] = None,
+        migration_steps: Optional[list[int]] = None
+    ) -> None:
         raise NotImplementedError
 
     async def sleep_async(self, level: int = 1) -> None:
@@ -233,8 +243,13 @@ class InprocClient(EngineCoreClient):
     def reset_prefix_cache(self) -> None:
         self.engine_core.reset_prefix_cache()
 
-    def reset_pipeline(self) -> None:
-        self.engine_core.reset_pipeline()
+    def set_pp_config(
+        self,
+        pp_layer_config: list,
+        alternative_configs: Optional[dict] = None,
+        migration_steps: Optional[list[int]] = None
+    ) -> None:
+        self.engine_core.set_pp_config(pp_layer_config, alternative_configs, migration_steps)
 
     def sleep(self, level: int = 1) -> None:
         self.engine_core.sleep(level)
@@ -696,8 +711,8 @@ class SyncMPClient(MPClient):
     def reset_prefix_cache(self) -> None:
         self.call_utility("reset_prefix_cache")
 
-    def reset_pipeline(self) -> None:
-        self.call_utility("reset_pipeline")
+    def set_pp_config(self, pp_layer_config: list) -> None:
+        self.call_utility("set_pp_config", pp_layer_config)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
@@ -887,8 +902,8 @@ class AsyncMPClient(MPClient):
     async def reset_prefix_cache_async(self) -> None:
         await self.call_utility_async("reset_prefix_cache")
 
-    async def reset_pipeline_async(self) -> None:
-        await self.call_utility_async("reset_pipeline")
+    async def set_pp_config_async(self, pp_layer_config: list) -> None:
+        await self.call_utility_async("set_pp_config", pp_layer_config)
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)

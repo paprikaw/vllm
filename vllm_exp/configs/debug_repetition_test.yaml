@@ -17,7 +17,7 @@ envs:
   VLLM_USE_RAY_COMPILED_DAG: "1"
   NCCL_SOCKET_IFNAME: "bond0.3027"
   GLOO_SOCKET_IFNAME: "bond0.3027"
-  VLLM_SERVER_DEV_MODE: "1"  # Enable /reset_pipeline endpoint
+  VLLM_SERVER_DEV_MODE: "1"  # Enable /set_pp_config endpoint
 
 is_log_cover: true
 

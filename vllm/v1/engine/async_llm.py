@@ -498,9 +498,25 @@ class AsyncLLM(EngineClient):
             raise ValueError("Not supported on CPU.")
         await self.engine_core.reset_prefix_cache_async()
 
-    async def reset_pipeline(self) -> None:
-        """Reset pipeline configuration to initial state."""
-        await self.engine_core.reset_pipeline_async()
+    async def set_pp_config(
+        self,
+        pp_layer_config: list,
+        alternative_configs: Optional[dict] = None,
+        migration_steps: Optional[list[int]] = None
+    ) -> None:
+        """Set pipeline configuration to a specific target config.
+        
+        If the target config is the same as current config, the migration is skipped.
+        
+        Args:
+            pp_layer_config: Target configuration as list of [start, end] pairs per rank.
+                             Example: [[0, 39], [40, 63]] for 2 ranks.
+            alternative_configs: Optional new migration targets.
+            migration_steps: Optional new migration trigger points (request indices).
+        """
+        await self.engine_core.set_pp_config_async(pp_layer_config,
+                                                   alternative_configs,
+                                                   migration_steps)
 
     async def sleep(self, level: int = 1) -> None:
         await self.engine_core.sleep_async(level)

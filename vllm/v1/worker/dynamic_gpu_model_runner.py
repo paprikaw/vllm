@@ -87,6 +87,25 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self._ptr_table_start_layer: int = 0
         # Create CustomModelLoader for weight preloading
         self.custom_loader = CustomModelLoader(self.vllm_config.load_config)
+        # Inference stream for stream-specific synchronization (set by worker)
+        self.inference_stream: Optional[torch.cuda.Stream] = None
+    
+    def set_inference_stream(self, stream: torch.cuda.Stream) -> None:
+        """Set the inference stream for stream-specific synchronization."""
+        self.inference_stream = stream
+        logger.info(f"Inference stream set: {stream}")
+    
+    def stream_synchronize(self) -> None:
+        """Synchronize only the inference stream, not the entire device.
+        
+        This avoids deadlock with _listen_loop's CUDA operations by not waiting
+        for operations on other streams (like the default stream used by _listen_loop).
+        Falls back to device synchronize if no inference stream is set.
+        """
+        if self.inference_stream is not None:
+            self.inference_stream.synchronize()
+        else:
+            torch.cuda.synchronize()
 
     def load_model(self) -> None:
         """Override to use CustomModelLoader with weight preloading."""
@@ -348,8 +367,14 @@ class DynamicGPUModelRunner(GPUModelRunner):
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
+            # [SYNC_DEBUG] Before sync_and_slice_intermediate_tensors (Rank 1 receives from Rank 0)
+            logger.info(f"[SYNC_DEBUG] before sync_and_slice (waiting for intermediate_tensors)")
+            _sync_start_recv = time.time()
+            self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
+            logger.info(f"[SYNC_DEBUG] after sync before sync_and_slice, took {(time.time() - _sync_start_recv)*1000:.2f}ms")
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True)
+            self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
         # Get start_layer for computing local layer index in flexi_direct
@@ -364,6 +389,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
                                  v_ptr_tables=v_ptr_tables_tensor,
                                  start_layer=start_layer):
             self.maybe_setup_kv_connector(scheduler_output)
+            self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
             try:
                 model_forward_start = time.time()
                 model_output = self.model(
@@ -373,6 +399,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                 )
                 model_forward_end = time.time()
+                # [SYNC_DEBUG] After model forward
+                logger.info(f"[SYNC_DEBUG] before sync after model forward")
+                _sync_start_mf = time.time()
+                self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
+                logger.info(f"[SYNC_DEBUG] after sync after model forward, took {(time.time() - _sync_start_mf)*1000:.2f}ms")
             except Exception as e:
                 time.sleep(2)
                 logger.info(f"Exception during model forward: {e}")
@@ -403,6 +434,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
         else:
             sample_hidden_states = hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
+            # [SYNC_DEBUG] After compute_logits
+            logger.info(f"[SYNC_DEBUG] before sync after compute_logits")
+            _sync_start_cl = time.time()
+            self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
+            logger.info(f"[SYNC_DEBUG] after sync after compute_logits, took {(time.time() - _sync_start_cl)*1000:.2f}ms")
         if broadcast_pp_output:
             model_output_broadcast_data = {
                 "logits": logits.contiguous(),
@@ -423,6 +459,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            # [SYNC_DEBUG] After sampler
+            logger.info(f"[SYNC_DEBUG] before sync after sampler")
+            _sync_start_sampler = time.time()
+            self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
+            logger.info(f"[SYNC_DEBUG] after sync after sampler, took {(time.time() - _sync_start_sampler)*1000:.2f}ms")
         else:
             # When indexing with a tensor (bonus_logits_indices), PyTorch
             # creates a new tensor with separate storage from the original
@@ -468,21 +509,45 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 discard_sampled_tokens_req_indices.append(i)
         # NOTE: GPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
+        
+        # DEBUG: Add synchronize points to find the real blocking location
+        import time as _time
+        logger.info(f"[SYNC_DEBUG] before cuda.synchronize() #1")
+        _sync_start = _time.time()
+        self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
+        logger.info(f"[SYNC_DEBUG] after cuda.synchronize() #1, took {(_time.time() - _sync_start)*1000:.2f}ms")
+        
         logprobs_tensors = sampler_output.logprobs_tensors
+        logger.info(f"[SYNC_DEBUG] before logprobs_tensors.tolists()")
+        _tolist_start = _time.time()
         logprobs_lists = logprobs_tensors.tolists() \
             if logprobs_tensors is not None else None
+        logger.info(f"[SYNC_DEBUG] after logprobs_tensors.tolists(), took {(_time.time() - _tolist_start)*1000:.2f}ms")
 
         # Compute prompt logprobs if needed.
+        logger.info(f"[SYNC_DEBUG] before _get_prompt_logprobs_dict()")
+        _prompt_start = _time.time()
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
             scheduler_output,
         )
+        logger.info(f"[SYNC_DEBUG] after _get_prompt_logprobs_dict(), took {(_time.time() - _prompt_start)*1000:.2f}ms")
+        
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
         max_gen_len = sampled_token_ids.shape[-1]
+        
+        logger.info(f"[SYNC_DEBUG] before cuda.synchronize() #2")
+        _sync_start2 = _time.time()
+        self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
+        logger.info(f"[SYNC_DEBUG] after cuda.synchronize() #2, took {(_time.time() - _sync_start2)*1000:.2f}ms")
+        
+        logger.info(f"[SYNC_DEBUG] before sampled_token_ids.tolist(), shape={sampled_token_ids.shape}")
+        _tolist_start2 = _time.time()
         if max_gen_len == 1:
             # No spec decode tokens.
             valid_sampled_token_ids = sampled_token_ids.tolist()
+            logger.info(f"[SYNC_DEBUG] after sampled_token_ids.tolist(), took {(_time.time() - _tolist_start2)*1000:.2f}ms")
         else:
             # Includes spec decode tokens.
             valid_sampled_token_ids = self.rejection_sampler.parse_output(
@@ -802,8 +867,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def add_layers(self, layers_list: list[Tuple[int, int]], device: torch.device) -> None:
         if not isinstance(self.model, DynamicQwen3ForCausalLM):
             raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
-        logger.info(f"before add layer, synchronize")
-        torch.cuda.synchronize()
+        time_start = time.time()
         # gc.collect()
         # torch.cuda.empty_cache()
         # available_memory = torch.cuda.mem_get_info()[0]
@@ -826,6 +890,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             for layers in layers_list:
                 assert len(layers) == 2
                 self.custom_loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model, device)
+        logger.info(f"Model Runner, Added layers {layers_list} to model on device {device}, took {time.time() - time_start:.2f} seconds")
 
     def reinitialize_kv_cache(self, kv_cache_config: KVCacheConfig, kv_synchronizer: DynamicKVSynchronizer) -> None:
         """
@@ -947,6 +1012,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             kv_cache_spec = kv_cache_group.kv_cache_spec
             for layer_name in kv_cache_group.layer_names:
+                assert num_blocks >= kv_cache_config.num_blocks
                 if isinstance(kv_cache_spec, AttentionSpec):
                     kv_cache_shape = self.attn_backends[i].get_kv_cache_shape(
                         num_blocks, kv_cache_spec.block_size,
@@ -1167,27 +1233,33 @@ class DynamicGPUModelRunner(GPUModelRunner):
         logger.info(f"commit_ptr_tables: committed stacked tensors with {self.k_ptr_table.num_layers} layers, "
                     f"_ptr_table_start_layer updated to {self._ptr_table_start_layer}")
 
-    def refresh_ptr_tensors_cache(self) -> None:
+    def update_internal_kv_ptr_tensor(self) -> None:
         """
         Update the cached stacked tensors to reflect current k_ptr_tensors/v_ptr_tensors.
         
         Use this after resize/compact operations where the ptr_tensors content changes
         (different pointer values or different num_blocks) but num_layers stays the same.
         
-        This is a lightweight operation that does NOT:
-        - Recreate the PtrTable instances
-        - Change _ptr_table_start_layer
-        
-        It only updates _cached_stacked_ptr_tensors to match the current ptr_tensors.
+        This also updates _ptr_table_start_layer to match the current model.start_layer,
+        which is critical after layer deletion/addition.
         """
         time_start = time.time()
+        
+        # Update start_layer to match current model state
+        # This is critical after layer deletion when model.start_layer changes
+        old_start_layer = self._ptr_table_start_layer
+        self._ptr_table_start_layer = getattr(self.model.model, 'start_layer', 0)
+        
         if self.k_ptr_table is not None and self.k_ptr_tensors:
             self.k_ptr_table.set_ptr_tensors(self.k_ptr_tensors)
         if self.v_ptr_table is not None and self.v_ptr_tensors:
             self.v_ptr_table.set_ptr_tensors(self.v_ptr_tensors)
+        
+        if old_start_layer != self._ptr_table_start_layer:
+            logger.info(f"refresh_ptr_tensors_cache: updated _ptr_table_start_layer from {old_start_layer} to {self._ptr_table_start_layer}")
         logger.info(f"refresh_ptr_tensors_cache: updated stacked tensors cache in {human_readable_duration(time.time() - time_start)}")
 
-    def flexi_release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
+    def flexi_atomic_switch_kv_cache_config_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         '''
         目前release_kv_cache依赖于model.start_layers来进行kv cache list的删除。
         因此只能先release kv cache再删除layers
@@ -1239,7 +1311,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         for layer_name in deleted_layer_names:
             del forward_context[layer_name]
 
-    def release_kv_cache_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
+    def atomic_switch_kv_cache_config_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
         '''
         目前release_kv_cache依赖于model.start_layers来进行kv cache list的删除。
         因此只能先release kv cache再删除layers
@@ -1473,7 +1545,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
             layer_module = model.model.layers[layer]
             logger.info(f"before gather kv tensor using kernal, device:{torch.cuda.current_device()}, stream:{torch.cuda.current_stream()}")
-            flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_page_list,value_cache_page_list,  self.page_meta, self.page_meta, slot_mapping,"auto",layer_module.self_attn.attn._k_scale, layer_module.self_attn.attn._v_scale)
+            # Only call the kernel if there are tokens to process - empty slot_mapping causes CUDA error
+            if slot_mapping.numel() > 0:
+                flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_page_list,value_cache_page_list,  self.page_meta, self.page_meta, slot_mapping,"auto",layer_module.self_attn.attn._k_scale, layer_module.self_attn.attn._v_scale)
 
         return key_cache, value_cache, key_cache_page_list, value_cache_page_list
 

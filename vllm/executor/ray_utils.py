@@ -283,6 +283,14 @@ def initialize_ray_cluster(
     assert_ray_available()
     from vllm.platforms import current_platform
 
+    # Set RAY_DEDUP_LOGS=0 before ray.init to disable log deduplication
+    # This must be set before ray.init because Ray's log deduplication
+    # is configured at driver initialization time
+    import os
+    if "RAY_DEDUP_LOGS" not in os.environ:
+        os.environ["RAY_DEDUP_LOGS"] = "0"
+        logger.info("Setting RAY_DEDUP_LOGS=0 to disable log deduplication")
+
     if ray.is_initialized():
         logger.info("Ray is already initialized. Skipping Ray initialization.")
     elif current_platform.is_rocm() or current_platform.is_xpu():

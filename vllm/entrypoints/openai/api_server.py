@@ -933,23 +933,64 @@ if envs.VLLM_SERVER_DEV_MODE:
         await engine_client(raw_request).reset_prefix_cache(device)
         return Response(status_code=200)
 
-    @router.post("/reset_pipeline")
-    async def reset_pipeline(raw_request: Request):
+    @router.post("/set_pp_config")
+    async def set_pp_config(raw_request: Request):
         """
-        Reset pipeline configuration to initial state.
+        Set pipeline configuration to a specific target config.
         
-        This is called between benchmark repetitions to restore the initial
-        pipeline parallel configuration. It performs a synchronous migration
-        back to the initial pp_layer_partition and resets the migration
-        thread counters.
+        Used to dynamically change pipeline parallel configuration. If the target
+        config is the same as current config, the server will skip the migration.
+        This endpoint is used for sweep_test mode where a single server serves 
+        multiple experiments with different PP configs.
+        
+        Request body:
+            {
+                "pp_layer_config": [[0, 39], [40, 63]],  // list of [start, end] per rank
+                "alternative_configs": {0: [[0,17], [18,63]], 1: [[0,19], [20,63]]},  // optional
+                "migration_steps": [200, 400]  // optional: request indices to trigger migration
+            }
         """
         try:
-            logger.info("Resetting pipeline configuration to initial state...")
-            await engine_client(raw_request).reset_pipeline()
-            logger.info("Pipeline reset completed successfully")
+            body = await raw_request.json()
+            pp_layer_config = body.get("pp_layer_config")
+            if pp_layer_config is None:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "pp_layer_config is required"}
+                )
+            # Convert to list of tuples if needed
+            pp_layer_config = [tuple(x) if isinstance(x, list) else x for x in pp_layer_config]
+            
+            # Optional migration configuration
+            alternative_configs = body.get("alternative_configs")
+            migration_steps = body.get("migration_steps")
+            
+            # Convert alternative_configs - handle both formats:
+            # Format 1: {"pp_layer_configs": {"0": [...], "1": [...]}}
+            # Format 2: {"0": [...], "1": [...]} (keys are strings due to JSON)
+            if alternative_configs is not None:
+                # Check if wrapped in pp_layer_configs
+                if "pp_layer_configs" in alternative_configs:
+                    inner_configs = alternative_configs.get("pp_layer_configs", {})
+                else:
+                    inner_configs = alternative_configs
+                
+                alternative_configs = {
+                    int(k): [tuple(x) if isinstance(x, list) else x for x in v]
+                    for k, v in inner_configs.items()
+                }
+            
+            logger.info("Setting pp_layer_config to: %s, alternative_configs: %s, migration_steps: %s",
+                       pp_layer_config, alternative_configs, migration_steps)
+            await engine_client(raw_request).set_pp_config(
+                pp_layer_config,
+                alternative_configs,
+                migration_steps
+            )
+            logger.info("PP config set successfully to: %s", pp_layer_config)
             return Response(status_code=200)
         except Exception as e:
-            logger.error("Failed to reset pipeline: %s", str(e), exc_info=True)
+            logger.error("Failed to set pp config: %s", str(e), exc_info=True)
             return JSONResponse(
                 status_code=500,
                 content={"error": str(e)}

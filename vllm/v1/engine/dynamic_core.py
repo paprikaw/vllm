@@ -18,7 +18,7 @@ from collections import deque
 from concurrent.futures import Future
 from inspect import isclass, signature
 from logging import DEBUG
-from typing import Any, Callable, Optional, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Optional, Tuple, TypeVar, Union
 import math
 
 import msgspec
@@ -110,13 +110,30 @@ class DynamicEngineCore(EngineCore):
             initial_layer_configs.append((start_layer, end_layer))
             start_layer = end_layer + 1
         self.cur_pp_layer_config = initial_layer_configs
-        # Store initial config for reset_pipeline
+        # Store initial config for reference
         self.initial_pp_layer_config = list(initial_layer_configs)
         self.migration_in_process = False
         
         # Event to signal migration_thread to reset its request counter
-        # This is triggered by reset_pipeline between benchmark repetitions
+        # This is triggered by set_pp_config between benchmark repetitions
         self._migration_reset_event = threading.Event()
+        
+        # Mutable migration configuration - can be updated by set_pp_config
+        # These are used by migration_thread to determine when to trigger migrations
+        self._migration_alternative_configs: Dict[int, Any] = {}
+        self._migration_steps: set = set()
+        self._migration_config_lock = threading.Lock()
+        
+        # Initialize from dynamic_config if available
+        if vllm_config.dynamic_config and vllm_config.dynamic_config.is_migration:
+            if vllm_config.dynamic_config.alternative_configs:
+                # alternative_configs is a dict like {"pp_layer_configs": {"0": [[0,31],[32,63]], ...}}
+                pp_layer_configs = vllm_config.dynamic_config.alternative_configs.get("pp_layer_configs", {})
+                self._migration_alternative_configs = {
+                    int(k): v for k, v in pp_layer_configs.items()
+                }
+            if vllm_config.dynamic_config.migration_steps:
+                self._migration_steps = set(vllm_config.dynamic_config.migration_steps)
 
         # Setup KV Caches and update CacheConfig after profiling.
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
@@ -885,7 +902,9 @@ class DynamicEngineCore(EngineCore):
             compacted_length = min(maximum_kv_block_num_after_compact)
             if need_compact:
                 logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
-                engine_core_outputs.extend(self._compact_kv_cache(compacted_length))
+                # Get bitmap from scheduler before compacting
+                bitmap = self.scheduler.shrink_block_pool(compacted_length)
+                self._compact_kv_cache(compacted_length, bitmap)
                 logger.info(f"debug -------------- KV cache compacted to {compacted_length} blocks before adding layers")
                 logger.info(f"[timeline]: after compact kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
 
@@ -898,8 +917,16 @@ class DynamicEngineCore(EngineCore):
             # 注意：在 sync migration 中必须使用同步的 add_layers，
             # 否则 _listen_loop 在绑定 KV cache 时会等待 _layer_loaded_cv 锁，
             # 但该锁被 async_add_layers 线程持有，导致死锁。
+            
+            # Save original config before updating - needed for find_src_rank_for_range
+            original_pp_layer_config = deepcopy(self.cur_pp_layer_config)
+            
             for r, add_list in adding_per_rank.items():
                 self.model_executor.add_layers(r, add_list)
+            # Update cur_pp_layer_config immediately after add_layers succeeds
+            # This ensures Engine state matches Worker state even if later operations fail
+            self.cur_pp_layer_config = deepcopy(tmp_pp_layer_config)
+            logger.info(f"[sync_migration]: updated cur_pp_layer_config to intermediate state {self.cur_pp_layer_config} after add_layers")
             time_kv_compact_end = time.time()
             logger.info(f"[timeline]: before start actual kv cache migration, time taken to add weights, compact, resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
 
@@ -909,12 +936,13 @@ class DynamicEngineCore(EngineCore):
             # Ensure no in-flight work before snapshotting KV state
 
             # 计算 src->dst 传输对
-            # 辅助函数：根据当前分片配置找到包含区间 [lo, hi] 的源 rank
+            # 辅助函数：根据原始分片配置找到包含区间 [lo, hi] 的源 rank
+            # Note: Use original_pp_layer_config (saved before add_layers), not cur_pp_layer_config
             def find_src_rank_for_range(lo: int, hi: int) -> int:
-                for src_rank, (cur_lo, cur_hi) in enumerate(self.cur_pp_layer_config):
+                for src_rank, (cur_lo, cur_hi) in enumerate(original_pp_layer_config):
                     if lo >= cur_lo and hi <= cur_hi:
                         return src_rank
-                raise AssertionError(f"No source rank found for range [{lo}, {hi}] in {self.cur_pp_layer_config}")
+                raise AssertionError(f"No source rank found for range [{lo}, {hi}] in {original_pp_layer_config}")
 
             # 聚合为以 src_rank 为键的 rank_to_layers_ids 映射
             sending_plan_for_ranks: dict[int, dict[int, list[Tuple[int, int]]]] = {}
@@ -950,47 +978,88 @@ class DynamicEngineCore(EngineCore):
             for rank, layers in enumerate(final_pp_layer_config):
                 assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
             resized_block_num = min(deleting_layer_assesses)
+            # Always update scheduler's pp_layer_config, regardless of whether block num changes
+            self.scheduler.sync_change_configuration(pp_layer_config)
             if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
                 assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
                 logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
-                self.scheduler.sync_change_configuration(pp_layer_config)
-                # self.scheduler.update_layer_config([(0, 23), (24, 63)])
                 self.model_executor.resize_kv_cache(resized_block_num)
             self.cur_pp_layer_config = pp_layer_config
             logger.info(f"[sync_migration]: updated cur_pp_layer_config to {self.cur_pp_layer_config}, time taken: {human_readable_duration(time.time() - time_start)}")
 
             return engine_core_outputs
 
-    def reset_pipeline(self) -> list[EngineCoreOutputs]:
-        """Reset pipeline configuration to the initial state.
+    def set_pp_config(
+        self,
+        pp_layer_config: list[Tuple[int, int]],
+        alternative_configs: Optional[Dict[int, Any]] = None,
+        migration_steps: Optional[list[int]] = None,
+    ) -> list[EngineCoreOutputs]:
+        """Set pipeline configuration to a specific target config.
         
-        This is a synchronous operation that:
-        1. Waits for all running requests to complete
-        2. Drains all running requests
-        3. Migrates layers back to initial configuration
-        4. Resets migration thread state for next repetition
+        This method allows setting any valid pp_layer_config dynamically.
+        If the target config is the same as the current config, the migration
+        is skipped (only migration thread state is reset).
         
-        Called between benchmark repetitions to restore initial configuration.
+        This is used in sweep_test mode where a single server instance
+        serves multiple experiments with different PP configurations.
+        
+        Args:
+            pp_layer_config: Target configuration as list of (start, end) tuples per rank.
+                             Example: [(0, 39), (40, 63)] for 2 ranks.
+            alternative_configs: Optional new migration targets. If provided, updates
+                                 the migration_thread's configuration.
+                                 Format: {0: [(0,17), (18,63)], 1: [(0,19), (20,63)]}
+            migration_steps: Optional new migration steps (request indices at which
+                            to trigger migration). If provided, updates the migration_thread.
+        
+        Returns:
+            List of EngineCoreOutputs from processing any pending requests.
         """
-        outputs = []  # Initialize outputs
+        outputs = []
         
-        # Check if already at initial configuration
-        if self.cur_pp_layer_config == self.initial_pp_layer_config:
-            logger.info("Already at initial configuration, skipping layer migration")
+        # Update migration configuration if provided
+        with self._migration_config_lock:
+            if alternative_configs is not None:
+                # alternative_configs may be in format {"pp_layer_configs": {"0": [...], "1": [...]}}
+                # Extract and convert keys to int
+                if "pp_layer_configs" in alternative_configs:
+                    pp_layer_configs = alternative_configs.get("pp_layer_configs", {})
+                    self._migration_alternative_configs = {
+                        int(k): v for k, v in pp_layer_configs.items()
+                    }
+                else:
+                    # Already in {int: config} format
+                    self._migration_alternative_configs = {
+                        int(k) if isinstance(k, str) else k: v 
+                        for k, v in alternative_configs.items()
+                    }
+                logger.info(f"set_pp_config: Updated alternative_configs to {self._migration_alternative_configs}")
+            if migration_steps is not None:
+                self._migration_steps = set(migration_steps)
+                logger.info(f"set_pp_config: Updated migration_steps to {migration_steps}")
+        
+        # Check if already at target configuration
+        # Normalize both configs to list of tuples for comparison
+        # (cur_pp_layer_config uses tuples, pp_layer_config from JSON uses lists)
+        normalized_cur = [tuple(x) for x in self.cur_pp_layer_config]
+        normalized_target = [tuple(x) for x in pp_layer_config]
+        if normalized_cur == normalized_target:
+            logger.info(f"set_pp_config: Already at target configuration {pp_layer_config}, skipping migration")
         else:
-            logger.info(f"reset_pipeline: resetting from {self.cur_pp_layer_config} to {self.initial_pp_layer_config}")
+            logger.info(f"set_pp_config: changing from {self.cur_pp_layer_config} to {pp_layer_config}")
             
-            # Convert initial config to list of tuples format expected by change_model_configuration_by_kv_transfer_sync
-            target_config = [(start, end) for start, end in self.initial_pp_layer_config]
-            
-            # Use sync migration to reset to initial configuration
-            outputs.extend(self.change_model_configuration_by_kv_transfer_sync(target_config))
+            # Use sync migration to change to target configuration
+            outputs.extend(self.change_model_configuration_by_kv_transfer_sync(pp_layer_config))
         
-        # Signal migration_thread to reset its request counter for next repetition
-        logger.info("Signaling migration_thread to reset request counter")
+        # Signal migration_thread to reset request counter for next benchmark run
+        logger.info("set_pp_config: Signaling migration_thread to reset request counter")
+        # Also clear the request_num_queue to discard any pending request counts
+        # from the previous repetition
+        assert self.request_num_queue.empty()
         self._migration_reset_event.set()
         
-        logger.info(f"reset_pipeline completed, now at {self.cur_pp_layer_config}")
+        logger.info(f"set_pp_config completed, now at {self.cur_pp_layer_config}")
         return outputs
 
     def migrate_layer_v1(self, rank_from: int, rank_to: int, num_layers: int) -> list[EngineCoreOutputs]:
@@ -1497,17 +1566,6 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             logger.info("is_migration is not set, skipping migration")
             return
 
-        # --- config choices & indices ---
-        # Each configuration name must be an integer
-        alternative_configs = {
-            int(k): v for k, v in self.dynamic_config.alternative_configs.pp_layer_configs.items()
-        }
-        migration_steps = set(self.dynamic_config.migration_steps)
-        max_index = max(alternative_configs.keys())
-        cur_config_index = min(alternative_configs.keys())  # 若你希望从0开始，也可直接置0
-
-        logger.info(f"alternative_configs: {alternative_configs}")
-        logger.info(f"migration_steps: {migration_steps}")
         # --- sliding window settings ---
         WINDOW = 50 
         UP_THRESHOLD = 0.8   # 只有窗口满且均值>0.6才上调
@@ -1519,7 +1577,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         # (initial config is from VLLM_PP_LAYER_PARTITION, not from alternative_configs)
         cur_config = 0
         while True:
-            # Check if reset was requested (between benchmark repetitions)
+            # Check if reset was requested (between benchmark repetitions or experiments)
             if self._migration_reset_event.is_set():
                 logger.info(f"migration_thread: resetting request counter from {num_of_requests} to 0, cur_config from {cur_config} to 0")
                 num_of_requests = 0
@@ -1528,12 +1586,25 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             
             num_of_requests += self.request_num_queue.get()
             logger.info("num_of_requests: " + str(num_of_requests))
+            
+            # Read current migration config under lock
+            with self._migration_config_lock:
+                alternative_configs = dict(self._migration_alternative_configs)
+                migration_steps = set(self._migration_steps)
+            
+            # Log current config for debugging (only occasionally)
+            if num_of_requests % 100 == 0:
+                logger.info(f"migration_thread: current alternative_configs={alternative_configs}, migration_steps={migration_steps}")
+            
             if num_of_requests in migration_steps:
                 # First increment cur_config to get the target configuration
                 # (cur_config=0 is initial config, cur_config=1 is first migration target, etc.)
                 cur_config += 1
-                logger.info(f"change model configuration to config index {cur_config}")
-                self.change_model_configuration_by_kv_transfer_async(alternative_configs[cur_config])
+                if cur_config in alternative_configs:
+                    logger.info(f"change model configuration to config index {cur_config}")
+                    self.change_model_configuration_by_kv_transfer_async(alternative_configs[cur_config])
+                else:
+                    logger.warning(f"migration_thread: cur_config {cur_config} not found in alternative_configs, skipping migration")
                 # outputs = self.migrate_layer_v1(1, 0, 24)
                 # logger.info("debug-------- engineoutput when migration: " + str(outputs))
                 # for output in outputs:
@@ -1562,7 +1633,9 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                 if kv_cache_ratio >= 0.9:
                     continue
                 compact_ratio = kv_cache_ratio + 0.1
-                self._compact_kv_cache(int(compact_ratio * num_kv_blocks))
+                compacted_length = int(compact_ratio * num_kv_blocks)
+                bitmap = self.scheduler.shrink_block_pool(compacted_length)
+                self._compact_kv_cache(compacted_length, bitmap)
     def metrics_thread(self):
         while True:
             metrics = self.metrics_queue.get()

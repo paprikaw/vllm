@@ -36,6 +36,18 @@ inline double get_elapsed_ms(
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+// CUDA error checking macro
+#define CUDA_CHECK(call)                                                     \
+    do {                                                                     \
+        cudaError_t err = call;                                              \
+        if (err != cudaSuccess) {                                            \
+            throw std::runtime_error(                                        \
+                std::string("CUDA error in ") + __FILE__ + ":" +             \
+                std::to_string(__LINE__) + " - " +                           \
+                cudaGetErrorString(err));                                    \
+        }                                                                    \
+    } while (0)
+
 // ============================================================================
 // Method 1: Python-style allocation (baseline)
 // ============================================================================
@@ -91,7 +103,7 @@ allocate_with_cuda_async(
 ) {
     // Set the correct CUDA device
     int device_id = device.is_cuda() ? device.index() : 0;
-    cudaSetDevice(device_id);
+    CUDA_CHECK(cudaSetDevice(device_id));
     
     // Calculate tensor size in bytes
     int64_t numel = 1;
@@ -107,6 +119,17 @@ allocate_with_cuda_async(
     // Use the stream provided by the caller
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     
+    // Check available memory before allocation
+    size_t free_mem, total_mem;
+    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+    // size_t total_required = size * bytes_per_tensor * 2;  // K and V
+    // if (free_mem < total_required) {
+    //     throw std::runtime_error(
+    //         "Insufficient GPU memory for KV cache allocation. "
+    //         "Required: " + std::to_string(total_required / (1024*1024)) + " MB, "
+    //         "Available: " + std::to_string(free_mem / (1024*1024)) + " MB");
+    // }
+    
     // Allocate all pointers using cudaMallocAsync on the specified stream
     std::vector<int64_t> k_ptrs(size);
     std::vector<int64_t> v_ptrs(size);
@@ -114,8 +137,8 @@ allocate_with_cuda_async(
     for (int64_t i = 0; i < size; ++i) {
         void* k_ptr;
         void* v_ptr;
-        cudaMallocAsync(&k_ptr, bytes_per_tensor, stream);
-        cudaMallocAsync(&v_ptr, bytes_per_tensor, stream);
+        CUDA_CHECK(cudaMallocAsync(&k_ptr, bytes_per_tensor, stream));
+        CUDA_CHECK(cudaMallocAsync(&v_ptr, bytes_per_tensor, stream));
         k_ptrs[i] = reinterpret_cast<int64_t>(k_ptr);
         v_ptrs[i] = reinterpret_cast<int64_t>(v_ptr);
     }
@@ -123,17 +146,17 @@ allocate_with_cuda_async(
     // Allocate device memory for pointer arrays
     void** k_ptrs_dev;
     void** v_ptrs_dev;
-    cudaMallocAsync(&k_ptrs_dev, size * sizeof(void*), stream);
-    cudaMemcpyAsync(k_ptrs_dev, k_ptrs.data(),
+    CUDA_CHECK(cudaMallocAsync(&k_ptrs_dev, size * sizeof(void*), stream));
+    CUDA_CHECK(cudaMemcpyAsync(k_ptrs_dev, k_ptrs.data(),
                size * sizeof(void*),
-               cudaMemcpyHostToDevice, stream);
+               cudaMemcpyHostToDevice, stream));
     
-    cudaMallocAsync(&v_ptrs_dev, size * sizeof(void*), stream);
-    cudaMemcpyAsync(v_ptrs_dev, v_ptrs.data(),
+    CUDA_CHECK(cudaMallocAsync(&v_ptrs_dev, size * sizeof(void*), stream));
+    CUDA_CHECK(cudaMemcpyAsync(v_ptrs_dev, v_ptrs.data(),
                size * sizeof(void*),
-               cudaMemcpyHostToDevice, stream);
+               cudaMemcpyHostToDevice, stream));
     // Synchronize stream to ensure all allocations are complete
-    cudaStreamSynchronize(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     
     auto end = std::chrono::high_resolution_clock::now();
     
@@ -176,14 +199,17 @@ void free_page_list(
     int64_t stream_ptr
 ) {
     // Set the correct CUDA device
-    cudaSetDevice(device_id);
+    CUDA_CHECK(cudaSetDevice(device_id));
     
     // Use the stream provided by the caller
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     void *ptr_dev = reinterpret_cast<void*>(ptr); 
 
     // Free each pointer using cudaFreeAsync
-    cudaFreeAsync(ptr_dev, stream);
+    if (ptr_dev != nullptr) {
+        CUDA_CHECK(cudaFreeAsync(ptr_dev, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 }
 // ============================================================================
 // Free memory allocated by cudaMallocAsync
@@ -199,7 +225,7 @@ void free_cache(
     }
     
     // Set the correct CUDA device
-    cudaSetDevice(device_id);
+    CUDA_CHECK(cudaSetDevice(device_id));
     
     // Use the stream provided by the caller
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -208,9 +234,13 @@ void free_cache(
     for (int64_t ptr_int : ptrs) {
         void* ptr = reinterpret_cast<void*>(ptr_int);
         if (ptr != nullptr) {
-            cudaFreeAsync(ptr, stream);
+            CUDA_CHECK(cudaFreeAsync(ptr, stream));
         }
     }
+    
+    // Synchronize the stream to ensure memory is actually released
+    // This is important because cudaFreeAsync only schedules the free operation
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 // ============================================================================

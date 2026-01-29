@@ -438,9 +438,44 @@ def create_ptr_tensor_from_list(ptr_list: list[int], device: torch.device) -> to
     Returns:
         torch.Tensor of shape (num_blocks,) with dtype uint64
     """
-    # Create tensor on CPU first then move to GPU
-    ptr_tensor = torch.tensor(ptr_list, dtype=torch.uint64, device='cpu')
-    return ptr_tensor.to(device)
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # VERSION MARKER: v3 - CPU-first creation with full debug logging
+    logger.info(f"[create_ptr_tensor v3] called with len={len(ptr_list) if ptr_list else 0}, device={device}")
+    
+    # Validate input
+    if not ptr_list:
+        logger.warning(f"[create_ptr_tensor] Empty ptr_list, returning empty tensor on {device}")
+        return torch.empty(0, dtype=torch.uint64, device=device)
+    
+    # Log current CUDA state for debugging
+    if device.type == 'cuda':
+        current_device = torch.cuda.current_device()
+        logger.info(f"[create_ptr_tensor] len={len(ptr_list)}, target_device={device}, current_cuda_device={current_device}")
+        # Ensure correct CUDA device context before tensor operations
+        torch.cuda.set_device(device)
+        # Sync to ensure no pending errors
+        torch.cuda.synchronize(device)
+    
+    # Create tensor on CPU first then move to GPU (more reliable for cross-node Ray)
+    try:
+        ptr_tensor = torch.tensor(ptr_list, dtype=torch.uint64, device='cpu')
+    except Exception as e:
+        logger.error(f"[create_ptr_tensor] Failed to create CPU tensor: {e}, len={len(ptr_list)}, first_5={ptr_list[:5]}")
+        raise
+    
+    if device.type == 'cuda':
+        try:
+            result = ptr_tensor.to(device, non_blocking=False)
+            # Sync to ensure transfer completed successfully
+            torch.cuda.synchronize(device)
+            return result
+        except Exception as e:
+            logger.error(f"[create_ptr_tensor] Failed to move tensor to {device}: {e}")
+            raise
+    else:
+        return ptr_tensor
 
 
 def dynamic_flexi_bind_kv_cache(

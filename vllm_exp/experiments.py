@@ -35,26 +35,33 @@ def generate_analysis_report(logm: Union[LogManager, SweepLogManager], vars: Opt
     """
     Automatically generate analysis files in the log directory after experiment completes.
     Uses logm.get_path_with_log_type to construct filenames consistently.
+    
+    For sweep_test mode (SweepLogManager with vars), this generates an analysis report
+    for the specific experiment's server.log in its subdirectory.
     """
     try:
-        log_dir = logm.get_dir()
-        
-        # Find all server log files
-        server_logs = list(log_dir.glob("server-*.log"))
-        
-        if not server_logs:
-            C.print(f"[yellow]Warning: No server logs found in {log_dir}[/]")
-            return
-        
-        C.print(f"[bold cyan]Generating analysis reports in {log_dir}[/]")
-        
-        # If vars is provided, only analyze the corresponding server log
+        # If vars is provided, use get_path_with_log_type to find the exact server log
+        # This works correctly for both LogManager and SweepLogManager
         if vars is not None:
             server_log_path = logm.get_path_with_log_type("server", "log", vars)
             if not server_log_path.exists():
                 C.print(f"[yellow]Warning: Server log not found: {server_log_path}[/]")
                 return
             server_logs = [server_log_path]
+            log_dir = server_log_path.parent
+        else:
+            # No vars: search for server logs in base directory
+            log_dir = logm.get_dir()
+            server_logs = list(log_dir.glob("server-*.log"))
+            if not server_logs:
+                # Also try server.log (used in sweep_test subdirectories)
+                server_logs = list(log_dir.glob("**/server.log"))
+            
+            if not server_logs:
+                C.print(f"[yellow]Warning: No server logs found in {log_dir}[/]")
+                return
+        
+        C.print(f"[bold cyan]Generating analysis reports in {log_dir}[/]")
         
         # Process each server log
         for log_file in sorted(server_logs):
@@ -62,7 +69,7 @@ def generate_analysis_report(logm: Union[LogManager, SweepLogManager], vars: Opt
             # This ensures consistency with server log naming
             analysis_path = logm.get_path_with_log_type("analysis", "txt", vars)
             
-            C.print(f"  Analyzing {log_file.name} -> {analysis_path.name}")
+            C.print(f"  Analyzing {log_file.name} -> {analysis_path}")
             
             # Run analysis on this server log
             with open(analysis_path, 'w') as f:
@@ -207,6 +214,302 @@ class _ProcStdoutCapture:
             pass
 
 
+class DynamicLogRedirector:
+    """Dynamically redirect subprocess output to different log files in real-time.
+    
+    Unlike _ProcStdoutCapture which writes to a single file, this class allows
+    switching the output destination at runtime. This is useful for sweep_test
+    where a single server instance serves multiple experiments, each requiring
+    its own log file.
+    
+    Additionally, this class supports writing to a global log file that captures
+    all output, useful for real-time monitoring during long-running experiments.
+    
+    Usage:
+        redirector = DynamicLogRedirector(proc, global_log_path=Path("/path/to/global.log"))
+        redirector.switch_log_file(Path("/path/to/exp1.log"))
+        # ... run experiment 1 ...
+        redirector.switch_log_file(Path("/path/to/exp2.log"))
+        # ... run experiment 2 ...
+        redirector.close()
+    """
+
+    def __init__(self, proc: subprocess.Popen, initial_log_path: Optional[Path] = None,
+                 global_log_path: Optional[Path] = None):
+        """Initialize the dynamic log redirector.
+        
+        Args:
+            proc: Subprocess with stdout=PIPE
+            initial_log_path: Optional initial log file path for per-experiment logs.
+                              If not provided, output is discarded until switch_log_file is called.
+            global_log_path: Optional path for a global log file that captures ALL output.
+                             This file is written to continuously and is useful for monitoring.
+        """
+        if proc.stdout is None:
+            raise ValueError("proc.stdout is None; start process with stdout=PIPE")
+        self._proc = proc
+        self._current_log_path: Optional[Path] = None
+        self._current_fd: Optional[FileIO] = None
+        self._global_log_path: Optional[Path] = global_log_path
+        self._global_fd: Optional[FileIO] = None
+        self._lock = threading.Lock()
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run, 
+            name="vllm_exp_dynamic_log_redirector", 
+            daemon=True
+        )
+        
+        # Open global log file if provided
+        if global_log_path:
+            global_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._global_fd = open(global_log_path, "wb", buffering=0)
+            startup_marker = f"=== GLOBAL_LOG_START: {datetime.datetime.now().isoformat()} ===\n"
+            self._global_fd.write(startup_marker.encode('utf-8'))
+            C.print(f"[bold cyan]Global server log: {global_log_path}[/]")
+        
+        # Set initial log file if provided
+        if initial_log_path:
+            self._switch_log_file_internal(initial_log_path)
+        
+        self._thread.start()
+
+    @property
+    def current_log_path(self) -> Optional[Path]:
+        """Get the current log file path."""
+        with self._lock:
+            return self._current_log_path
+    
+    @property
+    def global_log_path(self) -> Optional[Path]:
+        """Get the global log file path."""
+        return self._global_log_path
+
+    def _switch_log_file_internal(self, new_log_path: Path) -> None:
+        """Internal method to switch log file without lock (caller must hold lock)."""
+        # Close current file if open
+        if self._current_fd is not None:
+            try:
+                self._current_fd.flush()
+                self._current_fd.close()
+            except Exception:
+                pass
+        
+        # Open new file
+        new_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._current_fd = open(new_log_path, "wb", buffering=0)
+        self._current_log_path = new_log_path
+        
+        # Write a marker to indicate log switch
+        marker = f"=== LOG_SWITCH: Switched to {new_log_path} at {datetime.datetime.now().isoformat()} ===\n"
+        marker_bytes = marker.encode('utf-8')
+        self._current_fd.write(marker_bytes)
+        
+        # Also write marker to global log
+        if self._global_fd is not None:
+            self._global_fd.write(marker_bytes)
+
+    def switch_log_file(self, new_log_path: Path) -> None:
+        """Switch to a new log file for subsequent output.
+        
+        This method is thread-safe and can be called while the subprocess
+        is producing output. The switch happens atomically.
+        
+        Args:
+            new_log_path: Path to the new log file. Parent directories will be created.
+        """
+        with self._lock:
+            C.print(f"[bold cyan]Switching log output to: {new_log_path}[/]")
+            self._switch_log_file_internal(new_log_path)
+
+    def write_marker(self, marker_line: bytes) -> None:
+        """Write a marker line to the current log file.
+        
+        Args:
+            marker_line: Bytes to write as a marker.
+        """
+        with self._lock:
+            if self._current_fd is not None:
+                self._current_fd.write(marker_line)
+                try:
+                    self._current_fd.flush()
+                except Exception:
+                    pass
+            # Also write to global log
+            if self._global_fd is not None:
+                self._global_fd.write(marker_line)
+                try:
+                    self._global_fd.flush()
+                except Exception:
+                    pass
+
+    def _run(self) -> None:
+        """Stream read loop - runs in background thread."""
+        try:
+            while self._running:
+                chunk = self._proc.stdout.readline()  # type: ignore[union-attr]
+                if not chunk:
+                    break
+                with self._lock:
+                    # Write to per-experiment log
+                    if self._current_fd is not None:
+                        self._current_fd.write(chunk)
+                    # Also write to global log
+                    if self._global_fd is not None:
+                        self._global_fd.write(chunk)
+        finally:
+            try:
+                with self._lock:
+                    if self._current_fd is not None:
+                        self._current_fd.flush()
+                    if self._global_fd is not None:
+                        self._global_fd.flush()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        """Close the redirector and release resources."""
+        self._running = False
+        try:
+            self._thread.join(timeout=10)
+        except Exception:
+            pass
+        try:
+            with self._lock:
+                if self._current_fd is not None:
+                    self._current_fd.flush()
+                    self._current_fd.close()
+                    self._current_fd = None
+                if self._global_fd is not None:
+                    # Write closing marker
+                    closing_marker = f"=== GLOBAL_LOG_END: {datetime.datetime.now().isoformat()} ===\n"
+                    self._global_fd.write(closing_marker.encode('utf-8'))
+                    self._global_fd.flush()
+                    self._global_fd.close()
+                    self._global_fd = None
+        except Exception:
+            pass
+
+
+# =========================
+# Experiment Success Checking
+# =========================
+
+import re
+
+def check_experiment_completed(logm: SweepLogManager, vars_mapping: Dict[str, Any]) -> tuple[bool, str]:
+    """Check if an experiment has already completed successfully.
+    
+    This function checks multiple criteria to determine if an experiment
+    was successful:
+    1. benchmark.log exists and contains successful completion markers
+    2. request_metrics.csv exists and has data
+    3. The number of successful requests matches the expected count
+    
+    Args:
+        logm: Log manager for path generation
+        vars_mapping: Variables for file naming
+    
+    Returns:
+        Tuple of (is_completed, reason_message)
+    """
+    # Get paths
+    benchmark_log_path = logm.get_path_with_log_type("benchmark", "log", vars_mapping)
+    metrics_path = logm.get_path_with_log_type("request_metrics", "csv", vars_mapping)
+    
+    # Check 1: benchmark.log must exist
+    if not benchmark_log_path.exists():
+        return False, "benchmark.log not found"
+    
+    # Check 2: Parse benchmark.log for success indicators
+    try:
+        with open(benchmark_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except Exception as e:
+        return False, f"Failed to read benchmark.log: {e}"
+    
+    # Check for fatal errors in the log
+    fatal_error_patterns = [
+        r"ERROR.*Connection refused",
+        r"ERROR.*Cannot connect to host",
+        r"Traceback \(most recent call last\)",
+        r"Exception:",
+        r"Failed to start benchmark",
+    ]
+    
+    for pattern in fatal_error_patterns:
+        if re.search(pattern, content, re.IGNORECASE):
+            return False, f"Found error pattern in benchmark.log: {pattern}"
+    
+    # Check for "Successful requests:" line
+    success_match = re.search(r'Successful requests:\s+(\d+)', content)
+    if not success_match:
+        return False, "No 'Successful requests:' line found in benchmark.log"
+    
+    successful_requests = int(success_match.group(1))
+    if successful_requests == 0:
+        return False, "Successful requests count is 0"
+    
+    # Check for "Benchmark Result" section (indicates completion)
+    if "Benchmark Result" not in content:
+        return False, "'Benchmark Result' section not found (benchmark may have been interrupted)"
+    
+    # Check 3: request_metrics.csv must exist and have data
+    if not metrics_path.exists():
+        return False, "request_metrics.csv not found"
+    
+    try:
+        with open(metrics_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        # At least header + 1 data row
+        if len(lines) < 2:
+            return False, "request_metrics.csv has no data rows"
+    except Exception as e:
+        return False, f"Failed to read request_metrics.csv: {e}"
+    
+    # All checks passed
+    return True, f"Experiment completed successfully ({successful_requests} requests)"
+
+
+def check_experiment_completed_for_spec(
+    logm: SweepLogManager, 
+    vars_mapping: Dict[str, Any],
+    bench_spec: 'BenchmarkSpec'
+) -> tuple[bool, str]:
+    """Enhanced check that also verifies the expected request count.
+    
+    Args:
+        logm: Log manager for path generation
+        vars_mapping: Variables for file naming
+        bench_spec: Benchmark spec to get expected request count
+    
+    Returns:
+        Tuple of (is_completed, reason_message)
+    """
+    is_completed, reason = check_experiment_completed(logm, vars_mapping)
+    
+    if not is_completed:
+        return False, reason
+    
+    # Additional check: verify request count matches expectation
+    benchmark_log_path = logm.get_path_with_log_type("benchmark", "log", vars_mapping)
+    try:
+        with open(benchmark_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        
+        success_match = re.search(r'Successful requests:\s+(\d+)', content)
+        if success_match:
+            actual_count = int(success_match.group(1))
+            expected_count = bench_spec.num_total_requests
+            
+            if actual_count < expected_count:
+                return False, f"Only {actual_count}/{expected_count} requests completed"
+    except Exception:
+        pass  # If we can't verify, trust the basic check
+    
+    return True, reason
+
+
 def _split_server_log_by_marker(raw_path: Path, warmup_path: Path, main_path: Path) -> bool:
     """Split a raw server log into warmup/main parts.
 
@@ -277,6 +580,91 @@ def _split_timestamp_metrics_csv(raw_path: Path, boundary_ts: float, warmup_path
                 if w_main.tell() == 0:
                     main_writer.writerow(header)
                 main_writer.writerow(row)
+
+
+def _extract_timestamp_metrics_by_time_range(
+    global_metrics_path: Path,
+    output_path: Path,
+    start_ts: float,
+    end_ts: float,
+) -> bool:
+    """Extract timestamp metrics for a specific time range from global metrics CSV.
+    
+    Args:
+        global_metrics_path: Path to the global metrics CSV file
+        output_path: Path to write the extracted metrics
+        start_ts: Start timestamp (inclusive)
+        end_ts: End timestamp (inclusive)
+    
+    Returns:
+        True if any rows were extracted
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    if not global_metrics_path.exists():
+        return False
+    
+    rows_written = 0
+    with open(global_metrics_path, "r", newline="", encoding="utf-8", errors="ignore") as r, \
+            open(output_path, "w", newline="") as w_out:
+        reader = csv.reader(r)
+        writer = csv.writer(w_out)
+        
+        header: Optional[list[str]] = None
+        for row in reader:
+            if not row:
+                continue
+            # Header row
+            if row[0] == "timestamp":
+                header = row
+                continue
+            if header is None:
+                header = ["timestamp"]
+            try:
+                ts = float(row[0])
+            except Exception:
+                continue
+            # Check if timestamp is within the range
+            if start_ts <= ts <= end_ts:
+                if w_out.tell() == 0:
+                    writer.writerow(header)
+                writer.writerow(row)
+                rows_written += 1
+    
+    return rows_written > 0
+
+
+def _get_time_range_from_request_metrics(request_metrics_path: Path) -> tuple[Optional[float], Optional[float]]:
+    """Get the time range of an experiment from its request_metrics.csv.
+    
+    Args:
+        request_metrics_path: Path to the request_metrics.csv file
+    
+    Returns:
+        Tuple of (start_ts, end_ts) or (None, None) if file doesn't exist or is empty
+    """
+    if not request_metrics_path.exists():
+        return None, None
+    
+    start_ts = None
+    end_ts = None
+    
+    with open(request_metrics_path, "r", newline="", encoding="utf-8", errors="ignore") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row or row[0] == "timestamp":
+                continue
+            try:
+                ts = float(row[0])
+                if start_ts is None or ts < start_ts:
+                    start_ts = ts
+                if end_ts is None or ts > end_ts:
+                    end_ts = ts
+            except Exception:
+                continue
+    
+    return start_ts, end_ts
+
 ## Utils 
 def load_config(path: str) -> MultiConfig:
     with open(path, "r") as f:
@@ -876,6 +1264,7 @@ def generate_experiment_specs(
             chunked_prefill=exp_cfg.vllm.chunked_prefill,
             enable_cuda_graph=exp_cfg.vllm.enable_cuda_graph,
             enable_nsight=exp_cfg.vllm.enable_nsight,
+            weight_chunk_size_mb=exp_cfg.vllm.weight_chunk_size_mb,
             pp_layer_partition=exp_cfg.vllm.pp_layer_partition,
             pp_layer_config=exp_cfg.vllm.pp_layer_config,
             alternative_configs=exp_cfg.vllm.get_alternative_configs(),
@@ -905,6 +1294,10 @@ def generate_experiment_specs(
             print_outputs=exp_cfg.benchmark.print_outputs,
             profile=exp_cfg.benchmark.profile,
             warmup=exp_cfg.benchmark.warmup,
+            # Pipeline config for repetition reset
+            initial_pp_config=exp_cfg.vllm.get_initial_pp_config(),
+            alternative_configs=exp_cfg.vllm.get_alternative_configs(),
+            migration_steps=exp_cfg.vllm.get_migration_steps(),
         )
         
         yield SweepExperimentSpec(
@@ -945,6 +1338,9 @@ def start_vllm_for_sweep(
         raise ValueError("spec.server_raw_log_path must be set before calling start_vllm_for_sweep")
     
     env = os.environ.copy()
+    
+    # Set weight chunk size environment variable
+    env["VLLM_WEIGHT_CHUNK_SIZE_MB"] = str(spec.weight_chunk_size_mb)
     
     serve_args = [
         "vllm", "serve", spec.model_path,
@@ -1177,9 +1573,13 @@ def sweep_test(cfg: SweepTestConfig, logm: SweepLogManager):
     
     Uses generator to produce experiment specs from config,
     then runs each experiment sequentially.
+    
+    If cfg.overwrite is False, experiments that have already completed
+    successfully will be skipped.
     """
     all_ok = True
     experiment_count = 0
+    skipped_count = 0
     
     for exp in generate_experiment_specs(cfg, logm):
         experiment_count += 1
@@ -1187,6 +1587,18 @@ def sweep_test(cfg: SweepTestConfig, logm: SweepLogManager):
         C.print(f"[bold magenta]Experiment {exp.experiment_index + 1}/{exp.total_experiments}[/]")
         C.print(f"[bold magenta]vars: {exp.vars_mapping}[/]")
         C.print(f"[bold magenta]{'='*60}[/]\n")
+        
+        # Check if we should skip this experiment (overwrite=False mode)
+        if not cfg.overwrite:
+            is_completed, reason = check_experiment_completed_for_spec(
+                logm, exp.vars_mapping, exp.bench_spec
+            )
+            if is_completed:
+                C.print(f"[bold green]SKIPPING:[/] {reason}")
+                skipped_count += 1
+                continue
+            else:
+                C.print(f"[cyan]Running (not skipped): {reason}[/]")
         
         ok = _run_single_sweep_experiment(
             exp.vllm_spec, exp.bench_spec, logm, exp.vars_mapping
@@ -1201,4 +1613,459 @@ def sweep_test(cfg: SweepTestConfig, logm: SweepLogManager):
         return
     
     status = "All succeeded" if all_ok else "Some failed"
-    C.print(f"\n[bold cyan]Sweep test completed: {experiment_count} experiments, {status}[/]")
+    if skipped_count > 0:
+        C.print(f"\n[bold cyan]Sweep test completed: {experiment_count} experiments ({skipped_count} skipped), {status}[/]")
+    else:
+        C.print(f"\n[bold cyan]Sweep test completed: {experiment_count} experiments, {status}[/]")
+
+
+# =========================
+# Single Server Mode Helper Functions
+# =========================
+
+def parse_pp_layer_partition(pp_partition_str: str) -> list:
+    """Parse pp_layer_partition string to list of [start, end] pairs.
+    
+    Args:
+        pp_partition_str: String like "32,32" meaning 32 layers on each rank.
+    
+    Returns:
+        List of [start, end] pairs, e.g. [[0, 31], [32, 63]]
+    """
+    parts = [int(x.strip()) for x in pp_partition_str.split(",")]
+    result = []
+    current_start = 0
+    for num_layers in parts:
+        result.append([current_start, current_start + num_layers - 1])
+        current_start += num_layers
+    return result
+
+
+async def call_set_pp_config(
+    base_url: str,
+    pp_layer_config: list,
+    alternative_configs: Optional[Dict[int, Any]] = None,
+    migration_steps: Optional[list[int]] = None,
+    timeout: float = 120.0
+) -> bool:
+    """Call the set_pp_config API endpoint.
+    
+    Args:
+        base_url: Base URL of the vLLM server (e.g., http://localhost:8000)
+        pp_layer_config: Target configuration as list of [start, end] pairs per rank.
+        alternative_configs: Optional dict of migration targets. Keys are config indices,
+                            values are pp_layer_config lists.
+        migration_steps: Optional list of request indices at which to trigger migration.
+        timeout: Request timeout in seconds
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    import aiohttp
+    url = f"{base_url}/set_pp_config"
+    payload = {"pp_layer_config": pp_layer_config}
+    
+    # Add optional migration configuration
+    if alternative_configs is not None:
+        # Convert keys to string for JSON (dict keys must be strings)
+        payload["alternative_configs"] = {str(k): v for k, v in alternative_configs.items()}
+    if migration_steps is not None:
+        payload["migration_steps"] = migration_steps
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                if response.status == 200:
+                    C.print(f"[green]PP config set successfully to {pp_layer_config}[/]")
+                    if alternative_configs:
+                        C.print(f"[green]  Migration configs: {alternative_configs}[/]")
+                        C.print(f"[green]  Migration steps: {migration_steps}[/]")
+                    else:
+                        C.print(f"[green]  No migration configured for this experiment[/]")
+                    return True
+                else:
+                    try:
+                        error_body = await response.json()
+                        error_msg = error_body.get('error', 'Unknown error')
+                    except Exception:
+                        error_msg = await response.text()
+                    C.print(f"[red]set_pp_config failed with status {response.status}[/]")
+                    C.print(f"[red]Error: {error_msg}[/]")
+                    return False
+    except Exception as e:
+        C.print(f"[red]Failed to set pp config: {e}[/]")
+        return False
+
+
+def call_set_pp_config_sync(
+    base_url: str,
+    pp_layer_config: list,
+    alternative_configs: Optional[Dict[int, Any]] = None,
+    migration_steps: Optional[list[int]] = None,
+    timeout: float = 120.0
+) -> bool:
+    """Synchronous wrapper for call_set_pp_config.
+    
+    Args:
+        base_url: Base URL of the vLLM server
+        pp_layer_config: Target configuration as list of [start, end] pairs per rank.
+        alternative_configs: Optional dict of migration targets.
+        migration_steps: Optional list of request indices for migration triggers.
+        timeout: Request timeout in seconds
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(
+        call_set_pp_config(base_url, pp_layer_config, alternative_configs, migration_steps, timeout)
+    )
+
+
+def start_vllm_single_instance(
+    spec: VllmServerSpec,
+    initial_log_path: Optional[Path] = None,
+    global_log_path: Optional[Path] = None,
+) -> tuple[subprocess.Popen, DynamicLogRedirector, Path]:
+    """Start a single vLLM server instance with dynamic log redirection.
+    
+    This is used for single-server sweep_test mode where one server
+    serves multiple experiments with different PP configurations.
+    
+    Args:
+        spec: VllmServerSpec with all parameters including paths
+        initial_log_path: Optional initial log file path for per-experiment logs.
+        global_log_path: Optional path for a global log file that captures ALL output.
+                         This is useful for real-time monitoring during experiments.
+    
+    Returns:
+        (process, log_redirector, metrics_path)
+    
+    Raises:
+        ValueError: If metrics_csv_path is not set in spec
+    """
+    if not spec.metrics_csv_path:
+        raise ValueError("spec.metrics_csv_path must be set before calling start_vllm_single_instance")
+    
+    env = os.environ.copy()
+    
+    # Set weight chunk size environment variable
+    env["VLLM_WEIGHT_CHUNK_SIZE_MB"] = str(spec.weight_chunk_size_mb)
+    
+    serve_args = [
+        "vllm", "serve", spec.model_path,
+        "--pipeline-parallel-size", str(spec.pipeline_parallel_size),
+        "--gpu-memory-utilization", str(spec.gpu_memory_utilization),
+        "--max-model-len", str(spec.max_model_len),
+        "--served-model-name", spec.model_name,
+        "--distributed-executor-backend", "ray",
+        "--disable-log-requests",
+        "--no-enable-prefix-caching",
+        "--scheduler-cls", "vllm.v1.core.sched.dynamic_scheduler.DynamicScheduler",
+        "--worker-cls", "vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker",
+    ]
+    
+    if spec.block_size:
+        serve_args.extend(["--block-size", str(spec.block_size)])
+    if spec.chunked_prefill:
+        serve_args.append("--enable-chunked-prefill")
+    if not spec.enable_cuda_graph:
+        serve_args.append("--enforce-eager")
+    if spec.enable_nsight:
+        serve_args.append("--ray-workers-use-nsight")
+    if spec.rank_to_node:
+        serve_args.extend(["--ray-rank-to-node", json.dumps(spec.rank_to_node)])
+    
+    # Generate dynamic config from spec
+    dynamic_cfg = json.dumps(spec.to_dynamic_cfg())
+    serve_args.extend(["-D", dynamic_cfg])
+    
+    # Clear existing metrics file
+    metrics_raw_path = Path(spec.metrics_csv_path)
+    if metrics_raw_path.exists():
+        os.remove(metrics_raw_path)
+    
+    # Clear existing global log file if provided
+    if global_log_path and global_log_path.exists():
+        os.remove(global_log_path)
+
+    C.print(f"[bold cyan]Starting vLLM single instance with initial pp_layer_config: {spec.pp_layer_config}[/]")
+    
+    proc = subprocess.Popen(
+        serve_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        preexec_fn=os.setsid,
+        bufsize=0,
+    )
+    
+    # Use DynamicLogRedirector with both per-experiment and global log
+    log_redirector = DynamicLogRedirector(proc, initial_log_path, global_log_path)
+    return proc, log_redirector, metrics_raw_path
+
+
+def _run_single_experiment_on_running_server(
+    vllm_spec: VllmServerSpec,
+    bench_spec: BenchmarkSpec,
+    logm: SweepLogManager,
+    vars_mapping: Dict[str, Any],
+    log_redirector: DynamicLogRedirector,
+    is_first_experiment: bool = False,
+    global_metrics_path: Optional[Path] = None,
+) -> bool:
+    """Run a single experiment on an already-running server.
+    
+    This is used in single-server mode where the server is already running.
+    The function switches the PP config if needed and runs the benchmark.
+    
+    Args:
+        vllm_spec: VllmServerSpec for this experiment
+        bench_spec: BenchmarkSpec for running benchmark
+        logm: Log manager
+        vars_mapping: Variables for file naming
+        log_redirector: DynamicLogRedirector for switching log files
+        is_first_experiment: If True, skip set_pp_config (server already has correct config)
+        global_metrics_path: Path to the global metrics CSV file (shared by all experiments)
+    
+    Returns:
+        True if experiment succeeded
+    """
+    ok = False
+    
+    try:
+        logm.write_constants_meta(vars_mapping)
+        
+        # Switch log file for this experiment
+        assert vllm_spec.server_raw_log_path is not None
+        server_raw_path = Path(vllm_spec.server_raw_log_path)
+        log_redirector.switch_log_file(server_raw_path)
+        
+        # Always set PP config (even for first experiment) to update migration configuration
+        # Parse pp_layer_partition to get target config (initial config for this experiment)
+        target_pp_config = parse_pp_layer_partition(vllm_spec.pp_layer_partition)
+        C.print(f"[bold cyan]Setting PP config to: {target_pp_config}[/]")
+        
+        # Build alternative_configs and migration_steps from vllm_spec
+        # vllm_spec.alternative_configs format: {"pp_layer_configs": {"0": [[0,31],[32,63]], ...}}
+        # API expects: {0: [[0,31],[32,63]], 1: [[0,19],[20,63]], ...}
+        alternative_configs = None
+        migration_steps = None
+        
+        if vllm_spec.alternative_configs and "pp_layer_configs" in vllm_spec.alternative_configs:
+            inner = vllm_spec.alternative_configs["pp_layer_configs"]
+            alternative_configs = {int(k): v for k, v in inner.items()}
+            C.print(f"[dim]  Alternative configs: {alternative_configs}[/]")
+        
+        if vllm_spec.migration_steps:
+            migration_steps = list(vllm_spec.migration_steps)
+            C.print(f"[dim]  Migration steps: {migration_steps}[/]")
+        else:
+            C.print(f"[dim]  No migration for this experiment[/]")
+        
+        if not call_set_pp_config_sync(
+            bench_spec.base_url,
+            target_pp_config,
+            alternative_configs=alternative_configs,
+            migration_steps=migration_steps
+        ):
+            C.print("[red]ERROR: Failed to set PP config[/]")
+            return False
+        
+        # Wait a bit for config change to take effect
+        time.sleep(1)
+        
+        # Run benchmark
+        ok = start_benchmark_for_sweep(bench_spec)
+        
+        if not ok:
+            C.print("[yellow]WARNING:[/] Benchmark failed")
+        
+        # Process logs - copy raw to main
+        server_main_path = logm.get_path_with_log_type("server", "log", vars_mapping)
+        if server_main_path.exists():
+            os.remove(server_main_path)
+        
+        # Give log redirector time to flush
+        time.sleep(0.5)
+        if server_raw_path.exists():
+            shutil.copyfile(server_raw_path, server_main_path)
+        
+        # Copy metrics from global metrics path
+        # Extract only the metrics for this experiment's time range based on request_metrics timestamps
+        if global_metrics_path and global_metrics_path.exists():
+            ts_main_path = logm.get_path_with_log_type("timestamp_metrics", "csv", vars_mapping)
+            if ts_main_path.exists():
+                os.remove(ts_main_path)
+            
+            # Get time range from request_metrics
+            request_metrics_path = Path(bench_spec.metrics_file_path)
+            start_ts, end_ts = _get_time_range_from_request_metrics(request_metrics_path)
+            
+            if start_ts is not None and end_ts is not None:
+                # Add some buffer (10 seconds before and after) to capture all relevant metrics
+                buffer_seconds = 10.0
+                extracted = _extract_timestamp_metrics_by_time_range(
+                    global_metrics_path, ts_main_path,
+                    start_ts - buffer_seconds, end_ts + buffer_seconds
+                )
+                if not extracted:
+                    C.print(f"[yellow]WARNING: No timestamp metrics found for time range {start_ts:.2f} - {end_ts:.2f}[/]")
+            else:
+                # Fallback: copy the whole file if we can't determine time range
+                C.print("[yellow]WARNING: Could not determine time range from request_metrics, copying full metrics[/]")
+                shutil.copyfile(global_metrics_path, ts_main_path)
+        
+    except Exception as e:
+        C.print(f"[red]ERROR[/] {e}")
+        import traceback
+        traceback.print_exc()
+        ok = False
+    finally:
+        time.sleep(1)
+        generate_analysis_report(logm, vars_mapping)
+    
+    return ok
+
+
+def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
+    """Run sweep test with a single server instance.
+    
+    Unlike sweep_test which starts/stops the server for each experiment,
+    this function starts the server once and switches PP configurations
+    between experiments using the set_pp_config API.
+    
+    This provides:
+    1. Faster experiment iteration (no server restart overhead)
+    2. Separate log files for each experiment via DynamicLogRedirector
+    3. Dynamic PP config switching via set_pp_config API
+    
+    If cfg.overwrite is False, experiments that have already completed
+    successfully will be skipped.
+    
+    Args:
+        cfg: SweepTestConfig
+        logm: SweepLogManager for log file management
+    """
+    all_ok = True
+    experiment_count = 0
+    skipped_count = 0
+    proc = None
+    log_redirector = None
+    
+    try:
+        # Pre-generate all experiment specs
+        all_experiments = list(generate_experiment_specs(cfg, logm))
+        
+        if not all_experiments:
+            C.print("[red]ERROR: No valid experiments generated (benchmark_config required)[/]")
+            return
+        
+        # Pre-check which experiments need to run (for overwrite=False mode)
+        experiments_to_run = []
+        if not cfg.overwrite:
+            C.print("[bold cyan]Checking which experiments need to run (overwrite=False)...[/]")
+            for exp in all_experiments:
+                is_completed, reason = check_experiment_completed_for_spec(
+                    logm, exp.vars_mapping, exp.bench_spec
+                )
+                if is_completed:
+                    C.print(f"  [green]SKIP:[/] {exp.vars_mapping} - {reason}")
+                    skipped_count += 1
+                else:
+                    C.print(f"  [cyan]NEED:[/] {exp.vars_mapping} - {reason}")
+                    experiments_to_run.append(exp)
+            
+            if not experiments_to_run:
+                C.print(f"\n[bold green]All {len(all_experiments)} experiments already completed, nothing to run![/]")
+                return
+            
+            C.print(f"\n[bold cyan]Will run {len(experiments_to_run)} experiments (skipping {skipped_count} completed)[/]")
+        else:
+            experiments_to_run = all_experiments
+        
+        C.print(f"[bold cyan]Starting single-server sweep test with {len(experiments_to_run)} experiments[/]")
+        
+        # Get the first experiment to start the server
+        # Use the first experiment that needs to run for server config
+        first_exp = experiments_to_run[0]
+        
+        # Create a global metrics path for the server
+        global_metrics_path = logm.get_dir() / "global_metrics_raw.csv"
+        first_exp.vllm_spec.metrics_csv_path = str(global_metrics_path)
+        
+        # Create initial log path (per-experiment)
+        initial_log_path = Path(first_exp.vllm_spec.server_raw_log_path) if first_exp.vllm_spec.server_raw_log_path else None
+        
+        # Create global log path in project root directory for real-time monitoring
+        global_log_path = logm.get_dir() / "server_global.log"
+        
+        # Start the server once
+        proc, log_redirector, metrics_path = start_vllm_single_instance(
+            first_exp.vllm_spec,
+            initial_log_path=initial_log_path,
+            global_log_path=global_log_path
+        )
+        
+        # Wait for server to be ready
+        C.print("[bold cyan]Waiting for server to be ready...[/]")
+        C.print(f"[bold cyan]Monitor server status: tail -f {global_log_path}[/]")
+        if not wait_ready(first_exp.bench_spec.base_url, 300):
+            C.print("[red]ERROR: vLLM server not ready in time[/]")
+            return
+        
+        C.print("[green]vLLM server is ready[/]")
+        
+        # Run each experiment
+        for i, exp in enumerate(experiments_to_run):
+            experiment_count += 1
+            is_first = (i == 0)
+            
+            C.print(f"\n[bold magenta]{'='*60}[/]")
+            C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)}[/]")
+            C.print(f"[bold magenta]vars: {exp.vars_mapping}[/]")
+            C.print(f"[bold magenta]PP partition: {exp.vllm_spec.pp_layer_partition}[/]")
+            C.print(f"[bold magenta]{'='*60}[/]\n")
+            
+            ok = _run_single_experiment_on_running_server(
+                exp.vllm_spec,
+                exp.bench_spec,
+                logm,
+                exp.vars_mapping,
+                log_redirector,
+                is_first_experiment=is_first,
+                global_metrics_path=global_metrics_path,
+            )
+            
+            if not ok:
+                all_ok = False
+                C.print(f"[yellow]Experiment {experiment_count}/{len(experiments_to_run)} failed[/]")
+                # Continue with next experiment instead of stopping
+                continue
+        
+        status = "All succeeded" if all_ok else "Some failed"
+        if skipped_count > 0:
+            C.print(f"\n[bold cyan]Single-server sweep test completed: {experiment_count} run, {skipped_count} skipped, {status}[/]")
+        else:
+            C.print(f"\n[bold cyan]Single-server sweep test completed: {experiment_count} experiments, {status}[/]")
+        
+    except Exception as e:
+        C.print(f"[red]ERROR in sweep_test_single_server: {e}[/]")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Clean up
+        if proc:
+            C.print("[bold cyan]Stopping vLLM server...[/]")
+            stop_tree(proc)
+        if log_redirector:
+            log_redirector.close()
+        time.sleep(3)
+

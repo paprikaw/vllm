@@ -11,7 +11,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum, auto
 from threading import Thread
-from typing import Any, Callable, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, Optional, TypeVar, Union
 
 import msgspec
 import zmq
@@ -290,8 +290,14 @@ class DynamicAsyncMPClient(DynamicMPClient):
     async def reset_prefix_cache_async(self) -> None:
         await self.call_utility_async("reset_prefix_cache")
 
-    async def reset_pipeline_async(self) -> None:
-        await self.call_utility_async("reset_pipeline")
+    async def set_pp_config_async(
+        self,
+        pp_layer_config: list,
+        alternative_configs: Optional[Dict] = None,
+        migration_steps: Optional[list[int]] = None
+    ) -> None:
+        await self.call_utility_async("set_pp_config", pp_layer_config,
+                                      alternative_configs, migration_steps)
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)

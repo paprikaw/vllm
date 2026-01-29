@@ -1,10 +1,11 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "debug_repetition_sweep"
+project: "migration_cmp"
 type: "sweep_test"
 
 envs:
+  RAY_DEDUP_LOGS: "0"  # Disable Ray log deduplication for debugging
   NCCL_DEBUG: INFO
   NCCL_CUMEM_HOST_ENABLE: "0"
   VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
@@ -20,39 +21,38 @@ envs:
   VLLM_USE_RAY_COMPILED_DAG: "1"
   NCCL_SOCKET_IFNAME: "bond0.3027"
   GLOO_SOCKET_IFNAME: "bond0.3027"
-  VLLM_SERVER_DEV_MODE: "1"  # Enable /reset_pipeline endpoint
+  VLLM_SERVER_DEV_MODE: "1"  # Enable /set_pp_config endpoint
 
 is_log_cover: true
 
 static_config:
   model:
-    path: "/home/bxb1/data/huggingface/Qwen3-32B"
-    name: "Qwen3-32B"
+    path: "/home/bxb1/data/huggingface/Qwen3-32B-FP8"
+    name: "Qwen3-32B-FP8"
   
   network:
     rank_to_ip:
       0: "spartan-gpgpu169"
-      1: "spartan-gpgpu169"
+      1: "spartan-gpgpu007"
     rank_to_node:
       0: "spartan-gpgpu169"
-      1: "spartan-gpgpu169"
+      1: "spartan-gpgpu007"
   
   vllm:
     head_addr: "localhost"
     pipeline_parallel_size: 2
-    gpu_memory_utilization: 0.75
+    gpu_memory_utilization: 0.8
     max_model_len: 8000
     chunked_prefill: true
     enable_cuda_graph: false
     enable_nsight: false
-    enable_flexi_flash_attn: false
+    enable_flexi_flash_attn: true
   
   benchmark:
     burstiness: 100.0
     benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     profile: false
     print_outputs: true
-    pattern_batch_size: 150
     warmup:
       enabled: false
       num_total_requests: 25
@@ -63,14 +63,35 @@ static_config:
 # No sweep variables - single experiment with benchmark_config inside sweep_config
 sweep_config:
   # Test repetition with 3 repetitions, no migration
+  vllm:
+    enable_flexi_flash_attn: [true, false]
   benchmark_config:
     - num_total_requests: 100  # Small number for quick testing
-      repetition: 2           # 3 repetitions to test the feature
+      repetition: 3           # 3 repetitions to test the feature
       pp_layer_config:
-        0: "32, 32"           # Single config = no migration, only reset between reps
-        50: "20, 44"           # Single config = no migration, only reset between reps
+        0: "18, 46"           # Single config = no migration, only reset between reps
+        50: "36, 28"           # Single config = no migration, only reset between reps
       requests:
         0:
           request_rate: 2.0
-          input_lens: 500
-          output_lens: 32
+          input_lens:  512 
+          output_lens: 64
+    # - num_total_requests: 200  # Small number for quick testing
+    #   repetition: 3           # 3 repetitions to test the feature
+    #   pp_layer_config:
+    #     0: "36, 28"           # Single config = no migration, only reset between reps
+    #   requests:
+    #     0:
+    #       request_rate: 2.0
+    #       input_lens:  512 
+    #       output_lens: 64
+    # - num_total_requests: 200  # Small number for quick testing
+    #   repetition: 3           # 3 repetitions to test the feature
+    #   pp_layer_config:
+    #     0: "18, 16"           # Single config = no migration, only reset between reps
+    #   requests:
+    #     0:
+    #       request_rate: 2.0
+    #       input_lens:  512 
+    #       output_lens: 64
+overwrite: true

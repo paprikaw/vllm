@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from fractions import Fraction
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, TYPE_CHECKING
 
 import torch
 from torch.nn import Parameter
@@ -9,6 +9,17 @@ from torch.nn import Parameter
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.utils import _make_synced_weight_loader
+
+if TYPE_CHECKING:
+    from vllm.dynamic_utils import ForegroundBackgroundGate
+
+
+def _chunked_copy(dst: torch.Tensor, src: torch.Tensor, 
+                  fbgate: Optional["ForegroundBackgroundGate"] = None,
+                  name: str = "param") -> None:
+    """Helper to do chunked copy with optional fbgate support."""
+    from vllm.model_executor.layers.linear import chunked_copy_inplace
+    chunked_copy_inplace(name, dst=dst, src=src, fbgate=fbgate)
 
 __all__ = [
     "BasevLLMParameter", "PackedvLLMParameter", "PerTensorScaleParameter",
@@ -63,22 +74,29 @@ class BasevLLMParameter(Parameter):
         cond2 = loaded_weight.ndim == 0 and loaded_weight.numel() == 1
         return (cond1 and cond2)
 
-    def _assert_and_load(self, loaded_weight: torch.Tensor):
+    def _assert_and_load(self, loaded_weight: torch.Tensor,
+                         fbgate: Optional["ForegroundBackgroundGate"] = None):
         assert (self.data.shape == loaded_weight.shape
                 or self._is_1d_and_scalar(loaded_weight))
-        self.data.copy_(loaded_weight)
+        _chunked_copy(self.data, loaded_weight, fbgate=fbgate, name="BasevLLMParameter")
 
-    def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
-        self._assert_and_load(loaded_weight)
+    def load_column_parallel_weight(self, loaded_weight: torch.Tensor,
+                                    fbgate: Optional["ForegroundBackgroundGate"] = None):
+        self._assert_and_load(loaded_weight, fbgate=fbgate)
 
-    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
-        self._assert_and_load(loaded_weight)
+    def load_row_parallel_weight(self, loaded_weight: torch.Tensor,
+                                 fbgate: Optional["ForegroundBackgroundGate"] = None):
+        self._assert_and_load(loaded_weight, fbgate=fbgate)
 
-    def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        self._assert_and_load(loaded_weight)
+    def load_merged_column_weight(self, loaded_weight: torch.Tensor,
+                                  fbgate: Optional["ForegroundBackgroundGate"] = None,
+                                  **kwargs):
+        self._assert_and_load(loaded_weight, fbgate=fbgate)
 
-    def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        self._assert_and_load(loaded_weight)
+    def load_qkv_weight(self, loaded_weight: torch.Tensor,
+                        fbgate: Optional["ForegroundBackgroundGate"] = None,
+                        **kwargs):
+        self._assert_and_load(loaded_weight, fbgate=fbgate)
 
 
 class _ColumnvLLMParameter(BasevLLMParameter):
@@ -100,15 +118,18 @@ class _ColumnvLLMParameter(BasevLLMParameter):
     def output_dim(self):
         return self._output_dim
 
-    def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
+    def load_column_parallel_weight(self, loaded_weight: torch.Tensor,
+                                    fbgate: Optional["ForegroundBackgroundGate"] = None):
         tp_rank = get_tensor_model_parallel_rank()
         shard_size = self.data.shape[self.output_dim]
         loaded_weight = loaded_weight.narrow(self.output_dim,
                                              tp_rank * shard_size, shard_size)
         assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
+        _chunked_copy(self.data, loaded_weight, fbgate=fbgate, name="ColumnvLLMParameter")
 
-    def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
+    def load_merged_column_weight(self, loaded_weight: torch.Tensor,
+                                  fbgate: Optional["ForegroundBackgroundGate"] = None,
+                                  **kwargs):
 
         shard_offset = kwargs.get("shard_offset")
         shard_size = kwargs.get("shard_size")
@@ -127,9 +148,11 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         loaded_weight = loaded_weight.narrow(self.output_dim,
                                              tp_rank * shard_size, shard_size)
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        _chunked_copy(param_data, loaded_weight, fbgate=fbgate, name="MergedColumnvLLMParameter")
 
-    def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
+    def load_qkv_weight(self, loaded_weight: torch.Tensor,
+                        fbgate: Optional["ForegroundBackgroundGate"] = None,
+                        **kwargs):
 
         shard_offset = kwargs.get("shard_offset")
         shard_size = kwargs.get("shard_size")
@@ -152,7 +175,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                                              shard_id * shard_size, shard_size)
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        _chunked_copy(param_data, loaded_weight, fbgate=fbgate, name="QKVvLLMParameter")
 
 
 class RowvLLMParameter(BasevLLMParameter):
@@ -171,7 +194,8 @@ class RowvLLMParameter(BasevLLMParameter):
     def input_dim(self):
         return self._input_dim
 
-    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
+    def load_row_parallel_weight(self, loaded_weight: torch.Tensor,
+                                 fbgate: Optional["ForegroundBackgroundGate"] = None):
         tp_rank = get_tensor_model_parallel_rank()
         shard_size = self.data.shape[self.input_dim]
         loaded_weight = loaded_weight.narrow(self.input_dim,
@@ -181,7 +205,7 @@ class RowvLLMParameter(BasevLLMParameter):
             loaded_weight = loaded_weight.reshape(1)
 
         assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
+        _chunked_copy(self.data, loaded_weight, fbgate=fbgate, name="RowvLLMParameter")
 
 
 class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
@@ -251,7 +275,9 @@ class PerTensorScaleParameter(BasevLLMParameter):
         super().load_row_parallel_weight(*args, **kwargs)
 
     def _load_into_shard_id(self, loaded_weight: torch.Tensor,
-                            shard_id: Union[str, int], **kwargs):
+                            shard_id: Union[str, int],
+                            fbgate: Optional["ForegroundBackgroundGate"] = None,
+                            **kwargs):
         """
         Slice the parameter data based on the shard id for 
         loading.
@@ -268,7 +294,7 @@ class PerTensorScaleParameter(BasevLLMParameter):
 
         param_data = param_data[shard_id]
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        _chunked_copy(param_data, loaded_weight, fbgate=fbgate, name="PerTensorScaleParameter")
 
 
 class PackedColumnParameter(_ColumnvLLMParameter):

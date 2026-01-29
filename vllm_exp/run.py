@@ -64,14 +64,21 @@ def sweep(
 def sweep_test(
     config: str = typer.Option(..., help="Path to sweep_test config.yaml"),
     log_dir: str = typer.Option("/root/vllm_workbench/logs", help="Base log dir"),
+    single_server: bool = typer.Option(False, "--single-server", "-s", 
+                                        help="Use single-server mode: start server once and switch PP configs between experiments"),
 ):
     """Run sweep test experiment with the new unified configuration format.
     
     This is the recommended way to run parametric experiments.
     One config file = one project with sweep variables.
+    
+    Modes:
+    - Default: Start/stop server for each experiment
+    - --single-server: Start server once, switch PP configs via API
     """
     cfg = load_sweep_test_config(config)
-    C.rule(f"[bold green]Sweep Test: {cfg.project}[/]")
+    mode_str = "Single-Server Mode" if single_server else "Default Mode"
+    C.rule(f"[bold green]Sweep Test ({mode_str}): {cfg.project}[/]")
     
     # Set environment variables
     os.environ.update(cfg.envs)
@@ -85,8 +92,12 @@ def sweep_test(
     logm = SweepLogManager(base_dir, cfg)
     
     # Run sweep test
-    from .experiments import sweep_test as run_sweep_test
-    run_sweep_test(cfg, logm)
+    if single_server:
+        from .experiments import sweep_test_single_server
+        sweep_test_single_server(cfg, logm)
+    else:
+        from .experiments import sweep_test as run_sweep_test
+        run_sweep_test(cfg, logm)
 
 
 if __name__ == "__main__":

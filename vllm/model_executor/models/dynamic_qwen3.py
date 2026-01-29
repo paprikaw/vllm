@@ -208,8 +208,6 @@ class DynamicQwen3Model(Qwen3Model):
 
     def delete_layers(self, layers: Tuple[int, int]):
         """Delete the layer module and its parameters at the given index."""
-        import gc
-        import torch
 
         # Adapt input layers to the model's layers open internal representation
         deleted_start_layer, deleted_end_layer = layers[0], layers[1] + 1
@@ -219,6 +217,7 @@ class DynamicQwen3Model(Qwen3Model):
         assert deleted_start_layer >= old_start_layer and deleted_end_layer <= old_end_layer, f"layers must be in the range of start_layer and end_layer, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
         assert deleted_start_layer == old_start_layer or deleted_end_layer == old_end_layer, f"model layers must be continuous after delete layers, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
 
+        tmp_layer_dict = []
         with self.model_lock:
             time_start = time.time()
             for layer_idx in range(deleted_start_layer, deleted_end_layer):
@@ -226,16 +225,33 @@ class DynamicQwen3Model(Qwen3Model):
                 layer = self.layers[layer_idx]
                 assert layer is not None, "Layer is None"
                 assert layer is not PPMissingLayer, "Layer is PPMissingLayer"
+                # for name, _ in list(layer.named_parameters(recurse=True)):
+                #     # 删除每个参数
+                #     delattr(layer, name.split(".")[-1])
+                # for name, _ in list(layer.named_children()):
+                #     delattr(layer, name)
                 self.layers[layer_idx] = PPMissingLayer()  # 占位符
-                # Explicitly delete the layer to release GPU memory
-                del layer
                 logger.info(f"Layer {layer_idx} deleted successfully.")
-            
-            # Force garbage collection and release CUDA memory
-            gc.collect()
-            torch.cuda.empty_cache()
+                tmp_layer_dict.append(layer)
+                # 2. 显式从 _modules 中删除（可选但更保险）
+                # 由于 nn.ModuleList 自动注册子模块，这一步确保彻底清除
+                # prefix = f"layers.{layer_idx}"
+                # keys_to_delete = (k for k in self._modules if k.startswith(prefix))
+                # for key in keys_to_delete:
+                #     self._modules.pop(key)
             
             logger.info(f"Deleted layers took {human_readable_duration(time.time() - time_start)}")
+        
+        # Actually delete the layer objects to free GPU memory
+        free_before = torch.cuda.memory_allocated()
+        for layer in tmp_layer_dict:
+            del layer
+        tmp_layer_dict.clear()
+        del tmp_layer_dict
+        gc.collect()
+        torch.cuda.empty_cache()
+        free_after = torch.cuda.memory_allocated()
+        logger.info(f"[delete_layers] Freed {(free_before - free_after) / 1024**3:.2f} GB of GPU memory for model weights")
 
         # Update the start_layer and end_layer
         if deleted_start_layer == old_start_layer:
@@ -382,9 +398,19 @@ class DynamicQwen3Model(Qwen3Model):
                    continue 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                
+                # Check if this is a v2 weight loader (used by FP8 quantization)
+                # v2 loaders now also accept fbgate parameter as keyword argument
+                is_v2_loader = hasattr(weight_loader, "__name__") and "v2" in weight_loader.__name__
+                
                 if isinstance(param_to_module[name], MergedColumnParallelLinear):
                     time_start = time.time()
-                    weight_loader(self.fbgate, param, loaded_weight, shard_id)
+                    if is_v2_loader:
+                        # v2 loader: (param, loaded_weight, shard_id, fbgate=fbgate)
+                        weight_loader(param, loaded_weight, shard_id, fbgate=self.fbgate)
+                    else:
+                        # v1 loader: (fbgate, param, loaded_weight, shard_id)
+                        weight_loader(self.fbgate, param, loaded_weight, shard_id)
                     logger.info(f"stacked params, loaded weight using weight loader: {weight_loader} for param: {name}, took {human_readable_duration(time.time() - time_start)}")
                     break
 
@@ -414,10 +440,20 @@ class DynamicQwen3Model(Qwen3Model):
                 # chunk_weight_loader = getattr(parent_module, "chunk_weight_loader", None) if parent_module else None
                 weight_loader = getattr(param, "weight_loader",
                         default_weight_loader)
+                
+                # Check if this is a v2 weight loader (used by FP8 quantization)
+                # v2 loaders now also accept fbgate parameter as keyword argument
+                is_v2_loader = hasattr(weight_loader, "__name__") and "v2" in weight_loader.__name__
+                
                 assert not isinstance(param_to_module[name], MergedColumnParallelLinear)
                 if isinstance(param_to_module[name], RowParallelLinear):
                     time_start = time.time()
-                    weight_loader(self.fbgate, param, loaded_weight)
+                    if is_v2_loader:
+                        # v2 loader: (param, loaded_weight, fbgate=fbgate)
+                        weight_loader(param, loaded_weight, fbgate=self.fbgate)
+                    else:
+                        # v1 loader: (fbgate, param, loaded_weight)
+                        weight_loader(self.fbgate, param, loaded_weight)
                     logger.info(f"loaded weight using weight loader: {weight_loader} for param: {name}, took {human_readable_duration(time.time() - time_start)}")
                     loaded_params.add(name)
                     return

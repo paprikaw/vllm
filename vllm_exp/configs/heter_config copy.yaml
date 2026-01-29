@@ -1,7 +1,7 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "debug_parameter_sweep"
+project: "heter_config_test"
 type: "sweep_test"
 
 envs:
@@ -14,7 +14,7 @@ envs:
   DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
   KV_SYNC_USE_CPU: "0"
   VLLM_USE_CPU_MODEL: "0"
-  CUDA_LAUNCH_BLOCKING: "0"
+  CUDA_LAUNCH_BLOCKING: "1"
   PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
   VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
   VLLM_USE_RAY_COMPILED_DAG: "1"
@@ -32,14 +32,14 @@ static_config:
   network:
     rank_to_ip:
       0: "spartan-gpgpu169"
-      1: "spartan-gpgpu169"
+      1: "spartan-gpgpu003"
     rank_to_node:
       0: "spartan-gpgpu169"
-      1: "spartan-gpgpu169"
+      1: "spartan-gpgpu003"
   vllm:
     head_addr: "localhost"
     pipeline_parallel_size: 2
-    gpu_memory_utilization: 0.75
+    gpu_memory_utilization: 0.88
     max_model_len: 8000
     chunked_prefill: true
     enable_cuda_graph: false
@@ -50,20 +50,37 @@ static_config:
     profile: false
     print_outputs: true
     pattern_batch_size: 150
-    num_total_requests: 100  # Shared across all sweep combinations
-    repetition: 1  # Shared across all sweep combinations
+    num_total_requests: 100
+    repetition: 1
+    
+    # Fixed pp_layer_config with migration at request 50
+    pp_layer_config:
+      0: "32, 32"    # Initial config: 32 layers on each GPU
+      50: "20, 44"   # Migration at request 50: 20 layers on GPU0, 44 on GPU1
+    
+    # Fixed request parameters
+    requests:
+      0:
+        request_rate: 2.0
+        input_lens: 500
+        output_lens: 32
+
     warmup:
       enabled: false
       num_total_requests: 25
       input_length: 10000
       output_length: 50
       request_rate: 25
-# Parameter sweep mode - individual parameters are combined via Cartesian product
+
+# Parameter sweep mode - sweep only vLLM parameters
+# Since static_config.benchmark defines pp_layer_config + requests,
+# sweep_config.benchmark should NOT be used (conflict error will be raised)
 sweep_config:
   vllm:
     enable_flexi_flash_attn: [true, false]
-  benchmark:
-    pp_layer_configs: ["20, 44"]  # pp_layer_partition strings
-    request_rates: [1.0]  # float values
-    input_lens: [500]  # int values  
-    output_lens: [100]  # int values
+    # Optionally sweep weight chunk size:
+    # weight_chunk_size_mb: [5.0, 10.0, 20.0]
+
+# If true, always rerun all experiments. If false, skip experiments that have already
+# completed successfully (based on benchmark.log and request_metrics.csv checks)
+overwrite: false

@@ -138,8 +138,19 @@ class BenchCfg(BaseModel):
     # Optional metrics output path when running via vllm_exp
     metrics_file_name: Optional[str] = None
     # Number of times to repeat the benchmark (default 1 = single run)
-    # After each repetition, reset_pipeline is called to restore initial config
+    # After each repetition, set_pp_config is called to restore initial config
     repetition: int = 1
+    
+    # Pipeline config for repetition reset (used when repetition > 1)
+    initial_pp_config: Optional[List[List[int]]] = None
+    """Initial PP layer config to restore between repetitions.
+    Format: [[start, end], [start, end], ...] per rank."""
+    alternative_configs: Optional[Dict[str, Any]] = None
+    """Migration target configs. Format: {"pp_layer_configs": {"0": [...], "1": [...]}}.
+    Passed to set_pp_config when resetting between repetitions."""
+    migration_steps: Optional[List[int]] = None
+    """Request indices at which migration is triggered.
+    Passed to set_pp_config when resetting between repetitions."""
 
     # Optional warmup stage (separate logs + metrics)
     warmup: Optional[WarmupBenchCfg] = None
@@ -253,7 +264,7 @@ class SweepBenchmarkConfig(BaseModel):
     
     repetition: int = 1
     """Number of times to repeat the benchmark. After each repetition,
-    reset_pipeline is called to return to the initial pp configuration."""
+    set_pp_config is called to return to the initial pp configuration."""
     
     pp_layer_config: Dict[int, str]
     """Pipeline layer partition configs indexed by request number.
@@ -339,6 +350,8 @@ class SweepBenchmarkParams(BaseModel):
 class SweepVllmParams(BaseModel):
     """Individual vLLM parameters for parameter-sweep mode."""
     enable_flexi_flash_attn: Optional[List[bool]] = None
+    weight_chunk_size_mb: Optional[List[float]] = None
+    """List of weight chunk sizes (MB) for sweep. Affects weight loading during migration."""
 
 
 class SweepConfig(BaseModel):
@@ -381,7 +394,7 @@ class SweepConfig(BaseModel):
     
     # Note: gpu_memory_utilization and block_size are NOT sweep parameters.
     # They should only be defined in static_config.vllm.
-    # Only enable_flexi_flash_attn can be swept via sweep_config.vllm.
+    # Only enable_flexi_flash_attn and weight_chunk_size_mb can be swept via sweep_config.vllm.
     
     def get_sweep_axes(
         self,
@@ -389,22 +402,29 @@ class SweepConfig(BaseModel):
     ) -> Dict[str, List[Any]]:
         """Return all non-None sweep axes for Cartesian product.
         
-        Handles both benchmark_config mode and parameter sweep mode.
+        Handles three modes:
+        1. benchmark_config mode: Complete SweepBenchmarkConfig list provided directly
+        2. Parameter sweep mode: Generate from sweep_config.benchmark parameters
+        3. Fixed-benchmark mode: Use static_config.benchmark's pp_layer_config + requests
         
         Args:
             static_benchmark_cfg: Static benchmark config for shared parameters
-                                  (num_total_requests, repetition) in parameter-sweep mode.
+                                  (num_total_requests, repetition) in parameter-sweep mode,
+                                  or complete benchmark config in fixed-benchmark mode.
         """
         axes = {}
         
-        # enable_flexi_flash_attn can only come from sweep_config.vllm
-        if self.vllm is not None and self.vllm.enable_flexi_flash_attn is not None:
-            axes['enable_flexi_flash_attn'] = self.vllm.enable_flexi_flash_attn
+        # vLLM sweep parameters
+        if self.vllm is not None:
+            if self.vllm.enable_flexi_flash_attn is not None:
+                axes['enable_flexi_flash_attn'] = self.vllm.enable_flexi_flash_attn
+            if self.vllm.weight_chunk_size_mb is not None:
+                axes['weight_chunk_size_mb'] = self.vllm.weight_chunk_size_mb
         
-        # Mode 1: benchmark_config provided directly
+        # Mode 1: benchmark_config provided directly in sweep_config
         if self.benchmark_config is not None:
             axes['benchmark_config'] = self.benchmark_config
-        # Mode 2: Generate benchmark_config from individual parameters
+        # Mode 2: Generate benchmark_config from individual sweep parameters
         elif self.benchmark is not None:
             assert static_benchmark_cfg is not None
             num_requests = static_benchmark_cfg.num_total_requests
@@ -413,6 +433,10 @@ class SweepConfig(BaseModel):
                 num_total_requests=num_requests,
                 repetition=repetition
             )
+        # Mode 3: Fixed-benchmark mode - use static_config.benchmark's pp_layer_config + requests
+        elif static_benchmark_cfg is not None and static_benchmark_cfg.has_fixed_benchmark:
+            # Create a single benchmark_config from static_config.benchmark
+            axes['benchmark_config'] = [static_benchmark_cfg.to_sweep_benchmark_config()]
         
         return axes
     
@@ -496,6 +520,8 @@ class StaticVllmCfg(BaseModel):
     block_size: Optional[int] = None
     head_addr: str = "head"
     port: int = 8000
+    weight_chunk_size_mb: float = 10.0
+    """Weight chunk size in MB for chunked weight loading during migration. Default 10 MB."""
 
 
 class StaticBenchCfg(BaseModel):
@@ -503,6 +529,29 @@ class StaticBenchCfg(BaseModel):
     
     Contains shared parameters that apply to all sweep combinations.
     These should NOT be redefined in sweep_config to avoid conflicts.
+    
+    Supports two modes:
+    1. Parameter-sweep mode: Define only shared params (num_total_requests, repetition),
+       and let sweep_config.benchmark define the sweep axes.
+    2. Fixed-benchmark mode: Define pp_layer_config and requests here to fix the
+       benchmark configuration. Then sweep only vLLM parameters like enable_flexi_flash_attn.
+    
+    Example (fixed-benchmark mode):
+        static_config:
+          benchmark:
+            num_total_requests: 100
+            repetition: 1
+            pp_layer_config:
+              0: "32, 32"
+              50: "20, 44"  # Migration at request 50
+            requests:
+              0:
+                request_rate: 2.0
+                input_lens: 500
+                output_lens: 32
+        sweep_config:
+          vllm:
+            enable_flexi_flash_attn: [true, false]
     """
     pattern_batch_size: int = 150
     profile: bool = False
@@ -517,6 +566,32 @@ class StaticBenchCfg(BaseModel):
     
     repetition: int = 1
     """Number of repetitions per experiment (shared across all sweep combinations)."""
+    
+    # Optional: Fixed benchmark configuration (for fixed-benchmark mode)
+    pp_layer_config: Optional[Dict[int, str]] = None
+    """Pipeline layer partition configs indexed by request number.
+    If defined, this becomes a fixed benchmark config and sweep_config.benchmark
+    should not be used. Example: {0: "32,32", 50: "20,44"} means migration at request 50."""
+    
+    requests: Optional[Dict[int, RequestStageConfig]] = None
+    """Request configurations indexed by request number.
+    Required when pp_layer_config is defined. Example: {0: {request_rate: 2.0, ...}}."""
+    
+    @property
+    def has_fixed_benchmark(self) -> bool:
+        """Returns True if this config defines a fixed benchmark (pp_layer_config + requests)."""
+        return self.pp_layer_config is not None and self.requests is not None
+    
+    def to_sweep_benchmark_config(self) -> 'SweepBenchmarkConfig':
+        """Convert to SweepBenchmarkConfig when using fixed-benchmark mode."""
+        if not self.has_fixed_benchmark:
+            raise ValueError("Cannot convert to SweepBenchmarkConfig: pp_layer_config or requests not defined")
+        return SweepBenchmarkConfig(
+            num_total_requests=self.num_total_requests,
+            repetition=self.repetition,
+            pp_layer_config=self.pp_layer_config,  # type: ignore
+            requests=self.requests,  # type: ignore
+        )
 
 
 class StaticConfig(BaseModel):
@@ -537,7 +612,9 @@ class SweepTestConfig(BaseModel):
     1. If using parameter-sweep mode (sweep_config.benchmark), shared params
        like num_total_requests and repetition must come from static_config.benchmark
     2. If using benchmark_config mode, repetition/num_total_requests are per-config
-    3. vLLM params: if defined in sweep_config, they become sweep axes;
+    3. If using fixed-benchmark mode (static_config.benchmark has pp_layer_config + requests),
+       sweep_config.benchmark and sweep_config.benchmark_config should not be used
+    4. vLLM params: if defined in sweep_config, they become sweep axes;
        static_config provides fallback values
     """
     project: str
@@ -546,6 +623,7 @@ class SweepTestConfig(BaseModel):
     sweep_config: SweepConfig
     envs: Dict[str, str] = {}
     is_log_cover: bool = False
+    overwrite: bool = True  # If False, skip experiments that have already succeeded
     
     @model_validator(mode='after')
     def validate_no_conflicts(self) -> 'SweepTestConfig':
@@ -560,6 +638,20 @@ class SweepTestConfig(BaseModel):
                 "'sweep_config.benchmark' are mutually exclusive. "
                 "Use benchmark_config for complete configs or benchmark for parameter sweep."
             )
+        
+        # Check for fixed-benchmark mode conflicts
+        if self.static_config.benchmark.has_fixed_benchmark:
+            if self.sweep_config.benchmark is not None:
+                errors.append(
+                    "Configuration conflict: 'static_config.benchmark' has pp_layer_config and requests defined, "
+                    "which enables fixed-benchmark mode. 'sweep_config.benchmark' should not be used in this mode. "
+                    "Only sweep vLLM parameters like enable_flexi_flash_attn or weight_chunk_size_mb."
+                )
+            if self.sweep_config.benchmark_config is not None:
+                errors.append(
+                    "Configuration conflict: 'static_config.benchmark' has pp_layer_config and requests defined, "
+                    "which enables fixed-benchmark mode. 'sweep_config.benchmark_config' should not be used in this mode."
+                )
         
         # Note: enable_flexi_flash_attn can appear in:
         # - static_config.vllm.enable_flexi_flash_attn (single value, fallback)
@@ -606,7 +698,7 @@ class ExpVllmConfig:
     
     Merged from:
     - static_config.vllm (base values)
-    - sweep_config.vllm (overrides like enable_flexi_flash_attn)
+    - sweep_config.vllm (overrides like enable_flexi_flash_attn, weight_chunk_size_mb)
     """
     pipeline_parallel_size: int
     gpu_memory_utilization: float
@@ -618,9 +710,11 @@ class ExpVllmConfig:
     chunked_prefill: bool
     enable_cuda_graph: bool
     enable_nsight: bool
-    
-    # Pipeline partition (from sweep benchmark_config)
     pp_layer_partition: str  # Initial partition, e.g. "32,32"
+    
+    # Fields with defaults must come after required fields
+    weight_chunk_size_mb: float = 10.0
+    """Weight chunk size in MB for chunked weight loading during migration."""
     pp_layer_config: Dict[int, str] = field(default_factory=dict)  # {0: "32,32", 100: "20,44"}
     
     @property
@@ -657,6 +751,21 @@ class ExpVllmConfig:
     def get_migration_steps(self) -> List[int]:
         """Get request indices where configuration changes."""
         return [k for k in sorted(self.pp_layer_config.keys()) if k > 0]
+    
+    def get_initial_pp_config(self) -> List[List[int]]:
+        """Get initial PP config in [[start, end], ...] format.
+        
+        Used for resetting pipeline configuration between benchmark repetitions.
+        """
+        pp_str = self.pp_layer_partition.replace(" ", "")
+        layers = [int(x.strip()) for x in pp_str.split(",")]
+        ranges = []
+        start = 0
+        for num_layers in layers:
+            end = start + num_layers - 1
+            ranges.append([start, end])
+            start = end + 1
+        return ranges
 
 
 @dataclass
@@ -711,6 +820,7 @@ class ExperimentConfig:
         "output_lens": "out",
         "num_total_requests": "n_req",
         "repetition": "rep",
+        "weight_chunk_size_mb": "chunk",
     }
     
     model: ExpModelConfig
@@ -720,7 +830,7 @@ class ExperimentConfig:
     
     def get_naming_vars(self) -> Dict[str, Any]:
         """Generate vars_mapping for file naming using NAMING_ALIASES."""
-        return {
+        vars_dict = {
             "flexi": self.vllm.enable_flexi_flash_attn,
             "pp": self.vllm.pp_layer_partition,
             "rr": self.benchmark.request_rate,
@@ -730,6 +840,10 @@ class ExperimentConfig:
             "n_req": self.benchmark.num_total_requests,
             "rep": self.benchmark.repetition,
         }
+        # Only include chunk size if it's not the default (10.0)
+        if self.vllm.weight_chunk_size_mb != 10.0:
+            vars_dict["chunk"] = self.vllm.weight_chunk_size_mb
+        return vars_dict
     
     @classmethod
     def iter_from_sweep_test_config(
@@ -775,9 +889,10 @@ class ExperimentConfig:
             # Extract sweep parameters from combination
             bench_cfg: SweepBenchmarkConfig = combo_dict['benchmark_config']
             enable_flexi: Optional[bool] = combo_dict.get('enable_flexi_flash_attn')
+            weight_chunk_size: Optional[float] = combo_dict.get('weight_chunk_size_mb')
             
             # Create ExperimentConfig from this combination
-            yield cls._create_from_combo(static_cfg, bench_cfg, enable_flexi)
+            yield cls._create_from_combo(static_cfg, bench_cfg, enable_flexi, weight_chunk_size)
     
     @classmethod
     def _create_from_combo(
@@ -785,6 +900,7 @@ class ExperimentConfig:
         static_cfg: 'StaticConfig',
         bench_cfg: SweepBenchmarkConfig,
         enable_flexi_flash_attn: Optional[bool] = None,
+        weight_chunk_size_mb: Optional[float] = None,
     ) -> 'ExperimentConfig':
         """Create a single ExperimentConfig from static config and one sweep combination.
         
@@ -794,9 +910,11 @@ class ExperimentConfig:
             static_cfg: Static configuration
             bench_cfg: Sweep benchmark configuration (from sweep axes)
             enable_flexi_flash_attn: Override from sweep axis (if sweeping), otherwise use static
+            weight_chunk_size_mb: Override from sweep axis (if sweeping), otherwise use static
         """
-        # Resolve enable_flexi_flash_attn: sweep overrides static
+        # Resolve sweep overrides: sweep values override static values
         flexi = enable_flexi_flash_attn if enable_flexi_flash_attn is not None else static_cfg.vllm.enable_flexi_flash_attn
+        chunk_size = weight_chunk_size_mb if weight_chunk_size_mb is not None else static_cfg.vllm.weight_chunk_size_mb
         
         # Get initial values from bench_cfg
         sorted_pp_keys = sorted(bench_cfg.pp_layer_config.keys())
@@ -827,6 +945,7 @@ class ExperimentConfig:
             chunked_prefill=static_cfg.vllm.chunked_prefill,
             enable_cuda_graph=static_cfg.vllm.enable_cuda_graph,
             enable_nsight=static_cfg.vllm.enable_nsight,
+            weight_chunk_size_mb=chunk_size,
             pp_layer_partition=initial_pp,
             pp_layer_config={k: v.replace(" ", "") for k, v in bench_cfg.pp_layer_config.items()},
         )
@@ -912,6 +1031,8 @@ class VllmServerSpec:
     chunked_prefill: bool = False
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
+    weight_chunk_size_mb: float = 10.0
+    """Weight chunk size in MB for chunked weight loading during migration."""
     
     # Migration/Partition
     pp_layer_partition: str = ""
@@ -977,7 +1098,16 @@ class BenchmarkSpec:
     # Repetition config
     repetition: int = 1
     """Number of times to repeat the benchmark. After each repetition,
-    reset_pipeline is called to return to the initial pp configuration."""
+    set_pp_config is called to return to the initial pp configuration."""
+    
+    # Pipeline config for repetition reset
+    initial_pp_config: Optional[List[List[int]]] = None
+    """Initial PP layer config to restore between repetitions.
+    Format: [[start, end], [start, end], ...] per rank."""
+    alternative_configs: Optional[Dict[str, Any]] = None
+    """Migration target configs. Format: {"pp_layer_configs": {"0": [...], "1": [...]}}"""
+    migration_steps: Optional[List[int]] = None
+    """Request indices at which migration is triggered."""
     
     # Features
     print_outputs: bool = False
@@ -1023,6 +1153,10 @@ class BenchmarkSpec:
             "warmup": self.warmup.model_dump() if self.warmup else None,
             "metrics_file_name": self.metrics_file_path,
             "repetition": self.repetition,
+            # Pipeline config for repetition reset
+            "initial_pp_config": self.initial_pp_config,
+            "alternative_configs": self.alternative_configs,
+            "migration_steps": self.migration_steps,
         }
 
     def write_benchmark_config(self) -> None:

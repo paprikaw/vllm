@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_FUSED_MOE_CHUNK_SIZE: int = 64 * 1024
+    VLLM_WEIGHT_CHUNK_SIZE_MB: float = 10.0
     VLLM_USE_RAY_SPMD_WORKER: bool = False
     VLLM_USE_RAY_COMPILED_DAG: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "auto"
@@ -549,6 +550,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION", "0"))),
     "VLLM_FUSED_MOE_CHUNK_SIZE":
     lambda: int(os.getenv("VLLM_FUSED_MOE_CHUNK_SIZE", "32768")),
+    
+    # Weight chunk size in MB for chunked weight loading during migration.
+    # Controls how large each chunk is when copying weights in the background.
+    # Smaller chunks allow more interleaving with inference, larger chunks reduce overhead.
+    "VLLM_WEIGHT_CHUNK_SIZE_MB":
+    lambda: float(os.getenv("VLLM_WEIGHT_CHUNK_SIZE_MB", "10.0")),
 
     # If set, vllm will skip the deprecation warnings.
     "VLLM_NO_DEPRECATION_WARNING":

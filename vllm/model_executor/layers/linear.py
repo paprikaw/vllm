@@ -744,14 +744,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     def weight_loader_v2(self,
                          param: BasevLLMParameter,
                          loaded_weight: torch.Tensor,
-                         loaded_shard_id: Optional[int] = None):
+                         loaded_shard_id: Optional[int] = None,
+                         fbgate: Optional[ForegroundBackgroundGate] = None):
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight,
-                                                shard_id=0)
+                                                shard_id=0, fbgate=fbgate)
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight)
+                param.load_merged_column_weight(loaded_weight=loaded_weight, fbgate=fbgate)
                 return
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(param, loaded_weight)
@@ -782,7 +783,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param.load_merged_column_weight(loaded_weight=loaded_weight,
                                         shard_id=loaded_shard_id,
                                         shard_offset=shard_offset,
-                                        shard_size=shard_size)
+                                        shard_size=shard_size,
+                                        fbgate=fbgate)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -1307,7 +1309,8 @@ class RowParallelLinear(LinearBase):
         logger.info(f"Row Linear Loader, copy from {param_data.shape} to {loaded_weight.shape} time taken to copy: {human_readable_duration(time.time() - time_start)}")
 
     def weight_loader_v2(self, param: BasevLLMParameter,
-                         loaded_weight: torch.Tensor):
+                         loaded_weight: torch.Tensor,
+                         fbgate: Optional[ForegroundBackgroundGate] = None):
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -1315,7 +1318,7 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        param.load_row_parallel_weight(loaded_weight=loaded_weight)
+        param.load_row_parallel_weight(loaded_weight=loaded_weight, fbgate=fbgate)
 
     def forward(
         self, input_
@@ -1617,7 +1620,7 @@ def chunked_copy_inplace(
     src: torch.Tensor,
     n_copy: Optional[int] = None,
     fbgate: Optional[ForegroundBackgroundGate] = None,
-    chunk_size_mb: float = 10.0,
+    chunk_size_mb: Optional[float] = None,
     non_blocking: bool = False,
 ) -> torch.Tensor:
     """
@@ -1629,7 +1632,8 @@ def chunked_copy_inplace(
         dst: 目标 tensor (会被修改)
         src: 源 tensor
         n_copy: 分成多少批 (None 则根据 chunk_size_mb 自动计算)
-        chunk_size_mb: 每批的大小 (MB),仅当 n_copy=None 时使用
+        chunk_size_mb: 每批的大小 (MB),仅当 n_copy=None 时使用。
+                       If None, uses VLLM_WEIGHT_CHUNK_SIZE_MB env var (default 10.0).
         non_blocking: 是否使用非阻塞 copy
         fbgate: ForegroundBackgroundGate 对象,用于控制前后台执行上下文
     
@@ -1646,6 +1650,12 @@ def chunked_copy_inplace(
         >>> # 或者指定参数
         >>> chunked_copy_inplace(param_data, loaded_weight, n_copy=20)
     """
+    from vllm import envs
+    
+    # Use environment variable if chunk_size_mb not specified
+    if chunk_size_mb is None:
+        chunk_size_mb = envs.VLLM_WEIGHT_CHUNK_SIZE_MB
+    
     # 参数验证
     assert dst.shape == src.shape, f"Shape mismatch: dst {dst.shape} vs src {src.shape}"
     

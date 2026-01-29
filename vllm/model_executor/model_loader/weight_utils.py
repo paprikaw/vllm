@@ -852,97 +852,104 @@ def human_readable_duration(seconds: float) -> str:
         # Fallback to raw seconds if any unexpected error happens
         return f"{seconds:.3f}s"
 
-def chunked_copy_inplace(
-    name: str,
-    dst: torch.Tensor,
-    src: torch.Tensor,
-    n_copy: Optional[int] = None,
-    fbgate: Optional[ForegroundBackgroundGate] = None,
-    chunk_size_mb: float = 10.0,
-    non_blocking: bool = False,
-) -> torch.Tensor:
-    """
-    分批执行 tensor copy (inplace),完全兼容 tensor.copy_() 的用法
+# def chunked_copy_inplace(
+#     name: str,
+#     dst: torch.Tensor,
+#     src: torch.Tensor,
+#     n_copy: Optional[int] = None,
+#     fbgate: Optional[ForegroundBackgroundGate] = None,
+#     chunk_size_mb: Optional[float] = None,
+#     non_blocking: bool = False,
+# ) -> torch.Tensor:
+#     """
+#     分批执行 tensor copy (inplace),完全兼容 tensor.copy_() 的用法
     
-    这个函数可以直接替换 `dst.copy_(src)`,接口完全兼容
+#     这个函数可以直接替换 `dst.copy_(src)`,接口完全兼容
     
-    Args:
-        dst: 目标 tensor (会被修改)
-        src: 源 tensor
-        n_copy: 分成多少批 (None 则根据 chunk_size_mb 自动计算)
-        chunk_size_mb: 每批的大小 (MB),仅当 n_copy=None 时使用
-        non_blocking: 是否使用非阻塞 copy
-        fbgate: ForegroundBackgroundGate 对象,用于控制前后台执行上下文
+#     Args:
+#         dst: 目标 tensor (会被修改)
+#         src: 源 tensor
+#         n_copy: 分成多少批 (None 则根据 chunk_size_mb 自动计算)
+#         chunk_size_mb: 每批的大小 (MB),仅当 n_copy=None 时使用。
+#                        If None, uses VLLM_WEIGHT_CHUNK_SIZE_MB env var (default 10.0).
+#         non_blocking: 是否使用非阻塞 copy
+#         fbgate: ForegroundBackgroundGate 对象,用于控制前后台执行上下文
     
-    Returns:
-        dst (用于链式调用,兼容原生 copy_ 行为)
+#     Returns:
+#         dst (用于链式调用,兼容原生 copy_ 行为)
     
-    Example:
-        >>> # 原代码
-        >>> param_data.copy_(loaded_weight)
+#     Example:
+#         >>> # 原代码
+#         >>> param_data.copy_(loaded_weight)
         
-        >>> # 新代码 - 直接替换
-        >>> chunked_copy_inplace(param_data, loaded_weight)
+#         >>> # 新代码 - 直接替换
+#         >>> chunked_copy_inplace(param_data, loaded_weight)
         
-        >>> # 或者指定参数
-        >>> chunked_copy_inplace(param_data, loaded_weight, n_copy=20)
-    """
-    # 参数验证
-    assert dst.shape == src.shape, f"Shape mismatch: dst {dst.shape} vs src {src.shape}"
+#         >>> # 或者指定参数
+#         >>> chunked_copy_inplace(param_data, loaded_weight, n_copy=20)
+#     """
+#     from vllm import envs
     
-    # 如果 tensor 很小或不在 CUDA 上,直接 copy
-    total_bytes = src.numel() * src.element_size()
-    min_size_for_chunking = 2 * chunk_size_mb * 1024 * 1024  # 两倍于所定义的size大小
+#     # Use environment variable if chunk_size_mb not specified
+#     if chunk_size_mb is None:
+#         chunk_size_mb = envs.VLLM_WEIGHT_CHUNK_SIZE_MB
     
-    if fbgate is not None:
-        with fbgate.background():
-            dst.copy_(src, non_blocking=non_blocking)
-            return dst
-    else:
-        dst.copy_(src, non_blocking=non_blocking)
-        return dst
+#     # 参数验证
+#     assert dst.shape == src.shape, f"Shape mismatch: dst {dst.shape} vs src {src.shape}"
+    
+#     # 如果 tensor 很小或不在 CUDA 上,直接 copy
+#     total_bytes = src.numel() * src.element_size()
+#     min_size_for_chunking = 2 * chunk_size_mb * 1024 * 1024  # 两倍于所定义的size大小
+    
+#     if fbgate is not None:
+#         with fbgate.background():
+#             dst.copy_(src, non_blocking=non_blocking)
+#             return dst
+#     else:
+#         dst.copy_(src, non_blocking=non_blocking)
+#         return dst
 
-    if total_bytes < min_size_for_chunking or not (dst.is_cuda and src.is_cuda):
-        dst.copy_(src, non_blocking=non_blocking)
-        return dst
+#     if total_bytes < min_size_for_chunking or not (dst.is_cuda and src.is_cuda):
+#         dst.copy_(src, non_blocking=non_blocking)
+#         return dst
     
-    # 自动计算 n_copy
-    if n_copy is None:
-        total_mb = total_bytes / (1024 * 1024)
-        n_copy = max(1, int(total_mb / chunk_size_mb + 0.5))
+#     # 自动计算 n_copy
+#     if n_copy is None:
+#         total_mb = total_bytes / (1024 * 1024)
+#         n_copy = max(1, int(total_mb / chunk_size_mb + 0.5))
     
     
-    # 如果 n_copy = 1,直接 copy
-    if n_copy == 1:
-        dst.copy_(src, non_blocking=non_blocking)
-        return dst
+#     # 如果 n_copy = 1,直接 copy
+#     if n_copy == 1:
+#         dst.copy_(src, non_blocking=non_blocking)
+#         return dst
     
-    # 展平为 1D 方便切片
-    dst_flat = dst.view(-1)
-    src_flat = src.view(-1)
-    total_elements = dst_flat.numel()
+#     # 展平为 1D 方便切片
+#     dst_flat = dst.view(-1)
+#     src_flat = src.view(-1)
+#     total_elements = dst_flat.numel()
     
-    # 计算每批的大小
-    chunk_size = (total_elements + n_copy - 1) // n_copy
+#     # 计算每批的大小
+#     chunk_size = (total_elements + n_copy - 1) // n_copy
     
-    # 使用当前 stream
-    for i in range(n_copy):
-        start_idx = i * chunk_size
-        end_idx = min((i + 1) * chunk_size, total_elements)
+#     # 使用当前 stream
+#     for i in range(n_copy):
+#         start_idx = i * chunk_size
+#         end_idx = min((i + 1) * chunk_size, total_elements)
         
-        if start_idx >= total_elements:
-            break
-        if fbgate is not None:
-            with fbgate.background():
-                time_start = time.time()
-                dst_flat[start_idx:end_idx].copy_(
-                    src_flat[start_idx:end_idx],
-                    non_blocking=non_blocking
-                )
-                logger.info(f"[Weight Loading] Chunked copy for {name} chunk {i+1}/{n_copy} took {human_readable_duration(time.time() - time_start)}")
-        else:
-            dst_flat[start_idx:end_idx].copy_(
-                src_flat[start_idx:end_idx],
-                non_blocking=non_blocking
-            )
-    return dst
+#         if start_idx >= total_elements:
+#             break
+#         if fbgate is not None:
+#             with fbgate.background():
+#                 time_start = time.time()
+#                 dst_flat[start_idx:end_idx].copy_(
+#                     src_flat[start_idx:end_idx],
+#                     non_blocking=non_blocking
+#                 )
+#                 logger.info(f"[Weight Loading] Chunked copy for {name} chunk {i+1}/{n_copy} took {human_readable_duration(time.time() - time_start)}")
+#         else:
+#             dst_flat[start_idx:end_idx].copy_(
+#                 src_flat[start_idx:end_idx],
+#                 non_blocking=non_blocking
+#             )
+#     return dst

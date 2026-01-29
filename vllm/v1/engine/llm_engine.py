@@ -268,9 +268,6 @@ class LLMEngine:
     def reset_prefix_cache(self, device: Optional[Device] = None):
         self.engine_core.reset_prefix_cache()
 
-    def reset_pipeline(self):
-        self.engine_core.reset_pipeline()
-
     def sleep(self, level: int = 1):
         self.engine_core.sleep(level)
 
