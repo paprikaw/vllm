@@ -217,7 +217,7 @@ class DynamicQwen3Model(Qwen3Model):
         assert deleted_start_layer >= old_start_layer and deleted_end_layer <= old_end_layer, f"layers must be in the range of start_layer and end_layer, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
         assert deleted_start_layer == old_start_layer or deleted_end_layer == old_end_layer, f"model layers must be continuous after delete layers, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
 
-        tmp_layer_dict = []
+        # tmp_layer_dict = []
         with self.model_lock:
             time_start = time.time()
             for layer_idx in range(deleted_start_layer, deleted_end_layer):
@@ -232,7 +232,7 @@ class DynamicQwen3Model(Qwen3Model):
                 #     delattr(layer, name)
                 self.layers[layer_idx] = PPMissingLayer()  # 占位符
                 logger.info(f"Layer {layer_idx} deleted successfully.")
-                tmp_layer_dict.append(layer)
+                # tmp_layer_dict.append(layer)
                 # 2. 显式从 _modules 中删除（可选但更保险）
                 # 由于 nn.ModuleList 自动注册子模块，这一步确保彻底清除
                 # prefix = f"layers.{layer_idx}"
@@ -243,15 +243,15 @@ class DynamicQwen3Model(Qwen3Model):
             logger.info(f"Deleted layers took {human_readable_duration(time.time() - time_start)}")
         
         # Actually delete the layer objects to free GPU memory
-        free_before = torch.cuda.memory_allocated()
-        for layer in tmp_layer_dict:
-            del layer
-        tmp_layer_dict.clear()
-        del tmp_layer_dict
-        gc.collect()
-        torch.cuda.empty_cache()
-        free_after = torch.cuda.memory_allocated()
-        logger.info(f"[delete_layers] Freed {(free_before - free_after) / 1024**3:.2f} GB of GPU memory for model weights")
+        # free_before = torch.cuda.memory_allocated()
+        # for layer in tmp_layer_dict:
+        #     del layer
+        # tmp_layer_dict.clear()
+        # del tmp_layer_dict
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        # free_after = torch.cuda.memory_allocated()
+        # logger.info(f"[delete_layers] Freed {(free_before - free_after) / 1024**3:.2f} GB of GPU memory for model weights")
 
         # Update the start_layer and end_layer
         if deleted_start_layer == old_start_layer:
@@ -286,8 +286,6 @@ class DynamicQwen3Model(Qwen3Model):
         assert self.sched_start_layer != -1 and self.sched_end_layer != -1, "Please set sched_layers first"
 
         # 从环境变量读取每个 layer 的超时时间（秒）
-        import os
-        layer_timeout = float(os.environ.get("VLLM_LAYER_TIMEOUT", "1.0"))
         time_start = time.time()
         with self.model_lock:
             logger.info(f"getting model lock taking {human_readable_duration(time.time() - time_start)}")
@@ -311,30 +309,10 @@ class DynamicQwen3Model(Qwen3Model):
                 #     end = 41
 
                 logger.debug(f"forwarding model with layers: {self.sched_start_layer} to {self.sched_end_layer}, total layers: {len(self.layers)}")
-                
-                # 🔴 诊断日志：检查 layer 配置一致性
-                logger.info(f"[LAYER_CHECK] model.start_layer={self.start_layer}, model.end_layer={self.end_layer}, "
-                           f"sched_start_layer={self.sched_start_layer}, sched_end_layer={self.sched_end_layer}, "
-                           f"len(self.layers)={len(self.layers)}")
-                
-                # 检查要 forward 的 layers 是否是真实的层（不是 PPMissingLayer）
-                missing_layers = []
-                for idx in range(self.sched_start_layer, self.sched_end_layer):
-                    if idx < len(self.layers):
-                        layer_obj = self.layers[idx]
-                        if isinstance(layer_obj, PPMissingLayer):
-                            missing_layers.append(idx)
-                if missing_layers:
-                    logger.error(f"[LAYER_CHECK] ERROR: Trying to forward through PPMissingLayers at indices: {missing_layers}")
-                
                 forwarding_start_time = time.time()
                 for layer_idx, layer in enumerate(self.layers[self.sched_start_layer:self.sched_end_layer], start=self.sched_start_layer):
                     layer_start_time = time.time()
                     try:
-                        # 检查是否是 PPMissingLayer
-                        if isinstance(layer, PPMissingLayer):
-                            logger.error(f"[LAYER_CHECK] CRITICAL: Forwarding through PPMissingLayer at layer_idx={layer_idx}")
-                        
                         # 使用 threading.Timer 实现超时检测
                         result = [None, None]  # 用于存储结果
                         

@@ -96,6 +96,7 @@ class MigrationConfig(BaseModel):
     alternative_configs: PPLayerConfigs
     migration_steps: list[int] = Field(default_factory=list)
     compact_steps: list[int] = Field(default_factory=list)
+    migration_mode: str = Field(default="async")  # "async" or "sync" - determines which migration method to use
     """
     Configurations that is used when switching between different pipeline configurations.
     

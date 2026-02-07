@@ -4164,6 +4164,12 @@ class DynamicConfig:
     Format: [100, 200, 300] means migrate at request 100, 200, and 300.
     If non-empty, migration is enabled."""
 
+    migration_mode: str = "async"
+    """Migration mode: 'async' or 'sync'. 
+    'async' uses change_model_configuration_by_kv_transfer_async().
+    'sync' uses change_model_configuration_by_kv_transfer_sync().
+    Default is 'async'."""
+
     rank_to_ip: Optional[dict[str, str]] = None
     """Mapping from pipeline parallel rank to reachable IP address.
     Format: {"0": "192.168.1.1", "1": "192.168.1.2", ...}

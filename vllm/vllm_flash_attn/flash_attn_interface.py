@@ -1023,7 +1023,6 @@ def flexi_direct_flash_attn_varlen_func(
     assert k_ptr_table.dtype == torch.uint64, "k_ptr_table must be uint64"
     assert v_ptr_table.dtype == torch.uint64, "v_ptr_table must be uint64"
     assert k_ptr_table.shape == v_ptr_table.shape, "k_ptr_table and v_ptr_table must have same shape"
-    
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     

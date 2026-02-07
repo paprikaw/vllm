@@ -241,7 +241,10 @@ class PtrTable:
         
         # Find valid layers and get max num_blocks
         not_valid_layers = [(i, ptr_tensors[i]) for i in range(self.num_layers) if ptr_tensors[i].numel() == 0]
-        assert not not_valid_layers
+        if not_valid_layers:
+            for i, t in not_valid_layers:
+                logger.info(f"PtrTable: Layer {i} has zero blocks in ptr_tensors, tensor: {t}")
+            raise ValueError("All layers must have non-zero blocks in ptr_tensors.")
         
         max_blocks = max(t.numel() for t in ptr_tensors)
         
@@ -281,7 +284,8 @@ class PtrTable:
         num_layers = min(self.num_layers, len(ptr_tensors))
         
         if num_layers == 0 or batch_size == 0:
-            return self.ptr_table[:num_layers, :batch_size].view(torch.uint64)
+            raise ValueError(f"No valid layers or requests to update PtrTable., num_reqs: {num_reqs}, num_layers: {num_layers}, block_table shape: {block_table.shape}, ptr_tensors length: {len(ptr_tensors)}")
+            # return self.ptr_table[:num_layers, :batch_size].view(torch.uint64)
         
         # Use cached stacked tensors if available
         # Note: commit_stacked_tensors() should be called explicitly after migration

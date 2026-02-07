@@ -158,9 +158,17 @@ class PairPipe:
                                                   rank=pair_rank,
                                                   world_size=2,
                                                   store_timeout=store_timeout_s)
+        # Separate signal group for kv_patch ready signals
+        # This avoids protocol conflict where "ack" could be received by recv_meta()
+        self.signal_group = StatelessProcessGroup.create(host=host,
+                                                  port=port+200,
+                                                  rank=pair_rank,
+                                                  world_size=2,
+                                                  store_timeout=store_timeout_s)
         # Ensure both sides are ready
         self.meta_group.barrier()
         self.data_group.barrier()
+        self.signal_group.barrier()
 
 
         self.is_use_nccl = not os.getenv("KV_SYNC_USE_CPU", "0") == "1"
@@ -179,13 +187,24 @@ class PairPipe:
         assert dtype is not None and shape is not None
         return torch.empty(shape, dtype=dtype, device=self.device)
 
-    def send_obj(self, obj: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]) -> None:
+    def send_meta(self, obj: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]) -> None:
         self.meta_group.send_obj(obj, dst=self.peer_rank)
 
-    def recv_obj(self) -> Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]:
+    def recv_meta(self) -> Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]:
         obj = self.meta_group.recv_obj(src=self.peer_rank)
         assert isinstance(obj, (KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta)), "The object should be a KVTensorMeta, KVPatchMeta, or FlexiKVTensorMeta"
         return obj
+
+    def wait_ready_for_kv_patch(self) -> None:
+        logger.info(f"[PairPipe.wait_ready_for_kv_patch] Waiting for ready signal from peer {self.peer_rank}")
+        obj = self.signal_group.recv_obj(src=self.peer_rank)
+        assert obj == "ack", f"Expected 'ack' but got {obj}"
+        return
+
+    def notify_ready_for_kv_patch(self) -> None:
+        logger.info(f"[PairPipe.notify_ready_for_kv_patch] Notifying peer {self.peer_rank} that ready")
+        self.signal_group.send_obj("ack", dst=self.peer_rank)
+        return
 
     def send_data(self, tensor: torch.Tensor, stream=None, wait_for_ack: bool = False) -> None:
         """发送数据，可以指定使用的 CUDA stream，并可选择等待接收方确认
@@ -208,29 +227,26 @@ class PairPipe:
         logger.info(f"[PairPipe.send_data] Starting send to peer {self.peer_rank}, tensor_shape={tensor.shape}, is_use_nccl={self.is_use_nccl}, wait_for_ack={wait_for_ack}")
         
         # 如果需要等待确认，先接收对方的 ACK（表示对方已经 acquire lock 并准备好接收）
-        if wait_for_ack:
-            logger.info(f"[PairPipe.send_data] Waiting for ACK from peer {self.peer_rank} before sending")
-            ack = self.meta_group.recv_obj(src=self.peer_rank)
-            assert ack == "ACK", f"Expected ACK, got {ack}"
-            logger.info(f"[PairPipe.send_data] Received ACK from peer {self.peer_rank}")
         
         if self.is_use_nccl:
             assert self._nccl is not None, "The nccl communicator should be initialized"
             dev_tensor = tensor.to(self.device)
             logger.info(f"[PairPipe.send_data] Calling NCCL send, nccl_rank={self._nccl.rank}, peer_rank={self.peer_rank}")
             # Acquire NCCL lock to prevent deadlock with Ray compiled_dag's NCCL operations
-            if self._nccl_lock is not None:
-                logger.info(f"[PairPipe.send_data] Acquiring NCCL lock for send")
-                with self._nccl_lock:
-                    self._nccl.send(dev_tensor, dst=self.peer_rank, stream=stream)
-                    # Synchronize within the lock to ensure the NCCL operation completes
-                    if stream is not None:
-                        stream.synchronize()
-                    else:
-                        torch.cuda.synchronize(device=dev_tensor.device)
-                logger.info(f"[PairPipe.send_data] NCCL lock released after send")
-            else:
-                self._nccl.send(dev_tensor, dst=self.peer_rank, stream=stream)
+            # if wait_for_ack:
+                # logger.info(f"[PairPipe.send_data] Waiting for ACK from peer {self.peer_rank} before sending")
+                # ack = self.meta_group.recv_obj(src=self.peer_rank)
+                # assert ack == "SYC+ACK", f"Expected ACK, got {ack}"
+                # self.meta_group.send_obj("ACK", dst=self.peer_rank)
+
+                # logger.info(f"[PairPipe.send_data] Received ACK from peer {self.peer_rank}")
+            self._nccl.send(dev_tensor, dst=self.peer_rank, stream=stream)
+            # Synchronize within the lock to ensure the NCCL operation completes
+            # if stream is not None:
+            #     stream.synchronize()
+            # else:
+            #     torch.cuda.synchronize(device=dev_tensor.device)
+            #     logger.info(f"[PairPipe.send_data] NCCL lock released after send")
             logger.info(f"[PairPipe.send_data] NCCL send completed")
         else:
             self.data_group.send_obj(tensor, dst=self.peer_rank)
@@ -260,35 +276,33 @@ class PairPipe:
             assert self._nccl is not None, "The nccl communicator should be initialized"
             buf = self._prepare_recv_buffer(dtype, shape)
             logger.info(f"[PairPipe.recv_data] Buffer prepared, calling NCCL recv, nccl_rank={self._nccl.rank}, peer_rank={self.peer_rank}")
-            assert self._nccl_lock is not None
             # Protocol: acquire lock BEFORE sending ACK, then recv within lock
-            if send_ack:
-                logger.info(f"[PairPipe.recv_data] Acquiring NCCL lock before sending ACK")
-                time_start = time.time()
-                with self._nccl_lock:
-                    # Send ACK while holding lock - this tells sender we're ready
-                    from vllm.v1.utils import human_readable_duration
-                    logger.info(f"[PairPipe.recv_data] Acquiring NCCL lock using {human_readable_duration(time_start - time.time())} and sending ACK to peer {self.peer_rank} (lock held)")
-                    self.meta_group.send_obj("ACK", dst=self.peer_rank)
-                    
-                    # Now recv - sender will acquire lock and send after receiving our ACK
-                    self._nccl.recv(buf, src=self.peer_rank, stream=stream)
-                    # NCCL recv is async - must synchronize within the lock
-                    if stream is not None:
-                        stream.synchronize()
-                    else:
-                        torch.cuda.synchronize(device=buf.device)
-                logger.info(f"[PairPipe.recv_data] NCCL lock released after recv")
+            logger.info(f"[PairPipe.recv_data] Acquiring NCCL lock before sending ACK")
+            time_start = time.time()
+            # Send ACK while holding lock - this tells sender we're ready
+            from vllm.v1.utils import human_readable_duration
+            logger.info(f"[PairPipe.recv_data] Acquiring NCCL lock using {human_readable_duration(time_start - time.time())} and sending ACK to peer {self.peer_rank} (lock held)")
+            # self.meta_group.send_obj("SYC+ACK", dst=self.peer_rank)
+            # ack = self.meta_group.recv_obj(src=self.peer_rank)
+            # assert ack == "ACK", f"Expected ACK, got {ack}"
+                
+            # Now recv - sender will acquire lock and send after receiving our ACK
+            self._nccl.recv(buf, src=self.peer_rank, stream=stream)
+            # NCCL recv is async - must synchronize within the lock
+            if stream is not None:
+                stream.synchronize()
             else:
-                # No ACK needed, but still use lock for safety
-                logger.info(f"[PairPipe.recv_data] Acquiring NCCL lock for recv (no ACK)")
-                with self._nccl_lock:
-                    self._nccl.recv(buf, src=self.peer_rank, stream=stream)
-                    if stream is not None:
-                        stream.synchronize()
-                    else:
-                        torch.cuda.synchronize(device=buf.device)
-                logger.info(f"[PairPipe.recv_data] NCCL lock released after recv")
+                torch.cuda.synchronize(device=buf.device)
+            logger.info(f"[PairPipe.recv_data] NCCL lock released after recv")
+            # else:
+            #     # No ACK needed, but still use lock for safety
+            #     logger.info(f"[PairPipe.recv_data] Acquiring NCCL lock for recv (no ACK)")
+            #     self._nccl.recv(buf, src=self.peer_rank, stream=stream)
+            #     if stream is not None:
+            #         stream.synchronize()
+            #     else:
+            #         torch.cuda.synchronize(device=buf.device)
+            #     logger.info(f"[PairPipe.recv_data] NCCL lock released after recv")
             logger.info(f"[PairPipe.recv_data] NCCL recv completed and synchronized")
         else:
             buf = self.data_group.recv_obj(src=self.peer_rank)
@@ -503,9 +517,9 @@ class DynamicKVSynchronizer():
     def _send_meta_to_rank(self, rank: int, meta: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]) -> None:
         pipe = self._ensure_pipe_and_buffer(rank, 'send')
         pipe = self._pair_pipes_send[rank]
-        pipe.send_obj(meta)
+        pipe.send_meta(meta)
 
-    def _send_data_to_rank(self, rank: int, kv_cache: torch.Tensor, synchronize: bool = False, wait_for_ack: bool = False) -> None:
+    def _send_data_to_rank(self, rank: int, kv_cache: torch.Tensor, synchronize: bool = True, wait_for_ack: bool = False) -> None:
         """发送 KV 数据到指定 rank
         
         Args:
@@ -538,7 +552,7 @@ class DynamicKVSynchronizer():
         """
         pipe = self._ensure_pipe_and_buffer(rank, 'recv')
         pipe = self._pair_pipes_recv[rank]
-        return self._control_adapter.validate_python(pipe.recv_obj())
+        return self._control_adapter.validate_python(pipe.recv_meta())
 
     def _recv_data_from_rank(self, rank: int,
                                dtype: torch.dtype,
@@ -597,7 +611,9 @@ class DynamicKVSynchronizer():
                 self._flexi_send_kv_tensors_sync(rank, layer_ids, start_layer_id, slot_mapping)
             else:
                 self._regular_send_kv_tensors_sync(rank, layer_ids, kv_caches, start_layer_id)
-
+            # 在这里发送是为了符合目前的协议设计
+            self.wait_for_kv_patch(rank) 
+            self.send_sync_finished_to_rank(rank, layer_ids)
         return None
 
     def _regular_send_kv_tensors_sync(self, rank: int, layer_ids: list[int], 
@@ -619,8 +635,6 @@ class DynamicKVSynchronizer():
             logger.info(f"[debug]: rank {self.rank} send kv tensor data to rank {rank} for layer {layer_id}")
             self._send_data_to_rank(rank, kv_cache, synchronize=False, wait_for_ack=True)
             self.kv_cache_transfer_in_process[rank] = True
-        # Send sync_finished signal
-        self.send_sync_finished_to_rank(rank, layer_ids)
 
     def _flexi_send_kv_tensors_sync(self, rank: int, layer_ids: list[int], 
                                      start_layer_id: int, slot_mapping: Optional[torch.Tensor]) -> None:
@@ -660,9 +674,6 @@ class DynamicKVSynchronizer():
             
             # Use send_kv_tensor_to_rank interface
             self.send_kv_tensor_to_rank(rank, kv_tensor_meta, kv_out, slot_mapping_tensor)
-        
-        # Send sync_finished signal
-        self.send_sync_finished_to_rank(rank, layer_ids)
 
 
     # ########################################## #
@@ -845,6 +856,16 @@ class DynamicKVSynchronizer():
         # Mark transfer as complete
         self.kv_cache_transfer_in_process[rank] = False
 
+    # 在发送完kv tensor之后，sender如果直接发送send，那么根据我们的parallel nccl发送机制，需要先获取nccl锁再发送。然而receiver可能还没有准备好接收，这会导致nccl锁被占用很长时间，从而导致pipeline ranks之间的通行被block
+    # 因此，这里的funtion时sender先等待receiver的ready信号，再获取nccl锁发送
+    def wait_for_kv_patch(self, rank: int) -> None:
+        send_pipe = self._ensure_pipe_and_buffer(rank, 'recv')
+        send_pipe.wait_ready_for_kv_patch()
+
+    def notify_for_kv_patch(self, rank: int) -> None:
+        recv_pipe = self._ensure_pipe_and_buffer(rank, 'send')
+        recv_pipe.notify_ready_for_kv_patch()
+
     def send_kv_tensor_to_rank(self, rank: int, kv_tensor_meta: Union[KVTensorMeta, FlexiKVTensorMeta], kv_tensor: torch.Tensor, slot_mapping: Optional[torch.Tensor] = None) -> None:
         """Send a single KV tensor to a peer rank.
 
@@ -859,12 +880,14 @@ class DynamicKVSynchronizer():
             self._send_data_to_rank(rank, kv_tensor, wait_for_ack=True)
         else:
             assert slot_mapping is not None, "slot_mapping should be provided when sending FlexiKVTensorMeta"
-            self._send_meta_to_rank(rank, kv_tensor_meta)
-            logger.info(f"[debug]: sent kv tensor meta to rank {rank}")
-            self._send_data_to_rank(rank, slot_mapping, wait_for_ack=True)
-            logger.info(f"[debug]: sent slot mapping to rank {rank}")
-            self._send_data_to_rank(rank, kv_tensor, wait_for_ack=True)
-            logger.info(f"[debug]: sent kv tensor to rank {rank}")
+            assert self._nccl_lock is not None, "NCCL lock should be provided for FlexiKVTensorMeta transfer"
+            with self._nccl_lock:
+                self._send_meta_to_rank(rank, kv_tensor_meta)
+                logger.info(f"[debug]: sent kv tensor meta to rank {rank}")
+                self._send_data_to_rank(rank, slot_mapping, wait_for_ack=True)
+                logger.info(f"[debug]: sent slot mapping to rank {rank}")
+                self._send_data_to_rank(rank, kv_tensor, wait_for_ack=True)
+                logger.info(f"[debug]: sent kv tensor to rank {rank}")
     
     def send_kv_patch_to_rank(self, 
             target_rank: int,
@@ -875,13 +898,16 @@ class DynamicKVSynchronizer():
         #     self.last_patch_ids[target_rank] = 0
         # self.last_patch_ids[target_rank] += 1
         meta, kv_payload, slot_mapping = kv_patches.meta, kv_patches.kv_payload, kv_patches.slot_mapping
-        self._send_meta_to_rank(target_rank, meta)
-        logger.info(f"sent meta to rank {target_rank}, patch id: {meta.id}, layer ids: {meta.layer_ids}, num tokens: {meta.num_tokens}")
-        self._send_data_to_rank(target_rank, slot_mapping, wait_for_ack=True)
-        logger.info(f"sent slot mapping to rank {target_rank}, patch id: {meta.id}")
-        self._send_data_to_rank(target_rank, kv_payload, wait_for_ack=True)
-        logger.info(f"sent kv payload to rank {target_rank}, patch id: {meta.id}")
-
+        time_start = time.time()
+        with self._nccl_lock:
+            time_in = time.time() 
+            self._send_meta_to_rank(target_rank, meta)
+            logger.info(f"sent meta to rank {target_rank}, patch id: {meta.id}, layer ids: {meta.layer_ids}, num tokens: {meta.num_tokens}, time taken: {time.time() - time_in}")
+            self._send_data_to_rank(target_rank, slot_mapping, wait_for_ack=True)
+            logger.info(f"sent slot mapping to rank {target_rank}, patch id: {meta.id}, time taken: {time.time() - time_in}")
+            self._send_data_to_rank(target_rank, kv_payload, wait_for_ack=True)
+            logger.info(f"sent kv payload to rank {target_rank}, patch id: {meta.id}, pyload_shape:{kv_payload.shape} time taken: {time.time() - time_in}")
+        logger.info(f"Time got lock for send kv patch: {time_in - time_start}, time within lock: {time.time() - time_in}, total time: {time.time() - time_start}")
         if meta.type == "kv_patch_finished":
             self.kv_cache_transfer_in_process[target_rank] = False
 
@@ -1078,25 +1104,34 @@ class DynamicKVSynchronizer():
     def recv_controller(self, rank: int) -> Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]:
         pipe = self._ensure_pipe_and_buffer(rank, 'recv')
         pipe = self._pair_pipes_recv[rank]
-        meta_obj = pipe.recv_obj()
+        meta_obj = pipe.recv_meta()
         return self._control_adapter.validate_python(meta_obj)
 
     def recv_kv_tensor(self,from_rank: int, meta: Union[KVTensorMeta, FlexiKVTensorMeta]) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if isinstance(meta, FlexiKVTensorMeta):
-            slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape, send_ack=True)
-            kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape, send_ack=True)
+            time_start = time.time()
+            with self._nccl_lock:
+                logger.info(f"rev tensor getting lock took{time.time() - time_start} seconds")
+                slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape, send_ack=True)
+                logger.info(f"rev tensor received slot mapping took{time.time() - time_start} seconds")
+                kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape, send_ack=True)
+                logger.info(f"rev tensor received kv payload took{time.time() - time_start} seconds")
             assert kv_payload.dim() == 4 and kv_payload.size(0) == 2 
             return slot_mapping, kv_payload
         else:
-            kv_payload = self._recv_data_from_rank(from_rank, meta.dtype, meta.shape, send_ack=True)
+            with self._nccl_lock:
+                kv_payload = self._recv_data_from_rank(from_rank, meta.dtype, meta.shape, send_ack=True)
             assert kv_payload.dim() == 5 and kv_payload.size(0) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
             return kv_payload
 
     def recv_kv_patch(self, from_rank: int,meta: KVPatchMeta) -> Tuple[torch.Tensor, torch.Tensor]:
         is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
-        slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape, True)
-        kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape, True)
-        
+        time_start = time.time()
+        with self._nccl_lock:
+            time_in = time.time()
+            slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape, True)
+            kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape, True)
+        logger.info(f"Time got lock for recv kv patch: {time_in - time_start}, time within lock: {time.time() - time_in}, total time: {time.time() - time_start}") 
         # For kv_patch_finished with empty data, skip the dimension assertion
         if meta.type == 'kv_patch_finished' and kv_payload.numel() == 0:
             logger.info(f"[recv_kv_patch]: received empty kv_patch_finished from rank {from_rank}")
@@ -1132,8 +1167,6 @@ class DynamicKVSynchronizer():
         # assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
         if slot_mapping.size(0) != meta.num_tokens:
             logger.info(f"Warning: slot_mapping size {slot_mapping.size(0)} does not match num_tokens {meta.num_tokens}, proceed anyway.")
-        # NOTE: Removed torch.cuda.synchronize() here to avoid blocking the entire CUDA context
-        # which would deadlock with Pipeline Parallelism NCCL communication.
         # The operations below are executed in the default stream and will be properly ordered.
         with self.device:
             logger.info(f"[listen loop] apply kv patch to kv cache on device {self.device}")

@@ -26,6 +26,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.dynamic_utils import ForegroundBackgroundGate
 from vllm.sampling_params import SamplingType
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
+from vllm.v1.attention.backends.flash_attn import CommonAttentionMetadata, FlashAttentionMetadata
 from vllm.v1.utils import dynamic_bind_kv_cache, dynamic_flexi_bind_kv_cache, human_readable_size, human_readable_duration
 
 from vllm.sequence import IntermediateTensors
@@ -35,7 +36,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheSpec, KVCacheConfig,
                                         SlidingWindowSpec)
 from vllm.v1.utils import extract_layer_index
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner, SpecDecodeMetadata
 from vllm.v1.utils import dynamic_bind_kv_cache, dynamic_bind_single_kv_tensor
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput, EMPTY_MODEL_RUNNER_OUTPUT
@@ -228,13 +229,230 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 raise
             return result
 
+    def _dynamic_prepare_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[dict[str, FlashAttentionMetadata], torch.Tensor,
+               Optional[SpecDecodeMetadata], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        assert total_num_scheduled_tokens > 0
+        num_reqs = self.input_batch.num_reqs
+        assert num_reqs > 0
+
+        # OPTIMIZATION: Start copying the block table first.
+        # This way, we can overlap the copy with the following CPU operations.
+        self.input_batch.block_table.commit(num_reqs)
+        # Update PtrTables for flexi_direct after block_table has been committed
+        # This runs asynchronously on GPU using efficient index_select operations
+        k_ptr_tables_tensor = None
+        v_ptr_tables_tensor = None
+        if self.k_ptr_tensors and self.v_ptr_tensors:
+            time_start = time.time()
+            num_reqs = self.input_batch.num_reqs
+            
+            # PtrTable should already be initialized via commit_ptr_tables()
+            # called during dynamic_initialize_kv_cache_flexi or finish_migration
+            if self.k_ptr_table is None or self.v_ptr_table is None:
+                raise RuntimeError(
+                    f"PtrTable not initialized. "
+                    "Ensure commit_ptr_tables() is called after KV cache initialization."
+                )
+            
+            # Use the committed PtrTable's num_layers, NOT len(k_ptr_tensors)
+            # During migration, k_ptr_tensors may have been extended with new layer slots,
+            # but only the committed layers should participate in inference.
+            # The new layers will become active after commit_ptr_tables() is called
+            # at the end of migration (in finish_migration).
+            
+            # Get the block_table from input_batch (it's already on GPU after commit)
+            block_table = self.input_batch.block_table[0].get_device_tensor()
+            
+            time_start = time.time()
+            # Update ptr_tables using efficient GPU operations
+            k_ptr_tables_tensor = self.k_ptr_table.update_from_block_table_and_ptr_tensors(
+                block_table, self.k_ptr_tensors, num_reqs)
+            v_ptr_tables_tensor = self.v_ptr_table.update_from_block_table_and_ptr_tensors(block_table, self.v_ptr_tensors, num_reqs)
+            logger.info(f"kv ptr_tables update took {human_readable_duration(time.time() - time_start)}")
+        # Get the number of scheduled tokens for each request.
+        req_ids = self.input_batch.req_ids
+        tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+        num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+        max_num_scheduled_tokens = max(tokens)
+
+        # Get request indices.
+        # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+        req_indices = np.repeat(self.arange_np[:num_reqs],
+                                num_scheduled_tokens)
+
+        # Get batched arange.
+        # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        # Equivalent to but faster than:
+        # np.concatenate([np.arange(n) for n in num_scheduled_tokens])
+        # Step 1. [2, 5, 3] -> [2, 7, 10]
+        cu_num_tokens = np.cumsum(num_scheduled_tokens)
+        # Step 2. [2, 7, 10] -> [0, 0, 2, 2, 2, 2, 2, 7, 7, 7]
+        cumsums_offsets = np.repeat(cu_num_tokens - num_scheduled_tokens,
+                                    num_scheduled_tokens)
+        # Step 3. [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        arange = self.arange_np[:total_num_scheduled_tokens] - cumsums_offsets
+
+        # Get positions.
+        positions_np = self.positions_np[:total_num_scheduled_tokens]
+        np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
+               arange,
+               out=positions_np)
+
+        # Calculate M-RoPE positions.
+        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+        if self.uses_mrope:
+            self._calc_mrope_positions(scheduler_output)
+
+        # Get token indices.
+        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
+        # where M is the max_model_len.
+        token_indices = (positions_np +
+                         req_indices * self.input_batch.token_ids_cpu.shape[1])
+
+        # NOTE(woosuk): We use torch.index_select instead of np.take here
+        # because torch.index_select is much faster than np.take for large
+        # tensors.
+        torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
+                           0,
+                           torch.from_numpy(token_indices),
+                           out=self.input_ids_cpu[:total_num_scheduled_tokens])
+
+        # Calculate the slot mapping for each KV cache group.
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(
+                self.kv_cache_config.kv_cache_groups):
+            block_size = kv_cache_group_spec.kv_cache_spec.block_size
+            block_table: BlockTable = self.input_batch.block_table[
+                kv_cache_group_id]
+            # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+            # block_table_indices: -> [0, 0, K, K, K + 1, K + 1, K + 2, 2 * K, 2 * K, 2 * K + 1]
+            # where K is the max_num_blocks_per_req and the block size is 2.
+            # NOTE(woosuk): We can't simply use `token_indices // block_size`
+            # here because M (max_model_len) is not necessarily divisible by
+            # block_size.
+            block_table_indices = (
+                req_indices * block_table.max_num_blocks_per_req +
+                positions_np // block_size)
+            block_table_cpu = block_table.get_cpu_tensor()
+            block_numbers = block_table_cpu.flatten(
+            )[block_table_indices].numpy()
+            block_offsets = positions_np % block_size
+
+            np.add(
+                block_numbers * block_size,
+                block_offsets,
+                out=block_table.slot_mapping_np[:total_num_scheduled_tokens])
+            # logger.info(f"block_table_indices: {block_table_indices}")
+            # logger.info(f"block_table_cpu: {block_table_cpu.flatten()}")
+            # logger.info(f"block_numbers: {block_numbers}")
+            # logger.info(f"block_offsets: {block_offsets}")
+            # logger.info(f"block_table.slot_mapping_np: {block_table.slot_mapping_np[:total_num_scheduled_tokens]}")
+
+        # Prepare the attention metadata.
+        self.query_start_loc_np[0] = 0
+        self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
+
+        self.seq_lens_np[:num_reqs] = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+            num_scheduled_tokens)
+
+        # Copy the tensors to the GPU.
+        self.input_ids[:total_num_scheduled_tokens].copy_(
+            self.input_ids_cpu[:total_num_scheduled_tokens], non_blocking=True)
+        if self.uses_mrope:
+            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+            self.mrope_positions[:, :total_num_scheduled_tokens].copy_(
+                self.mrope_positions_cpu[:, :total_num_scheduled_tokens],
+                non_blocking=True)
+        else:
+            # Common case (1D positions)
+            self.positions[:total_num_scheduled_tokens].copy_(
+                self.positions_cpu[:total_num_scheduled_tokens],
+                non_blocking=True)
+
+        self.query_start_loc[:num_reqs + 1].copy_(
+            self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
+        self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
+                                       non_blocking=True)
+
+        # Fill unused with -1. Needed for reshape_and_cache
+        self.seq_lens[num_reqs:].fill_(0)
+        self.query_start_loc[num_reqs + 1:].fill_(-1)
+
+        query_start_loc = self.query_start_loc[:num_reqs + 1]
+        seq_lens = self.seq_lens[:num_reqs]
+
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc, seq_lens=seq_lens)
+
+        attn_metadata: dict[str, FlashAttentionMetadata] = {}
+        # Prepare the attention metadata for each KV cache group and make layers
+        # in the same group share the same metadata.
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(
+                self.kv_cache_config.kv_cache_groups):
+
+            # Prepare for cascade attention if enabled & beneficial.
+            common_prefix_len = 0
+            if self.cascade_attn_enabled:
+                common_prefix_len = self._compute_cascade_attn_prefix_len(
+                    num_scheduled_tokens,
+                    scheduler_output.
+                    num_common_prefix_blocks[kv_cache_group_id],
+                    kv_cache_group_spec.kv_cache_spec,
+                    self.attn_metadata_builders[kv_cache_group_id],
+                )
+
+            attn_metadata_i = (
+                self.attn_metadata_builders[kv_cache_group_id].build(
+                    num_reqs=num_reqs,
+                    num_actual_tokens=total_num_scheduled_tokens,
+                    max_query_len=max_num_scheduled_tokens,
+                    common_prefix_len=common_prefix_len,
+                    common_attn_metadata=common_attn_metadata))
+            for layer_name in kv_cache_group_spec.layer_names:
+                attn_metadata[layer_name] = attn_metadata_i
+
+        use_spec_decode = len(
+            scheduler_output.scheduled_spec_decode_tokens) > 0
+        if not use_spec_decode:
+            # NOTE(woosuk): Due to chunked prefills, the batch may contain
+            # partial requests. While we should not sample any token
+            # from these partial requests, we do so for simplicity.
+            # We will ignore the sampled tokens from the partial requests.
+            # TODO: Support prompt logprobs.
+            logits_indices = query_start_loc[1:] - 1
+            spec_decode_metadata = None
+        else:
+            # Get the number of draft tokens for each request.
+            # Iterate over the dictionary rather than all requests since not all
+            # requests have draft tokens.
+            num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
+            for req_id, draft_token_ids in (
+                    scheduler_output.scheduled_spec_decode_tokens.items()):
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                num_draft_tokens[req_idx] = len(draft_token_ids)
+
+            spec_decode_metadata = self._calc_spec_decode_metadata(
+                num_draft_tokens, cu_num_tokens)
+            logits_indices = spec_decode_metadata.logits_indices
+
+        # Hot-Swap lora model
+        if self.lora_config:
+            self.set_active_loras(self.input_batch, num_scheduled_tokens)
+
+        return attn_metadata, logits_indices, spec_decode_metadata, k_ptr_tables_tensor, v_ptr_tables_tensor
+
     @torch.inference_mode()
     def _execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
-        start_time = time.time()
+
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
@@ -244,9 +462,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
             return self.kv_connector_no_forward(scheduler_output)
         time_start_prepare = time.time()
         # Prepare the decoder inputs.
-        attn_metadata, logits_indices, spec_decode_metadata = (
-            self._prepare_inputs(scheduler_output))
-        logger.info(f"prepare_inputs took {human_readable_duration(time.time() - time_start_prepare)}")
+        attn_metadata, logits_indices, spec_decode_metadata, k_ptr_tables_tensor, v_ptr_tables_tensor = (
+            self._dynamic_prepare_inputs(scheduler_output))
         
         # DEBUG: Log critical batch state for cross-node synchronization debugging
         pp_rank = get_pp_group().rank
@@ -274,44 +491,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
         num_computed_tokens_first5 = self.input_batch.num_computed_tokens_cpu[:min(5, num_reqs)].tolist()
         scheduled_tokens_per_req = [scheduler_output.num_scheduled_tokens.get(req_id, 0) 
                                     for req_id in batch_req_ids[:5]]
-        logger.info(f"[PP_BATCH] rank={pp_rank} step_id={step_id} batch_num_reqs={num_reqs} "
-                   f"sched_num_reqs={len(all_sched_req_ids)} "
-                   f"batch_req_ids_first5={[r[-8:] for r in batch_req_ids[:5]]} "
-                   f"num_computed_first5={num_computed_tokens_first5} "
-                   f"scheduled_tokens_first5={scheduled_tokens_per_req}")
-        
-        # Update PtrTables for flexi_direct after block_table has been committed
-        # This runs asynchronously on GPU using efficient index_select operations
-        k_ptr_tables_tensor = None
-        v_ptr_tables_tensor = None
-        if self.k_ptr_tensors and self.v_ptr_tensors:
-            num_reqs = self.input_batch.num_reqs
-            
-            # PtrTable should already be initialized via commit_ptr_tables()
-            # called during dynamic_initialize_kv_cache_flexi or finish_migration
-            if self.k_ptr_table is None:
-                raise RuntimeError(
-                    f"PtrTable not initialized. "
-                    "Ensure commit_ptr_tables() is called after KV cache initialization."
-                )
-            
-            # Use the committed PtrTable's num_layers, NOT len(k_ptr_tensors)
-            # During migration, k_ptr_tensors may have been extended with new layer slots,
-            # but only the committed layers should participate in inference.
-            # The new layers will become active after commit_ptr_tables() is called
-            # at the end of migration (in finish_migration).
-            
-            # Get the block_table from input_batch (it's already on GPU after commit)
-            block_table = self.input_batch.block_table[0].get_device_tensor()
-            
-            time_start = time.time()
-            # Update ptr_tables using efficient GPU operations
-            k_ptr_tables_tensor = self.k_ptr_table.update_from_block_table_and_ptr_tensors(
-                block_table, self.k_ptr_tensors, num_reqs)
-            v_ptr_tables_tensor = self.v_ptr_table.update_from_block_table_and_ptr_tensors(
-                block_table, self.v_ptr_tensors, num_reqs)
-            logger.info(f"kv ptr_tables update took {human_readable_duration(time.time() - time_start)}")
-
+        # logger.info(f"[PP_BATCH] rank={pp_rank} step_id={step_id} batch_num_reqs={num_reqs} "
+        #            f"sched_num_reqs={len(all_sched_req_ids)} "
+        #            f"batch_req_ids_first5={[r[-8:] for r in batch_req_ids[:5]]} "
+        #            f"num_computed_first5={num_computed_tokens_first5} "
+        #            f"scheduled_tokens_first5={scheduled_tokens_per_req}")
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if (self.use_cuda_graph
@@ -370,14 +554,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
-            # [SYNC_DEBUG] Before sync_and_slice_intermediate_tensors (Rank 1 receives from Rank 0)
-            logger.info(f"[SYNC_DEBUG] before sync_and_slice (waiting for intermediate_tensors)")
-            _sync_start_recv = time.time()
-            self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
-            logger.info(f"[SYNC_DEBUG] after sync before sync_and_slice, took {(time.time() - _sync_start_recv)*1000:.2f}ms")
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True)
-            self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
         # Get start_layer for computing local layer index in flexi_direct
@@ -392,26 +570,17 @@ class DynamicGPUModelRunner(GPUModelRunner):
                                  v_ptr_tables=v_ptr_tables_tensor,
                                  start_layer=start_layer):
             self.maybe_setup_kv_connector(scheduler_output)
-            self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
             try:
-                model_forward_start = time.time()
                 model_output = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
                 )
-                model_forward_end = time.time()
-                # [SYNC_DEBUG] After model forward
-                logger.info(f"[SYNC_DEBUG] before sync after model forward")
-                _sync_start_mf = time.time()
-                self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
-                logger.info(f"[SYNC_DEBUG] after sync after model forward, took {(time.time() - _sync_start_mf)*1000:.2f}ms")
             except Exception as e:
                 time.sleep(2)
                 logger.info(f"Exception during model forward: {e}")
                 raise e
-
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
@@ -437,11 +606,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         else:
             sample_hidden_states = hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
-            # [SYNC_DEBUG] After compute_logits
-            logger.info(f"[SYNC_DEBUG] before sync after compute_logits")
-            _sync_start_cl = time.time()
-            self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
-            logger.info(f"[SYNC_DEBUG] after sync after compute_logits, took {(time.time() - _sync_start_cl)*1000:.2f}ms")
+            #  After compute_logits
         if broadcast_pp_output:
             model_output_broadcast_data = {
                 "logits": logits.contiguous(),
@@ -462,11 +627,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
-            # [SYNC_DEBUG] After sampler
-            logger.info(f"[SYNC_DEBUG] before sync after sampler")
-            _sync_start_sampler = time.time()
-            self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
-            logger.info(f"[SYNC_DEBUG] after sync after sampler, took {(time.time() - _sync_start_sampler)*1000:.2f}ms")
         else:
             # When indexing with a tensor (bonus_logits_indices), PyTorch
             # creates a new tensor with separate storage from the original
@@ -514,43 +674,23 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # Move as many CPU operations as possible before this sync point.
         
         # DEBUG: Add synchronize points to find the real blocking location
-        import time as _time
-        logger.info(f"[SYNC_DEBUG] before cuda.synchronize() #1")
-        _sync_start = _time.time()
-        self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
-        logger.info(f"[SYNC_DEBUG] after cuda.synchronize() #1, took {(_time.time() - _sync_start)*1000:.2f}ms")
-        
         logprobs_tensors = sampler_output.logprobs_tensors
-        logger.info(f"[SYNC_DEBUG] before logprobs_tensors.tolists()")
-        _tolist_start = _time.time()
         logprobs_lists = logprobs_tensors.tolists() \
             if logprobs_tensors is not None else None
-        logger.info(f"[SYNC_DEBUG] after logprobs_tensors.tolists(), took {(_time.time() - _tolist_start)*1000:.2f}ms")
 
         # Compute prompt logprobs if needed.
-        logger.info(f"[SYNC_DEBUG] before _get_prompt_logprobs_dict()")
-        _prompt_start = _time.time()
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
             scheduler_output,
         )
-        logger.info(f"[SYNC_DEBUG] after _get_prompt_logprobs_dict(), took {(_time.time() - _prompt_start)*1000:.2f}ms")
         
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
         max_gen_len = sampled_token_ids.shape[-1]
         
-        logger.info(f"[SYNC_DEBUG] before cuda.synchronize() #2")
-        _sync_start2 = _time.time()
-        self.stream_synchronize()  # Use stream-specific sync to avoid deadlock with _listen_loop
-        logger.info(f"[SYNC_DEBUG] after cuda.synchronize() #2, took {(_time.time() - _sync_start2)*1000:.2f}ms")
-        
-        logger.info(f"[SYNC_DEBUG] before sampled_token_ids.tolist(), shape={sampled_token_ids.shape}")
-        _tolist_start2 = _time.time()
         if max_gen_len == 1:
             # No spec decode tokens.
             valid_sampled_token_ids = sampled_token_ids.tolist()
-            logger.info(f"[SYNC_DEBUG] after sampled_token_ids.tolist(), took {(_time.time() - _tolist_start2)*1000:.2f}ms")
         else:
             # Includes spec decode tokens.
             valid_sampled_token_ids = self.rejection_sampler.parse_output(

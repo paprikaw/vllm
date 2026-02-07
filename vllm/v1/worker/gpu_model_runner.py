@@ -516,7 +516,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit(num_reqs)
-
+        # Update PtrTables for flexi_direct after block_table has been committed
+        # This runs asynchronously on GPU using efficient index_select operations
+        k_ptr_tables_tensor = None
+        v_ptr_tables_tensor = None
+        if self.k_ptr_tensors and self.v_ptr_tensors:
+            num_reqs = self.input_batch.num_reqs
+            
+            # PtrTable should already be initialized via commit_ptr_tables()
+            # called during dynamic_initialize_kv_cache_flexi or finish_migration
+            if self.k_ptr_table is None or self.v_ptr_table is None:
+                raise RuntimeError(
+                    f"PtrTable not initialized. "
+                    "Ensure commit_ptr_tables() is called after KV cache initialization."
+                )
+            
+            # Use the committed PtrTable's num_layers, NOT len(k_ptr_tensors)
+            # During migration, k_ptr_tensors may have been extended with new layer slots,
+            # but only the committed layers should participate in inference.
+            # The new layers will become active after commit_ptr_tables() is called
+            # at the end of migration (in finish_migration).
+            
+            # Get the block_table from input_batch (it's already on GPU after commit)
+            block_table = self.input_batch.block_table[0].get_device_tensor()
+            
+            time_start = time.time()
+            # Update ptr_tables using efficient GPU operations
+            k_ptr_tables_tensor = self.k_ptr_table.update_from_block_table_and_ptr_tensors(
+                block_table, self.k_ptr_tensors, num_reqs)
+            v_ptr_tables_tensor = self.v_ptr_table.update_from_block_table_and_ptr_tensors(block_table, self.v_ptr_tensors, num_reqs)
+            logger.info(f"kv ptr_tables update took {human_readable_duration(time.time() - time_start)}")
         # Get the number of scheduled tokens for each request.
         req_ids = self.input_batch.req_ids
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]

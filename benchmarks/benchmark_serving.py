@@ -166,6 +166,7 @@ def calculate_metrics(
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
     metrics_file_name: Optional[str] = None,
+    repetition_index: Optional[int] = None,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -233,13 +234,26 @@ def calculate_metrics(
             for ts in timestamps
         ]
 
-        # Overwrite to keep each metrics file phase-pure and avoid
-        # duplicate headers across multiple calculate_metrics() calls.
-        with open(file_name, "w", newline='') as f:
+        # When repetition_index is provided:
+        #   - repetition_index == 1: write mode with header (first repetition)
+        #   - repetition_index > 1: append mode without header
+        # When repetition_index is None: write mode with header (single run)
+        if repetition_index is not None and repetition_index > 1:
+            # Append mode for subsequent repetitions
+            write_mode = "a"
+            write_header = False
+        else:
+            # Write mode for first repetition or single run
+            write_mode = "w"
+            write_header = True
+        
+        with open(file_name, write_mode, newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp", "datetime", "tpots", "ttfts", "e2els"])
+            if write_header:
+                writer.writerow(["timestamp", "datetime", "tpots", "ttfts", "e2els", "repetition"])
+            rep_val = repetition_index if repetition_index is not None else 1
             for ts, dt, t, tf, e in zip(timestamps, datetimes, tpots, ttfts, e2els):
-                writer.writerow([ts, dt, t, tf, e])
+                writer.writerow([ts, dt, t, tf, e, rep_val])
     if goodput_config_dict:
         valid_metrics = []
         slo_values = []
@@ -517,8 +531,8 @@ async def run_repetition_benchmark(
         print(f"###################### REPETITION {rep}/{repetition} ######################")
         print(f"{'#' * 70}")
         
-        # Run single benchmark (add base_url to kwargs for run_multi_stage_benchmark)
-        kwargs_with_base_url = {**kwargs, 'base_url': base_url}
+        # Run single benchmark (add base_url and repetition_index to kwargs for run_multi_stage_benchmark)
+        kwargs_with_base_url = {**kwargs, 'base_url': base_url, 'repetition_index': rep}
         metrics, output_lens = await run_single_benchmark_func(**kwargs_with_base_url)
         all_metrics_list.append(metrics)
         all_output_lens.extend(output_lens)
@@ -644,9 +658,13 @@ async def run_multi_stage_benchmark(
     goodput_config_dict: dict[str, float],
     print_outputs: bool,
     warmup_stage_count: int = 0,
+    repetition_index: Optional[int] = None,
 ):
     """
     执行多阶段基准测试，每个阶段使用不同的请求速率和请求数量
+    
+    Args:
+        repetition_index: Current repetition number (1-indexed). If None, treated as single run.
     """
     
     # Execute stages sequentially: wait warmup fully completes before main.
@@ -790,6 +808,7 @@ async def run_multi_stage_benchmark(
         # Write request_metrics for full run if warmup is disabled.
         # Otherwise, warmup/main are written to separate phase files.
         metrics_file_name=full_run_metrics_file,
+        repetition_index=repetition_index,
     )
         
     def _print_latency_block(m: BenchmarkMetrics) -> None:
@@ -873,6 +892,7 @@ async def run_multi_stage_benchmark(
             selected_percentiles=selected_percentiles,
             goodput_config_dict=goodput_config_dict,
             metrics_file_name=warmup_file,
+            repetition_index=repetition_index,
         )
         main_metrics, _ = calculate_metrics(
             input_requests=main_inputs,
@@ -883,6 +903,7 @@ async def run_multi_stage_benchmark(
             selected_percentiles=selected_percentiles,
             goodput_config_dict=goodput_config_dict,
             metrics_file_name=main_file,
+            repetition_index=repetition_index,
         )
 
         def _print_block(title: str, m: BenchmarkMetrics, dur: float):

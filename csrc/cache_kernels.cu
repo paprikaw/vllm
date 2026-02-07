@@ -586,12 +586,6 @@ void flexi_reshape_and_cache_flash(
     torch::Tensor& v_scale) {
 
   int num_tokens = slot_mapping.size(0);
-  
-  // Early return if no tokens to process - avoid invalid CUDA kernel configuration
-  if (num_tokens == 0) {
-    return;
-  }
-  
   int num_heads = key.size(1);
   int head_size = key.size(2);
   int block_size = key_cache_meta.size(0);
@@ -638,12 +632,6 @@ void flexi_gather_pages(
     int64_t block_size) {
 
   int num_tokens = slot_mapping.size(0);
-  
-  // Early return if no tokens to process - avoid invalid CUDA kernel configuration
-  if (num_tokens == 0) {
-    return;
-  }
-  
   int num_heads = key_out.size(1);
   int head_size = key_out.size(2);
 

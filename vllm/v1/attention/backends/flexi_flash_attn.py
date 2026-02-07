@@ -267,8 +267,9 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
                             alibi_slopes=self.alibi_slopes,
                             out=output[:num_actual_tokens],
                         )
-                
+
                 if not use_flexi_direct:
+                    assert False
                     # Fallback to original flexi_flash_attn_varlen_func
                     flexi_flash_attn_varlen_func(
                         q=query[:num_actual_tokens],

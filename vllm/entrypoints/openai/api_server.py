@@ -180,6 +180,7 @@ async def build_async_engine_client_from_engine_args(
         dynamic_config = MigrationConfig(
             alternative_configs=dc.alternative_configs,
             migration_steps=dc.migration_steps,
+            migration_mode=dc.migration_mode,
         )
     else:
         # Fallback: load from deployment_config_path file

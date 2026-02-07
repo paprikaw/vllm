@@ -751,7 +751,7 @@ class DynamicEngineCore(EngineCore):
             return should_sync
 
         def sync_by_checking_leftover_tokens() -> bool:
-            token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 2000))
+            token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 500))
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor) 
             assert isinstance(self.scheduler, DynamicScheduler)
             receiver_list = list(adding_per_rank.keys())
@@ -1056,9 +1056,7 @@ class DynamicEngineCore(EngineCore):
         logger.info("set_pp_config: Signaling migration_thread to reset request counter")
         # Also clear the request_num_queue to discard any pending request counts
         # from the previous repetition
-        assert self.request_num_queue.empty()
         self._migration_reset_event.set()
-        
         logger.info(f"set_pp_config completed, now at {self.cur_pp_layer_config}")
         return outputs
 
@@ -1568,9 +1566,6 @@ class DynamicEngineCoreProc(DynamicEngineCore):
 
         # --- sliding window settings ---
         WINDOW = 50 
-        UP_THRESHOLD = 0.8   # 只有窗口满且均值>0.6才上调
-        DOWN_THRESHOLD = 0.5 # 滞回：窗口满且均值<0.5才下调
-        kv_utilizations = deque(maxlen=WINDOW)
 
         num_of_requests = 0 
         # Start from 0: alternative_configs now represents migration targets only
@@ -1602,7 +1597,14 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                 cur_config += 1
                 if cur_config in alternative_configs:
                     logger.info(f"change model configuration to config index {cur_config}")
-                    self.change_model_configuration_by_kv_transfer_async(alternative_configs[cur_config])
+                    # Use migration_mode to determine which method to call
+                    migration_mode = self.dynamic_config.migration_mode
+                    if migration_mode == "sync":
+                        logger.info(f"Using sync migration mode")
+                        self.change_model_configuration_by_kv_transfer_sync(alternative_configs[cur_config])
+                    else:
+                        logger.info(f"Using async migration mode")
+                        self.change_model_configuration_by_kv_transfer_async(alternative_configs[cur_config])
                 else:
                     logger.warning(f"migration_thread: cur_config {cur_config} not found in alternative_configs, skipping migration")
                 # outputs = self.migrate_layer_v1(1, 0, 24)

@@ -23,6 +23,18 @@ class MetricType(Enum):
     SPECIAL = "special"           # Custom processing (e.g., migration times)
 
 
+class MetricCategory(Enum):
+    """Category for grouping metrics in reports."""
+    TIMELINE = "timeline"         # Timeline metrics for migration/KV operations
+    MODEL_LOCK = "model_lock"     # Lock acquisition metrics
+    FORWARDING = "forwarding"     # Model forwarding metrics  
+    COMMUNICATION = "communication"  # Inter-node communication
+    MEMORY = "memory"             # Memory allocation metrics
+    COMPILED_DAG = "compiled_dag" # Ray CompiledDAG metrics
+    OTHER = "other"               # Uncategorized metrics
+    STOP_TIME = "stop_time"               # Stop time metrics
+
+
 @dataclass
 class MetricConfig:
     """Configuration for a single metric."""
@@ -35,58 +47,135 @@ class MetricConfig:
     show_in_report: bool = True
     custom_processor: Optional[Callable] = None  # Custom processing function
     description: str = ""
+    category: MetricCategory = MetricCategory.OTHER  # Category for grouping
 
 
 # ============================================================================
 # METRIC DEFINITIONS - ADD NEW METRICS HERE
 # ============================================================================
 METRIC_CONFIGS = [
-    # Migration and Engine Metrics
+    # =========================================================================
+    # TIMELINE METRICS - Migration and KV Cache Operations
+    # =========================================================================
     MetricConfig(
-        name="migration_process",
-        display_name="Migration Process Times",
+        name="timeline_migration_total",
+        display_name="[Timeline] Migration Process Total Time",
         log_pattern=r'\[timeline\]: migration process time taken: ([0-9.eE+-]+\s*[a-zµ]+)',
         metric_type=MetricType.SPECIAL,
-        description="Time taken for complete migration process"
+        category=MetricCategory.TIMELINE,
+        description="Total time for entire migration process"
     ),
     MetricConfig(
-        name="engine_locking",
-        display_name="Engine Locking Times (During Migration)",
+        name="timeline_compact_kv_total",
+        display_name="[Timeline] Compact KV Cache Total Time",
+        log_pattern=r'\[timeline\]: compact kv cache total time taken: ([0-9.eE+-]+\s*[a-zµ]+)',
+        metric_type=MetricType.SPECIAL,
+        category=MetricCategory.TIMELINE,
+        description="Total time for KV cache compaction"
+    ),
+    MetricConfig(
+        name="timeline_resize_kv_total",
+        display_name="[Timeline] Total Resize KV Cache Time",
+        log_pattern=r'\[timeline\]: total resize kv cache time taken: ([0-9.eE+-]+\s*[a-zµ]+)',
+        category=MetricCategory.TIMELINE,
+        description="Total time for resizing KV cache"
+    ),
+    MetricConfig(
+        name="timeline_weight_loading",
+        display_name="[Timeline] After Weight Loading",
+        log_pattern=r'\[timeline\]: after weight loading.*?taken: ([0-9.eE+-]+\s*[a-zµ]+)',
+        category=MetricCategory.TIMELINE,
+        description="Time after weight loading"
+    ),
+        MetricConfig(
+        name="timeline_bind_kv_cache_total",
+        display_name="[Timeline] Bind KV Cache Total Time",
+        log_pattern=r'\[timeline\]: bind kv cache time taken: ([0-9.eE+-]+\s*[a-zµ]+)',
+        metric_type=MetricType.SPECIAL,
+        category=MetricCategory.TIMELINE,
+        description="Total time for binding KV cache"
+    ),
+    MetricConfig(
+        name="timeline_receive_kv_tensor_total",
+        display_name="[Timeline] Receive KV Tensor Total Time",
+        log_pattern=r'\[timeline\]: receive kv tensor finished, time taken ([0-9.eE+-]+\s*[a-zµ]+)',
+        metric_type=MetricType.SPECIAL,
+        category=MetricCategory.TIMELINE,
+        description="Total time for receiving KV tensor"
+    ),
+
+    MetricConfig(
+        name="timeline_notify_kv_patches",
+        display_name="[Timeline] Notify For KV Patches",
+        log_pattern=r'\[timeline\]: notify for kv patches took ([0-9.eE+-]+\s*[a-zµ]+)',
+        metric_type=MetricType.SPECIAL,
+        category=MetricCategory.TIMELINE,
+        description="Time to notify for KV patches"
+    ),
+    MetricConfig(
+        name="timeline_wait_kv_patch",
+        display_name="[Timeline] Wait For KV Patch Preparation",
+        log_pattern=r'\[timeline\]: wait for kv patch preparation take ([0-9.eE+-]+\s*[a-zµ]+)',
+        metric_type=MetricType.SPECIAL,
+        category=MetricCategory.TIMELINE,
+        description="Time waiting for KV patch preparation"
+    ),
+    MetricConfig(
+        name="timeline_receive_kv_patches",
+        display_name="[Timeline] After Receiving KV Cache Patches",
+        log_pattern=r'\[timeline\]: after listen to kv cache patches.*?taken: ([0-9.eE+-]+\s*[a-zµ]+)',
+        metric_type=MetricType.SPECIAL,
+        category=MetricCategory.TIMELINE,
+        description="Time after listening to KV cache patches"
+    ),
+    MetricConfig(
+        name="timeline_remove_layers",
+        display_name="[Timeline] After Remove Layers",
+        log_pattern=r'\[timeline\]: after remove layers.*?taken: ([0-9.eE+-]+\s*[a-zµ]+)',
+        category=MetricCategory.TIMELINE,
+        description="Time after removing layers"
+    ),
+
+    MetricConfig(
+        name="timeline_add_layers_in_lock",
+        display_name="[Timeline] Add Layers Within Lock Time",
+        log_pattern=r'\[timeline\]: time within lock when add layers time taken: ([0-9.eE+-]+\s*[a-zµ]+)',
+        category=MetricCategory.STOP_TIME,
+        description="Time spent within lock when adding layers"
+    ),
+    MetricConfig(
+        name="timeline_engine_locking",
+        display_name="[Timeline] Engine Locking Time",
         log_pattern=r'\[timeline\]: engine locking time: ([0-9.eE+-]+\s*[a-zµ]+)',
         metric_type=MetricType.SPECIAL,
+        category=MetricCategory.STOP_TIME,
         description="Time spent acquiring engine lock during migration"
     ),
-    MetricConfig(
-        name="compact_kv_cache",
-        display_name="Compact KV Cache Times (Within Lock)",
+        MetricConfig(
+        name="timeline_compact_kv_cache_lock",
+        display_name="[Timeline] KV Cache Compaction Within Lock",
         log_pattern=r'\[timeline\]: kv cache compaction within lock take ([0-9.eE+-]+\s*[a-zµ]+)',
         metric_type=MetricType.SPECIAL,
-        description="Time spent compacting KV cache"
+        category=MetricCategory.STOP_TIME,
+        description="Time spent compacting KV cache within lock"
     ),
     MetricConfig(
-        name="bind_kv_cache",
-        display_name="Bind KV Cache Times (During Migration)",
-        log_pattern=r'\[timeline\]: bind single kv cache for layer .+ take ([0-9.eE+-]+\s*[a-zµ]+)',
-        description="Time to bind KV cache for each layer"
+        name="timeline_before_kv_migration",
+        display_name="[Timeline] Before KV Migration (Add Weights, Compact, Resize)",
+        log_pattern=r'\[timeline\]: before start actual kv cache migration.*?: ([0-9.eE+-]+\s*[a-zµ]+)',
+        metric_type=MetricType.SPECIAL,
+        category=MetricCategory.OTHER,
+        description="Time before actual KV migration starts"
     ),
-    
-    # Model Lock Metrics
-    MetricConfig(
-        name="getting_model_lock",
-        display_name="Getting Model Lock Taking",
-        log_pattern=r'getting model lock taking (\S+)',
-    ),
-    MetricConfig(
-        name="getting_forward_lock",
-        display_name="Getting Forward Lock Taking",
-        log_pattern=r'getting forward lock taking (\S+)',
-    ),
-    
-    # Engine and Forwarding
+
+    # =========================================================================
+    # FORWARDING METRICS  
+    # =========================================================================
     MetricConfig(
         name="engine_step_time",
         display_name="Process Engine Step Time",
         log_pattern=r'process the engine step, time: ([0-9.eE+-]+\s*seconds)',
+        category=MetricCategory.FORWARDING,
     ),
     MetricConfig(
         name="after_layer_forwarding",
@@ -94,115 +183,169 @@ METRIC_CONFIGS = [
         log_pattern=r'after Layer forwarding took ([0-9.eE+-]+\s*[a-zµ]+), layer (\d+)',
         metric_type=MetricType.KEYED_DICT,
         key_group=2,
+        category=MetricCategory.FORWARDING,
         description="Time for forwarding each layer"
     ),
     MetricConfig(
         name="after_forwarding",
         display_name="After Forwarding Took",
         log_pattern=r'after forwarding took ([0-9.eE+-]+\s*[a-zµ]+)',
+        category=MetricCategory.FORWARDING,
     ),
     MetricConfig(
         name="attn_forward",
         display_name="Attention Forward Times",
         log_pattern=r'\[timeline\] attention forward took ([0-9.eE+-]+\s*[a-zµ]+)',
+        category=MetricCategory.FORWARDING,
         description="Time taken for attention forward"
     ),
-    
-    # Communication
-    MetricConfig(
-        name="communication_time",
-        display_name="Communication Time from Upstream",
-        log_pattern=r'Communication time from upstream: ([0-9.eE+-]+\s*[a-zµ]+)',
-    ),
-
     MetricConfig(
         name="attention_forward",
         display_name="Attention Forward Took",
         log_pattern=r'attention forward took ([0-9.eE+-]+\s*[a-zµ]+)',
+        category=MetricCategory.FORWARDING,
     ),
-    
-    # Memory Allocation
+    # =========================================================================
+    # MODEL LOCK METRICS
+    # =========================================================================
+    MetricConfig(
+        name="getting_model_lock",
+        display_name="Getting Model Lock Taking",
+        log_pattern=r'getting model lock taking (\S+)',
+        category=MetricCategory.MODEL_LOCK,
+    ),
+    MetricConfig(
+        name="getting_forward_lock",
+        display_name="Getting Forward Lock Taking",
+        log_pattern=r'getting forward lock taking (\S+)',
+        category=MetricCategory.MODEL_LOCK,
+    ),
+
+
+    # =========================================================================
+    # COMMUNICATION METRICS
+    # =========================================================================
+    MetricConfig(
+        name="communication_time",
+        display_name="Communication Time from Upstream",
+        log_pattern=r'Communication time from upstream: ([0-9.eE+-]+\s*[a-zµ]+)',
+        category=MetricCategory.COMMUNICATION,
+    ),
+
+    # =========================================================================
+    # MEMORY ALLOCATION METRICS
+    # =========================================================================
     MetricConfig(
         name="memory_stress_tester",
         display_name="[Memory Allocation] MemoryStressTester Allocation Time",
         log_pattern=r'MemoryStressTester: cycle #.+alloc_time=([0-9.eE+-]+\s*ms)',
+        category=MetricCategory.MEMORY,
     ),
-
     MetricConfig(
         name="allocate_kv",
         display_name="[Memory Allocation] Asynchronous KV Allocation Time",
         log_pattern=r'async kv allocation: .+alloc_time=([0-9.eE+-]+\s*ms)',
+        category=MetricCategory.MEMORY,
     ),
-    
-    
-
     MetricConfig(
         name="weight_loading",
         display_name="Weight Loading Time (Individual Weights)",
         log_pattern=r'\[Weight Loading\] Loaded weight for .+ took ([0-9.eE+-]+\s*[a-zµ]+)',
+        category=MetricCategory.MEMORY,
     ),
-
-    # Weight Loading
     MetricConfig(
         name="weight_loading_lock",
         display_name="Weight Loading Lock Acquisition Time",
         log_pattern=r'\[Weight Loading\] Got lock before loading weight, took ([0-9.eE+-]+\s*[a-zµ]+)',
+        category=MetricCategory.MEMORY,
     ),
     
-    
-    # CompiledDAG Metrics
+    # =========================================================================
+    # COMPILED DAG METRICS
+    # =========================================================================
     MetricConfig(
         name="compiled_dag_write_lock",
         display_name="[CompiledDAG] WRITE Forward Lock Acquisition Time",
         log_pattern=r'\[CompiledDAG WRITE\].+time acuiring lock: ([0-9.eE+-]+\s*seconds)',
+        category=MetricCategory.COMPILED_DAG,
     ),
     MetricConfig(
         name="compiled_dag_read_lock",
         display_name="[CompiledDAG] READ Forward Lock Acquisition Time",
         log_pattern=r'\[CompiledDAG READ\].+time acquiring lock: ([0-9.eE+-]+\s*seconds)',
+        category=MetricCategory.COMPILED_DAG,
     ),
-
     MetricConfig(
         name="compiled_dag_write_complete",
         display_name="[CompiledDAG] WRITE Completion Time",
         log_pattern=r'\[CompiledDAG WRITE\].+Write completed, time taken: ([0-9.eE+-]+\s*seconds)',
+        category=MetricCategory.COMPILED_DAG,
     ),
-
     MetricConfig(
         name="compiled_dag_read_complete",
         display_name="[CompiledDAG] READ Completion Time",
         log_pattern=r'\[CompiledDAG READ\].+Read completed, time taken: ([0-9.eE+-]+\s*seconds)',
+        category=MetricCategory.COMPILED_DAG,
     ),
     MetricConfig(
         name="tensor_metadata_recv",
         display_name="[Ray.Comm.Read] Tensor Metadata Receive Time",
         log_pattern=r'received tensor metadata in ([0-9.eE+-]+\s*seconds)',
+        category=MetricCategory.COMPILED_DAG,
     ),
     MetricConfig(
         name="dynamic_channel_recv",
         display_name="[Ray.Comm.Read] Tensors Received Time",
         log_pattern=r'\[DynamicChannel\] Tensor read completed in ([0-9.eE+-]+\s*seconds)',
+        category=MetricCategory.COMPILED_DAG,
     ),
     MetricConfig(
         name="nccl_recv_buffer_alloc",
         display_name="[RAY.NCCLGROUP.Read] Recv Buffer Allocation Time",
         log_pattern=r'\[RAY\.NCCLGROUP\] Recv buffer allocated in ([0-9.eE+-]+\s*seconds)',
+        category=MetricCategory.COMPILED_DAG,
     ),
     MetricConfig(
         name="nccl_recv_data",
         display_name="[RAY.NCCLGROUP.Read] Received Data From Comm Time",
         log_pattern=r'\[RAY\.NCCLGROUP\] received data from comm taking ([0-9.eE+-]+\s*seconds)',
+        category=MetricCategory.COMPILED_DAG,
     ),
     MetricConfig(
         name="nccl_cuda_sync",
         display_name="[RAY.NCCLGROUP.Read] CUDA Synchronize Time",
         log_pattern=r'\[RAY\.NCCLGROUP\] cuda synchronize taking ([0-9.eE+-]+\s*seconds)',
+        category=MetricCategory.COMPILED_DAG,
     ),
     MetricConfig(
         name="nccl_send_queued",
         display_name="[RAY.NCCLGROUP.Send] Send Queued To Peer Time",
         log_pattern=r'\[RAY\.NCCLGROUP\] send queued to peer.+in ([0-9.eE+-]+\s*s), total: ([0-9.eE+-]+\s*s)',
+        category=MetricCategory.COMPILED_DAG,
     ),
+]
+
+# Category display names and order
+CATEGORY_DISPLAY = {
+    MetricCategory.TIMELINE: "📊 TIMELINE METRICS (Migration & KV Operations)",
+    MetricCategory.STOP_TIME: "⏱️ STOP TIME METRICS (Service Interruption)",
+    MetricCategory.MODEL_LOCK: "🔒 MODEL LOCK METRICS",
+    MetricCategory.FORWARDING: "⏩ FORWARDING METRICS",
+    MetricCategory.COMMUNICATION: "📡 COMMUNICATION METRICS",
+    MetricCategory.MEMORY: "💾 MEMORY ALLOCATION METRICS",
+    MetricCategory.COMPILED_DAG: "🔄 COMPILED DAG METRICS",
+    MetricCategory.OTHER: "📋 OTHER METRICS",
+}
+
+CATEGORY_ORDER = [
+    MetricCategory.TIMELINE,
+    MetricCategory.STOP_TIME,
+    MetricCategory.MODEL_LOCK,
+    MetricCategory.FORWARDING,
+    MetricCategory.COMMUNICATION,
+    MetricCategory.MEMORY,
+    MetricCategory.COMPILED_DAG,
+    MetricCategory.OTHER,
 ]
 
 
@@ -259,15 +402,21 @@ class LogMetricsAnalyzer:
                 for config in METRIC_CONFIGS:
                     match = re.search(config.log_pattern, line)
                     if match:
-                        # Extract time value
-                        time_value = match.group(config.time_group)
+                        # Check if there are any groups to extract
+                        if match.lastindex is None or match.lastindex < config.time_group:
+                            # Pattern matched but no capturing group for time - use marker
+                            time_value = "matched"
+                        else:
+                            # Extract time value
+                            time_value = match.group(config.time_group)
                         
                         # Store based on metric type
                         if config.metric_type == MetricType.SIMPLE_LIST or config.metric_type == MetricType.SPECIAL:
                             self.metrics[config.name].append(time_value)
                         elif config.metric_type == MetricType.KEYED_DICT:
-                            key = int(match.group(config.key_group))
-                            self.metrics[config.name][key].append(time_value)
+                            if match.lastindex and match.lastindex >= config.key_group:
+                                key = int(match.group(config.key_group))
+                                self.metrics[config.name][key].append(time_value)
         
         print(f"Finished parsing log file.\n")
     
@@ -281,6 +430,15 @@ class LogMetricsAnalyzer:
         print(f"Metric: {display_name}")
         print(f"Total count: {len(values)}")
         print(f"{'='*80}")
+        
+        # Format time with appropriate units (moved here so it's always available)
+        def format_time(us):
+            if us < 1000:
+                return f"{us:.2f}µs"
+            elif us < 1000000:
+                return f"{us/1000:.2f}ms"
+            else:
+                return f"{us/1000000:.2f}s"
         
         # Count occurrences and collect all time values in microseconds
         counter = Counter(values)
@@ -305,15 +463,6 @@ class LogMetricsAnalyzer:
             median_us = statistics.median(all_times_us)
             min_us = min(all_times_us)
             max_us = max(all_times_us)
-            
-            # Format with appropriate units
-            def format_time(us):
-                if us < 1000:
-                    return f"{us:.2f}µs"
-                elif us < 1000000:
-                    return f"{us/1000:.2f}ms"
-                else:
-                    return f"{us/1000000:.2f}s"
             
             print(f"\nStatistics:")
             print(f"  Average: {format_time(avg_us)}")
@@ -376,27 +525,50 @@ class LogMetricsAnalyzer:
         print()
     
     def generate_report(self, top_n: int = 20):
-        """Generate complete analysis report."""
+        """Generate complete analysis report grouped by category."""
         print("\n" + "="*80)
         print("VLLM LOG METRICS ANALYSIS REPORT")
         print("="*80)
         
-        # Process metrics in order defined in METRIC_CONFIGS
+        # Group metrics by category
+        metrics_by_category: Dict[MetricCategory, List[MetricConfig]] = defaultdict(list)
         for config in METRIC_CONFIGS:
-            if not config.show_in_report:
+            if config.show_in_report:
+                metrics_by_category[config.category].append(config)
+        
+        # Process metrics in category order
+        for category in CATEGORY_ORDER:
+            configs = metrics_by_category.get(category, [])
+            
+            # Check if any metrics in this category have data
+            has_data = False
+            for config in configs:
+                metric_data = self.metrics.get(config.name)
+                if metric_data:
+                    has_data = True
+                    break
+            
+            if not has_data:
                 continue
             
-            metric_data = self.metrics.get(config.name)
-            if not metric_data:
-                continue
+            # Print category header
+            print("\n" + "#"*80)
+            print(f"# {CATEGORY_DISPLAY.get(category, category.value)}")
+            print("#"*80)
             
-            # Print based on metric type
-            if config.metric_type == MetricType.SPECIAL:
-                self.print_special_metric(config.name, config.display_name, metric_data)
-            elif config.metric_type == MetricType.KEYED_DICT:
-                self.print_layer_distribution(config.name, config.display_name, metric_data, top_n)
-            else:  # SIMPLE_LIST
-                self.print_distribution(config.name, config.display_name, metric_data, top_n)
+            # Process each metric in this category
+            for config in configs:
+                metric_data = self.metrics.get(config.name)
+                if not metric_data:
+                    continue
+                
+                # Print based on metric type
+                if config.metric_type == MetricType.SPECIAL:
+                    self.print_special_metric(config.name, config.display_name, metric_data)
+                elif config.metric_type == MetricType.KEYED_DICT:
+                    self.print_layer_distribution(config.name, config.display_name, metric_data, top_n)
+                else:  # SIMPLE_LIST
+                    self.print_distribution(config.name, config.display_name, metric_data, top_n)
         
         print("\n" + "="*80)
         print("ANALYSIS COMPLETE")

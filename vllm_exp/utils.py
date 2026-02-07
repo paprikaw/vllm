@@ -94,6 +94,7 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, log_dir: Path, log_file_name: 
         "pp_layer_partition": spec.start_pp_layer_partition,
         "alternative_configs": alternative_configs_dict,
         "migration_steps": cfg.migration.migration_steps,
+        "migration_mode": cfg.migration.migration_mode,
     })
     serve_args.extend(["-D", dynamic_cfg])
     

@@ -237,7 +237,6 @@ class CustomModelLoader(DefaultModelLoader):
                 loaded_weights = model.load_weights(
                     self.get_layer_weights(model_config, model, layers)) 
                 logger.info(f"[debug]: after weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-                logger.info(f"[timeline]: after weight loading, time taken: {human_readable_duration(time.time() - time_start)}")
                 if model_config.quantization is None and loaded_weights is not None:
                     weights_not_loaded = weights_to_load - loaded_weights
                     if weights_not_loaded:

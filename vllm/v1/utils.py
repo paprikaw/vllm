@@ -469,7 +469,6 @@ def create_ptr_tensor_from_list(ptr_list: list[int], device: torch.device) -> to
         try:
             result = ptr_tensor.to(device, non_blocking=False)
             # Sync to ensure transfer completed successfully
-            torch.cuda.synchronize(device)
             return result
         except Exception as e:
             logger.error(f"[create_ptr_tensor] Failed to move tensor to {device}: {e}")
@@ -633,17 +632,6 @@ def dynamic_flexi_bind_single_kv_tensor(
     """
     with device:
         torch.cuda.set_device(device)
-        # 🔴 诊断日志：检查 layer 配置一致性
-        logger.info(f"[KV_BIND_CHECK] bind_single_kv_tensor: start_layer={start_layer}, end_layer={end_layer}, "
-                   f"layer_index={layer_index}, len(runner.key_caches)={len(runner.key_caches)}, "
-                   f"expected_num_layers={end_layer - start_layer}")
-        
-        # 检查 key_caches 长度是否与 layer 范围一致
-        expected_num_layers = end_layer - start_layer
-        if len(runner.key_caches) != expected_num_layers:
-            logger.error(f"[KV_BIND_CHECK] ERROR: key_caches length mismatch! "
-                        f"len(key_caches)={len(runner.key_caches)}, expected={expected_num_layers}")
-        
         # Determine local index in runner kv cache list
         assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
         local_index = layer_index - start_layer

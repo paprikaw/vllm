@@ -63,6 +63,7 @@ class VllmCfg(BaseModel):
     pipeline_parallel_size: int = 2
     gpu_memory_utilization: float = 0.9
     max_model_len: int = 8000
+    max_num_batched_tokens: Optional[int] = None  # Max tokens per batch for chunked prefill (default: 2048 when chunked_prefill=True)
     chunked_prefill: bool = True
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
@@ -81,6 +82,7 @@ class MigrationCfg(BaseModel):
     compact_steps: list[int] = []
     tester_start_step: Optional[int] = None
     memory_stress_tester: Optional[Dict[str, Any]] = None
+    migration_mode: str = "async"  # "async" or "sync" - determines which migration method to use
 
 class WarmupBenchCfg(BaseModel):
     """Optional warmup stage config for vllm_exp.
@@ -141,6 +143,12 @@ class BenchCfg(BaseModel):
     # After each repetition, set_pp_config is called to restore initial config
     repetition: int = 1
     
+    # Dataset configuration
+    dataset_name: str = "random"
+    """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
+    dataset_path: Optional[str] = None
+    """Path to dataset file. Required for burstgpt and sharegpt."""
+    
     # Pipeline config for repetition reset (used when repetition > 1)
     initial_pp_config: Optional[List[List[int]]] = None
     """Initial PP layer config to restore between repetitions.
@@ -151,6 +159,8 @@ class BenchCfg(BaseModel):
     migration_steps: Optional[List[int]] = None
     """Request indices at which migration is triggered.
     Passed to set_pp_config when resetting between repetitions."""
+    migration_mode: Optional[str] = None
+    """Migration mode: "async" or "sync". Determines which migration method to use."""
 
     # Optional warmup stage (separate logs + metrics)
     warmup: Optional[WarmupBenchCfg] = None
@@ -265,6 +275,12 @@ class SweepBenchmarkConfig(BaseModel):
     repetition: int = 1
     """Number of times to repeat the benchmark. After each repetition,
     set_pp_config is called to return to the initial pp configuration."""
+    
+    dataset_name: str = "random"
+    """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
+    
+    dataset_path: Optional[str] = None
+    """Path to dataset file. Required for burstgpt and sharegpt."""
     
     pp_layer_config: Dict[int, str]
     """Pipeline layer partition configs indexed by request number.
@@ -513,6 +529,7 @@ class StaticVllmCfg(BaseModel):
     pipeline_parallel_size: int = 2
     gpu_memory_utilization: float = 0.9
     max_model_len: int = 8000
+    max_num_batched_tokens: Optional[int] = None  # Max tokens per batch for chunked prefill (default: 2048 when chunked_prefill=True)
     chunked_prefill: bool = True
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
@@ -703,6 +720,7 @@ class ExpVllmConfig:
     pipeline_parallel_size: int
     gpu_memory_utilization: float
     max_model_len: int
+    max_num_batched_tokens: Optional[int]  # Max tokens per batch for chunked prefill
     block_size: Optional[int]
     head_addr: str
     port: int
@@ -794,6 +812,12 @@ class ExpBenchmarkConfig:
     profile: bool = False
     benchmark_script_path: str = ""
     warmup: Optional[WarmupBenchCfg] = None
+    
+    # Dataset configuration
+    dataset_name: str = "random"
+    """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
+    dataset_path: Optional[str] = None
+    """Path to dataset file. Required for burstgpt and sharegpt."""
 
 
 @dataclass
@@ -878,8 +902,16 @@ class ExperimentConfig:
             return
         
         # Build Cartesian product of all sweep axes
-        # sweep_axes: {"enable_flexi_flash_attn": [True, False], "benchmark_config": [cfg1, cfg2, ...]}
+        # IMPORTANT: Ensure enable_flexi_flash_attn is the OUTERMOST loop
+        # because switching flexi mode requires server restart.
+        # We reorder axes so that 'enable_flexi_flash_attn' comes first if present.
         axis_names = list(sweep_axes.keys())
+        
+        # Reorder: put enable_flexi_flash_attn first (outermost loop)
+        if 'enable_flexi_flash_attn' in axis_names:
+            axis_names.remove('enable_flexi_flash_attn')
+            axis_names.insert(0, 'enable_flexi_flash_attn')
+        
         axis_values = [sweep_axes[name] for name in axis_names]
         
         for combo in itertools.product(*axis_values):
@@ -938,6 +970,7 @@ class ExperimentConfig:
             pipeline_parallel_size=static_cfg.vllm.pipeline_parallel_size,
             gpu_memory_utilization=static_cfg.vllm.gpu_memory_utilization,
             max_model_len=static_cfg.vllm.max_model_len,
+            max_num_batched_tokens=static_cfg.vllm.max_num_batched_tokens,
             block_size=static_cfg.vllm.block_size,
             head_addr=static_cfg.vllm.head_addr,
             port=static_cfg.vllm.port,
@@ -964,6 +997,9 @@ class ExperimentConfig:
             profile=static_cfg.benchmark.profile,
             benchmark_script_path=static_cfg.benchmark.benchmark_script_path,
             warmup=static_cfg.benchmark.warmup,
+            # Dataset configuration - prefer sweep config, fallback to static
+            dataset_name=bench_cfg.dataset_name,
+            dataset_path=bench_cfg.dataset_path if bench_cfg.dataset_path else static_cfg.benchmark.dataset_path,
         )
         
         return cls(
@@ -1022,6 +1058,7 @@ class VllmServerSpec:
     pipeline_parallel_size: int
     gpu_memory_utilization: float
     max_model_len: int
+    max_num_batched_tokens: Optional[int]
     block_size: Optional[int]
     head_addr: str
     port: int
@@ -1094,6 +1131,12 @@ class BenchmarkSpec:
     input_output_lens: List[List[int]] = field(default_factory=list)
     pattern_batch_size: int = 150
     burstiness: float = 100.0
+    
+    # Dataset config
+    dataset_name: str = "random"
+    """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
+    dataset_path: Optional[str] = None
+    """Path to dataset file. Required for burstgpt and sharegpt."""
     
     # Repetition config
     repetition: int = 1

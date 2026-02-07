@@ -1655,7 +1655,7 @@ def chunked_copy_inplace(
     # Use environment variable if chunk_size_mb not specified
     if chunk_size_mb is None:
         chunk_size_mb = envs.VLLM_WEIGHT_CHUNK_SIZE_MB
-    
+    logger.info(f"[Weight Loading] chunked_copy_inplace called for {name} with chunk_size_mb={chunk_size_mb} MB, n_copy={n_copy}, non_blocking={non_blocking}")
     # 参数验证
     assert dst.shape == src.shape, f"Shape mismatch: dst {dst.shape} vs src {src.shape}"
     
@@ -1705,6 +1705,7 @@ def chunked_copy_inplace(
                     src_flat[start_idx:end_idx],
                     non_blocking=non_blocking
                 )
+                # torch.cuda.synchronize()
                 logger.info(f"[Weight Loading] Chunked copy for {name} chunk {i+1}/{n_copy} took {human_readable_duration(time.time() - time_start)}")
         else:
             dst_flat[start_idx:end_idx].copy_(
