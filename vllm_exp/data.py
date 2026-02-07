@@ -32,7 +32,7 @@ def collect_variables(cfg: Config) -> Dict[str, Any]:
         "chunked_prefill": cfg.vllm.chunked_prefill,
         "enable_cuda_graph": cfg.vllm.enable_cuda_graph,
         "enable_nsight": cfg.vllm.enable_nsight,
-        "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
+        "attention_kernel": cfg.vllm.attention_kernel,
         "block_size": cfg.vllm.block_size,
         "model_name": cfg.model.name,
         "model_path": cfg.model.path,
@@ -52,7 +52,7 @@ def collect_aliases() -> Dict[str, str]:
         "delay": "delay",
         "start_pp_layer_partition": "pp",
         "is_migration": "mig",
-        "enable_flexi_flash_attn": "flexi"
+        "attention_kernel": "kernel"
     }
 
 class ModelCfg(BaseModel):
@@ -67,7 +67,7 @@ class VllmCfg(BaseModel):
     chunked_prefill: bool = True
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
-    enable_flexi_flash_attn: bool = False
+    attention_kernel: str = "direct"  # "flash", "flexi", or "direct"
     block_size: Optional[int] = None  # KV cache block size (1, 8, 16, 32, 64, 128), None means use vLLM default
     head_addr: str = "head"
     port: int = 8000
@@ -144,7 +144,7 @@ class BenchCfg(BaseModel):
     repetition: int = 1
     
     # Dataset configuration
-    dataset_name: str = "random"
+    dataset_name: str = "pattern"
     """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
     dataset_path: Optional[str] = None
     """Path to dataset file. Required for burstgpt and sharegpt."""
@@ -276,7 +276,7 @@ class SweepBenchmarkConfig(BaseModel):
     """Number of times to repeat the benchmark. After each repetition,
     set_pp_config is called to return to the initial pp configuration."""
     
-    dataset_name: str = "random"
+    dataset_name: str = "pattern"
     """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
     
     dataset_path: Optional[str] = None
@@ -365,7 +365,8 @@ class SweepBenchmarkParams(BaseModel):
 
 class SweepVllmParams(BaseModel):
     """Individual vLLM parameters for parameter-sweep mode."""
-    enable_flexi_flash_attn: Optional[List[bool]] = None
+    attention_kernel: Optional[List[str]] = None
+    """List of attention kernels to sweep: 'flash', 'flexi', 'direct'."""
     weight_chunk_size_mb: Optional[List[float]] = None
     """List of weight chunk sizes (MB) for sweep. Affects weight loading during migration."""
 
@@ -388,7 +389,7 @@ class SweepConfig(BaseModel):
     Example (parameter sweep mode):
         sweep_config:
           vllm:
-            enable_flexi_flash_attn: [true, false]
+            attention_kernel: [flash, flexi, direct]
           benchmark:
             pp_layer_configs: ["32, 32", "20, 44"]
             request_rates: [1.0, 2.0]
@@ -398,7 +399,7 @@ class SweepConfig(BaseModel):
     
     # Naming aliases for file naming - only for actual sweep parameters
     NAMING_ALIASES: ClassVar[Dict[str, str]] = {
-        "enable_flexi_flash_attn": "flexi",
+        "attention_kernel": "kernel",
     }
     
     # Mode 1: Complete benchmark_config list
@@ -410,7 +411,7 @@ class SweepConfig(BaseModel):
     
     # Note: gpu_memory_utilization and block_size are NOT sweep parameters.
     # They should only be defined in static_config.vllm.
-    # Only enable_flexi_flash_attn and weight_chunk_size_mb can be swept via sweep_config.vllm.
+    # Only attention_kernel and weight_chunk_size_mb can be swept via sweep_config.vllm.
     
     def get_sweep_axes(
         self,
@@ -432,8 +433,8 @@ class SweepConfig(BaseModel):
         
         # vLLM sweep parameters
         if self.vllm is not None:
-            if self.vllm.enable_flexi_flash_attn is not None:
-                axes['enable_flexi_flash_attn'] = self.vllm.enable_flexi_flash_attn
+            if self.vllm.attention_kernel is not None:
+                axes['attention_kernel'] = self.vllm.attention_kernel
             if self.vllm.weight_chunk_size_mb is not None:
                 axes['weight_chunk_size_mb'] = self.vllm.weight_chunk_size_mb
         
@@ -533,7 +534,7 @@ class StaticVllmCfg(BaseModel):
     chunked_prefill: bool = True
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
-    enable_flexi_flash_attn: bool = False
+    attention_kernel: str = "direct"  # "flash", "flexi", or "direct"
     block_size: Optional[int] = None
     head_addr: str = "head"
     port: int = 8000
@@ -551,7 +552,7 @@ class StaticBenchCfg(BaseModel):
     1. Parameter-sweep mode: Define only shared params (num_total_requests, repetition),
        and let sweep_config.benchmark define the sweep axes.
     2. Fixed-benchmark mode: Define pp_layer_config and requests here to fix the
-       benchmark configuration. Then sweep only vLLM parameters like enable_flexi_flash_attn.
+       benchmark configuration. Then sweep only vLLM parameters like attention_kernel.
     
     Example (fixed-benchmark mode):
         static_config:
@@ -568,7 +569,7 @@ class StaticBenchCfg(BaseModel):
                 output_lens: 32
         sweep_config:
           vllm:
-            enable_flexi_flash_attn: [true, false]
+            attention_kernel: [flash, flexi, direct]
     """
     pattern_batch_size: int = 150
     profile: bool = False
@@ -576,6 +577,8 @@ class StaticBenchCfg(BaseModel):
     benchmark_script_path: str = "/root/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     burstiness: float = 100.0
     warmup: Optional[WarmupBenchCfg] = None
+    dataset_name: str = "pattern"
+    dataset_path: Optional[str] = None
     
     # Shared parameters for parameter-sweep mode
     num_total_requests: int = 100
@@ -662,7 +665,7 @@ class SweepTestConfig(BaseModel):
                 errors.append(
                     "Configuration conflict: 'static_config.benchmark' has pp_layer_config and requests defined, "
                     "which enables fixed-benchmark mode. 'sweep_config.benchmark' should not be used in this mode. "
-                    "Only sweep vLLM parameters like enable_flexi_flash_attn or weight_chunk_size_mb."
+                    "Only sweep vLLM parameters like attention_kernel or weight_chunk_size_mb."
                 )
             if self.sweep_config.benchmark_config is not None:
                 errors.append(
@@ -670,10 +673,10 @@ class SweepTestConfig(BaseModel):
                     "which enables fixed-benchmark mode. 'sweep_config.benchmark_config' should not be used in this mode."
                 )
         
-        # Note: enable_flexi_flash_attn can appear in:
-        # - static_config.vllm.enable_flexi_flash_attn (single value, fallback)
-        # - sweep_config.vllm.enable_flexi_flash_attn (list for sweeping)
-        # When sweep_config.vllm.enable_flexi_flash_attn is provided, it overrides static_config.
+        # Note: attention_kernel can appear in:
+        # - static_config.vllm.attention_kernel (single value, fallback)
+        # - sweep_config.vllm.attention_kernel (list for sweeping)
+        # When sweep_config.vllm.attention_kernel is provided, it overrides static_config.
         # No conflict check needed - sweep takes precedence over static.
         
         # Note: gpu_memory_utilization and block_size can ONLY appear in static_config.vllm
@@ -715,7 +718,7 @@ class ExpVllmConfig:
     
     Merged from:
     - static_config.vllm (base values)
-    - sweep_config.vllm (overrides like enable_flexi_flash_attn, weight_chunk_size_mb)
+    - sweep_config.vllm (overrides like attention_kernel, weight_chunk_size_mb)
     """
     pipeline_parallel_size: int
     gpu_memory_utilization: float
@@ -724,7 +727,7 @@ class ExpVllmConfig:
     block_size: Optional[int]
     head_addr: str
     port: int
-    enable_flexi_flash_attn: bool
+    attention_kernel: str  # "flash", "flexi", or "direct"
     chunked_prefill: bool
     enable_cuda_graph: bool
     enable_nsight: bool
@@ -814,7 +817,7 @@ class ExpBenchmarkConfig:
     warmup: Optional[WarmupBenchCfg] = None
     
     # Dataset configuration
-    dataset_name: str = "random"
+    dataset_name: str = "pattern"
     """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
     dataset_path: Optional[str] = None
     """Path to dataset file. Required for burstgpt and sharegpt."""
@@ -836,7 +839,7 @@ class ExperimentConfig:
     
     # Naming aliases for file naming
     NAMING_ALIASES: ClassVar[Dict[str, str]] = {
-        "enable_flexi_flash_attn": "flexi",
+        "attention_kernel": "kernel",
         "pp_layer_partition": "pp",
         "request_rate": "rr",
         "has_migration": "mig",
@@ -855,7 +858,7 @@ class ExperimentConfig:
     def get_naming_vars(self) -> Dict[str, Any]:
         """Generate vars_mapping for file naming using NAMING_ALIASES."""
         vars_dict = {
-            "flexi": self.vllm.enable_flexi_flash_attn,
+            "kernel": self.vllm.attention_kernel,
             "pp": self.vllm.pp_layer_partition,
             "rr": self.benchmark.request_rate,
             "mig": self.vllm.has_migration,
@@ -902,15 +905,15 @@ class ExperimentConfig:
             return
         
         # Build Cartesian product of all sweep axes
-        # IMPORTANT: Ensure enable_flexi_flash_attn is the OUTERMOST loop
-        # because switching flexi mode requires server restart.
-        # We reorder axes so that 'enable_flexi_flash_attn' comes first if present.
+        # IMPORTANT: Ensure attention_kernel is the OUTERMOST loop
+        # because switching kernel mode requires server restart.
+        # We reorder axes so that 'attention_kernel' comes first if present.
         axis_names = list(sweep_axes.keys())
         
-        # Reorder: put enable_flexi_flash_attn first (outermost loop)
-        if 'enable_flexi_flash_attn' in axis_names:
-            axis_names.remove('enable_flexi_flash_attn')
-            axis_names.insert(0, 'enable_flexi_flash_attn')
+        # Reorder: put attention_kernel first (outermost loop)
+        if 'attention_kernel' in axis_names:
+            axis_names.remove('attention_kernel')
+            axis_names.insert(0, 'attention_kernel')
         
         axis_values = [sweep_axes[name] for name in axis_names]
         
@@ -920,18 +923,18 @@ class ExperimentConfig:
             
             # Extract sweep parameters from combination
             bench_cfg: SweepBenchmarkConfig = combo_dict['benchmark_config']
-            enable_flexi: Optional[bool] = combo_dict.get('enable_flexi_flash_attn')
+            attn_kernel: Optional[str] = combo_dict.get('attention_kernel')
             weight_chunk_size: Optional[float] = combo_dict.get('weight_chunk_size_mb')
             
             # Create ExperimentConfig from this combination
-            yield cls._create_from_combo(static_cfg, bench_cfg, enable_flexi, weight_chunk_size)
+            yield cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size)
     
     @classmethod
     def _create_from_combo(
         cls,
         static_cfg: 'StaticConfig',
         bench_cfg: SweepBenchmarkConfig,
-        enable_flexi_flash_attn: Optional[bool] = None,
+        attention_kernel: Optional[str] = None,
         weight_chunk_size_mb: Optional[float] = None,
     ) -> 'ExperimentConfig':
         """Create a single ExperimentConfig from static config and one sweep combination.
@@ -941,11 +944,11 @@ class ExperimentConfig:
         Args:
             static_cfg: Static configuration
             bench_cfg: Sweep benchmark configuration (from sweep axes)
-            enable_flexi_flash_attn: Override from sweep axis (if sweeping), otherwise use static
+            attention_kernel: Override from sweep axis (if sweeping), otherwise use static
             weight_chunk_size_mb: Override from sweep axis (if sweeping), otherwise use static
         """
         # Resolve sweep overrides: sweep values override static values
-        flexi = enable_flexi_flash_attn if enable_flexi_flash_attn is not None else static_cfg.vllm.enable_flexi_flash_attn
+        kernel = attention_kernel if attention_kernel is not None else static_cfg.vllm.attention_kernel
         chunk_size = weight_chunk_size_mb if weight_chunk_size_mb is not None else static_cfg.vllm.weight_chunk_size_mb
         
         # Get initial values from bench_cfg
@@ -974,7 +977,7 @@ class ExperimentConfig:
             block_size=static_cfg.vllm.block_size,
             head_addr=static_cfg.vllm.head_addr,
             port=static_cfg.vllm.port,
-            enable_flexi_flash_attn=flexi,
+            attention_kernel=kernel,
             chunked_prefill=static_cfg.vllm.chunked_prefill,
             enable_cuda_graph=static_cfg.vllm.enable_cuda_graph,
             enable_nsight=static_cfg.vllm.enable_nsight,
@@ -1064,7 +1067,7 @@ class VllmServerSpec:
     port: int
     
     # Features
-    enable_flexi_flash_attn: bool = False
+    attention_kernel: str = "direct"  # "flash", "flexi", or "direct"
     chunked_prefill: bool = False
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
@@ -1095,7 +1098,7 @@ class VllmServerSpec:
     def to_dynamic_cfg(self) -> Dict[str, Any]:
         """Generate dynamic config dict for -D flag."""
         cfg = {
-            "enable_flexi_flash_attn": self.enable_flexi_flash_attn,
+            "attention_kernel": self.attention_kernel,
             "pp_layer_partition": self.pp_layer_partition,
             "pattern_batch_size": self.pattern_batch_size,
             "metrics_csv_path": self.metrics_csv_path,
@@ -1133,7 +1136,7 @@ class BenchmarkSpec:
     burstiness: float = 100.0
     
     # Dataset config
-    dataset_name: str = "random"
+    dataset_name: str = "pattern"
     """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
     dataset_path: Optional[str] = None
     """Path to dataset file. Required for burstgpt and sharegpt."""
