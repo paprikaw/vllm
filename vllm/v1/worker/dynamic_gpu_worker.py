@@ -165,7 +165,7 @@ class DynamicGPUWorker(Worker):
         assert isinstance(self.model_runner, DynamicGPUModelRunner)
         start_layer = self.model_runner.model.model.start_layer
         fctx = self.vllm_config.compilation_config.static_forward_context
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         for layer_id in sorted(layer_ids):
             # 1) 层已加载
             assert self.model_runner.has_layer(layer_id), (
@@ -247,7 +247,7 @@ class DynamicGPUWorker(Worker):
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
         logger.info(f"[operation]: Add Model Layers: {layer_list}")
         time_start = time.time()
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         torch.cuda.synchronize() 
         gc.collect()
         torch.cuda.empty_cache()
@@ -288,12 +288,13 @@ class DynamicGPUWorker(Worker):
                                                         self.model_runner.key_cache_ptrs
                         self.model_runner.value_cache_ptrs = [0] * left_added_layer_num + \
                                                         self.model_runner.value_cache_ptrs
-                        # Pad k_ptr_tensors and v_ptr_tensors with empty tensors
-                        empty_tensor = torch.tensor([], dtype=torch.uint64, device=self.device)
-                        self.model_runner.k_ptr_tensors = [empty_tensor.clone() for _ in range(left_added_layer_num)] + \
-                                                        self.model_runner.k_ptr_tensors
-                        self.model_runner.v_ptr_tensors = [empty_tensor.clone() for _ in range(left_added_layer_num)] + \
-                                                        self.model_runner.v_ptr_tensors
+                        # Pad k_ptr_tensors and v_ptr_tensors with empty tensors (direct mode only)
+                        if self.vllm_config.dynamic_config.use_direct_ptr:
+                            empty_tensor = torch.tensor([], dtype=torch.uint64, device=self.device)
+                            self.model_runner.k_ptr_tensors = [empty_tensor.clone() for _ in range(left_added_layer_num)] + \
+                                                            self.model_runner.k_ptr_tensors
+                            self.model_runner.v_ptr_tensors = [empty_tensor.clone() for _ in range(left_added_layer_num)] + \
+                                                            self.model_runner.v_ptr_tensors
 
                         self.dynamic_kv_synchronizer.key_cache_list = [[] for _ in range(left_added_layer_num)] + \
                                                         self.dynamic_kv_synchronizer.key_cache_list
@@ -311,10 +312,11 @@ class DynamicGPUWorker(Worker):
                         self.model_runner.value_caches.extend([[] for _ in range(pad_right)])
                         self.model_runner.key_cache_ptrs.extend([0] * pad_right)
                         self.model_runner.value_cache_ptrs.extend([0] * pad_right)
-                        # Pad k_ptr_tensors and v_ptr_tensors with empty tensors
-                        empty_tensor = torch.tensor([], dtype=torch.uint64, device=self.device)
-                        self.model_runner.k_ptr_tensors.extend([empty_tensor.clone() for _ in range(pad_right)])
-                        self.model_runner.v_ptr_tensors.extend([empty_tensor.clone() for _ in range(pad_right)])
+                        # Pad k_ptr_tensors and v_ptr_tensors with empty tensors (direct mode only)
+                        if self.vllm_config.dynamic_config.use_direct_ptr:
+                            empty_tensor = torch.tensor([], dtype=torch.uint64, device=self.device)
+                            self.model_runner.k_ptr_tensors.extend([empty_tensor.clone() for _ in range(pad_right)])
+                            self.model_runner.v_ptr_tensors.extend([empty_tensor.clone() for _ in range(pad_right)])
 
                         self.dynamic_kv_synchronizer.key_cache_list.extend([[] for _ in range(pad_right)])
                         self.dynamic_kv_synchronizer.value_cache_list.extend([[] for _ in range(pad_right)])
@@ -457,7 +459,7 @@ class DynamicGPUWorker(Worker):
             from contextlib import nullcontext
             context = nullcontext()
         with context:
-            if self.vllm_config.dynamic_config.enable_flexi_flash_attn:
+            if self.vllm_config.dynamic_config.use_flexi_kv:
                 logger.info("Using flexi flash attention dynamic initialize kv cache")
                 self.model_runner.dynamic_initialize_kv_cache_flexi(kv_cache_configs[self.rank], self.dynamic_kv_synchronizer, num_blocks)
             else:
@@ -563,7 +565,7 @@ class DynamicGPUWorker(Worker):
         # self.model_runner.release_kv_cache_for_layers(layers_list)
         from vllm.config import get_current_vllm_config
         vllm_config = get_current_vllm_config()
-        is_flexi = vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = vllm_config.dynamic_config.use_flexi_kv
         start_layer = self.model_runner.model.model.start_layer
         free_before, total = torch.cuda.mem_get_info()
         logger.info(f"before release_kv_cache_for_layers: free={free_before / 1024 ** 3:.2f} GB, total={total / 1024 ** 3:.2f} GB")
@@ -617,7 +619,7 @@ class DynamicGPUWorker(Worker):
         # self.model_runner.release_kv_cache_for_layers(layers_list)
         from vllm.config import get_current_vllm_config
         vllm_config = get_current_vllm_config()
-        is_flexi = vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = vllm_config.dynamic_config.use_flexi_kv
         free_before, total = torch.cuda.mem_get_info()
         logger.info(f"before release_kv_cache_for_layers: free={free_before / 1024 ** 3:.2f} GB, total={total / 1024 ** 3:.2f} GB")
         if is_flexi:
@@ -741,7 +743,7 @@ class DynamicGPUWorker(Worker):
     def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         runner = self.model_runner
         start_layer, end_layer = runner.model.model.start_layer, runner.model.model.end_layer
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         assert isinstance(runner.model, DynamicQwen3ForCausalLM)
         logger.info(f"start to compact kv cache for layers {runner.model.model.start_layer} to {runner.model.model.end_layer}")
         time_start = time.time()
@@ -760,13 +762,10 @@ class DynamicGPUWorker(Worker):
         for key_cache, value_cache in zip(runner.key_caches, runner.value_caches):
             tmp_key_cache.append([page for page in key_cache])
             tmp_value_cache.append([page for page in value_cache])
-         # Create temporary copies of the caches and pointers
-        tmp_old_key_ptrs = deepcopy(self.model_runner.key_cache_ptrs)
-        tmp_old_value_ptrs = deepcopy(self.model_runner.value_cache_ptrs)
-        tmp_new_key_ptrs: list[int] = []
-        tmp_new_value_ptrs: list[int] = []
-        tmp_new_key_ptr_tensors: list[torch.Tensor] = [create_ptr_tensor_from_list(page_ptr_list, self.model_runner.device) for page_ptr_list in tmp_key_cache]
-        tmp_new_value_ptr_tensors: list[torch.Tensor] = [create_ptr_tensor_from_list(page_ptr_list, self.model_runner.device) for page_ptr_list in tmp_value_cache]
+        # Always track old GPU pointer arrays for freeing after rebind
+        tmp_old_key_ptrs = list(self.model_runner.key_cache_ptrs)
+        tmp_old_value_ptrs = list(self.model_runner.value_cache_ptrs)
+        use_direct = self.vllm_config.dynamic_config.use_direct_ptr
         
         def _migrate_block_by_swapping_ptrs(old_block_id: int, new_block_id: int, migrate_record: dict[int, int]):
             assert len(tmp_key_cache) != 0
@@ -776,37 +775,52 @@ class DynamicGPUWorker(Worker):
                 value_cache[ new_block_id], value_cache[ old_block_id] = value_cache[ old_block_id], value_cache[ new_block_id]
             migrate_record[old_block_id] = new_block_id
 
-        if runner.vllm_config.dynamic_config.enable_flexi_flash_attn:
+        if runner.vllm_config.dynamic_config.use_flexi_kv:
             compact_cache_with_record(_migrate_block_by_swapping_ptrs, is_used, compacted_length, num_blocks, migrate_record)
 
-            # Prepare new kv ptrs
             forward_context = runner.vllm_config.compilation_config.static_forward_context
             # 🔴 FIX: Sort forward_context by layer index to ensure consistent ordering
             sorted_forward_context = sorted(forward_context.items(), key=lambda x: extract_layer_index(x[0]))
+
+            # Rebuild GPU pointer arrays AFTER compaction (needed by both flexi and direct kernels)
+            tmp_new_key_ptrs: list[int] = []
+            tmp_new_value_ptrs: list[int] = []
             for layer_name, attn_module in sorted_forward_context:
                 idx = extract_layer_index(layer_name)
                 local_idx = idx - start_layer
-                # Free old GPU pointer arrays to avoid memory leak
                 with self.model_runner.fbgate.background():
                     new_k_ptrs, new_v_ptrs = kv_allocator.prepare_flexi_kv_ptrs(
-                    tmp_key_cache[local_idx], tmp_value_cache[local_idx])
+                        tmp_key_cache[local_idx], tmp_value_cache[local_idx])
                 logger.info(f"prepare kv ptr for layer {layer_name}, new_k_ptrs: {hex(new_k_ptrs)}, new_v_ptrs: {hex(new_v_ptrs)}")
                 tmp_new_key_ptrs.append(new_k_ptrs)
                 tmp_new_value_ptrs.append(new_v_ptrs)
+
+            # PtrTensors only needed by direct kernel — build AFTER compaction
+            if use_direct:
+                tmp_new_key_ptr_tensors: list[torch.Tensor] = [
+                    create_ptr_tensor_from_list(kc, self.model_runner.device) for kc in tmp_key_cache]
+                tmp_new_value_ptr_tensors: list[torch.Tensor] = [
+                    create_ptr_tensor_from_list(vc, self.model_runner.device) for vc in tmp_value_cache]
+
             # Bind the new kv cache
             with self.model_runner.forward_lock:
                 time_start_within_lock = time.time()
                 for layer_name, attn_module in sorted_forward_context:
                     idx = extract_layer_index(layer_name)
                     local_idx = idx - start_layer
-                    new_k_ptrs, new_v_ptrs = tmp_new_key_ptrs[local_idx], tmp_new_value_ptrs[local_idx]
                     new_k_cache, new_v_cache = tmp_key_cache[local_idx], tmp_value_cache[local_idx]
-                    new_k_ptr_tensor, new_v_ptr_tensor = tmp_new_key_ptr_tensors[local_idx], tmp_new_value_ptr_tensors[local_idx]
-                    # Free old GPU pointer arrays to avoid memory leak
-                    dynamic_flexi_bind_single_kv_cache(start_layer, end_layer, idx, new_k_cache, new_v_cache, new_k_ptrs, new_v_ptrs,new_k_ptr_tensor, new_v_ptr_tensor, forward_context, self.dynamic_kv_synchronizer, runner)
+                    new_k_ptrs, new_v_ptrs = tmp_new_key_ptrs[local_idx], tmp_new_value_ptrs[local_idx]
+                    if use_direct:
+                        new_k_ptr_tensor = tmp_new_key_ptr_tensors[local_idx]
+                        new_v_ptr_tensor = tmp_new_value_ptr_tensors[local_idx]
+                    else:
+                        new_k_ptr_tensor = None
+                        new_v_ptr_tensor = None
+                    dynamic_flexi_bind_single_kv_cache(start_layer, end_layer, idx, new_k_cache, new_v_cache, new_k_ptrs, new_v_ptrs, new_k_ptr_tensor, new_v_ptr_tensor, forward_context, self.dynamic_kv_synchronizer, runner)
                 
-                # Update stacked tensors cache to reflect new ptr_tensors (must be before freeing old pointers)
-                self.model_runner.update_kv_ptr_tensor(tmp_new_key_ptr_tensors, tmp_new_value_ptr_tensors)
+                # Update stacked tensors cache (direct mode only, must be before freeing old pointers)
+                if use_direct:
+                    self.model_runner.update_kv_ptr_tensor(tmp_new_key_ptr_tensors, tmp_new_value_ptr_tensors)
 
                 logger.debug(f"after binding, synchronizer key cache ptr list: {self.dynamic_kv_synchronizer.key_cache_ptrs}, value cache ptr list: {self.dynamic_kv_synchronizer.value_cache_ptrs}") 
                 # 遍历CachedRequestState更新block_ids
@@ -825,6 +839,7 @@ class DynamicGPUWorker(Worker):
                 self.migration_records_for_specific_scheduler_output_version[self.cur_scheduler_output_version] = migrate_record
                 self.cur_scheduler_output_version += 1
             assert self.device is not None
+            # Free old GPU pointer arrays (needed by both flexi and direct)
             for old_k_ptrs, old_v_ptrs in zip(tmp_old_key_ptrs, tmp_old_value_ptrs):
                 with self.model_runner.fbgate.background():
                     kv_allocator.free_page_list(old_k_ptrs, self.device)
@@ -888,7 +903,7 @@ class DynamicGPUWorker(Worker):
         # Ensure correct CUDA device is set for this worker (important for Ray RPC calls)
         if self.device is not None:
             torch.cuda.set_device(self.device)
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         if new_length == self.block_num:
             logger.info(f"kv cache length is already {new_length}, no need to resize")
             return
@@ -943,6 +958,7 @@ class DynamicGPUWorker(Worker):
 
     def _flexi_resize_kv_cache(self, new_length: int) -> None:
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        use_direct_ptr = self.vllm_config.dynamic_config.use_direct_ptr
         time_start = time.time()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -965,8 +981,8 @@ class DynamicGPUWorker(Worker):
         tmp_value_cache_list = []
         tmp_key_cache_ptr_list = []
         tmp_value_cache_ptr_list = []
-        tmp_new_key_ptr_tensors: list[torch.Tensor] = []
-        tmp_new_value_ptr_tensors: list[torch.Tensor] = []
+        tmp_new_key_ptr_tensors: list[Optional[torch.Tensor]] = []
+        tmp_new_value_ptr_tensors: list[Optional[torch.Tensor]] = []
 
         tmp_old_key_cache_list = []
         tmp_old_value_cache_list = []
@@ -978,7 +994,7 @@ class DynamicGPUWorker(Worker):
                 idx = extract_layer_index(layer_name)
                 local_idx = idx - start_layer
 
-                # Free old GPU pointer arrays before allocating new ones
+                # Track old GPU pointer arrays for freeing later
                 old_k_ptrs, old_v_ptrs = self.model_runner.key_cache_ptrs[local_idx], self.model_runner.value_cache_ptrs[local_idx]
                 old_key_cache = self.model_runner.key_caches[local_idx][new_length:]
                 old_value_cache = self.model_runner.value_caches[local_idx][new_length:]
@@ -991,10 +1007,16 @@ class DynamicGPUWorker(Worker):
                 new_key_cache = self.model_runner.key_caches[local_idx][:new_length]
                 new_value_cache = self.model_runner.value_caches[local_idx][:new_length]
                 with self.model_runner.fbgate.background():
+                    # Both flexi and direct need GPU pointer arrays for the kernel
                     new_key_ptrs, new_value_ptrs = kv_allocator.prepare_flexi_kv_ptrs(new_key_cache, new_value_cache)
-                    new_key_ptr_tensor = create_ptr_tensor_from_list(new_key_cache, self.model_runner.device)
-                    new_value_ptr_tensor = create_ptr_tensor_from_list(new_value_cache, self.model_runner.device)
                     logger.info(f"resizing for kv cache, new_key_ptrs: {hex(new_key_ptrs)}, new_value_ptrs: {hex(new_value_ptrs)}")
+                    # PtrTensors only needed by direct kernel
+                    if use_direct_ptr:
+                        new_key_ptr_tensor = create_ptr_tensor_from_list(new_key_cache, self.model_runner.device)
+                        new_value_ptr_tensor = create_ptr_tensor_from_list(new_value_cache, self.model_runner.device)
+                    else:
+                        new_key_ptr_tensor = None
+                        new_value_ptr_tensor = None
                 tmp_key_cache_list.append(new_key_cache)
                 tmp_value_cache_list.append(new_value_cache)
                 tmp_key_cache_ptr_list.append(new_key_ptrs)
@@ -1020,14 +1042,15 @@ class DynamicGPUWorker(Worker):
                     dynamic_flexi_bind_single_kv_cache(start_layer, end_layer,idx, key_cache, value_cache, new_k_ptrs, new_v_ptrs,  new_key_ptrs_tensor, new_value_ptrs_tensor, forward_context, self.dynamic_kv_synchronizer, self.model_runner)
 
                     logger.info(f"[timeline]: bind single kv cache for layer {layer_name} take {human_readable_duration(time.time() - before_bind_time)}")
-                self.model_runner.update_kv_ptr_tensor(tmp_new_key_ptr_tensors, tmp_new_value_ptr_tensors)
+                if use_direct_ptr:
+                    self.model_runner.update_kv_ptr_tensor(tmp_new_key_ptr_tensors, tmp_new_value_ptr_tensors)
             time_after_in_lock = time.time()
             with self.resizing_done_cv:
                 self.resizing_done = True
                 self.resizing_done_cv.notify_all()
 
             assert self.device is not None
-            # Free old key and value ptrs
+            # Free old GPU pointer arrays (needed by both flexi and direct)
             for old_key_ptr, old_value_ptr in zip(tmp_old_key_cache_ptr_list, tmp_old_value_cache_ptr_list):
                 with self.model_runner.fbgate.background():
                     kv_allocator.free_page_list(old_key_ptr, self.device)
@@ -1044,8 +1067,8 @@ class DynamicGPUWorker(Worker):
             extended_kv_cache_shape = (T, H, Dh)
             tmp_new_allocated_key_cache = []
             tmp_new_allocated_value_cache = []
-            tmp_new_key_ptr_tensors: list[torch.Tensor] = []
-            tmp_new_value_ptr_tensors: list[torch.Tensor] = []
+            tmp_new_key_ptr_tensors: list[Optional[torch.Tensor]] = []
+            tmp_new_value_ptr_tensors: list[Optional[torch.Tensor]] = []
 
             tmp_old_key_cache_ptr_list = []
             tmp_old_value_cache_ptr_list = []
@@ -1070,9 +1093,15 @@ class DynamicGPUWorker(Worker):
                 new_value_cache = value_cache + new_allocated_value_cache
                 logger.info(f"[resize_kv_cache debug] new_key_cache len={len(new_key_cache)}, new_value_cache len={len(new_value_cache)}, device={self.model_runner.device}")
                 with self.model_runner.fbgate.background():
+                    # Both flexi and direct need GPU pointer arrays for the kernel
                     new_k_ptrs, new_v_ptrs = kv_allocator.prepare_flexi_kv_ptrs(new_key_cache, new_value_cache)
-                    new_key_ptr_tensor = create_ptr_tensor_from_list(new_key_cache, self.model_runner.device)
-                    new_value_ptr_tensor = create_ptr_tensor_from_list(new_value_cache, self.model_runner.device)
+                    # PtrTensors only needed by direct kernel
+                    if use_direct_ptr:
+                        new_key_ptr_tensor = create_ptr_tensor_from_list(new_key_cache, self.model_runner.device)
+                        new_value_ptr_tensor = create_ptr_tensor_from_list(new_value_cache, self.model_runner.device)
+                    else:
+                        new_key_ptr_tensor = None
+                        new_value_ptr_tensor = None
 
                 tmp_new_allocated_key_cache.append(new_key_cache)
                 tmp_new_allocated_value_cache.append(new_value_cache)
@@ -1081,7 +1110,7 @@ class DynamicGPUWorker(Worker):
                 tmp_key_cache_ptr_list.append(new_k_ptrs)
                 tmp_value_cache_ptr_list.append(new_v_ptrs)
                 
-                # Add old ptrs for freeing later
+                # Track old ptrs for freeing later
                 old_k_ptrs, old_v_ptrs = self.model_runner.key_cache_ptrs[local_idx], self.model_runner.value_cache_ptrs[local_idx]
                 tmp_old_key_cache_ptr_list.append(old_k_ptrs)
                 tmp_old_value_cache_ptr_list.append(old_v_ptrs)
@@ -1103,14 +1132,15 @@ class DynamicGPUWorker(Worker):
                     dynamic_flexi_bind_single_kv_cache(start_layer, end_layer, idx, new_key_cache, new_value_cache, new_k_ptrs, new_v_ptrs, new_k_ptr_tensor, new_v_ptr_tensor, forward_context, self.dynamic_kv_synchronizer, self.model_runner)
                     new_key_ptr_tensor_list.append(new_k_ptr_tensor)
                     new_value_ptr_tensor_list.append(new_v_ptr_tensor)
-                # Update stacked tensors cache to reflect new ptr_tensors (must be before freeing old pointers)
-                self.model_runner.update_kv_ptr_tensor(new_key_ptr_tensor_list, new_value_ptr_tensor_list)
+                # Update stacked tensors cache to reflect new ptr_tensors (direct mode only)
+                if use_direct_ptr:
+                    self.model_runner.update_kv_ptr_tensor(new_key_ptr_tensor_list, new_value_ptr_tensor_list)
             time_after_in_lock = time.time() 
             with self.resizing_done_cv:
                 self.resizing_done = True
                 self.resizing_done_cv.notify_all()
 
-            # Free old key and value ptrs
+            # Free old GPU pointer arrays (needed by both flexi and direct)
             for old_key_ptr, old_value_ptr in zip(tmp_old_key_cache_ptr_list, tmp_old_value_cache_ptr_list):
                 with self.model_runner.fbgate.background():
                     kv_allocator.free_page_list(old_key_ptr, self.model_runner.device)
@@ -1160,8 +1190,8 @@ class DynamicGPUWorker(Worker):
         logger.info(f"[operation]: rank {self.rank} start sending KV Cache Migration")
         num_layers = pp_layer_config[self.rank][1] - pp_layer_config[self.rank][0] + 1
         self.target_pp_layer_config = pp_layer_config
-        # Only prepare ptr_tables in flexi mode (non-flexi mode doesn't use ptr_tables)
-        if self.vllm_config.dynamic_config.enable_flexi_flash_attn:
+        # Only prepare ptr_tables in direct mode (flash/flexi don't use ptr_tables)
+        if self.vllm_config.dynamic_config.use_direct_ptr:
             self.model_runner.prepare_ptr_tables(num_layers)
         assert len(self.rank_to_layers_ids) == 0
         if self.rank not in src_to_plan:
@@ -1311,8 +1341,8 @@ class DynamicGPUWorker(Worker):
                         logger.info(f"[sync migration]: rank {self.rank} waiting for receive to finish")
                         self._receive_finished_cv.wait()
             logger.info(f"[timeline]: after start kv cache migration sync, time taken: {human_readable_duration(time.time() - time_start)}")
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn  
-        if is_flexi:
+        is_direct = self.vllm_config.dynamic_config.use_direct_ptr  
+        if is_direct:
             self.model_runner.commit_ptr_tables(self.model_runner.k_ptr_tensors, self.model_runner.v_ptr_tensors, target_start_layer=start_layer)
         logger.info(f"finish sync migration in {time.time() - time_start:.2f}")
         return None
@@ -1337,9 +1367,10 @@ class DynamicGPUWorker(Worker):
         torch.cuda.set_device(self.device)
         
         assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         time_start = None
-        while True:
+        try:
+          while True:
             received_layer = set()
             layers_to_be_received  = set()
             self.receiver_num_applied_token_dict[from_rank] = 0
@@ -1371,7 +1402,13 @@ class DynamicGPUWorker(Worker):
                 received_layer.add(meta.layer_id)
                 logger.info(f"[debug]: rank {self.rank} receive kv tensor meta {meta}")
 
-                with self.model_runner.fbgate.background():
+                # NOTE: Use foreground() instead of background() here.
+                # background() waits for ALL foreground tasks to finish, which
+                # deadlocks with compiled DAG (which uses foreground() for its
+                # NCCL recv and execute_model). KV migration NCCL uses a separate
+                # communicator and writes to newly allocated buffers, so it is
+                # safe to run concurrently with compiled DAG foreground tasks.
+                with self.model_runner.fbgate.foreground():
                     if is_flexi:
                         assert isinstance(meta, FlexiKVTensorMeta)
                         slot_mapping, kv_tensor = self.dynamic_kv_synchronizer.recv_kv_tensor(from_rank, meta)
@@ -1506,6 +1543,9 @@ class DynamicGPUWorker(Worker):
                     assert False, f"Unexpected message type: {meta.type}"
                 meta = self.dynamic_kv_synchronizer.recv_controller(from_rank)
             logger.info(f"[timeline]: after listen to kv cache patches, time taken: {human_readable_duration(time.time() - time_before_start_receive_patches)}")
+        except Exception as e:
+            logger.exception(f"[FATAL] _listen_loop(from_rank={from_rank}) crashed: {e}")
+            raise
         
     def all_patch_applied(self) -> bool:
         return all(self.is_all_patch_applied.values())
@@ -1611,8 +1651,8 @@ class DynamicGPUWorker(Worker):
                     caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value = self.atomic_shelve_kv_cache(self.rank, layer_ranges)
 
                 start_layer = self.target_pp_layer_config[self.rank][0]
-                is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
-                if is_flexi:
+                is_direct = self.vllm_config.dynamic_config.use_direct_ptr
+                if is_direct:
                     self.model_runner.commit_ptr_tables(self.model_runner.k_ptr_tensors, self.model_runner.v_ptr_tensors, target_start_layer=start_layer)
                 self.target_pp_layer_config = None
 
@@ -1656,7 +1696,7 @@ class DynamicGPUWorker(Worker):
         # This ensures all ptr_tensors changes are reflected in a single atomic switch
         from vllm.config import get_current_vllm_config
         vllm_config = get_current_vllm_config()
-        if vllm_config.dynamic_config.enable_flexi_flash_attn:
+        if vllm_config.dynamic_config.use_direct_ptr:
             time_start = time.time()
             logger.info(f"[timeline]: commit ptr tables after migration take {human_readable_duration(time.time() - time_start)}")
             logger.info(f"finish_migration: committed ptr_tables for flexi_direct")
