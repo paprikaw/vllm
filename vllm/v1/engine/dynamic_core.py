@@ -192,6 +192,10 @@ class DynamicEngineCore(EngineCore):
         # Make sure dynamic_config is not in the kwargs, but pulling out from it.
         self.migration_status = MigrationStatus.NOT_MIGRATING
         self.engine_lock = threading.Lock()
+        # Event to signal that an async migration has fully completed
+        # (including do_resize on workers). set_pp_config waits on this.
+        self._migration_done_event = threading.Event()
+        self._migration_done_event.set()  # initially no migration in progress
 
         self.scheduler_kv_cache_config: Optional[KVCacheConfig]
 
@@ -607,8 +611,9 @@ class DynamicEngineCore(EngineCore):
         """
         logger.info(f"Start migrating to new configuration {pp_layer_config}")
         self.migration_status = MigrationStatus.MIGRATING
+        self._migration_done_event.clear()  # signal that migration is in progress
         assert isinstance(self.scheduler, DynamicScheduler)
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         # 先获取一次内存快照
@@ -694,6 +699,14 @@ class DynamicEngineCore(EngineCore):
         # self.scheduler.shrink_block_pool(1700)
         # 对所有需要新增层的 rank 执行 add_layers（异步 fire-and-forget）
         logger.info(f"adding_per_rank: {adding_per_rank}")
+        if not adding_per_rank:
+            # No layers need to be transferred — target config matches current config.
+            # This can happen when set_pp_config didn't migrate back (e.g. already at target).
+            logger.info("No layers to add — skipping async migration (no-op)")
+            self.migration_status = MigrationStatus.NOT_MIGRATING
+            self._migration_done_event.set()
+            return
+
         for r, add_list in adding_per_rank.items():
             logger.info(f"rank {r}: adding layers {add_list}")
             self.model_executor.async_add_layers(r, add_list)
@@ -821,6 +834,7 @@ class DynamicEngineCore(EngineCore):
         if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
             logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
             self.migration_status = MigrationStatus.NOT_MIGRATING
+            self._migration_done_event.set()
             return
         time_start_checking_resizing_done = time.time()
         # Checking if the resizing is done and needed to extend the block pool
@@ -834,6 +848,7 @@ class DynamicEngineCore(EngineCore):
                 break
 
         self.migration_status = MigrationStatus.NOT_MIGRATING
+        self._migration_done_event.set()
         logger.info(f"[timeline]: after check resizing done process, time taken: {human_readable_duration(time.time() - time_start_checking_resizing_done)}")
         logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
 
@@ -1017,6 +1032,11 @@ class DynamicEngineCore(EngineCore):
             List of EngineCoreOutputs from processing any pending requests.
         """
         outputs = []
+        
+        # Wait for any ongoing async migration to fully complete
+        # (including worker-side do_resize / finish_migration) before resetting state
+        if not self._migration_done_event.wait(timeout=120):
+            raise RuntimeError("Timeout waiting for ongoing migration to complete before setting new PP config. Current migration may be stuck.")
         
         # Update migration configuration if provided
         with self._migration_config_lock:

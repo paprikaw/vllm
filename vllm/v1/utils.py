@@ -491,6 +491,7 @@ def dynamic_flexi_bind_kv_cache(
     page_meta: torch.Tensor,
     runner_k_ptr_tensors: list[torch.Tensor],
     runner_v_ptr_tensors: list[torch.Tensor],
+    use_direct_ptr: bool = True,
 ) -> None:
     """
     Bind the allocated KV cache to both ModelRunner and forward context so
@@ -544,12 +545,12 @@ def dynamic_flexi_bind_kv_cache(
         kv_synchronizer.key_cache_ptrs.append(key_dev_ptr[layer_name])
         kv_synchronizer.value_cache_ptrs.append(value_dev_ptr[layer_name])
         
-        # Create ptr tensors for flexi_direct implementation
-        # key_cache[layer_name] is a list of pointers (int), convert to tensor
-        k_ptr_tensor = create_ptr_tensor_from_list(key_cache[layer_name], device)
-        v_ptr_tensor = create_ptr_tensor_from_list(value_cache[layer_name], device)
-        runner_k_ptr_tensors.append(k_ptr_tensor)
-        runner_v_ptr_tensors.append(v_ptr_tensor)
+        # Create ptr tensors for flexi_direct implementation (only in direct mode)
+        if use_direct_ptr:
+            k_ptr_tensor = create_ptr_tensor_from_list(key_cache[layer_name], device)
+            v_ptr_tensor = create_ptr_tensor_from_list(value_cache[layer_name], device)
+            runner_k_ptr_tensors.append(k_ptr_tensor)
+            runner_v_ptr_tensors.append(v_ptr_tensor)
 
     from vllm.attention.dynamic_layer import FlexiAttention 
     # Bind kv_caches to forward context
@@ -638,8 +639,12 @@ def dynamic_flexi_bind_single_kv_tensor(
         assert local_index < len(runner.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(runner.key_caches)}"
         key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr = runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping,layer_index, kv_tensor, block_num, stream)
         logger.info(f"bind single kv tensor for {layer_index}, slot_mapping:{slot_mapping}, key_cache_ptr:{key_cache_ptr}, value_cache_ptr:{value_cache_ptr}")
-        k_ptr_tensor = create_ptr_tensor_from_list(key_cache_list, device)
-        v_ptr_tensor = create_ptr_tensor_from_list(value_cache_list, device)
+        
+        # PtrTensors only needed by direct kernel
+        use_direct_ptr = runner.vllm_config.dynamic_config.use_direct_ptr
+        if use_direct_ptr:
+            k_ptr_tensor = create_ptr_tensor_from_list(key_cache_list, device)
+            v_ptr_tensor = create_ptr_tensor_from_list(value_cache_list, device)
 
         with runner.forward_lock:        
             runner.key_caches[local_index] = key_cache_list
@@ -647,9 +652,10 @@ def dynamic_flexi_bind_single_kv_tensor(
             runner.key_cache_ptrs[local_index] = key_cache_ptr
             runner.value_cache_ptrs[local_index] = value_cache_ptr
         
-            # Create and bind k_ptr_tensor and v_ptr_tensor for flexi_direct implementation
-            runner.k_ptr_tensors[local_index] = k_ptr_tensor
-            runner.v_ptr_tensors[local_index] = v_ptr_tensor
+            # Update k_ptr_tensor/v_ptr_tensor only in direct mode
+            if use_direct_ptr:
+                runner.k_ptr_tensors[local_index] = k_ptr_tensor
+                runner.v_ptr_tensors[local_index] = v_ptr_tensor
         
             kv_synchronizer.key_cache_list[local_index] = key_cache_list
             kv_synchronizer.value_cache_list[local_index] = value_cache_list
@@ -708,12 +714,14 @@ def dynamic_flexi_bind_single_kv_cache(
     assert local_index < len(runner.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(runner.key_caches)}"
             
         
-    runner.k_ptr_tensors[local_index] = k_ptr_tensor
-    runner.v_ptr_tensors[local_index] = v_ptr_tensor
     runner.key_caches[local_index] = key_cache_list
     runner.value_caches[local_index] = value_cache_list
     runner.key_cache_ptrs[local_index] = key_cache_ptr
     runner.value_cache_ptrs[local_index] = value_cache_ptr
+    # Only update ptr_tensors if they exist (direct mode only)
+    if k_ptr_tensor is not None and v_ptr_tensor is not None and runner.k_ptr_tensors:
+        runner.k_ptr_tensors[local_index] = k_ptr_tensor
+        runner.v_ptr_tensors[local_index] = v_ptr_tensor
     kv_synchronizer.key_cache_list[local_index] = key_cache_list
     kv_synchronizer.value_cache_list[local_index] = value_cache_list
     kv_synchronizer.key_cache_ptrs[local_index] = key_cache_ptr

@@ -516,11 +516,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit(num_reqs)
-        # Update PtrTables for flexi_direct after block_table has been committed
+        # Update PtrTables for direct mode after block_table has been committed
         # This runs asynchronously on GPU using efficient index_select operations
         k_ptr_tables_tensor = None
         v_ptr_tables_tensor = None
-        if self.k_ptr_tensors and self.v_ptr_tensors:
+        use_direct_ptr = (hasattr(self.vllm_config, 'dynamic_config') 
+                          and self.vllm_config.dynamic_config is not None
+                          and self.vllm_config.dynamic_config.use_direct_ptr)
+        if use_direct_ptr and self.k_ptr_tensors and self.v_ptr_tensors:
             num_reqs = self.input_batch.num_reqs
             
             # PtrTable should already be initialized via commit_ptr_tables()

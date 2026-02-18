@@ -242,11 +242,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit(num_reqs)
-        # Update PtrTables for flexi_direct after block_table has been committed
+        # Update PtrTables for direct mode after block_table has been committed
         # This runs asynchronously on GPU using efficient index_select operations
         k_ptr_tables_tensor = None
         v_ptr_tables_tensor = None
-        if self.k_ptr_tensors and self.v_ptr_tensors:
+        if self.vllm_config.dynamic_config.use_direct_ptr:
             time_start = time.time()
             num_reqs = self.input_batch.num_reqs
             
@@ -1274,9 +1274,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
             self.page_meta,
             self.k_ptr_tensors,
             self.v_ptr_tensors,
+            use_direct_ptr=self.vllm_config.dynamic_config.use_direct_ptr,
         )
-        # Initialize PtrTable stacked tensors after binding all KV caches
-        self.commit_ptr_tables(self.k_ptr_tensors, self.v_ptr_tensors, is_first_time=True)
+        # Initialize PtrTable stacked tensors after binding all KV caches (direct mode only)
+        if self.vllm_config.dynamic_config.use_direct_ptr:
+            self.commit_ptr_tables(self.k_ptr_tensors, self.v_ptr_tensors, is_first_time=True)
         
         del kv_caches
         if has_kv_transfer_group():
@@ -1532,10 +1534,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
         def is_used(idx):
             return bitmap[idx]
         migrate_record: dict[int, int] = {}
-        if self.vllm_config.dynamic_config.enable_flexi_flash_attn:
+        if self.vllm_config.dynamic_config.use_flexi_kv:
             compact_cache_with_record(self._migrate_block_by_swapping_ptrs, is_used, compacted_length, num_blocks, migrate_record)
             # After swapping tensor references in Python lists, we must update the GPU pointer arrays
-            # because prepare_flexi_kv_ptrs caches the data_ptr() of each tensor on GPU
+            # because prepare_flexi_kv_ptrs caches the data_ptr() of each tensor on GPU.
+            # Both flexi and direct kernels read from these GPU pointer arrays.
             forward_context = self.vllm_config.compilation_config.static_forward_context
             for layer_name, attn_module in forward_context.items():
                 idx = extract_layer_index(layer_name) - self.model.model.start_layer

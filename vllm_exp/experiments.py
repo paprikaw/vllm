@@ -746,7 +746,7 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
     # Add dynamic config - pass all parameters through dynamic_cfg (no file needed)
     alternative_configs_dict = {"pp_layer_configs": cfg.migration.alternative_configs}
     dynamic_cfg = json.dumps({
-        "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
+        "attention_kernel": cfg.vllm.attention_kernel,
         "tester_start_step": cfg.migration.tester_start_step,
         "memory_stress_tester": cfg.migration.memory_stress_tester,
         "pp_layer_partition": spec.start_pp_layer_partition,
@@ -820,7 +820,7 @@ def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManag
     # Add dynamic config - pass all parameters through dynamic_cfg (no file needed)
     alternative_configs_dict = {"pp_layer_configs": cfg.migration.alternative_configs}
     dynamic_cfg = json.dumps({
-        "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
+        "attention_kernel": cfg.vllm.attention_kernel,
         "tester_start_step": cfg.migration.tester_start_step,
         "memory_stress_tester": cfg.migration.memory_stress_tester,
         "pp_layer_partition": spec.start_pp_layer_partition,
@@ -884,11 +884,6 @@ def start_benchmark(
 
     benchmark_config_path = os.environ.get("BENCHMARK_CONFIG_PATH")
     assert benchmark_config_path is not None
-    
-    # Get dataset configuration from config (default to 'pattern' for backward compatibility)
-    dataset_name = getattr(cfg.benchmark, 'dataset_name', 'pattern')
-    dataset_path = getattr(cfg.benchmark, 'dataset_path', None)
-    
     bench_args = [
         "python3", cfg.benchmark.benchmark_script_path,
         "--request-rate", str(spec.request_rate),
@@ -896,7 +891,7 @@ def start_benchmark(
         "--model", cfg.model.path,
         "--endpoint", "/v1/chat/completions",
         "--base-url", base_url,
-        "--dataset-name", dataset_name,
+        "--dataset-name", "pattern",
         "--served-model-name", cfg.model.name,
         "--goodput", "tpot:300", "ttft:5000",
         "--temperature", "0",
@@ -904,10 +899,6 @@ def start_benchmark(
         "--pattern-batch-size", str(cfg.benchmark.pattern_batch_size),
         "--benchmark-config", str(benchmark_config_path),
     ]
-    
-    # Add dataset-path for datasets that require it
-    if dataset_path is not None and dataset_name in ("burstgpt", "sharegpt"):
-        bench_args.extend(["--dataset-path", dataset_path])
     C.print(f"start to run benchmark with args: {bench_args}")
     if cfg.benchmark.print_outputs:
         bench_args.append("--print-outputs")
@@ -1040,7 +1031,7 @@ def one_off_test(cfg: Config, logm: LogManager):
         # Start vllm
         spec = ServerRunSpec(cfg.vllm.start_pp_layer_partitions[0], cfg.migration.is_migration)
         vars_mapping = {"start_pp_layer_partition": spec.start_pp_layer_partition,
-                        "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn}
+                        "attention_kernel": cfg.vllm.attention_kernel}
         logm.write_constants_meta(vars_mapping)
         proc, capture, timestamp_metrics_raw_path = start_vllm_with_raw_logging(cfg=cfg, spec=spec, logm=logm, vars=vars_mapping)
 
@@ -1275,7 +1266,7 @@ def generate_experiment_specs(
             block_size=exp_cfg.vllm.block_size,
             head_addr=exp_cfg.vllm.head_addr,
             port=exp_cfg.vllm.port,
-            enable_flexi_flash_attn=exp_cfg.vllm.enable_flexi_flash_attn,
+            attention_kernel=exp_cfg.vllm.attention_kernel,
             chunked_prefill=exp_cfg.vllm.chunked_prefill,
             enable_cuda_graph=exp_cfg.vllm.enable_cuda_graph,
             enable_nsight=exp_cfg.vllm.enable_nsight,
@@ -1309,9 +1300,6 @@ def generate_experiment_specs(
             print_outputs=exp_cfg.benchmark.print_outputs,
             profile=exp_cfg.benchmark.profile,
             warmup=exp_cfg.benchmark.warmup,
-            # Dataset config
-            dataset_name=exp_cfg.benchmark.dataset_name,
-            dataset_path=exp_cfg.benchmark.dataset_path,
             # Pipeline config for repetition reset
             initial_pp_config=exp_cfg.vllm.get_initial_pp_config(),
             alternative_configs=exp_cfg.vllm.get_alternative_configs(),
@@ -1439,7 +1427,7 @@ def start_benchmark_for_sweep(
         "--model", spec.model_path,
         "--endpoint", "/v1/chat/completions",
         "--base-url", spec.base_url,
-        "--dataset-name", spec.dataset_name,
+        "--dataset-name", "pattern",
         "--served-model-name", spec.model_name,
         "--goodput", "tpot:300", "ttft:5000",
         "--temperature", "0",
@@ -1447,10 +1435,6 @@ def start_benchmark_for_sweep(
         "--pattern-batch-size", str(spec.pattern_batch_size),
         "--benchmark-config", str(spec.benchmark_config_path),
     ]
-    
-    # Add dataset-path for datasets that require it
-    if spec.dataset_path is not None and spec.dataset_name in ("burstgpt", "sharegpt"):
-        bench_args.extend(["--dataset-path", spec.dataset_path])
     
     if spec.print_outputs:
         bench_args.append("--print-outputs")
@@ -1963,15 +1947,15 @@ def _run_single_experiment_on_running_server(
 
 
 def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
-    """Run sweep test with a single server instance per flexi mode.
+    """Run sweep test with a single server instance per kernel mode.
     
     Unlike sweep_test which starts/stops the server for each experiment,
-    this function starts the server once per flexi mode and switches PP 
+    this function starts the server once per kernel mode and switches PP 
     configurations between experiments using the set_pp_config API.
     
-    IMPORTANT: Switching between flexi and non-flexi modes requires a server
-    restart. This function ensures enable_flexi_flash_attn is the outermost
-    loop, and restarts the server when flexi mode changes.
+    IMPORTANT: Switching between kernel modes requires a server
+    restart. This function ensures attention_kernel is the outermost
+    loop, and restarts the server when kernel mode changes.
     
     This provides:
     1. Faster experiment iteration (no server restart overhead within same flexi mode)
@@ -2023,29 +2007,29 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
         
         C.print(f"[bold cyan]Starting single-server sweep test with {len(experiments_to_run)} experiments[/]")
         
-        # Group experiments by enable_flexi_flash_attn value
-        # Since we ensured flexi is the outermost loop in iter_from_sweep_test_config,
-        # experiments are already sorted by flexi value. But we group explicitly for clarity.
+        # Group experiments by attention_kernel value
+        # Since we ensured kernel is the outermost loop in iter_from_sweep_test_config,
+        # experiments are already sorted by kernel value. But we group explicitly for clarity.
         from itertools import groupby
         
-        def get_flexi_value(exp: SweepExperimentSpec) -> bool:
-            return exp.vllm_spec.enable_flexi_flash_attn
+        def get_kernel_value(exp: SweepExperimentSpec) -> str:
+            return exp.vllm_spec.attention_kernel
         
-        # Group experiments by flexi value (maintains order since flexi is outermost loop)
-        flexi_groups = []
-        for flexi_val, group_iter in groupby(experiments_to_run, key=get_flexi_value):
-            flexi_groups.append((flexi_val, list(group_iter)))
+        # Group experiments by kernel value (maintains order since kernel is outermost loop)
+        kernel_groups = []
+        for kernel_val, group_iter in groupby(experiments_to_run, key=get_kernel_value):
+            kernel_groups.append((kernel_val, list(group_iter)))
         
-        C.print(f"[bold cyan]Experiments grouped by flexi mode: {[(f, len(g)) for f, g in flexi_groups]}[/]")
+        C.print(f"[bold cyan]Experiments grouped by kernel mode: {[(k, len(g)) for k, g in kernel_groups]}[/]")
         
-        # Run experiments group by group, restarting server when flexi mode changes
-        for flexi_val, group_experiments in flexi_groups:
+        # Run experiments group by group, restarting server when kernel mode changes
+        for kernel_val, group_experiments in kernel_groups:
             proc = None
             log_redirector = None
             
             try:
                 C.print(f"\n[bold blue]{'='*60}[/]")
-                C.print(f"[bold blue]Starting server with enable_flexi_flash_attn={flexi_val}[/]")
+                C.print(f"[bold blue]Starting server with attention_kernel={kernel_val}[/]")
                 C.print(f"[bold blue]This group has {len(group_experiments)} experiments[/]")
                 C.print(f"[bold blue]{'='*60}[/]\n")
                 
@@ -2053,17 +2037,17 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 first_exp = group_experiments[0]
                 
                 # Create a global metrics path for the server (per flexi group)
-                flexi_suffix = "flexi" if flexi_val else "no_flexi"
-                global_metrics_path = logm.get_dir() / f"global_metrics_raw_{flexi_suffix}.csv"
+                kernel_suffix = kernel_val
+                global_metrics_path = logm.get_dir() / f"global_metrics_raw_{kernel_suffix}.csv"
                 first_exp.vllm_spec.metrics_csv_path = str(global_metrics_path)
                 
                 # Create initial log path (per-experiment)
                 initial_log_path = Path(first_exp.vllm_spec.server_raw_log_path) if first_exp.vllm_spec.server_raw_log_path else None
                 
-                # Create global log path for this flexi group
-                global_log_path = logm.get_dir() / f"server_global_{flexi_suffix}.log"
+                # Create global log path for this kernel group
+                global_log_path = logm.get_dir() / f"server_global_{kernel_suffix}.log"
                 
-                # Start the server for this flexi group
+                # Start the server for this kernel group
                 proc, log_redirector, metrics_path = start_vllm_single_instance(
                     first_exp.vllm_spec,
                     initial_log_path=initial_log_path,
@@ -2071,21 +2055,21 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 )
                 
                 # Wait for server to be ready
-                C.print(f"[bold cyan]Waiting for server to be ready (flexi={flexi_val})...[/]")
+                C.print(f"[bold cyan]Waiting for server to be ready (kernel={kernel_val})...[/]")
                 C.print(f"[bold cyan]Monitor server status: tail -f {global_log_path}[/]")
                 if not wait_ready(first_exp.bench_spec.base_url, 300):
-                    C.print(f"[red]ERROR: vLLM server not ready in time (flexi={flexi_val})[/]")
+                    C.print(f"[red]ERROR: vLLM server not ready in time (kernel={kernel_val})[/]")
                     continue
                 
-                C.print(f"[green]vLLM server is ready (flexi={flexi_val})[/]")
+                C.print(f"[green]vLLM server is ready (kernel={kernel_val})[/]")
                 
-                # Run each experiment in this flexi group
+                # Run each experiment in this kernel group
                 for i, exp in enumerate(group_experiments):
                     experiment_count += 1
                     is_first = (i == 0)
                     
                     C.print(f"\n[bold magenta]{'='*60}[/]")
-                    C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)} (flexi={flexi_val})[/]")
+                    C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)} (kernel={kernel_val})[/]")
                     C.print(f"[bold magenta]vars: {exp.vars_mapping}[/]")
                     C.print(f"[bold magenta]PP partition: {exp.vllm_spec.pp_layer_partition}[/]")
                     C.print(f"[bold magenta]{'='*60}[/]\n")
@@ -2109,7 +2093,7 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
             finally:
                 # Clean up server for this flexi group before starting next group
                 if proc:
-                    C.print(f"[bold cyan]Stopping vLLM server (flexi={flexi_val})...[/]")
+                    C.print(f"[bold cyan]Stopping vLLM server (kernel={kernel_val})...[/]")
                     stop_tree(proc)
                 if log_redirector:
                     log_redirector.close()

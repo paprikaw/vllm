@@ -11,7 +11,7 @@
    ```python
    @dataclass
    class DynamicConfig:
-       enable_flexi_flash_attn: bool = False
+       attention_kernel: str = "flash"  # Options: flash, flexi, direct
        your_new_param: bool = False  # 添加新参数
        """参数说明文档"""
    ```

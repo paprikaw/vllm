@@ -1,0 +1,507 @@
+\documentclass[sigplan,screen]{acmart}
+\acmSubmissionID{<PAPER_ID>}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+% Optional: Remove the ACM reference between the abstract and the main text
+\settopmatter{printfolios=true,printacmref=false}
+% Optional: Comment out the CCS concepts and keywords.
+%%
+%% \BibTeX command to typeset BibTeX logo in the docs
+\AtBeginDocument{%
+  \providecommand\BibTeX{{%
+    Bib\TeX}}}
+% \usepackage{cite}
+% \usepackage{amsmath,amssymb,amsfonts}
+% \usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage[skip=1pt]{caption}
+\usepackage{enumitem}
+\usepackage[ruled,linesnumbered,vlined]{algorithm2e}
+\usepackage{amsmath,amssymb}
+
+% -- Notation shortcuts for Algorithm --
+\newcommand{\Ccur}{C_{\mathrm{cur}}}
+\newcommand{\Ctgt}{C_{\mathrm{tgt}}}
+\newcommand{\Ctmp}{C_{\mathrm{int}}}
+\newcommand{\Madd}{\mathcal{M}_{\mathrm{add}}}
+\newcommand{\Mdel}{\mathcal{M}_{\mathrm{del}}}
+\newcommand{\Mmig}{\mathcal{M}_{\mathrm{mig}}}
+\newcommand{\Bmax}{B_{\max}}
+\newcommand{\Bcur}{B_{\mathrm{cur}}}
+\newcommand{\Bnew}{B_{\mathrm{new}}}
+
+\setlist[itemize]{topsep=2pt, partopsep=0pt, parsep=0pt, itemsep=2pt}
+% \pagestyle{plain}
+% \usepackage{algorithm2e}
+% \usepackage{algorithmicx}
+% \usepackage{algpseudocode}
+% \usepackage{amsmath}
+% \usepackage{amsfonts}
+% \usepackage[square, numbers, comma, sort&compress]{natbib}  % Use the "Natbib" style for the references in the Bibliography
+% \usepackage{verbatim}  % Needed for the "comment" environment to make LaTeX comments
+% \usepackage{listings}
+\usepackage{graphicx} % 确保图片能够被正确插入 
+\usepackage{float} % 提供 H 选项
+\usepackage{titlesec}
+% \usepackage{multirow}
+\usepackage{booktabs}
+% \usepackage{lscape}
+% \usepackage{amssymb}
+\usepackage{stfloats}
+% \usepackage{longtable}
+\renewcommand{\bibfont}{\footnotesize}
+%% Rights management information.  This information is sent to you
+%% when you complete the rights form.  These commands have SAMPLE
+%% values in them; it is your responsibility as an author to replace
+%% the commands and values with those provided to you when you
+%% complete the rights form.
+% \setcopyright{acmlicensed}
+% \copyrightyear{2018}
+% \acmYear{2018}
+% \acmDOI{XXXXXXX.XXXXXXX}
+%% These commands are for a PROCEEDINGS abstract or paper.
+% \acmConference[Conference acronym 'XX]{Make sure to enter the correct
+%   conference title from your rights confirmation email}{June 03--05,
+%   2018}{Woodstock, NY}
+%%
+%%  Uncomment \acmBooktitle if the title of the proceedings is different
+%%  from ``Proceedings of ...''!
+%%
+%%\acmBooktitle{Woodstock '18: ACM Symposium on Neural Gaze Detection,
+%%  June 03--05, 2018, Woodstock, NY}
+% \acmISBN{978-1-4503-XXXX-X/2018/06}
+
+
+%%
+%% Submission ID.
+%% Use this when submitting an article to a sponsored event. You'll
+%% receive a unique submission ID from the organizers
+%% of the event, and this ID should be used as the parameter to this command.
+%%\acmSubmissionID{123-A56-BU3}
+
+%%
+%% For managing citations, it is recommended to use bibliography
+%% files in BibTeX format.
+%%
+%% You can then either use BibTeX with the ACM-Reference-Format style,
+%% or BibLaTeX with the acmnumeric or acmauthoryear sytles, that include
+%% support for advanced citation of software artefact from the
+%% biblatex-software package, also separately available on CTAN.
+%%
+%% Look at the sample-*-biblatex.tex files for templates showcasing
+%% the biblatex styles.
+%%
+
+%%
+%% The majority of ACM publications use numbered citations and
+%% references.  The command \citestyle{authoryear} switches to the
+%% "author year" style.
+%%
+%% If you are preparing content for an event
+%% sponsored by ACM SIGGRAPH, you must use the "author year" style of
+%% citations and references.
+%% Uncommenting
+%% the next command will enable that style.
+%%\citestyle{acmauthoryear}
+
+
+%%
+%% end of the preamble, start of the body of the document source.
+\begin{document}
+
+%%
+%% The "title" command has an optional parameter,
+%% allowing the author to define a "short title" to be used in page headers.
+\title[RL-based Rescheduling of MSA Application in Cloud-Edge Continuum]{FlexiServe: Enabling LLM Pipeline Reconfiguration with Elastic KV Cache Resizing}
+% Reinforcement Learning-based
+% Rescheduling of Microservice
+% Architecture Applications in the
+% Cloud-Edge Continuum
+
+
+
+% If you give a name to your approach it would be more catchy!! 
+
+% For example: REALM (REinforcement-based Adaptive rescheduling for cLoud-edge Microservices)
+
+% RACE (Reinforcement for Application Continuum Execution)
+
+% MERLIN (Microservice Edge Rescheduling with Learning-based Intelligence for Networks)
+
+% or ReSchedIt
+% FlexiSched
+%%
+%% The "author" command and its associated commands are used to define
+%% the authors and their affiliations.
+%% Of note is the shared affiliation of the first two authors, and the
+%% "authornote" and "authornotemark" commands
+%% used to denote shared contribution to the research.
+% \author{Ben Trovato}
+% \authornote{Both authors contributed equally to this research.}
+% \email{trovato@corporation.com}
+% \orcid{1234-5678-9012}
+% \author{G.K.M. Tobin}
+% \authornotemark[1]
+% \email{webmaster@marysville-ohio.com}
+% \affiliation{%
+%   \institution{Institute for Clarity in Documentation}
+%   \city{Dublin}
+%   \state{Ohio}
+%   \country{USA}
+% }
+
+%% By default, the full list of authors will be used in the page
+%% headers. Often, this list is too long, and will overlap
+%% other information printed in the page headers. This command allows
+%% the author to define a more concise list
+%% of authors' names for this purpose.
+% \renewcommand{\shortauthors}{Trovato et al.}
+
+%%
+%% The abstract is a short summary of the work to be presented in the
+%% article.
+\begin{abstract}
+With the rapid advancement of large language models (LLMs), efficiently serving LLM inference under limited GPU resources has become a critical challenge. Recently, an increasing number of studies have explored applying serverless computing paradigms to LLM serving in order to maximize resource utilization. However, LLM inference workloads are highly diverse, and modern GPU clusters are inherently heterogeneous, making it necessary to dynamically adjust deployment configurations online to better adapt to the elastic and dynamic nature of serverless environments. At the same time, enabling such online reconfiguration is particularly challenging due to the stateful nature of LLM inference and the massive size of model parameters. In this paper, we propose a dynamic pipeline reconfiguration approach that enables online adjustment of pipeline configurations while minimizing service downtime and performance degradation. Our method allows the system to select the optimal pipeline configuration in response to changing workloads. Experimental results on heterogeneous GPU platforms, including NVIDIA A100 and L40s, demonstrate that our migration mechanism incurs less than 50 ms of service downtime, while introducing under 10\% overhead on both time-to-first-token (TTFT) and time-per-output-token (TPOT).
+
+\end{abstract}
+
+%%
+%% The code below is generated by the tool at http://dl.acm.org/ccs.cfm.
+%% Please copy and paste the code instead of the example below.
+%%
+% \begin{CCSXML}
+% <ccs2012>
+%  <concept>
+%   <concept_id>00000000.0000000.0000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>500</concept_significance>
+%  </concept>
+%  <concept>
+%   <concept_id>00000000.00000000.00000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>300</concept_significance>
+%  </concept>
+%  <concept>
+%   <concept_id>00000000.00000000.00000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>100</concept_significance>
+%  </concept>
+%  <concept>
+%   <concept_id>00000000.00000000.00000000</concept_id>
+%   <concept_desc>Do Not Use This Code, Generate the Correct Terms for Your Paper</concept_desc>
+%   <concept_significance>100</concept_significance>
+%  </concept>
+% </ccs2012>
+% \end{CCSXML}
+
+% \ccsdesc[500]{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+% \ccsdesc[300]{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+% \ccsdesc{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+% \ccsdesc[100]{Do Not Use This Code~Generate the Correct Terms for Your Paper}
+
+%%
+%% Keywords. The author(s) should pick words that accurately describe
+%% the work being presented. Separate the keywords with commas.
+\keywords{Cloud-edge continuum, microservice, scheduling}
+% \received{20 February 2007}
+% \received[revised]{12 March 2009}
+% \received[accepted]{5 June 2009}
+
+%%
+%% This command processes the author and affiliation and title
+%% information and builds the first part of the formatted document.
+\maketitle
+
+\section{Introduction}
+
+Large language models (LLMs) have advanced rapidly in recent years, driven by improvements in model architectures, training algorithms, and the availability of large-scale data and compute resources. This progress has enabled LLMs to serve as a core foundation for a wide range of applications, including AI-assisted programming, agentic systems, conversational interfaces, and domain-specific intelligent assistants. As these applications increasingly move from experimental use to production deployment, the efficiency and scalability of LLM serving systems have become critical system-level concerns.
+
+Unlike traditional AI workloads, LLM serving places sustained and intensive demands on hardware accelerators such as GPUs or TPUs. Consequently, efficient utilization of available GPU resources is essential. Prior works has explored deploying LLMs across multiple GPUs using heterogeneous devices, to aggregate compute capacity and reduce idle time. Pipeline Parallelism(PP) which is model distribution approach to allocate a partial of senquence of model layer in multiple GPUs is used to spread computational load in heterogeneous gpus.
+
+
+Existing LLM inference systems typically rely on offline profiling to determine a fixed PP configuration and assume that the layer-to-GPU mapping remains unchanged during inference. However, LLM serving systems must handle highly diverse workloads that differ in execution patterns—such as interactive chatbots, agentic workflows, and offline batch processing—as well as in performance objectives. In heterogeneous GPU environments, we observe that the optimal PP configuration varies substantially across workload patterns. This observation implies that to effectively support diverse workloads and serving requirements, LLM serving systems require mechanisms to dynamically reconfigure the number of model layers assigned to each GPU under pipeline parallelism.
+
+However, Enabling efficient reconfiguration of pipeline parallelism at runtime is non-trivial. Under current approaches, redistributing model layers across GPUs requires pausing inference to reload model weights and reinitialize KV caches, which can severely degrade inference performance. This challenge is further compounded by the memory management strategies used in state-of-the-art inference frameworks such as vLLM and SGLang, which adopt PageAttention as KV cache allocation strategy to reduce fragmentation. While effective under static configurations, PageAttention relies on layer-level pre-allocation of KV cache memory. During pipeline reconfiguration, adapting to a new PP configuration requires resizing the KV cache accordingly, yet the pre-allocated nature of PageAttention makes such resizing infeasible. 
+
+Together, these limitations hinder dynamic pipeline reconfiguration and motivate the need for system support that enables flexible layer migration and KV cache adaptation with minimal disruption to inference performance. Based on the insight that static pipeline-parallel configurations are insufficient for LLM deployment, we present \textbf{FlexiServe}, a dynamic inference architecture that enables online adjustment of layer placement across GPUs under pipeline parallelism. 
+
+FlexiServe adopts a top-down design spanning three coordinated \emph{level}. At the \emph{model level}, we introduce a placement algorithm that, given the current and target pipeline configurations, evaluates migration feasibility based on KV cache occupancy and GPU memory availability, and generates explicit migration instructions for each GPU worker. At the \emph{worker level}, a \emph{Layer Migrator} runs on each GPU and performs asynchronous model parameter loading, KV cache resizing, and KV cache migration during PP reconfiguration. At the \emph{kernel level}, to support efficient KV cache resizing, we employ a block-level KV cache pre-allocation strategy that enables dynamic expansion or shrinking of pre-allocated KV cache space. Together, these components allow FlexiServe to reconfigure pipeline parallelism at runtime while minimizing disruption to ongoing inference.
+
+Our \textbf{main contributions} are as follows:
+\begin{itemize}
+    \item We identify that in heterogeneous GPU deployment environments, no single pipeline-parallel (PP) configuration can efficiently adapt to all LLM workloads due to variations in workload characteristics and performance objectives. This observation motivates the need for an LLM serving framework that supports efficient PP reconfiguration.
+    \item We present \textbf{FlexiServe}, a unified LLM serving framework that enables dynamic PP reconfiguration. FlexiServe adopts a top-down system design that jointly optimizes from model-level to the attention kernel-level, minimizing inference overhead and service downtime during reconfiguration.
+    \item We conduct comprehensive experiments to isolate and quantify the impact of each optimization used during pipeline reconfiguration. Our results show that with FlexiServe, inference interruption caused by KV cache resizing and layer synchronization is limited to within 10~ms, representing a substantial improvement over prior approaches that incur service pauses on the order of seconds.
+\end{itemize}
+
+
+
+% Backup
+% \begin{figure}
+%     \centering
+%     \includegraphics[width=0.5\linewidth]{Figures/ce-arch.pdf}
+%     \caption{Architecture of Cloud-Edge Continuum}
+%     \label{fig:intro-ce}
+% \end{figure}
+\vspace{-1em}
+
+\section{Background}
+\subsection{LLM Inference}
+
+Unlike conventional AI workloads, LLMs inference operate on variable-length inputs and produce variable-length outputs. Prompt processing is referred to as the \emph{prefill} stage: the model consumes the prompt and computes activations for all prompt tokens in parallel, and this stage is typically compute-bound. After prefill, the model generates the next most likely token and feeds it back as input, producing an output sequence autoregressively; this process is the \emph{decode} stage. During decode, the model generates one token at a time and is often memory-bound due to repeated reads and writes of cached attention states and the low arithmetic intensity per step.
+
+During inference, LLMs materialize key–value (KV) caches to accelerate subsequent token generation. As context lengths and request concurrency increase, KV cache memory often becomes the dominant memory footprint. \emph{PagedAttention} improves KV cache utilization by managing the cache in fixed-size blocks (pages) and allocating these blocks to requests on demand, thereby reducing memory fragmentation.
+
+LLM serving performance is typically characterized by three metrics. \emph{Throughput} measures steady-state generation capacity (e.g., output tokens per second or requests per second) and is central for batch-style workloads. \emph{Time-to-first-token (TTFT)} captures the latency from request arrival to the first generated token. \emph{Time-per-output-token (TPOT)} measures the average latency per generated token after the first token. Different workload patterns emphasize different metrics, creating inherent trade-offs in serving system design.
+
+\subsection{Deployment of LLM Models}
+We refer to the assignment of model layers to GPUs under pipeline parallelism as a \emph{pipeline-parallel configuration} (PP configuration). Pipeline parallelism typically assigns an equal number of layers to each GPU. In heterogeneous environments, however, GPUs differ in compute throughput, memory bandwidth, and memory capacity, and the layer partition that satisfies a given service-level objective (SLO) is often inherently unbalanced. As a result, effective PP configuration in heterogeneous GPU setups may require \emph{uneven} layer-to-GPU assignments to align layer placement with device capabilities and performance goals.
+
+LLMs are typically deployed on GPUs. In homogeneous GPU clusters, devices are often tightly integrated within a single node with high-bandwidth interconnects, making TP an effective choice. In contrast, when inference spans multiple nodes or when GPUs are connected by lower-bandwidth links as is common in heterogeneous deployments, pipeline parallelism (PP) is generally more suitable. This work therefore focuses on PP-based LLM serving.
+
+We refer to the assignment of model layers to GPUs under pipeline parallelism as a \emph{pipeline-parallel configuration} (PP configuration). In homogeneous clusters, PP commonly assigns an equal number of layers to each GPU. In heterogeneous deployments, however, GPUs differ substantially in hardware characteristics and this often results in an uneven deployment of model layers. Table~X compares representative devices: A100 is a high-end accelerator designed for AI workloads and equipped with HBM, providing significantly higher memory bandwidth and  larger memory capacity than L40s; in contrast, L40s is based on a newer architecture and can offer higher peak compute throughput in some regimes.
+
+\section{Motivation}
+When deploying LLMs on heterogeneous GPUs, existing systems typically profile devices to quantify relative capability in compute throughput, memory bandwidth, and memory capacity, and then derive an SLO-aware pipeline-parallel (PP) configuration that is optimized for a target workload. This approach is inherently workload-specific: we find that in heterogeneous settings, the optimal PP configuration can shift significantly with workload properties such as input/output lengths and request rate. In particular, different workloads stress different phases of inference (compute-bound prefill vs.\ memory-bound decode), and a fixed layer partition cannot remain optimal across these regimes.
+
+Figure~X illustrates this effect on a two-GPU setup (A100 + L40s). For requests with long inputs (prefill-dominated), assigning more layers to L40s yields lower TTFT/TPOT; for requests with long outputs (decode-dominated), allocating more layers to A100 improves TTFT/TPOT. A plausible explanation is that A100's higher memory bandwidth better serves decode-intensive execution, whereas L40s can be more effective for compute-intensive prefill. 
+
+Motivated by this observation, we develop \textbf{FlexiServe}, which dynamically reconfigures PP layer placement at runtime to match the current workload. As shown in the third plot of Figure~X, when the workload shifts mid-run (from short-input to long-input requests), FlexiServe switches PP configurations online and outperforms static partitions. Achieving this benefit requires a top-down reconfiguration design that minimizes disruption to throughput, TTFT, and TPOT during configuration changes.
+
+
+Figure~X (third plot) demonstrates this capability in a workload-shift experiment: the request mix changes mid-run from short-input to long-input prompts, altering the dominant inference bottleneck. In response, FlexiServe switches to a more suitable PP configuration online and achieves lower TTFT/TPOT without sacrificing steady-state throughput. To enable such adaptation, FlexiServe adopts a top-down reconfiguration design with the explicit goal of minimizing downtime and bounding the impact of reconfiguration on throughput, TTFT, and TPOT.
+
+\section{Overview of FlexiServe}
+
+FlexiServe is an LLM inference framework that enables runtime reconfiguration of pipeline-parallel (PP) layer placement. At the \emph{model level}, FlexiServe designates one GPU node as the coordinator, which hosts the inference scheduler and a centralized \emph{Reconfiguration Coordinator}. Given the current and target PP configurations, the coordinator runs a placement algorithm to (1) evaluate reconfiguration feasibility based on GPU memory availability and KV cache state, and (2) generate an explicit reconfiguration plan that translates the target configuration into a sequence of coordinated actions, including KV cache resizing and migration, asynchronous weight loading, and final state synchronization.
+
+At the \emph{GPU level}, each device runs an \emph{inference worker} dedicated to executing model inference, alongside a local \emph{Reconfiguration Worker} responsible for carrying out reconfiguration actions. Each reconfiguration worker comprises three components. (1) A \emph{KV cache synchronizer} migrates KV states between source and destination layers during reconfiguration while preserving correctness under ongoing inference. To avoid perturbing inference communication, KV transfers are executed in a dedicated NCCL group isolated from the inference group, with explicit handling of deadlock risks arising from concurrent collective operations. (2) A \emph{weight loader} asynchronously stages newly assigned layer weights onto the target GPU. To bound interference with inference, weights are loaded in rate-limited chunks, trading slightly longer migration time for reduced performance impact. (3) A \emph{KV cache resizer} dynamically adjusts KV cache capacity to accommodate the post-reconfiguration layer placement and reclaims memory from removed layers; when shrinking, it performs cache compaction to mitigate fragmentation and restore usable free space.
+
+At the \emph{attention kernel level}, existing PagedAttention implementations pre-allocate contiguous KV cache regions per layer, which prevents efficient resizing during reconfiguration. FlexiServe extends PagedAttention with a block-level KV cache pre-allocation strategy and employs direct block-table addressing to reduce the overhead of indirect block-pointer lookups. This design enables block-level KV cache resizing and compaction while preserving performance comparable to the original PagedAttention kernel.
+
+Overall, the Reconfiguration Coordinator makes global, SLO-aware decisions and translates them into concrete reconfiguration plans; Reconfiguration Workers execute these plans asynchronously on each GPU while inference workers continue serving requests; and kernel-level KV cache support enables efficient resizing and compaction without sacrificing attention performance. By coordinating reconfiguration across all three layers, FlexiServe minimizes model downtime during PP reconfiguration and bounds its impact on throughput, TTFT, and TPOT, enabling practical and efficient dynamic reconfiguration for LLM serving under heterogeneous and evolving workloads.
+
+
+\section{Reconfiguration Coordinator}
+% Model Configurator是coordinate model configuration的核心组件，通过我们的layer migration算法，Model coordinator调用不同的premetive来调用GPU worker进行相应的步骤，并且最终完成搞笑的reconfiguration。在这一个章节，我们首先介绍在reconfigurate中所需要实现的premtive，这些preemptive由collective rpc调用不同的GPU reconfigrator执行对应的操作来实现。然后，我们将介绍我们的layer migration算法。
+
+The \emph{Reconfiguration Coordinator} is the central coordination component that orchestrates PP reconfiguration in FlexiServe. It implements a \emph{PP reconfiguration protocol} that specifies how a target PP configuration is realized through a sequence of coordinated actions across GPUs. Rather than treating reconfiguration as a monolithic operation, the protocol decomposes PP reconfiguration into a set of well-defined \emph{primitives}, each capturing a fundamental reconfiguration action. These primitives are invoked via collective RPCs and executed by GPU-level Reconfiguration Worker in a coordinated manner, enabling reconfiguration to proceed concurrently with inference while tightly controlling resource usage and interference.
+
+In this section, we first provide an end-to-end overview of the PP reconfiguration protocol. We then describe the core reconfiguration primitives defined by the protocol and their semantics. Finally, we present a reconfiguration algorithm that composes these primitives to safely and efficiently perform online PP reconfiguration at runtime.
+
+
+\subsection{General Reconfiguration Procedure}
+Figure~X illustrates a canonical PP reconfiguration workflow. We denote a PP configuration as an ordered tuple of layer ranges assigned to each GPU. For clarity, we consider a simplified setup with two GPUs (rank~0 and rank~1) serving a six-layer model. The initial configuration is $\mathcal{C}_A = \langle [1,3], [4,6] \rangle$, which evenly partitions the model across the two GPUs. The system then transitions to a target configuration $\mathcal{C}_B = \langle [1,2], [3,6] \rangle$, requiring one layer to be migrated from rank~0 to rank~1.
+
+At the outset, both GPUs have most of their memory occupied by model weights and KV caches. To create space for the incoming layer, rank~1 first resizes its KV cache, freeing sufficient memory to accommodate the additional layer weights and KV state. Once resizing completes, rank~1 begins loading the new layer weights, while rank~0 concurrently streams the corresponding KV cache. Importantly, throughout this migration phase, inference continues under the original configuration $\mathcal{C}_A$, meaning that both GPUs still execute three layers. As a result, the migrating layer on rank~0 continues to generate new KV entries, which are incrementally synchronized to rank~1 via streaming KV transfer.
+
+Meanwhile, the reconfiguration coordinator monitors KV cache synchronization progress by tracking the latest KV index produced on rank~0 and the highest index received on rank~1. Once the lag falls below a predefined threshold, the reconfigurator inserts a synchronization point, performs a final KV cache synchronization, and atomically switches the system to the new configuration $\mathcal{C}_B$. After the switch, rank~0 deletes the migrated layer and releases its weights and KV cache. Then the KV cache is resized again to reclaim freed memory.
+
+Several challenges arise during PP reconfiguration. First, migration requires resizing the KV cache to free memory for newly assigned layers; the system must ensure that the target PP configuration is feasible and can be accommodated on destination GPUs without interrupting ongoing inference. Second, when scaling beyond a two-GPU setting, the system must correctly and concurrently coordinate the sequence of stateful, latency-sensitive actions illustrated in Figure~X and commit the configuration change consistently across all devices.
+
+
+To address these challenges, we design a PP reconfiguration protocol that formalizes the required primitives, their coordination logic, and how a PP configuration change can be safely committed. We then present an algorithm that composes these primitives to efficiently transition between PP configurations at runtime.
+
+\subsection{Pipeline Parallelism Reconfiguration Protocal}
+
+The PP reconfiguration protocol exposes a set of \emph{primitives} invoked by the Reconfiguration Coordinator to orchestrate coordinated reconfiguration across GPUs. Based on their invocation semantics, these primitives fall into two categories: \emph{Collective Primitives (CP)} and \emph{Synchronization Primitives (SP)}. As illustrated in Figure~X, CP are issued by the Reconfiguration Coordinator via collective RPCs and executed by all Reconfiguration Workers. Each GPU performs the specified local actions on its assigned layer ranges independently, without a globally enforced execution order, allowing CP to proceed asynchronously across devices.
+
+In contrast, SP are embedded into the metadata of \emph{scheduled inference batches} and are executed only when all GPUs are processing the \emph{same batch}. Embedding SP at the batch level guarantees that every GPU observes the synchronization primitive at an identical pipeline boundary and applies it in pipeline order. This ensures that global state transitions—such as committing a new PP configuration—occur atomically with respect to a batch, preserving pipeline consistency and avoiding inference interruption.
+
+
+To uniformly represent per-GPU actions in collective primitives, we use a
+\emph{layer assignment map} $\mathcal{M}$. $\mathcal{M}$ maps GPU ranks to sets of
+layer ranges, i.e.,
+$\mathcal{M} : r \mapsto \{[l^{(r)}_{1,\text{lo}}, l^{(r)}_{1,\text{hi}}], \dots\}$,
+where $\mathcal{M}(r)$ specifies the layer ranges on which GPU $r$ should operate
+for a given primitive. For primitives involving data transfer across GPUs, we
+use a directional assignment map $\mathcal{M}_{\text{mig}}$, where
+$\mathcal{M}_{\text{mig}}(r_s, r_d)$ specifies the set of layer ranges transfer from source GPU $r_s$ to destination GPU $r_d$.
+
+The primitives are defined as follows:
+
+\begin{itemize}
+
+    \item \textbf{\textsc{Collective::CompactKV}$(B)$}:  
+    Compacts the KV cache on each GPU to $B$ blocks, reclaiming fragmented space required for subsequent KV resizing operation.
+    
+    \item \textbf{\textsc{Collective::ResizeKV}$(B)$}:  
+    Resizes the KV cache capacity on each GPU to $B$ blocks
+    
+    \item \textbf{\textsc{Collective::AddLayerWeights}$(\mathcal{M}_{\text{add}})$}:  
+    Instructs each Reconfiguration Worker $r$ to asynchronously load the weights
+    for the layer ranges specified in $\mathcal{M}_{\text{add}}(r)$. 
+
+    \item \textbf{\textsc{Collective::StartKVMigration}$(\mathcal{M}_{\text{mig}})$}:  
+    Initiates asynchronous KV cache migration according to
+    $\mathcal{M}_{\text{mig}}$, where $\mathcal{M}_{\text{mig}}(r_s, r_d)$ specifies
+    the layer ranges whose KV states should be streamed from source GPU $r_s$ to
+    destination GPU $r_d$.
+
+    \item \textbf{\textsc{Sync::SyncAndCommit}$(\mathcal{M}_{\text{del}},\, B_{\text{new}})$}:  
+    Performs a synchronized state transition that atomically commits the new PP
+    configuration. After the commit, each Reconfiguration Worker $r$ deletes the
+    layer weights and KV cache entries specified in $\mathcal{M}_{\text{del}}(r)$,
+    and resizes the KV cache to $B_{\text{new}}$ blocks to reclaim freed memory.
+
+\end{itemize}
+
+With the above primitives, we present our reconfiguration algorithm. Table~\ref{tab:notation} summarizes the notation used in Algorithm~\ref{alg:async-reconfig}.
+
+\begin{table}[t]
+\label{tab:notation}
+\scriptsize
+\caption{Notation used in Algorithm~\ref{alg:async-reconfig}.}
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Symbol} & \textbf{Description} \\
+\midrule
+$\Ccur,\Ctgt,\Ctmp$ & $r \mapsto \{\ell_1,\dots\}$: rank $\to$ layer set (current / target / intermediate) \\
+$\Madd,\Mdel$ & $r \mapsto \{\ell_1,\dots\}$: rank $\to$ layers to add / delete \\
+$\Mmig$ & $r_{src} \mapsto (r_{dst} \mapsto \{\ell_1,\dots\})$: layers to migrate \\
+$\Bmax(r)$ & Max KV blocks rank $r$ can hold \\
+$\Bcur,\Bnew$ & Current / post-reconfiguration KV block budget \\
+$M_r$ & Total GPU memory on rank $r$ \\
+$u$ & KV cache utilization ratio, $u \in (0,1]$ \\
+$W$ & Weight memory per layer \\
+$P$ & KV page (block) size \\
+$\tau$ & Convergence threshold (tokens) \\
+$\Delta t$ & Polling interval \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{algorithm}[t]
+\scriptsize
+\setlength{\algomargin}{0.6em}
+\SetAlgoNlRelativeSize{-2}
+\SetInd{0.3em}{0.5em}
+\SetSideCommentLeft
+\DontPrintSemicolon
+\SetAlgoLined
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\SetKwFunction{CompactKV}{Collective::CompactKV}
+\SetKwFunction{ResizeKV}{Collective::ResizeKV}
+\SetKwFunction{AddWeights}{Collective::AddLayerWeights}
+\SetKwFunction{StartMig}{Collective::StartKVMigration}
+\SetKwFunction{SyncCommit}{Sync::SyncAndCommit}
+\SetKwFunction{MaxBlocks}{MaxBlocks}
+\SetKwFunction{GetAppliedToken}{Collective::GetLastSyncedTokenIndex}
+\SetKwFunction{GetSchedToken}{getLastScheduledTokenIndex}
+\SetKwComment{cmt}{$\triangleright$\ }{}
+
+\SetKwProg{Fn}{Function}{:}{}
+\Fn{\MaxBlocks{$r, L$}}{
+  \Return $\lfloor (M_r \cdot u - L \cdot W)/(L \cdot P) \rfloor$
+}
+
+\KwIn{$\Ccur = \{(s_r, e_r)\}_{r=0}^{R-1}$: current PP config, rank $r$ owns layers $[s_r, e_r]$;
+  $\Ctgt = \{(s'_r, e'_r)\}_{r=0}^{R-1}$: target PP config;
+  $\tau$: convergence threshold (tokens)}
+\KwOut{$\mathrm{true}$ if reconfiguration succeeds; $\mathrm{false}$ if infeasible}
+
+\BlankLine
+%% Phase 1
+\cmt*[]{{\bfseries Phase~1: Feasibility assessment \& intermediate configuration}}
+
+$\Ctmp \gets \Ccur$;\quad
+$\Madd \gets \emptyset$\;
+
+\ForEach(\cmt*[f]{build intermediate config $\Ctmp$}){rank $r \in [0, R)$}{
+  $\Ctmp[r] \gets \Ccur[r] \cup \Ctgt[r]$
+  \cmt*[f]{new layers rank $r$ must add}\;
+  $\Bmax(r) \gets$ \MaxBlocks{$r,\, |\Ctmp[r]|$}\;
+}
+$B_{\mathrm{shrink}} \gets \min_{r}\, \Bmax(r)$\;
+
+$B_{\mathrm{used}} \gets$ current number of KV blocks in use\;
+\If{$B_{\mathrm{used}} > B_{\mathrm{shrink}}$}{
+  \Return $\mathrm{false}$
+  \cmt*[f]{insufficient memory for reconfiguration, abort}\;
+}
+\BlankLine
+%% Phase 2
+\cmt*[]{{\bfseries Phase~2: KV Compaction \& Resizing}};
+\If{$B_{\mathrm{shrink}} < \Bcur$}{
+  \CompactKV{$B_{\mathrm{shrink}}$}\;
+  \ResizeKV{$B_{\mathrm{shrink}}$}
+}
+\BlankLine
+%% Phase 3
+\cmt*[]{{\bfseries Phase~3: Asynchronous weight loading and KV Cache Migration}(non-blocking, concurrent with inference)}
+
+\AddWeights{$\Madd$}\;
+
+$\Mmig \gets \emptyset$\;
+\ForEach{$(r_{dst}, A_{r_{dst}}) \in \Madd$}{
+  \ForEach{layer $\ell \in A_{r_{dst}}$}{
+    $r_{src} \gets$ rank owning layer $\ell$ in $\Ccur$\;
+    $\Mmig[r_{src}][r_{dst}] \gets \Mmig[r_{src}][r_{dst}] \cup \{\ell\}$
+  }
+}
+\StartMig{$\Mmig$}
+
+\BlankLine
+%% Phase 4
+\cmt*[]{{\bfseries Phase~4: Convergence monitoring}};
+\Repeat{}{
+  $T_{\mathrm{sched}} \gets$ \GetSchedToken{}\;
+  $T_{\mathrm{applied}}[\,] \gets$ \GetAppliedToken{}\;
+  $\mathit{allDone} \gets \mathrm{true}$\;
+  \ForEach{rank $r \in \mathrm{dom}(\Madd)$}{
+    \If{$T_{\mathrm{sched}} - T_{\mathrm{applied}}[r] \ge \tau$}{
+      $\mathit{allDone} \gets \mathrm{false}$\;
+      \textbf{break}\;
+    }
+  }
+  \lIf{$\mathit{allDone}$}{\textbf{break}}
+  \textbf{sleep}($\Delta t$)\;
+}
+
+\BlankLine
+%% Phase 5
+\cmt*[]{{\bfseries Phase~5: Commit PP Configuration Change}}\;
+\ForEach(\cmt*[f]{compute layers to delete from $\Ctmp$}){rank $r \in [0, R)$}{
+  $\Mdel(r) \gets \Ctmp[r] \setminus \Ctgt[r]$\;
+  $\Bnew(r) \gets$ \MaxBlocks{$r,\, |\Ctgt[r]|$}
+}
+$\Bnew \gets \min_{r}\, \Bnew(r)$\;
+
+\SyncCommit{$\Mdel,\, \Bnew$}
+\cmt*[f]{commit new config, then delete old layers \& resize KV}\;
+
+\Return $\mathrm{true}$
+
+\caption{\textsc{Async PP Reconfiguration}\;
+The algorithm transitions from $\Ccur$ to $\Ctgt$ through an \emph{intermediate configuration} $\Ctmp$ in which both old and new layers coexist, enabling continuous inference throughout the migration.}
+\label{alg:async-reconfig}
+\end{algorithm}
+
+The key idea behind Algorithm~\ref{alg:async-reconfig} is to transition from $\Ccur$ to $\Ctgt$ through an \emph{intermediate configuration} $\Ctmp$ in which each rank holds the union of its current and target layer sets, allowing inference to continue uninterrupted throughout the migration. The algorithm proceeds in five phases.
+
+\paragraph{Phase~1: Feasibility assessment.}
+For each rank~$r$, the algorithm computes the intermediate layer set $\Ctmp[r] = \Ccur[r] \cup \Ctgt[r]$ and derives the maximum KV block capacity $\Bmax(r)$ under $\Ctmp$. The global KV budget is set to $B_{\mathrm{shrink}} = \min_r \Bmax(r)$. If the number of KV blocks currently in use exceeds $B_{\mathrm{shrink}}$, the reconfiguration is deemed infeasible and the algorithm aborts.
+
+\paragraph{Phase~2: KV compaction and resizing.}
+If $B_{\mathrm{shrink}} < \Bcur$, the coordinator invokes \textsc{CompactKV} followed by \textsc{ResizeKV} to shrink the KV cache on every rank, freeing memory for the additional layer weights that will be loaded in the next phase.
+
+\paragraph{Phase~3: Asynchronous weight loading and KV migration.}
+The coordinator issues \textsc{AddLayerWeights} to begin loading new layer weights on the destination ranks. Concurrently, it constructs the migration map $\Mmig$---mapping each source rank to its destination ranks and the associated layers---and invokes \textsc{StartKVMigration} to begin streaming KV states. Both operations proceed asynchronously alongside ongoing inference.
+
+\paragraph{Phase~4: Convergence monitoring.}
+The coordinator polls the gap between the last scheduled token index $T_{\mathrm{sched}}$ and the last synchronized token index $T_{\mathrm{applied}}[r]$ on each destination rank. Once this gap falls below the convergence threshold $\tau$ for all ranks in $\mathrm{dom}(\Madd)$, the KV state is considered sufficiently up-to-date and the algorithm proceeds to commit.
+
+\paragraph{Phase~5: Commit.}
+The coordinator computes the deletion map $\Mdel$ (layers in $\Ctmp$ no longer needed under $\Ctgt$) and the post-reconfiguration KV budget $\Bnew$. It then issues \textsc{SyncAndCommit}, which atomically switches the pipeline to $\Ctgt$, deletes obsolete layer weights and KV entries, and resizes the KV cache to $\Bnew$ to reclaim freed memory.
+
+\section{Reconfiguration Worker}
+% Reconfiguration Worker运行在模型运行的每一个GPU上，负责执行GPU level的reconfiguration操作。其按照功能主要划分为两个部分，第一个部分是KV syncrhonizer，用于在执行reconfiguration期间向目标GPU发送KV cache，或者接受其它GPU发送过来的KV Cache。另外一个部分是Weight loader，用于在GPU上load
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{bibliography}
+
+\end{document}
+\endinput
+%%
+%% End of file `sample-sigplan.tex'.

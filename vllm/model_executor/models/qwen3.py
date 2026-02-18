@@ -118,7 +118,7 @@ class Qwen3Attention(nn.Module):
             rope_scaling=rope_scaling,
         )
         vllm_config = get_current_vllm_config()
-        is_flexi = vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = vllm_config.dynamic_config.use_flexi_kv
         if is_flexi:
             logger.info("Using FlexiAttention in Qwen3Attention")
             self.attn = FlexiAttention(self.num_heads,

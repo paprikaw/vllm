@@ -47,8 +47,9 @@ class FlexiFlashAttentionBackend(FlashAttentionBackend):
     def get_impl_cls() -> Type["FlashAttentionImpl"]:
         from vllm.config import get_current_vllm_config
         vllm_config = get_current_vllm_config()
-        is_flexi = vllm_config.dynamic_config.enable_flexi_flash_attn
-        if is_flexi:
+        # Both 'flexi' and 'direct' kernels use FlexiFlashAttentionImpl;
+        # 'flash' uses the standard FlashAttentionImpl.
+        if vllm_config.dynamic_config.use_flexi_kv:
             return FlexiFlashAttentionImpl
         return FlashAttentionImpl
 
@@ -243,7 +244,7 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
                             _mismatch_logger = init_logger(__name__)
                             _mismatch_logger.error(f"[LAYER_MISMATCH] layer_idx={layer_idx}, start_layer={start_layer}, "
                                                   f"local_layer_idx={local_layer_idx}, k_ptr_tables.shape={k_ptr_tables.shape}, "
-                                                  f"layer_name={layer_name}. Falling back to non-direct mode!")
+                                                  f"layer_name={layer_name}. Falling back to flexi mode!")
                             use_flexi_direct = False
                         else:
                             # Get per-batch ptr_table for this layer
@@ -269,8 +270,7 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
                         )
 
                 if not use_flexi_direct:
-                    assert False
-                    # Fallback to original flexi_flash_attn_varlen_func
+                    # Flexi kernel: uses flexi_flash_attn_varlen_func with cached pointers
                     flexi_flash_attn_varlen_func(
                         q=query[:num_actual_tokens],
                         k_meta=page_meta,

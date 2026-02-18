@@ -1,0 +1,150 @@
+\documentclass[10pt]{article}
+\usepackage[ruled,linesnumbered,vlined]{algorithm2e}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage[margin=0.5in]{geometry}
+
+% -- Notation shortcuts --
+\newcommand{\Ccur}{C_{\mathrm{cur}}}
+\newcommand{\Ctgt}{C_{\mathrm{tgt}}}
+\newcommand{\Ctmp}{C_{\mathrm{int}}}
+\newcommand{\Madd}{\mathcal{M}_{\mathrm{add}}}
+\newcommand{\Mdel}{\mathcal{M}_{\mathrm{del}}}
+\newcommand{\Mmig}{\mathcal{M}_{\mathrm{mig}}}
+\newcommand{\Bmax}{B_{\max}}
+\newcommand{\Bcur}{B_{\mathrm{cur}}}
+\newcommand{\Bnew}{B_{\mathrm{new}}}
+% \newcommand{\AlgoCommentStyle}{\scriptsize\color{gray}}
+
+\begin{document}
+
+\begin{algorithm}[H]
+\scriptsize
+\setlength{\algowidth}{\columnwidth}
+\setlength{\algomargin}{0.8em}
+\SetAlgoNlRelativeSize{-1}
+\SetInd{0.4em}{0.6em}
+\SetCommentSty{AlgoCommentStyle}
+\SetSideCommentLeft
+\SetKwInput{KwIn}{\scriptsize\textbf{Input}}
+\SetKwInput{KwOut}{\scriptsize\textbf{Output}}
+\DontPrintSemicolon
+\SetAlgoLined
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\SetKwFunction{CompactKV}{Collective::CompactKV}
+\SetKwFunction{ResizeKV}{Collective::ResizeKV}
+\SetKwFunction{AddWeights}{Collective::AddLayerWeights}
+\SetKwFunction{StartMig}{Collective::StartKVMigration}
+\SetKwFunction{SyncCommit}{Sync::SyncAndCommit}
+\SetKwFunction{MaxBlocks}{MaxBlocks}
+\SetKwFunction{BuildMigPlan}{BuildMigrationPlan}
+\SetKwFunction{GetLag}{GetMigrationLag}
+\SetKwFunction{GetAppliedToken}{Collective::GetLastSyncedTokenIndex}
+\SetKwFunction{GetSchedToken}{getLastScheduledTokenIndex}
+\SetKwComment{cmt}{$\triangleright$\ }{}
+
+\textbf{Notation:}\;
+$\Ccur, \Ctgt, \Ctmp : r \mapsto \{\ell_1,\dots\}$\quad maps from rank to set of layer indices (current / target / intermediate PP config)\;
+$\Madd, \Mdel : r \mapsto \{\ell_1,\dots\}$\quad maps from rank to set of layers to add / delete\;
+$\Mmig : r_{src} \mapsto (r_{dst} \mapsto \{\ell_1,\dots\})$\quad nested map: source rank $\to$ destination rank $\to$ set of layers to migrate\;
+$\Bmax(r)$: scalar, max KV blocks rank $r$ can hold;\;
+$\Bcur$, $\Bnew$: scalars, current / post-reconfiguration KV block budget\;
+$M_r$: scalar, total GPU memory on rank $r$;\quad $u \in (0,1]$: KV cache utilization ratio\;
+$W$: scalar, weight memory per layer;\quad $P$: scalar, KV page (block) size\;
+$\tau$: scalar, convergence threshold (tokens);\quad $\Delta t$: scalar, polling interval\;
+
+\medskip
+
+\SetKwProg{Fn}{Function}{:}{}
+\Fn{\MaxBlocks{$r, L$}}{
+  \Return $\left\lfloor \frac{M_r \cdot u - L \cdot W}{L \cdot P} \right\rfloor$
+}
+
+\BlankLine
+
+\KwIn{Current PP configuration $\Ccur = \{(s_r, e_r)\}_{r=0}^{R-1}$, where each rank $r$ owns layers $[s_r, e_r]$;\\
+  target PP configuration $\Ctgt = \{(s'_r, e'_r)\}_{r=0}^{R-1}$;\\
+  convergence threshold $\tau$ (tokens)}
+\KwOut{$\mathrm{true}$ if reconfiguration succeeds; $\mathrm{false}$ if infeasible}
+
+\BlankLine
+%% ======= Phase 1: Assessment & Intermediate Config =======
+\cmt*[]{{\bfseries Phase~1: Feasibility assessment \& intermediate configuration}}
+
+$\Ctmp \gets \Ccur$;\quad
+$\Madd \gets \emptyset$\;
+
+\ForEach(\cmt*[f]{build intermediate config $\Ctmp$}){rank $r \in [0, R)$}{
+  $\Ctmp[r] \gets \Ccur[r] \cup \Ctgt[r]$
+  \cmt*[f]{new layers rank $r$ must add}\;
+  $\Bmax(r) \gets$ \MaxBlocks{$r,\, |\Ctmp[r]|$}\;
+}
+$B_{\mathrm{shrink}} \gets \min_{r}\, \Bmax(r)$\;
+
+$B_{\mathrm{used}} \gets$ current number of KV blocks in use\;
+\If{$B_{\mathrm{used}} > B_{\mathrm{shrink}}$}{
+  \Return $\mathrm{false}$
+  \cmt*[f]{insufficient memory for reconfiguration, abort}\;
+}
+\BlankLine
+%% ======= Phase 2: KV Compaction & Shrink =======
+\cmt*[]{{\bfseries Phase~2: KV Compaction \& Resizing}};
+\If{$B_{\mathrm{shrink}} < \Bcur$}{
+  \CompactKV{$B_{\mathrm{shrink}}$}\;
+  \ResizeKV{$B_{\mathrm{shrink}}$}
+}
+\BlankLine
+%% ======= Phase 3: Async Weight Loading =======
+\cmt*[]{{\bfseries Phase~3: Asynchronous weight loading and KV Cache Migration}(non-blocking, concurrent with inference)}
+
+\AddWeights{$\Madd$}\;
+
+$\Mmig \gets \emptyset$\;
+\ForEach{$(r_{dst}, A_{r_{dst}}) \in \Madd$}{
+  \ForEach{layer $\ell \in A_{r_{dst}}$}{
+    $r_{src} \gets$ rank owning layer $\ell$ in $\Ccur$\;
+    $\Mmig[r_{src}][r_{dst}] \gets \Mmig[r_{src}][r_{dst}] \cup \{\ell\}$
+  }
+}
+\StartMig{$\Mmig$}
+
+\BlankLine
+%% ======= Phase 4: Convergence Polling =======
+\cmt*[]{{\bfseries Phase~4: Convergence monitoring}};
+\Repeat{}{
+  $T_{\mathrm{sched}} \gets$ \GetSchedToken{}\;
+  $T_{\mathrm{applied}}[\,] \gets$ \GetAppliedToken{}\;
+  $\mathit{allDone} \gets \mathrm{true}$\;
+  \ForEach{rank $r \in \mathrm{dom}(\Madd)$}{
+    \If{$T_{\mathrm{sched}} - T_{\mathrm{applied}}[r] \ge \tau$}{
+      $\mathit{allDone} \gets \mathrm{false}$\;
+      \textbf{break}\;
+    }
+  }
+  \lIf{$\mathit{allDone}$}{\textbf{break}}
+  \textbf{sleep}($\Delta t$)\;
+}
+
+\BlankLine
+%% ======= Phase 6: Commit & Expand =======
+\cmt*[]{{\bfseries Phase~5: Commit PP Configuration Change}}\;
+\ForEach(\cmt*[f]{compute layers to delete from $\Ctmp$}){rank $r \in [0, R)$}{
+  $\Mdel(r) \gets \Ctmp[r] \setminus \Ctgt[r]$\;
+  $\Bnew(r) \gets$ \MaxBlocks{$r,\, |\Ctgt[r]|$}
+}
+$\Bnew \gets \min_{r}\, \Bnew(r)$\;
+
+\SyncCommit{$\Mdel,\, \Bnew$}
+\cmt*[f]{commit new config, then delete old layers \& resize KV}\;
+
+\Return $\mathrm{true}$
+
+\caption{\textsc{AsyncPPReconfiguration}---Live pipeline-parallelism reconfiguration with asynchronous KV cache migration.
+The algorithm transitions from $\Ccur$ to $\Ctgt$ through an \emph{intermediate configuration} $\Ctmp$ in which both old and new layers coexist, enabling continuous inference throughout the migration.}
+\label{alg:async-reconfig}
+\end{algorithm}
+
+\end{document}

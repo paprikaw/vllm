@@ -1275,6 +1275,7 @@ class DynamicGPUWorker(Worker):
                 with self.model_runner.fbgate.foreground():
                     self.dynamic_kv_synchronizer.send_kv_patch_to_rank(rank, kv_patch)
                 logger.info(f"[timeline]: send kv patch to rank {rank}, time taken: {time.time() - time_start}, data_size: {patch_slot_mapping_size / 1024 ** 2:.2f}MB + {patch_payload_size / 1024 ** 2:.2f}MB, kv patch id: {kv_patch.meta.id}, kv patch type: {kv_patch.meta.type}")
+            logger.info(f"[debug]: finished sending kv patch for layer_ids {layer_ids} to rank {rank}")
 
 
     def start_kv_cache_migration_sync(self, pp_layer_config: list[Tuple[int, int]], src_to_sending_layers: dict[int, dict[int, list[Tuple[int, int]]]], 

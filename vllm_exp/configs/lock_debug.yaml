@@ -1,7 +1,7 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "kernal_cmp_third"
+project: "lock_debug"
 type: "sweep_test"
 
 envs:
@@ -15,7 +15,7 @@ envs:
   DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
   KV_SYNC_USE_CPU: "0"
   VLLM_USE_CPU_MODEL: "0"
-  CUDA_LAUNCH_BLOCKING: "0"
+  CUDA_LAUNCH_BLOCKING: "1"
   PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
   VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
   VLLM_USE_RAY_COMPILED_DAG: "1"
@@ -64,18 +64,18 @@ static_config:
 sweep_config:
   # Test repetition with 3 repetitions, no migration
   vllm:
-    attention_kernel: [flash, direct]
+    attention_kernel: [flash]
   benchmark_config:
-    - num_total_requests: 50  # Small number for quick testing
+    - num_total_requests: 100  # Small number for quick testing
       repetition: 10           # 3 repetitions to test the feature
       pp_layer_config:
         0: "32, 32"           # Single config = no migration, only reset between reps
-        # 100: "16, 48"           # Single config = no migration, only reset between reps
+        50: "16, 48"           # Single config = no migration, only reset between reps
       requests:
         0:
-          request_rate: 10.0
-          input_lens: 64
-          output_lens: 512
+          request_rate: 3.0
+          input_lens: 512
+          output_lens: 16
     # - num_total_requests: 50  # Small number for quick testing
     #   repetition: 10           # 3 repetitions to test the feature
     #   pp_layer_config:

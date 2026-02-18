@@ -90,7 +90,7 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, log_dir: Path, log_file_name: 
     # Build dynamic config - pass all parameters through -D flag (no file needed)
     alternative_configs_dict = {"pp_layer_configs": cfg.migration.alternative_configs}
     dynamic_cfg = json.dumps({
-        "enable_flexi_flash_attn": cfg.vllm.enable_flexi_flash_attn,
+        "attention_kernel": cfg.vllm.attention_kernel,
         "pp_layer_partition": spec.start_pp_layer_partition,
         "alternative_configs": alternative_configs_dict,
         "migration_steps": cfg.migration.migration_steps,

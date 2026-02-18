@@ -143,12 +143,6 @@ class BenchCfg(BaseModel):
     # After each repetition, set_pp_config is called to restore initial config
     repetition: int = 1
     
-    # Dataset configuration
-    dataset_name: str = "pattern"
-    """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
-    dataset_path: Optional[str] = None
-    """Path to dataset file. Required for burstgpt and sharegpt."""
-    
     # Pipeline config for repetition reset (used when repetition > 1)
     initial_pp_config: Optional[List[List[int]]] = None
     """Initial PP layer config to restore between repetitions.
@@ -275,12 +269,6 @@ class SweepBenchmarkConfig(BaseModel):
     repetition: int = 1
     """Number of times to repeat the benchmark. After each repetition,
     set_pp_config is called to return to the initial pp configuration."""
-    
-    dataset_name: str = "pattern"
-    """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
-    
-    dataset_path: Optional[str] = None
-    """Path to dataset file. Required for burstgpt and sharegpt."""
     
     pp_layer_config: Dict[int, str]
     """Pipeline layer partition configs indexed by request number.
@@ -577,8 +565,6 @@ class StaticBenchCfg(BaseModel):
     benchmark_script_path: str = "/root/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     burstiness: float = 100.0
     warmup: Optional[WarmupBenchCfg] = None
-    dataset_name: str = "pattern"
-    dataset_path: Optional[str] = None
     
     # Shared parameters for parameter-sweep mode
     num_total_requests: int = 100
@@ -815,12 +801,6 @@ class ExpBenchmarkConfig:
     profile: bool = False
     benchmark_script_path: str = ""
     warmup: Optional[WarmupBenchCfg] = None
-    
-    # Dataset configuration
-    dataset_name: str = "pattern"
-    """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
-    dataset_path: Optional[str] = None
-    """Path to dataset file. Required for burstgpt and sharegpt."""
 
 
 @dataclass
@@ -1000,9 +980,6 @@ class ExperimentConfig:
             profile=static_cfg.benchmark.profile,
             benchmark_script_path=static_cfg.benchmark.benchmark_script_path,
             warmup=static_cfg.benchmark.warmup,
-            # Dataset configuration - prefer sweep config, fallback to static
-            dataset_name=bench_cfg.dataset_name,
-            dataset_path=bench_cfg.dataset_path if bench_cfg.dataset_path else static_cfg.benchmark.dataset_path,
         )
         
         return cls(
@@ -1134,12 +1111,6 @@ class BenchmarkSpec:
     input_output_lens: List[List[int]] = field(default_factory=list)
     pattern_batch_size: int = 150
     burstiness: float = 100.0
-    
-    # Dataset config
-    dataset_name: str = "pattern"
-    """Dataset type: 'random', 'pattern', 'burstgpt', 'sharegpt', 'sonnet', 'hf'"""
-    dataset_path: Optional[str] = None
-    """Path to dataset file. Required for burstgpt and sharegpt."""
     
     # Repetition config
     repetition: int = 1

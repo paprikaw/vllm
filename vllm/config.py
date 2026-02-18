@@ -4126,10 +4126,21 @@ class DynamicConfig:
     This config holds all custom experimental flags and parameters that are
     not part of the standard vLLM configuration.
     """
-    enable_flexi_flash_attn: bool = False
-    """Whether to enable Flexi Flash Attention implementation. When enabled,
-    uses the FlexiFlashAttentionImpl for attention computations which may
-    provide performance benefits for certain workloads."""
+    attention_kernel: str = "flash"
+    """Attention kernel to use. Options:
+    - 'flash': Standard FlashAttention (contiguous KV cache)
+    - 'flexi': Flexi FlashAttention (list-based KV cache, no ptr_tables)
+    - 'direct': Flexi Direct FlashAttention (list-based KV cache + ptr_tables)
+    """
+
+    VALID_ATTENTION_KERNELS = ("flash", "flexi", "direct")
+
+    def __post_init__(self):
+        if self.attention_kernel not in self.VALID_ATTENTION_KERNELS:
+            raise ValueError(
+                f"Invalid attention_kernel={self.attention_kernel!r}. "
+                f"Must be one of {self.VALID_ATTENTION_KERNELS}."
+            )
     
     tester_start_step: Optional[int] = None
     """The step at which to start the memory stress tester. If None, the tester
@@ -4181,10 +4192,20 @@ class DynamicConfig:
         """Whether migration is enabled (derived from migration_steps)."""
         return bool(self.migration_steps)
 
+    @property
+    def use_flexi_kv(self) -> bool:
+        """Whether to use list-based (flexi) KV cache. True for 'flexi' and 'direct' kernels."""
+        return self.attention_kernel in ("flexi", "direct")
+
+    @property
+    def use_direct_ptr(self) -> bool:
+        """Whether to use ptr_tables for direct memory access. True only for 'direct' kernel."""
+        return self.attention_kernel == "direct"
+
     def compute_hash(self) -> str:
         """Compute hash for dynamic config."""
         factors: list[Any] = []
-        factors.append(self.enable_flexi_flash_attn)
+        factors.append(self.attention_kernel)
         factors.append(self.tester_start_step)
         factors.append(self.memory_stress_tester)
         factors.append(self.pp_layer_partition)

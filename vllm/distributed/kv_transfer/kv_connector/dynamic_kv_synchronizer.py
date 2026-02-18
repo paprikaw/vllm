@@ -603,7 +603,7 @@ class DynamicKVSynchronizer():
         assert all(transfer_in_process == False for transfer_in_process in self.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
         assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
         
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         torch.cuda.synchronize()
         
         for rank, layer_ids in rank_to_layers_ids.items():
@@ -681,7 +681,7 @@ class DynamicKVSynchronizer():
     # ########################################## #
 
     def get_kv_patch(self, rank: int, start_layer_id: int, layer_ids: list[int], kv_meta: torch.Tensor) -> Generator[KVPatch, None, None]:
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         if is_flexi:
             return self._flexi_get_patch(rank,
                                             layer_ids=layer_ids,
@@ -778,7 +778,7 @@ class DynamicKVSynchronizer():
                 break
 
     def get_kv_tensor_from_cache(self, layer_ids: list[int],layer_id: int, start_layer_id: int, kv_cache_meta: torch.Tensor, slot_mapping: Optional[torch.Tensor] = None) -> Tuple[Union[KVTensorMeta, FlexiKVTensorMeta], torch.Tensor]:
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         if is_flexi:
             assert slot_mapping is not None, "slot_mapping should be provided when using flexi flash attention"
             return self._flexi_get_kv_tensor(
@@ -876,8 +876,10 @@ class DynamicKVSynchronizer():
         """
         self.kv_cache_transfer_in_process[rank] = True
         if isinstance(kv_tensor_meta, KVTensorMeta):
-            self._send_meta_to_rank(rank, kv_tensor_meta)
-            self._send_data_to_rank(rank, kv_tensor, wait_for_ack=True)
+            assert self._nccl_lock is not None, "NCCL lock should be provided for FlexiKVTensorMeta transfer"
+            with self._nccl_lock:
+                self._send_meta_to_rank(rank, kv_tensor_meta)
+                self._send_data_to_rank(rank, kv_tensor, wait_for_ack=True)
         else:
             assert slot_mapping is not None, "slot_mapping should be provided when sending FlexiKVTensorMeta"
             assert self._nccl_lock is not None, "NCCL lock should be provided for FlexiKVTensorMeta transfer"
@@ -1064,7 +1066,7 @@ class DynamicKVSynchronizer():
         self.last_patch_ids[rank] += 1
 
     def finish_kv_cache_transfer(self) -> None:
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         for rank in self.last_patch_ids:
             if is_flexi:
                 self.slot_mappings[rank].add_slot_mappings([], is_finished=True)
@@ -1084,7 +1086,7 @@ class DynamicKVSynchronizer():
 
     def add_new_tokens_to_kv_synchronizer(self, rank: int, slot_mapping: torch.Tensor, is_finished: bool, num_total_new_tokens: int) -> None:
         time_start = time.time()
-        # is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        # is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         # if is_flexi:
         self.slot_mappings[rank].add_slot_mappings(slot_mapping.tolist(), is_finished=is_finished, num_total_new_tokens=num_total_new_tokens)
         # else:
@@ -1125,7 +1127,7 @@ class DynamicKVSynchronizer():
             return kv_payload
 
     def recv_kv_patch(self, from_rank: int,meta: KVPatchMeta) -> Tuple[torch.Tensor, torch.Tensor]:
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         time_start = time.time()
         with self._nccl_lock:
             time_in = time.time()
@@ -1163,7 +1165,7 @@ class DynamicKVSynchronizer():
         values = kv_payload[1]
         logger.info(f"apply one patch with id {meta.id}, num_tokens: {meta.num_tokens}")
         # slot_mapping 已经被裁剪过，只包含有效的 token
-        is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         # assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
         if slot_mapping.size(0) != meta.num_tokens:
             logger.info(f"Warning: slot_mapping size {slot_mapping.size(0)} does not match num_tokens {meta.num_tokens}, proceed anyway.")

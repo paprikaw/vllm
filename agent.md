@@ -89,18 +89,16 @@ is_log_cover: true
 
 ### Performance Analysis Workflow
 
-For comparing flexi vs regular versions:
+For comparing attention kernels:
 
-1. **Create two configurations** (only difference: `enable_flexi_flash_attn`)
+1. **Create a sweep configuration** with `attention_kernel` options
    ```yaml
-   # Config 1: Regular
-   vllm:
-     enable_flexi_flash_attn: false
-   
-   # Config 2: Flexi
-   vllm:
-     enable_flexi_flash_attn: true
+   # Sweep across all three kernels
+   sweep_config:
+     vllm:
+       attention_kernel: [flash, flexi, direct]
    ```
+   Options: `flash` (standard FlashAttention), `flexi` (flexi kernel), `direct` (flexi direct kernel)
 
 2. **Run both experiments**
    ```bash

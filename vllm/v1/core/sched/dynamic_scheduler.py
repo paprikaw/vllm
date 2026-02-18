@@ -225,7 +225,7 @@ class DynamicScheduler(Scheduler):
             self.migration_in_process = True
             self.sender_list_during_migration = set(sender_list) 
             self.receiver_list_during_migration = set(receiver_list)
-            is_flexi = self.vllm_config.dynamic_config.enable_flexi_flash_attn
+            is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
             if should_increase_scheduler_output_version:
                 self.cur_scheduler_output_version += 1
             if is_flexi:
