@@ -328,16 +328,24 @@ async def set_pp_config(
     pp_layer_config: list,
     alternative_configs: Optional[dict] = None,
     migration_steps: Optional[list] = None,
+    migration_mode: Optional[str] = None,
     timeout: float = 120.0
 ) -> bool:
     """Set pipeline configuration to a specific target config.
     
     The server will skip if already at the target configuration.
+    Note: set_pp_config always uses sync migration internally for the
+    reset/restore operation. The migration_mode parameter only updates
+    the server's migration_mode setting for subsequent migrations
+    triggered by the migration_thread during the benchmark run.
     
     Args:
         base_url: Base URL of the vLLM server (e.g., http://localhost:8000)
         pp_layer_config: Target configuration as list of [start, end] pairs per rank.
                          Example: [[0, 39], [40, 63]] for 2 ranks.
+        migration_mode: Optional migration mode ('sync' or 'async') to set on the
+                       server for use by migration_thread. Does NOT affect the
+                       set_pp_config reset migration itself (always sync).
         timeout: Request timeout in seconds
     
     Returns:
@@ -350,6 +358,8 @@ async def set_pp_config(
         payload["alternative_configs"] = alternative_configs
     if migration_steps is not None:
         payload["migration_steps"] = migration_steps
+    if migration_mode is not None:
+        payload["migration_mode"] = migration_mode
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(set_url, json=payload, 
@@ -502,6 +512,7 @@ async def run_repetition_benchmark(
     initial_pp_config: Optional[list] = None,
     alternative_configs: Optional[dict] = None,
     migration_steps: Optional[list] = None,
+    migration_mode: Optional[str] = None,
     **kwargs
 ) -> tuple[BenchmarkMetrics, list[int]]:
     """Run benchmark multiple times with pipeline config reset between repetitions.
@@ -514,6 +525,7 @@ async def run_repetition_benchmark(
                           If None, skip the reset (server will handle same-config skip).
         alternative_configs: Optional migration target configs for set_pp_config.
         migration_steps: Optional migration trigger points (request indices).
+        migration_mode: Optional migration mode ('sync' or 'async') for migration_thread.
         **kwargs: Arguments to pass to run_single_benchmark_func
     
     Returns:
@@ -548,7 +560,8 @@ async def run_repetition_benchmark(
                     base_url,
                     initial_pp_config,
                     alternative_configs=alternative_configs,
-                    migration_steps=migration_steps
+                    migration_steps=migration_steps,
+                    migration_mode=migration_mode
                 )
                 if not success:
                     print(f"  Warning: Pipeline config reset failed, continuing anyway...")
@@ -1031,6 +1044,7 @@ async def benchmark(
     initial_pp_config: Optional[list] = None,
     alternative_configs: Optional[dict] = None,
     migration_steps: Optional[list] = None,
+    migration_mode: Optional[str] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1109,6 +1123,7 @@ async def benchmark(
                 initial_pp_config=initial_pp_config,
                 alternative_configs=alternative_configs,
                 migration_steps=migration_steps,
+                migration_mode=migration_mode,
                 request_func=request_func,
                 input_requests=input_requests,
                 request_rate_list=compact_kv_request_rate_list,
@@ -1675,6 +1690,7 @@ def main(args: argparse.Namespace):
     initial_pp_config = getattr(benchmark_config, "initial_pp_config", None)
     alternative_configs = getattr(benchmark_config, "alternative_configs", None)
     migration_steps = getattr(benchmark_config, "migration_steps", None)
+    migration_mode = getattr(benchmark_config, "migration_mode", None)
     
     if getattr(benchmark_config, "warmup", None) is not None and benchmark_config.warmup.enabled:
         warm = benchmark_config.warmup
@@ -1714,6 +1730,7 @@ def main(args: argparse.Namespace):
             initial_pp_config=initial_pp_config,
             alternative_configs=alternative_configs,
             migration_steps=migration_steps,
+            migration_mode=migration_mode,
         )
     )
 

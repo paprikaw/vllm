@@ -83,6 +83,7 @@ class MigrationCfg(BaseModel):
     tester_start_step: Optional[int] = None
     memory_stress_tester: Optional[Dict[str, Any]] = None
     migration_mode: str = "async"  # "async" or "sync" - determines which migration method to use
+    allow_resize: bool = True  # Whether to allow KV cache resize during migration
 
 class WarmupBenchCfg(BaseModel):
     """Optional warmup stage config for vllm_exp.
@@ -357,6 +358,10 @@ class SweepVllmParams(BaseModel):
     """List of attention kernels to sweep: 'flash', 'flexi', 'direct'."""
     weight_chunk_size_mb: Optional[List[float]] = None
     """List of weight chunk sizes (MB) for sweep. Affects weight loading during migration."""
+    migration_approach: Optional[List[str]] = None
+    """List of migration approaches to sweep: 'sync' or 'async'. Determines which migration method to use."""
+    allow_resize: Optional[List[bool]] = None
+    """List of allow_resize values to sweep. Controls whether KV cache resize is allowed during migration."""
 
 
 class SweepConfig(BaseModel):
@@ -425,6 +430,10 @@ class SweepConfig(BaseModel):
                 axes['attention_kernel'] = self.vllm.attention_kernel
             if self.vllm.weight_chunk_size_mb is not None:
                 axes['weight_chunk_size_mb'] = self.vllm.weight_chunk_size_mb
+            if self.vllm.migration_approach is not None:
+                axes['migration_approach'] = self.vllm.migration_approach
+            if self.vllm.allow_resize is not None:
+                axes['allow_resize'] = self.vllm.allow_resize
         
         # Mode 1: benchmark_config provided directly in sweep_config
         if self.benchmark_config is not None:
@@ -528,6 +537,10 @@ class StaticVllmCfg(BaseModel):
     port: int = 8000
     weight_chunk_size_mb: float = 10.0
     """Weight chunk size in MB for chunked weight loading during migration. Default 10 MB."""
+    migration_approach: str = "async"
+    """Migration approach: 'sync' or 'async'. Determines which migration method to use. Default 'async'."""
+    allow_resize: bool = True
+    """Whether to allow KV cache resize during migration. Default True."""
 
 
 class StaticBenchCfg(BaseModel):
@@ -626,7 +639,8 @@ class SweepTestConfig(BaseModel):
     project: str
     type: str = "sweep_test"
     static_config: StaticConfig
-    sweep_config: SweepConfig
+    sweep_config: Optional[SweepConfig] = None
+    sweep_configs: Optional[List[SweepConfig]] = None
     envs: Dict[str, str] = {}
     is_log_cover: bool = False
     overwrite: bool = True  # If False, skip experiments that have already succeeded
@@ -636,28 +650,50 @@ class SweepTestConfig(BaseModel):
         """Validate that there are no configuration conflicts between modes."""
         errors = []
         
-        # Check for mode conflicts: benchmark_config and benchmark should be mutually exclusive
-        if (self.sweep_config.benchmark_config is not None 
-            and self.sweep_config.benchmark is not None):
+        # Must provide either sweep_config or sweep_configs (not both)
+        if self.sweep_config is not None and self.sweep_configs is not None:
             errors.append(
-                "Configuration conflict: 'sweep_config.benchmark_config' and "
-                "'sweep_config.benchmark' are mutually exclusive. "
-                "Use benchmark_config for complete configs or benchmark for parameter sweep."
+                "Configuration conflict: 'sweep_config' and 'sweep_configs' are mutually exclusive. "
+                "Use 'sweep_config' for a single sweep or 'sweep_configs' for a list of sweeps."
+            )
+        if self.sweep_config is None and self.sweep_configs is None:
+            errors.append(
+                "Either 'sweep_config' or 'sweep_configs' must be provided."
             )
         
-        # Check for fixed-benchmark mode conflicts
-        if self.static_config.benchmark.has_fixed_benchmark:
-            if self.sweep_config.benchmark is not None:
+        # Validate each sweep config (singular or each item in the list)
+        configs_to_validate = []
+        if self.sweep_config is not None:
+            configs_to_validate = [self.sweep_config]
+        elif self.sweep_configs is not None:
+            configs_to_validate = self.sweep_configs
+        
+        for idx, sc in enumerate(configs_to_validate):
+            prefix = f"sweep_configs[{idx}]" if self.sweep_configs is not None else "sweep_config"
+            
+            # Check for mode conflicts: benchmark_config and benchmark should be mutually exclusive
+            if (sc.benchmark_config is not None and sc.benchmark is not None):
                 errors.append(
-                    "Configuration conflict: 'static_config.benchmark' has pp_layer_config and requests defined, "
-                    "which enables fixed-benchmark mode. 'sweep_config.benchmark' should not be used in this mode. "
-                    "Only sweep vLLM parameters like attention_kernel or weight_chunk_size_mb."
+                    f"Configuration conflict in {prefix}: 'benchmark_config' and "
+                    "'benchmark' are mutually exclusive. "
+                    "Use benchmark_config for complete configs or benchmark for parameter sweep."
                 )
-            if self.sweep_config.benchmark_config is not None:
-                errors.append(
-                    "Configuration conflict: 'static_config.benchmark' has pp_layer_config and requests defined, "
-                    "which enables fixed-benchmark mode. 'sweep_config.benchmark_config' should not be used in this mode."
-                )
+            
+            # Check for fixed-benchmark mode conflicts
+            if self.static_config.benchmark.has_fixed_benchmark:
+                if sc.benchmark is not None:
+                    errors.append(
+                        f"Configuration conflict in {prefix}: 'static_config.benchmark' has "
+                        "pp_layer_config and requests defined, which enables fixed-benchmark mode. "
+                        "'benchmark' should not be used in this mode. "
+                        "Only sweep vLLM parameters like attention_kernel or weight_chunk_size_mb."
+                    )
+                if sc.benchmark_config is not None:
+                    errors.append(
+                        f"Configuration conflict in {prefix}: 'static_config.benchmark' has "
+                        "pp_layer_config and requests defined, which enables fixed-benchmark mode. "
+                        "'benchmark_config' should not be used in this mode."
+                    )
         
         # Note: attention_kernel can appear in:
         # - static_config.vllm.attention_kernel (single value, fallback)
@@ -674,10 +710,38 @@ class SweepTestConfig(BaseModel):
         return self
     
     def get_sweep_axes(self) -> Dict[str, List[Any]]:
-        """Convenience method to get sweep axes with static config applied."""
-        return self.sweep_config.get_sweep_axes(
+        """Convenience method to get sweep axes with static config applied.
+        
+        Returns the sweep axes for the first (or only) sweep config.
+        For multi-sweep support, use get_all_sweep_axes() instead.
+        """
+        configs = self.get_resolved_sweep_configs()
+        if not configs:
+            return {}
+        return configs[0].get_sweep_axes(
             static_benchmark_cfg=self.static_config.benchmark
         )
+    
+    def get_resolved_sweep_configs(self) -> List[SweepConfig]:
+        """Return the list of SweepConfig objects to iterate over.
+        
+        Handles both sweep_config (singular) and sweep_configs (list) modes.
+        """
+        if self.sweep_configs is not None:
+            return self.sweep_configs
+        elif self.sweep_config is not None:
+            return [self.sweep_config]
+        return []
+    
+    def get_all_sweep_axes(self) -> List[Dict[str, List[Any]]]:
+        """Get sweep axes for all sweep configs.
+        
+        Returns a list of sweep axes dicts, one per sweep_config.
+        """
+        return [
+            sc.get_sweep_axes(static_benchmark_cfg=self.static_config.benchmark)
+            for sc in self.get_resolved_sweep_configs()
+        ]
 
 
 # =========================
@@ -722,6 +786,10 @@ class ExpVllmConfig:
     # Fields with defaults must come after required fields
     weight_chunk_size_mb: float = 10.0
     """Weight chunk size in MB for chunked weight loading during migration."""
+    migration_approach: str = "async"
+    """Migration approach: 'sync' or 'async'. Determines which migration method to use."""
+    allow_resize: bool = True
+    """Whether to allow KV cache resize during migration."""
     pp_layer_config: Dict[int, str] = field(default_factory=dict)  # {0: "32,32", 100: "20,44"}
     
     @property
@@ -828,6 +896,7 @@ class ExperimentConfig:
         "num_total_requests": "n_req",
         "repetition": "rep",
         "weight_chunk_size_mb": "chunk",
+        "migration_approach": "mig_mode",
     }
     
     model: ExpModelConfig
@@ -850,6 +919,11 @@ class ExperimentConfig:
         # Only include chunk size if it's not the default (10.0)
         if self.vllm.weight_chunk_size_mb != 10.0:
             vars_dict["chunk"] = self.vllm.weight_chunk_size_mb
+        # Always include migration_approach
+        vars_dict["mig_mode"] = self.vllm.migration_approach
+        # Only include allow_resize if it's not the default (True)
+        if not self.vllm.allow_resize:
+            vars_dict["resize"] = 0
         return vars_dict
     
     @classmethod
@@ -863,9 +937,13 @@ class ExperimentConfig:
         It combines static_config with each sweep combination to produce
         ExperimentConfig instances.
         
+        Supports both sweep_config (singular) and sweep_configs (list) modes.
+        When sweep_configs is used, experiments from each SweepConfig are
+        yielded sequentially.
+        
         Args:
             sweep_test_cfg: The complete sweep test configuration containing
-                           static_config and sweep_config
+                           static_config and sweep_config/sweep_configs
         
         Yields:
             ExperimentConfig for each combination in the Cartesian product
@@ -879,35 +957,42 @@ class ExperimentConfig:
         import itertools
         
         static_cfg = sweep_test_cfg.static_config
-        sweep_axes = sweep_test_cfg.get_sweep_axes()
         
-        if not sweep_axes:
-            return
-        
-        # Build Cartesian product of all sweep axes
-        # IMPORTANT: Ensure attention_kernel is the OUTERMOST loop
-        # because switching kernel mode requires server restart.
-        # We reorder axes so that 'attention_kernel' comes first if present.
-        axis_names = list(sweep_axes.keys())
-        
-        # Reorder: put attention_kernel first (outermost loop)
-        if 'attention_kernel' in axis_names:
-            axis_names.remove('attention_kernel')
-            axis_names.insert(0, 'attention_kernel')
-        
-        axis_values = [sweep_axes[name] for name in axis_names]
-        
-        for combo in itertools.product(*axis_values):
-            # combo is a tuple of values, one per axis
-            combo_dict = dict(zip(axis_names, combo))
+        # Iterate over all resolved sweep configs (handles both singular and list)
+        for sweep_config in sweep_test_cfg.get_resolved_sweep_configs():
+            sweep_axes = sweep_config.get_sweep_axes(
+                static_benchmark_cfg=static_cfg.benchmark
+            )
             
-            # Extract sweep parameters from combination
-            bench_cfg: SweepBenchmarkConfig = combo_dict['benchmark_config']
-            attn_kernel: Optional[str] = combo_dict.get('attention_kernel')
-            weight_chunk_size: Optional[float] = combo_dict.get('weight_chunk_size_mb')
+            if not sweep_axes:
+                continue
             
-            # Create ExperimentConfig from this combination
-            yield cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size)
+            # Build Cartesian product of all sweep axes
+            # IMPORTANT: Ensure attention_kernel is the OUTERMOST loop
+            # because switching kernel mode requires server restart.
+            # We reorder axes so that 'attention_kernel' comes first if present.
+            axis_names = list(sweep_axes.keys())
+            
+            # Reorder: put attention_kernel first (outermost loop)
+            if 'attention_kernel' in axis_names:
+                axis_names.remove('attention_kernel')
+                axis_names.insert(0, 'attention_kernel')
+            
+            axis_values = [sweep_axes[name] for name in axis_names]
+            
+            for combo in itertools.product(*axis_values):
+                # combo is a tuple of values, one per axis
+                combo_dict = dict(zip(axis_names, combo))
+                
+                # Extract sweep parameters from combination
+                bench_cfg: SweepBenchmarkConfig = combo_dict['benchmark_config']
+                attn_kernel: Optional[str] = combo_dict.get('attention_kernel')
+                weight_chunk_size: Optional[float] = combo_dict.get('weight_chunk_size_mb')
+                mig_approach: Optional[str] = combo_dict.get('migration_approach')
+                allow_resize: Optional[bool] = combo_dict.get('allow_resize')
+                
+                # Create ExperimentConfig from this combination
+                yield cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, allow_resize)
     
     @classmethod
     def _create_from_combo(
@@ -916,6 +1001,8 @@ class ExperimentConfig:
         bench_cfg: SweepBenchmarkConfig,
         attention_kernel: Optional[str] = None,
         weight_chunk_size_mb: Optional[float] = None,
+        migration_approach: Optional[str] = None,
+        allow_resize: Optional[bool] = None,
     ) -> 'ExperimentConfig':
         """Create a single ExperimentConfig from static config and one sweep combination.
         
@@ -926,10 +1013,14 @@ class ExperimentConfig:
             bench_cfg: Sweep benchmark configuration (from sweep axes)
             attention_kernel: Override from sweep axis (if sweeping), otherwise use static
             weight_chunk_size_mb: Override from sweep axis (if sweeping), otherwise use static
+            migration_approach: Override from sweep axis (if sweeping), otherwise use static
+            allow_resize: Override from sweep axis (if sweeping), otherwise use static
         """
         # Resolve sweep overrides: sweep values override static values
         kernel = attention_kernel if attention_kernel is not None else static_cfg.vllm.attention_kernel
         chunk_size = weight_chunk_size_mb if weight_chunk_size_mb is not None else static_cfg.vllm.weight_chunk_size_mb
+        mig_approach = migration_approach if migration_approach is not None else static_cfg.vllm.migration_approach
+        resize = allow_resize if allow_resize is not None else static_cfg.vllm.allow_resize
         
         # Get initial values from bench_cfg
         sorted_pp_keys = sorted(bench_cfg.pp_layer_config.keys())
@@ -962,6 +1053,8 @@ class ExperimentConfig:
             enable_cuda_graph=static_cfg.vllm.enable_cuda_graph,
             enable_nsight=static_cfg.vllm.enable_nsight,
             weight_chunk_size_mb=chunk_size,
+            migration_approach=mig_approach,
+            allow_resize=resize,
             pp_layer_partition=initial_pp,
             pp_layer_config={k: v.replace(" ", "") for k, v in bench_cfg.pp_layer_config.items()},
         )
@@ -1050,6 +1143,10 @@ class VllmServerSpec:
     enable_nsight: bool = False
     weight_chunk_size_mb: float = 10.0
     """Weight chunk size in MB for chunked weight loading during migration."""
+    migration_approach: str = "async"
+    """Migration approach: 'sync' or 'async'. Determines which migration method to use."""
+    allow_resize: bool = True
+    """Whether to allow KV cache resize during migration."""
     
     # Migration/Partition
     pp_layer_partition: str = ""
@@ -1081,6 +1178,8 @@ class VllmServerSpec:
             "metrics_csv_path": self.metrics_csv_path,
             "alternative_configs": self.alternative_configs,
             "migration_steps": self.migration_steps,
+            "migration_mode": self.migration_approach,
+            "allow_resize": self.allow_resize,
         }
         # Only include rank_to_ip if non-empty
         if self.rank_to_ip:
@@ -1125,6 +1224,8 @@ class BenchmarkSpec:
     """Migration target configs. Format: {"pp_layer_configs": {"0": [...], "1": [...]}}"""
     migration_steps: Optional[List[int]] = None
     """Request indices at which migration is triggered."""
+    migration_mode: Optional[str] = None
+    """Migration mode: 'sync' or 'async'. Passed to set_pp_config between repetitions."""
     
     # Features
     print_outputs: bool = False
@@ -1174,6 +1275,7 @@ class BenchmarkSpec:
             "initial_pp_config": self.initial_pp_config,
             "alternative_configs": self.alternative_configs,
             "migration_steps": self.migration_steps,
+            "migration_mode": self.migration_mode,
         }
 
     def write_benchmark_config(self) -> None:

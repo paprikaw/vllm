@@ -502,7 +502,8 @@ class AsyncLLM(EngineClient):
         self,
         pp_layer_config: list,
         alternative_configs: Optional[dict] = None,
-        migration_steps: Optional[list[int]] = None
+        migration_steps: Optional[list[int]] = None,
+        migration_mode: Optional[str] = None
     ) -> None:
         """Set pipeline configuration to a specific target config.
         
@@ -513,10 +514,12 @@ class AsyncLLM(EngineClient):
                              Example: [[0, 39], [40, 63]] for 2 ranks.
             alternative_configs: Optional new migration targets.
             migration_steps: Optional new migration trigger points (request indices).
+            migration_mode: Optional migration mode ('sync' or 'async').
         """
         await self.engine_core.set_pp_config_async(pp_layer_config,
                                                    alternative_configs,
-                                                   migration_steps)
+                                                   migration_steps,
+                                                   migration_mode)
 
     async def sleep(self, level: int = 1) -> None:
         await self.engine_core.sleep_async(level)

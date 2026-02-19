@@ -217,41 +217,30 @@ class DynamicQwen3Model(Qwen3Model):
         assert deleted_start_layer >= old_start_layer and deleted_end_layer <= old_end_layer, f"layers must be in the range of start_layer and end_layer, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
         assert deleted_start_layer == old_start_layer or deleted_end_layer == old_end_layer, f"model layers must be continuous after delete layers, old start_layer: {old_start_layer}, old end_layer: {old_end_layer}, deleted_start_layer{deleted_start_layer}, deleted_end_layer:{deleted_end_layer}"
 
-        # tmp_layer_dict = []
+        old_layers = []
         with self.model_lock:
             time_start = time.time()
             for layer_idx in range(deleted_start_layer, deleted_end_layer):
-                # # 1. 删除子模块引用
                 layer = self.layers[layer_idx]
                 assert layer is not None, "Layer is None"
                 assert layer is not PPMissingLayer, "Layer is PPMissingLayer"
-                # for name, _ in list(layer.named_parameters(recurse=True)):
-                #     # 删除每个参数
-                #     delattr(layer, name.split(".")[-1])
-                # for name, _ in list(layer.named_children()):
-                #     delattr(layer, name)
+                # Collect old layer reference before replacing
+                old_layers.append(layer)
                 self.layers[layer_idx] = PPMissingLayer()  # 占位符
                 logger.info(f"Layer {layer_idx} deleted successfully.")
-                # tmp_layer_dict.append(layer)
-                # 2. 显式从 _modules 中删除（可选但更保险）
-                # 由于 nn.ModuleList 自动注册子模块，这一步确保彻底清除
-                # prefix = f"layers.{layer_idx}"
-                # keys_to_delete = (k for k in self._modules if k.startswith(prefix))
-                # for key in keys_to_delete:
-                #     self._modules.pop(key)
             
             logger.info(f"Deleted layers took {human_readable_duration(time.time() - time_start)}")
         
         # Actually delete the layer objects to free GPU memory
-        # free_before = torch.cuda.memory_allocated()
-        # for layer in tmp_layer_dict:
-        #     del layer
-        # tmp_layer_dict.clear()
-        # del tmp_layer_dict
-        # gc.collect()
-        # torch.cuda.empty_cache()
-        # free_after = torch.cuda.memory_allocated()
-        # logger.info(f"[delete_layers] Freed {(free_before - free_after) / 1024**3:.2f} GB of GPU memory for model weights")
+        free_before = torch.cuda.memory_allocated()
+        for layer in old_layers:
+            del layer
+        old_layers.clear()
+        del old_layers
+        gc.collect()
+        torch.cuda.empty_cache()
+        free_after = torch.cuda.memory_allocated()
+        logger.info(f"[delete_layers] Freed {(free_before - free_after) / 1024**3:.2f} GB of GPU memory for model weights")
 
         # Update the start_layer and end_layer
         if deleted_start_layer == old_start_layer:

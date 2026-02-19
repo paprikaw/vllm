@@ -1123,6 +1123,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
             }
             for i in range(len(self.kv_caches)):
                 logger.info(f"kv_caches[{i}] shape: {self.kv_caches[i].shape}")
+            # Force garbage collection and clear CUDA cache to release GPU memory for deleted layer weights
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
             logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
     def dynamic_initialize_kv_cache(self, 

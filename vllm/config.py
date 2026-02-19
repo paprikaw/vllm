@@ -4187,6 +4187,12 @@ class DynamicConfig:
     Used by DynamicLayerKVConnector for bidirectional control channels.
     This takes precedence over the VLLM_LAYERKV_RANK_TO_IP environment variable."""
 
+    allow_resize: bool = True
+    """Whether to allow KV cache resize during migration.
+    When False, resize operations (shrink/expand) are skipped at both start
+    and end of migration. If the migration would require a resize (e.g. not
+    enough free memory without compacting), a RuntimeError is raised."""
+
     @property
     def is_migration(self) -> bool:
         """Whether migration is enabled (derived from migration_steps)."""
@@ -4214,6 +4220,7 @@ class DynamicConfig:
         factors.append(self.metrics_csv_path)
         factors.append(str(self.alternative_configs) if self.alternative_configs else None)
         factors.append(str(self.migration_steps) if self.migration_steps else None)
+        factors.append(self.allow_resize)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
 

@@ -965,6 +965,7 @@ if envs.VLLM_SERVER_DEV_MODE:
             # Optional migration configuration
             alternative_configs = body.get("alternative_configs")
             migration_steps = body.get("migration_steps")
+            migration_mode = body.get("migration_mode")
             
             # Convert alternative_configs - handle both formats:
             # Format 1: {"pp_layer_configs": {"0": [...], "1": [...]}}
@@ -981,12 +982,13 @@ if envs.VLLM_SERVER_DEV_MODE:
                     for k, v in inner_configs.items()
                 }
             
-            logger.info("Setting pp_layer_config to: %s, alternative_configs: %s, migration_steps: %s",
-                       pp_layer_config, alternative_configs, migration_steps)
+            logger.info("Setting pp_layer_config to: %s, alternative_configs: %s, migration_steps: %s, migration_mode: %s",
+                       pp_layer_config, alternative_configs, migration_steps, migration_mode)
             await engine_client(raw_request).set_pp_config(
                 pp_layer_config,
                 alternative_configs,
-                migration_steps
+                migration_steps,
+                migration_mode
             )
             logger.info("PP config set successfully to: %s", pp_layer_config)
             return Response(status_code=200)

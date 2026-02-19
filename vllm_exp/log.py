@@ -323,7 +323,8 @@ class SweepLogManager:
             "project": self.cfg.project,
             "type": self.cfg.type,
             "static_config": self.cfg.static_config.model_dump(),
-            "sweep_config": self.cfg.sweep_config.model_dump(),
+            "sweep_config": self.cfg.sweep_config.model_dump() if self.cfg.sweep_config else None,
+            "sweep_configs": [sc.model_dump() for sc in self.cfg.sweep_configs] if self.cfg.sweep_configs else None,
             "timestamp": datetime.datetime.now().isoformat(),
             "experiment_vars": vars_mapping or {},
         }

@@ -930,6 +930,7 @@ class DynamicGPUWorker(Worker):
 
             for layer_name, attn_module in forward_context.items():
                 torch.cuda.synchronize()
+                gc.collect()
                 torch.cuda.empty_cache()
                 logger.info(f"rresizing kv cache for laye {layer_name}")
                 layer_idx = extract_layer_index(layer_name)
@@ -953,6 +954,7 @@ class DynamicGPUWorker(Worker):
                 )
         
         torch.cuda.synchronize()
+        gc.collect()
         torch.cuda.empty_cache()
         logger.info(f"[timeline]: resize kv cache within: {human_readable_duration(time.time() - time_start)}")
 
@@ -1675,7 +1677,11 @@ class DynamicGPUWorker(Worker):
                         # For receiver: this will be overwritten by _listen_loop when all patches are applied
                         if is_sender:
                             self.after_migration_applied_token_num = num_total_migration_tokens
-                        self.resize_kv_cache(scheduler_output.new_kv_cache_block_num)
+                        allow_resize = self.vllm_config.dynamic_config.allow_resize
+                        if allow_resize:
+                            self.resize_kv_cache(scheduler_output.new_kv_cache_block_num)
+                        else:
+                            logger.info(f"allow_resize=False, skipping worker-side resize (would be {scheduler_output.new_kv_cache_block_num} blocks)")
                         self.finish_migration()
                         self.kv_resizing_done = True
                     finally:

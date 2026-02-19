@@ -1271,6 +1271,8 @@ def generate_experiment_specs(
             enable_cuda_graph=exp_cfg.vllm.enable_cuda_graph,
             enable_nsight=exp_cfg.vllm.enable_nsight,
             weight_chunk_size_mb=exp_cfg.vllm.weight_chunk_size_mb,
+            migration_approach=exp_cfg.vllm.migration_approach,
+            allow_resize=exp_cfg.vllm.allow_resize,
             pp_layer_partition=exp_cfg.vllm.pp_layer_partition,
             pp_layer_config=exp_cfg.vllm.pp_layer_config,
             alternative_configs=exp_cfg.vllm.get_alternative_configs(),
@@ -1304,6 +1306,7 @@ def generate_experiment_specs(
             initial_pp_config=exp_cfg.vllm.get_initial_pp_config(),
             alternative_configs=exp_cfg.vllm.get_alternative_configs(),
             migration_steps=exp_cfg.vllm.get_migration_steps(),
+            migration_mode=exp_cfg.vllm.migration_approach,
         )
         
         yield SweepExperimentSpec(
@@ -1655,6 +1658,7 @@ async def call_set_pp_config(
     pp_layer_config: list,
     alternative_configs: Optional[Dict[int, Any]] = None,
     migration_steps: Optional[list[int]] = None,
+    migration_mode: Optional[str] = None,
     timeout: float = 120.0
 ) -> bool:
     """Call the set_pp_config API endpoint.
@@ -1665,6 +1669,7 @@ async def call_set_pp_config(
         alternative_configs: Optional dict of migration targets. Keys are config indices,
                             values are pp_layer_config lists.
         migration_steps: Optional list of request indices at which to trigger migration.
+        migration_mode: Optional migration mode ('sync' or 'async').
         timeout: Request timeout in seconds
     
     Returns:
@@ -1680,6 +1685,8 @@ async def call_set_pp_config(
         payload["alternative_configs"] = {str(k): v for k, v in alternative_configs.items()}
     if migration_steps is not None:
         payload["migration_steps"] = migration_steps
+    if migration_mode is not None:
+        payload["migration_mode"] = migration_mode
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -1712,6 +1719,7 @@ def call_set_pp_config_sync(
     pp_layer_config: list,
     alternative_configs: Optional[Dict[int, Any]] = None,
     migration_steps: Optional[list[int]] = None,
+    migration_mode: Optional[str] = None,
     timeout: float = 120.0
 ) -> bool:
     """Synchronous wrapper for call_set_pp_config.
@@ -1721,6 +1729,7 @@ def call_set_pp_config_sync(
         pp_layer_config: Target configuration as list of [start, end] pairs per rank.
         alternative_configs: Optional dict of migration targets.
         migration_steps: Optional list of request indices for migration triggers.
+        migration_mode: Optional migration mode ('sync' or 'async').
         timeout: Request timeout in seconds
     
     Returns:
@@ -1734,7 +1743,7 @@ def call_set_pp_config_sync(
         asyncio.set_event_loop(loop)
     
     return loop.run_until_complete(
-        call_set_pp_config(base_url, pp_layer_config, alternative_configs, migration_steps, timeout)
+        call_set_pp_config(base_url, pp_layer_config, alternative_configs, migration_steps, migration_mode, timeout)
     )
 
 
@@ -1881,11 +1890,17 @@ def _run_single_experiment_on_running_server(
         else:
             C.print(f"[dim]  No migration for this experiment[/]")
         
+        # Determine migration mode from spec
+        migration_mode = getattr(vllm_spec, 'migration_approach', None)
+        if migration_mode:
+            C.print(f"[dim]  Migration mode: {migration_mode}[/]")
+        
         if not call_set_pp_config_sync(
             bench_spec.base_url,
             target_pp_config,
             alternative_configs=alternative_configs,
-            migration_steps=migration_steps
+            migration_steps=migration_steps,
+            migration_mode=migration_mode
         ):
             C.print("[red]ERROR: Failed to set PP config[/]")
             return False

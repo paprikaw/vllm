@@ -614,6 +614,7 @@ class DynamicEngineCore(EngineCore):
         self._migration_done_event.clear()  # signal that migration is in progress
         assert isinstance(self.scheduler, DynamicScheduler)
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+        allow_resize = self.vllm_config.dynamic_config.allow_resize
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         # 先获取一次内存快照
@@ -668,6 +669,12 @@ class DynamicEngineCore(EngineCore):
             assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
             compacted_length = min(maximum_kv_block_num_after_compact)
             original_length = self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
+
+            if need_compact and not allow_resize:
+                raise RuntimeError(
+                    "Migration requires KV cache compact/resize but allow_resize is disabled. "
+                    f"compacted_length={compacted_length}, original_length={original_length}")
+
             if need_compact:
                 time_start_compact_kv = time.time()
                 bitmap = self.scheduler.shrink_block_pool(compacted_length)
@@ -685,7 +692,7 @@ class DynamicEngineCore(EngineCore):
             logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
 
         # 需要resize kv cache来进行migration，这里的resize一定是缩小
-        if compacted_length != original_length:
+        if allow_resize and compacted_length != original_length:
             assert compacted_length < original_length, f"compacted_length: {compacted_length} is greater than the current kv cache size: {original_length}"
             # 我理解这里只要shrink block pool在resize kv cache之前调用就行了
             # TODO: 在resize之前，理论上需要保证没有shrink_kv_cache之前的in-flight request
@@ -821,10 +828,15 @@ class DynamicEngineCore(EngineCore):
                     assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
 
                 resized_block_num = min(deleting_layer_assesses)
-                logger.info(f"all tokens to be sent is less than the threshold, start to synchronize the kv cache, resized_block_num: {resized_block_num}")
-                if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
-                    assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
-                    logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
+                if not allow_resize:
+                    # When resize is disabled, keep the current block count
+                    resized_block_num = self.scheduler.kv_cache_manager.num_gpu_blocks
+                    logger.info(f"allow_resize=False, keeping current block count: {resized_block_num}")
+                else:
+                    logger.info(f"all tokens to be sent is less than the threshold, start to synchronize the kv cache, resized_block_num: {resized_block_num}")
+                    if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
+                        assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
+                        logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
 
                 self.scheduler.async_change_configuration(pp_layer_config, resized_block_num)
                 self.cur_pp_layer_config = pp_layer_config
@@ -860,6 +872,7 @@ class DynamicEngineCore(EngineCore):
         assert isinstance(self.scheduler, DynamicScheduler)
         time_start = time.time()
         engine_core_outputs = []
+        allow_resize = self.vllm_config.dynamic_config.allow_resize
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         with self.engine_lock:
@@ -915,6 +928,12 @@ class DynamicEngineCore(EngineCore):
             assert isinstance(self.scheduler, DynamicScheduler)
             assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
             compacted_length = min(maximum_kv_block_num_after_compact)
+
+            if need_compact and not allow_resize:
+                raise RuntimeError(
+                    "Sync migration requires KV cache compact/resize but allow_resize is disabled. "
+                    f"compacted_length={compacted_length}")
+
             if need_compact:
                 logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
                 # Get bitmap from scheduler before compacting
@@ -995,10 +1014,12 @@ class DynamicEngineCore(EngineCore):
             resized_block_num = min(deleting_layer_assesses)
             # Always update scheduler's pp_layer_config, regardless of whether block num changes
             self.scheduler.sync_change_configuration(pp_layer_config)
-            if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
+            if allow_resize and resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
                 assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
                 logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
                 self.model_executor.resize_kv_cache(resized_block_num)
+            elif not allow_resize:
+                logger.info(f"allow_resize=False, skipping end-of-migration resize (would be {resized_block_num} blocks)")
             self.cur_pp_layer_config = pp_layer_config
             logger.info(f"[sync_migration]: updated cur_pp_layer_config to {self.cur_pp_layer_config}, time taken: {human_readable_duration(time.time() - time_start)}")
 
@@ -1009,6 +1030,7 @@ class DynamicEngineCore(EngineCore):
         pp_layer_config: list[Tuple[int, int]],
         alternative_configs: Optional[Dict[int, Any]] = None,
         migration_steps: Optional[list[int]] = None,
+        migration_mode: Optional[str] = None,
     ) -> list[EngineCoreOutputs]:
         """Set pipeline configuration to a specific target config.
         
@@ -1027,6 +1049,8 @@ class DynamicEngineCore(EngineCore):
                                  Format: {0: [(0,17), (18,63)], 1: [(0,19), (20,63)]}
             migration_steps: Optional new migration steps (request indices at which
                             to trigger migration). If provided, updates the migration_thread.
+            migration_mode: Optional migration mode ('sync' or 'async'). If provided,
+                           updates self.dynamic_config.migration_mode for subsequent migrations.
         
         Returns:
             List of EngineCoreOutputs from processing any pending requests.
@@ -1037,6 +1061,11 @@ class DynamicEngineCore(EngineCore):
         # (including worker-side do_resize / finish_migration) before resetting state
         if not self._migration_done_event.wait(timeout=120):
             raise RuntimeError("Timeout waiting for ongoing migration to complete before setting new PP config. Current migration may be stuck.")
+        
+        # Update migration_mode if provided
+        if migration_mode is not None:
+            logger.info(f"set_pp_config: Updating migration_mode to '{migration_mode}'")
+            self.dynamic_config.migration_mode = migration_mode
         
         # Update migration configuration if provided
         with self._migration_config_lock:
@@ -1621,10 +1650,21 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                     migration_mode = self.dynamic_config.migration_mode
                     if migration_mode == "sync":
                         logger.info(f"Using sync migration mode")
-                        self.change_model_configuration_by_kv_transfer_sync(alternative_configs[cur_config])
-                    else:
+                        engine_core_outputs = self.change_model_configuration_by_kv_transfer_sync(alternative_configs[cur_config])
+                        # Drain outputs must be sent to output_queue so the
+                        # client receives responses for requests that finished
+                        # during the drain; otherwise the client hangs forever
+                        # waiting for the missing responses.
+                        for output in engine_core_outputs:
+                            if output is not None:
+                                self.output_queue.put_nowait(output)
+                        logger.info(f"migration_thread: flushed {len(engine_core_outputs)} drain outputs to output_queue")
+                    elif migration_mode == "async":
                         logger.info(f"Using async migration mode")
                         self.change_model_configuration_by_kv_transfer_async(alternative_configs[cur_config])
+                    else:
+                        raise ValueError(f"Invalid migration_mode: {migration_mode}. Must be 'sync' or 'async'.")
+
                 else:
                     logger.warning(f"migration_thread: cur_config {cur_config} not found in alternative_configs, skipping migration")
                 # outputs = self.migrate_layer_v1(1, 0, 24)

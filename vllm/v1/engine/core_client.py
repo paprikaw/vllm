@@ -99,7 +99,8 @@ class EngineCoreClient(ABC):
         self,
         pp_layer_config: list,
         alternative_configs: Optional[dict] = None,
-        migration_steps: Optional[list[int]] = None
+        migration_steps: Optional[list[int]] = None,
+        migration_mode: Optional[str] = None
     ) -> None:
         raise NotImplementedError
 
@@ -165,7 +166,8 @@ class EngineCoreClient(ABC):
         self,
         pp_layer_config: list,
         alternative_configs: Optional[dict] = None,
-        migration_steps: Optional[list[int]] = None
+        migration_steps: Optional[list[int]] = None,
+        migration_mode: Optional[str] = None
     ) -> None:
         raise NotImplementedError
 
@@ -247,9 +249,10 @@ class InprocClient(EngineCoreClient):
         self,
         pp_layer_config: list,
         alternative_configs: Optional[dict] = None,
-        migration_steps: Optional[list[int]] = None
+        migration_steps: Optional[list[int]] = None,
+        migration_mode: Optional[str] = None
     ) -> None:
-        self.engine_core.set_pp_config(pp_layer_config, alternative_configs, migration_steps)
+        self.engine_core.set_pp_config(pp_layer_config, alternative_configs, migration_steps, migration_mode)
 
     def sleep(self, level: int = 1) -> None:
         self.engine_core.sleep(level)
@@ -711,8 +714,12 @@ class SyncMPClient(MPClient):
     def reset_prefix_cache(self) -> None:
         self.call_utility("reset_prefix_cache")
 
-    def set_pp_config(self, pp_layer_config: list) -> None:
-        self.call_utility("set_pp_config", pp_layer_config)
+    def set_pp_config(self, pp_layer_config: list,
+                       alternative_configs: Optional[dict] = None,
+                       migration_steps: Optional[list[int]] = None,
+                       migration_mode: Optional[str] = None) -> None:
+        self.call_utility("set_pp_config", pp_layer_config,
+                          alternative_configs, migration_steps, migration_mode)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
@@ -902,8 +909,13 @@ class AsyncMPClient(MPClient):
     async def reset_prefix_cache_async(self) -> None:
         await self.call_utility_async("reset_prefix_cache")
 
-    async def set_pp_config_async(self, pp_layer_config: list) -> None:
-        await self.call_utility_async("set_pp_config", pp_layer_config)
+    async def set_pp_config_async(self, pp_layer_config: list,
+                                   alternative_configs: Optional[dict] = None,
+                                   migration_steps: Optional[list[int]] = None,
+                                   migration_mode: Optional[str] = None) -> None:
+        await self.call_utility_async("set_pp_config", pp_layer_config,
+                                      alternative_configs, migration_steps,
+                                      migration_mode)
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)
