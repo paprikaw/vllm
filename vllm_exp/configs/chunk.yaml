@@ -1,12 +1,11 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "config_finder_0.8"
+project: "chunk-test-blocking"
 type: "sweep_test"
 
 envs:
   RAY_DEDUP_LOGS: "0"  # Disable Ray log deduplication for debugging
-  # TMPDIR: "/home/bxb1/data/tmp"  # General temp directory
   NCCL_DEBUG: INFO
   NCCL_CUMEM_HOST_ENABLE: "0"
   VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
@@ -23,13 +22,11 @@ envs:
   NCCL_SOCKET_IFNAME: "bond0.3027"
   GLOO_SOCKET_IFNAME: "bond0.3027"
   VLLM_SERVER_DEV_MODE: "1"  # Enable /set_pp_config endpoint
-
 is_log_cover: true
 static_config:
   model:
-    path: "/home/bxb1/data/huggingface/Qwen3-32B-FP8"
-    name: "Qwen3-32B-FP8"
-  
+    path: "/home/bxb1/data/huggingface/Qwen3-32B"
+    name: "Qwen3-32B"
   network:
     rank_to_ip:
       0: "spartan-gpgpu166"
@@ -40,35 +37,66 @@ static_config:
   vllm:
     head_addr: "localhost"
     pipeline_parallel_size: 2
-    gpu_memory_utilization: 0.8
+    gpu_memory_utilization: 0.9
     max_model_len: 8000
     chunked_prefill: true
     enable_cuda_graph: false
     enable_nsight: false
     weight_chunk_size_mb: 5
     max_num_batched_tokens: 4096 
+  
   benchmark:
     burstiness: 100.0
     benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     profile: false
     print_outputs: true
-    num_total_requests: 100  # Shared across all sweep combinations
-    repetition: 1  # Shared across all sweep combinations
     warmup:
       enabled: false
       num_total_requests: 25
       input_length: 10000
       output_length: 50
       request_rate: 25
-
-# No sweep variables - single experiment with benchmark_config inside sweep_config
 sweep_configs:
-  # Test repetition with 3 repetitions, no migration
   - vllm:
       attention_kernel: [direct]
-    benchmark:
-      # pp_layer_configs: ["36,28", "32, 32", "28,36", "24, 40", "20, 44"]  # pp_layer_partition strings
-      pp_layer_configs: ["4, 60"]  # pp_layer_partition strings
-      request_rates: [2]  # float values
-      input_lens: [1024]  # int values
-      output_lens: [64]  # int values
+      allow_resize: [true]
+      weight_chunk_size_mb: [1, 5, 10, 30, 1000]
+      migration_approach: [async]
+    benchmark_config:
+      - num_total_requests: 200  # Small number for quick testing
+        repetition: 1           # 3 repetitions to test the feature
+        pp_layer_config:
+          0: "24, 40"           # Single config = no migration, only reset between reps
+          100: "32, 32"           # Single config = no migration, only reset between reps
+        requests:
+          0:
+            request_rate: 5.0
+            input_lens: 64 
+            output_lens: 64
+          100:
+            request_rate: 2.0
+            input_lens: 1024
+            output_lens: 64
+# # # Our version
+# # sweep_configs:
+# #   # Test repetition with 3 repetitions, no migration
+#   - vllm:
+#       attention_kernel: [direct]
+#       weight_chunk_size_mb: [5]
+#       migration_approach: [async]
+#     benchmark_config:
+#       - num_total_requests: 200  # Small number for quick testing
+#         repetition: 1           # 3 repetitions to test the feature
+#         pp_layer_config:
+#           0: "24, 40"           # Single config = no migration, only reset between reps
+#           100: "32, 32"           # Single config = no migration, only reset between reps
+#         requests:
+#           0:
+#             request_rate: 5.0
+#             input_lens: 64 
+#             output_lens: 64
+#           100:
+#             request_rate: 2.0
+#             input_lens: 1024
+#             output_lens: 64
+overwrite: true

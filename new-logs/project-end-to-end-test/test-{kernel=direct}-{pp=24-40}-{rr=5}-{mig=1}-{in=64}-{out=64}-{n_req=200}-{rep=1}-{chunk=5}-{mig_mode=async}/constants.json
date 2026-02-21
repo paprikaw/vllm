@@ -162,7 +162,7 @@
           "direct"
         ],
         "weight_chunk_size_mb": [
-          5.0
+          1000.0
         ],
         "migration_approach": [
           "async"
@@ -172,7 +172,7 @@
       "benchmark": null
     }
   ],
-  "timestamp": "2026-02-19T21:08:11.773987",
+  "timestamp": "2026-02-20T15:56:51.748568",
   "experiment_vars": {
     "kernel": "direct",
     "pp": "24,40",

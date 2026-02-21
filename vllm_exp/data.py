@@ -916,14 +916,9 @@ class ExperimentConfig:
             "n_req": self.benchmark.num_total_requests,
             "rep": self.benchmark.repetition,
         }
-        # Only include chunk size if it's not the default (10.0)
-        if self.vllm.weight_chunk_size_mb != 10.0:
-            vars_dict["chunk"] = self.vllm.weight_chunk_size_mb
-        # Always include migration_approach
+        vars_dict["chunk"] = self.vllm.weight_chunk_size_mb
         vars_dict["mig_mode"] = self.vllm.migration_approach
-        # Only include allow_resize if it's not the default (True)
-        if not self.vllm.allow_resize:
-            vars_dict["resize"] = 0
+        vars_dict["resize"] = 1 if self.vllm.allow_resize else 0
         return vars_dict
     
     @classmethod

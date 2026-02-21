@@ -1651,7 +1651,7 @@ def chunked_copy_inplace(
         >>> chunked_copy_inplace(param_data, loaded_weight, n_copy=20)
     """
     from vllm import envs
-    
+    assert non_blocking == False 
     # Use environment variable if chunk_size_mb not specified
     if chunk_size_mb is None:
         chunk_size_mb = envs.VLLM_WEIGHT_CHUNK_SIZE_MB

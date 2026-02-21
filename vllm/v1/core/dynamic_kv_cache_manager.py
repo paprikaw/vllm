@@ -108,7 +108,11 @@ class DynamicKVCacheManager(KVCacheManager):
         #         right -= 1
         #     if right < compacted_length:
         #         break
-        
+
+    def shrink_kv_cache(self, compacted_length: int) -> None:
+        """ Shrink the KV cache to a certain length. This should be called after compact_kv_cache to actually free the GPU memory.
+        """ 
+        assert compacted_length <= self.block_pool.num_gpu_blocks, f"compacted_length: {compacted_length} is greater than the current kv cache size: {self.block_pool.num_gpu_blocks}"
         self.block_pool.shrink_block_pool(compacted_length)
         self.num_gpu_blocks = compacted_length
         logger.info(f"after kv cache shrinking, the kv cache utilization is {self.block_pool.get_usage()}")

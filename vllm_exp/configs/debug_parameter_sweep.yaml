@@ -63,7 +63,7 @@ sweep_config:
   vllm:
     enable_flexi_flash_attn: [true]
   benchmark:
-    pp_layer_configs: ["36, 28", "32, 32", "28, 36","24, 40", "20, 44", "16, 48"]  # pp_layer_partition strings
+    pp_layer_configs: ["16, 48", "12, 52", "8, 56"]  # pp_layer_partition strings
     request_rates: [2.0]  # float values
     input_lens: [1024]  # int values  
     output_lens: [16]  # int values

@@ -503,7 +503,9 @@ class AsyncLLM(EngineClient):
         pp_layer_config: list,
         alternative_configs: Optional[dict] = None,
         migration_steps: Optional[list[int]] = None,
-        migration_mode: Optional[str] = None
+        migration_mode: Optional[str] = None,
+        allow_resize: Optional[bool] = None,
+        weight_chunk_size_mb: Optional[float] = None
     ) -> None:
         """Set pipeline configuration to a specific target config.
         
@@ -519,7 +521,9 @@ class AsyncLLM(EngineClient):
         await self.engine_core.set_pp_config_async(pp_layer_config,
                                                    alternative_configs,
                                                    migration_steps,
-                                                   migration_mode)
+                                                   migration_mode,
+                                                   allow_resize,
+                                                   weight_chunk_size_mb)
 
     async def sleep(self, level: int = 1) -> None:
         await self.engine_core.sleep_async(level)

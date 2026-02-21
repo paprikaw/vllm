@@ -620,7 +620,11 @@ class DynamicScheduler(Scheduler):
     def get_kv_cache_utilization(self) -> float:
         return self.kv_cache_manager.usage
     
-    def shrink_block_pool(self, compacted_length: int) -> bitarray:
+    def shrink_block_pool(self, compacted_length: int):
+        assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
+        self.kv_cache_manager.shrink_kv_cache(compacted_length)
+
+    def compact_kv_cache(self, compacted_length: int) -> bitarray:
         assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
         assert compacted_length < self.kv_cache_manager.num_gpu_blocks, f"compacted_length {compacted_length} should be smaller than current kv cache block num {self.kv_cache_manager.num_gpu_blocks}"
         bitmap = self.get_bitmap()

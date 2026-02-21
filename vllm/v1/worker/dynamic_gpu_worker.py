@@ -467,6 +467,11 @@ class DynamicGPUWorker(Worker):
                 self.model_runner.dynamic_initialize_kv_cache(kv_cache_configs[self.rank], self.dynamic_kv_synchronizer, num_blocks)
             self.dynamic_kv_synchronizer.create_slot_mappings(num_blocks * self.block_size)
 
+    def set_env_var(self, key: str, value: str) -> None:
+        """Update an environment variable in this worker process."""
+        os.environ[key] = value
+        logger.info(f"Worker {self.rank}: Updated env var {key}={value}")
+
     @torch.inference_mode()
     def execute_model(
         self,

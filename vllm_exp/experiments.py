@@ -1659,6 +1659,8 @@ async def call_set_pp_config(
     alternative_configs: Optional[Dict[int, Any]] = None,
     migration_steps: Optional[list[int]] = None,
     migration_mode: Optional[str] = None,
+    allow_resize: Optional[bool] = None,
+    weight_chunk_size_mb: Optional[float] = None,
     timeout: float = 120.0
 ) -> bool:
     """Call the set_pp_config API endpoint.
@@ -1670,6 +1672,7 @@ async def call_set_pp_config(
                             values are pp_layer_config lists.
         migration_steps: Optional list of request indices at which to trigger migration.
         migration_mode: Optional migration mode ('sync' or 'async').
+        allow_resize: Optional bool to update allow_resize on the server.
         timeout: Request timeout in seconds
     
     Returns:
@@ -1687,6 +1690,10 @@ async def call_set_pp_config(
         payload["migration_steps"] = migration_steps
     if migration_mode is not None:
         payload["migration_mode"] = migration_mode
+    if allow_resize is not None:
+        payload["allow_resize"] = allow_resize
+    if weight_chunk_size_mb is not None:
+        payload["weight_chunk_size_mb"] = weight_chunk_size_mb
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -1720,6 +1727,8 @@ def call_set_pp_config_sync(
     alternative_configs: Optional[Dict[int, Any]] = None,
     migration_steps: Optional[list[int]] = None,
     migration_mode: Optional[str] = None,
+    allow_resize: Optional[bool] = None,
+    weight_chunk_size_mb: Optional[float] = None,
     timeout: float = 120.0
 ) -> bool:
     """Synchronous wrapper for call_set_pp_config.
@@ -1730,6 +1739,7 @@ def call_set_pp_config_sync(
         alternative_configs: Optional dict of migration targets.
         migration_steps: Optional list of request indices for migration triggers.
         migration_mode: Optional migration mode ('sync' or 'async').
+        allow_resize: Optional bool to update allow_resize on the server.
         timeout: Request timeout in seconds
     
     Returns:
@@ -1743,7 +1753,7 @@ def call_set_pp_config_sync(
         asyncio.set_event_loop(loop)
     
     return loop.run_until_complete(
-        call_set_pp_config(base_url, pp_layer_config, alternative_configs, migration_steps, migration_mode, timeout)
+        call_set_pp_config(base_url, pp_layer_config, alternative_configs, migration_steps, migration_mode, allow_resize, weight_chunk_size_mb, timeout)
     )
 
 
@@ -1895,12 +1905,24 @@ def _run_single_experiment_on_running_server(
         if migration_mode:
             C.print(f"[dim]  Migration mode: {migration_mode}[/]")
         
+        # Pass allow_resize from spec
+        exp_allow_resize = getattr(vllm_spec, 'allow_resize', None)
+        if exp_allow_resize is not None:
+            C.print(f"[dim]  Allow resize: {exp_allow_resize}[/]")
+        
+        # Pass weight_chunk_size_mb from spec
+        exp_chunk_size = getattr(vllm_spec, 'weight_chunk_size_mb', None)
+        if exp_chunk_size is not None:
+            C.print(f"[dim]  Weight chunk size: {exp_chunk_size} MB[/]")
+        
         if not call_set_pp_config_sync(
             bench_spec.base_url,
             target_pp_config,
             alternative_configs=alternative_configs,
             migration_steps=migration_steps,
-            migration_mode=migration_mode
+            migration_mode=migration_mode,
+            allow_resize=exp_allow_resize,
+            weight_chunk_size_mb=exp_chunk_size
         ):
             C.print("[red]ERROR: Failed to set PP config[/]")
             return False

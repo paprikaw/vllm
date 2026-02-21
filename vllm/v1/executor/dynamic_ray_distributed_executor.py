@@ -549,3 +549,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
     def dynamic_initialize_from_config(self, kv_cache_configs: list[KVCacheConfig], num_blocks: int) -> None:
         self.collective_rpc("dynamic_initialize_from_config", args=(kv_cache_configs, num_blocks))
+
+    def set_env_var(self, key: str, value: str) -> None:
+        """Broadcast an environment variable update to all workers."""
+        self.collective_rpc("set_env_var", args=(key, value))

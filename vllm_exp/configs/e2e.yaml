@@ -26,18 +26,18 @@ is_log_cover: true
 static_config:
   model:
     path: "/home/bxb1/data/huggingface/Qwen3-32B"
-    name: "Qwen3-32B"
+    name: "Qwen3-32B-FP8"
   network:
     rank_to_ip:
-      0: "spartan-gpgpu010"
+      0: "spartan-gpgpu166"
       1: "spartan-gpgpu010"
     rank_to_node:
-      0: "spartan-gpgpu010"
+      0: "spartan-gpgpu166"
       1: "spartan-gpgpu010"
   vllm:
     head_addr: "localhost"
     pipeline_parallel_size: 2
-    gpu_memory_utilization: 0.9
+    gpu_memory_utilization: 0.8
     max_model_len: 8000
     chunked_prefill: true
     enable_cuda_graph: false
@@ -111,16 +111,16 @@ sweep_configs:
           100: "32, 32"           # Single config = no migration, only reset between reps
         requests:
           0:
-            request_rate: 5.0
+            request_rate: 2.0
             input_lens: 64 
-            output_lens: 64
+            output_lens: 512
           100:
             request_rate: 2.0
             input_lens: 1024
             output_lens: 64
-# # Our version
-# sweep_configs:
-#   # Test repetition with 3 repetitions, no migration
+# # # Our version
+# # sweep_configs:
+# #   # Test repetition with 3 repetitions, no migration
 #   - vllm:
 #       attention_kernel: [direct]
 #       weight_chunk_size_mb: [5]

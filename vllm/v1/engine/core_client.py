@@ -100,7 +100,9 @@ class EngineCoreClient(ABC):
         pp_layer_config: list,
         alternative_configs: Optional[dict] = None,
         migration_steps: Optional[list[int]] = None,
-        migration_mode: Optional[str] = None
+        migration_mode: Optional[str] = None,
+        allow_resize: Optional[bool] = None,
+        weight_chunk_size_mb: Optional[float] = None
     ) -> None:
         raise NotImplementedError
 
@@ -167,7 +169,9 @@ class EngineCoreClient(ABC):
         pp_layer_config: list,
         alternative_configs: Optional[dict] = None,
         migration_steps: Optional[list[int]] = None,
-        migration_mode: Optional[str] = None
+        migration_mode: Optional[str] = None,
+        allow_resize: Optional[bool] = None,
+        weight_chunk_size_mb: Optional[float] = None
     ) -> None:
         raise NotImplementedError
 
@@ -250,9 +254,11 @@ class InprocClient(EngineCoreClient):
         pp_layer_config: list,
         alternative_configs: Optional[dict] = None,
         migration_steps: Optional[list[int]] = None,
-        migration_mode: Optional[str] = None
+        migration_mode: Optional[str] = None,
+        allow_resize: Optional[bool] = None,
+        weight_chunk_size_mb: Optional[float] = None
     ) -> None:
-        self.engine_core.set_pp_config(pp_layer_config, alternative_configs, migration_steps, migration_mode)
+        self.engine_core.set_pp_config(pp_layer_config, alternative_configs, migration_steps, migration_mode, allow_resize, weight_chunk_size_mb)
 
     def sleep(self, level: int = 1) -> None:
         self.engine_core.sleep(level)
@@ -717,9 +723,12 @@ class SyncMPClient(MPClient):
     def set_pp_config(self, pp_layer_config: list,
                        alternative_configs: Optional[dict] = None,
                        migration_steps: Optional[list[int]] = None,
-                       migration_mode: Optional[str] = None) -> None:
+                       migration_mode: Optional[str] = None,
+                       allow_resize: Optional[bool] = None,
+                       weight_chunk_size_mb: Optional[float] = None) -> None:
         self.call_utility("set_pp_config", pp_layer_config,
-                          alternative_configs, migration_steps, migration_mode)
+                          alternative_configs, migration_steps, migration_mode,
+                          allow_resize, weight_chunk_size_mb)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
@@ -912,10 +921,13 @@ class AsyncMPClient(MPClient):
     async def set_pp_config_async(self, pp_layer_config: list,
                                    alternative_configs: Optional[dict] = None,
                                    migration_steps: Optional[list[int]] = None,
-                                   migration_mode: Optional[str] = None) -> None:
+                                   migration_mode: Optional[str] = None,
+                                   allow_resize: Optional[bool] = None,
+                                   weight_chunk_size_mb: Optional[float] = None) -> None:
         await self.call_utility_async("set_pp_config", pp_layer_config,
                                       alternative_configs, migration_steps,
-                                      migration_mode)
+                                      migration_mode, allow_resize,
+                                      weight_chunk_size_mb)
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)

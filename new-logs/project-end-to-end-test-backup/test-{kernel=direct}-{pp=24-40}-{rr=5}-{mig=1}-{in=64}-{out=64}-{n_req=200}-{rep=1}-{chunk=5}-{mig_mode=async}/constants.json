@@ -85,19 +85,94 @@
           "direct"
         ],
         "weight_chunk_size_mb": [
+          1000.0
+        ],
+        "migration_approach": [
+          "sync"
+        ],
+        "allow_resize": null
+      },
+      "benchmark": null
+    },
+    {
+      "benchmark_config": [
+        {
+          "num_total_requests": 200,
+          "repetition": 1,
+          "pp_layer_config": {
+            "0": "24, 40",
+            "100": "32, 32"
+          },
+          "requests": {
+            "0": {
+              "request_rate": 5.0,
+              "input_lens": 64,
+              "output_lens": 64
+            },
+            "100": {
+              "request_rate": 2.0,
+              "input_lens": 1024,
+              "output_lens": 64
+            }
+          }
+        }
+      ],
+      "vllm": {
+        "attention_kernel": [
+          "direct"
+        ],
+        "weight_chunk_size_mb": [
           5.0
         ],
         "migration_approach": [
           "async"
         ],
         "allow_resize": [
-          true
+          true,
+          false
         ]
+      },
+      "benchmark": null
+    },
+    {
+      "benchmark_config": [
+        {
+          "num_total_requests": 200,
+          "repetition": 1,
+          "pp_layer_config": {
+            "0": "24, 40",
+            "100": "32, 32"
+          },
+          "requests": {
+            "0": {
+              "request_rate": 5.0,
+              "input_lens": 64,
+              "output_lens": 64
+            },
+            "100": {
+              "request_rate": 2.0,
+              "input_lens": 1024,
+              "output_lens": 64
+            }
+          }
+        }
+      ],
+      "vllm": {
+        "attention_kernel": [
+          "direct"
+        ],
+        "weight_chunk_size_mb": [
+          1000.0
+        ],
+        "migration_approach": [
+          "async"
+        ],
+        "allow_resize": null
       },
       "benchmark": null
     }
   ],
-  "timestamp": "2026-02-19T20:53:18.028854",
+  "timestamp": "2026-02-20T12:13:48.791090",
   "experiment_vars": {
     "kernel": "direct",
     "pp": "24,40",
