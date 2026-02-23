@@ -1136,6 +1136,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_scattered = "residual" and is_residual_scattered
                 copy_len = num_tokens // tp if is_scattered else \
                     num_tokens
+                # DIAG: Check for tensor size mismatch before copy
+                if v.shape[0] < copy_len:
+                    logger.error(f"[DIAG_SYNC] MISMATCH! key={k} "
+                                f"copy_len={copy_len} num_tokens={num_tokens} "
+                                f"tensor_shape={v.shape} "
+                                f"intermediate_tensors_shapes={{kk: vv.shape for kk, vv in intermediate_tensors.items()}}")
                 self.intermediate_tensors[k][:copy_len].copy_(
                     v[:copy_len], non_blocking=True)
 

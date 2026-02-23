@@ -95,7 +95,6 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, log_dir: Path, log_file_name: 
         "alternative_configs": alternative_configs_dict,
         "migration_steps": cfg.migration.migration_steps,
         "migration_mode": cfg.migration.migration_mode,
-        "allow_resize": cfg.migration.allow_resize,
     })
     serve_args.extend(["-D", dynamic_cfg])
     

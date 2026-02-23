@@ -1,7 +1,7 @@
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.utils import extract_layer_index
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype
-from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
+from vllm.model_executor.models.dynamic_model_base import DynamicModelBase
 from vllm.logger import init_logger
 from typing import cast, Tuple, Generator, Iterable, Optional
 from tqdm.auto import tqdm
@@ -204,13 +204,13 @@ class CustomModelLoader(DefaultModelLoader):
 
         return model.eval()
 
-    def load_qwen3_layers(self, vllm_config: VllmConfig,
+    def load_dynamic_layers(self, vllm_config: VllmConfig,
                    model_config: ModelConfig,
                    layers: Tuple[int, int],
-                   model: DynamicQwen3ForCausalLM,
+                   model: DynamicModelBase,
                    device: torch.device
                    ) -> None:
-        assert isinstance(model, DynamicQwen3ForCausalLM), "model must be a DynamicQwen3ForCausalLM instance"
+        assert isinstance(model, DynamicModelBase), "model must be a DynamicModelBase instance"
         time_start = time.time()
         logger.info(f"[timeline]: start to load layers {layers}")
         # 创建低优先级 stream（priority 值越大优先级越低）

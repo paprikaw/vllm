@@ -296,13 +296,14 @@ class DynamicAsyncMPClient(DynamicMPClient):
         alternative_configs: Optional[Dict] = None,
         migration_steps: Optional[list[int]] = None,
         migration_mode: Optional[str] = None,
-        allow_resize: Optional[bool] = None,
-        weight_chunk_size_mb: Optional[float] = None
+        weight_chunk_size_mb: Optional[float] = None,
+        fixed_num_gpu_blocks: Optional[int] = None
     ) -> None:
         await self.call_utility_async("set_pp_config", pp_layer_config,
                                       alternative_configs, migration_steps,
-                                      migration_mode, allow_resize,
-                                      weight_chunk_size_mb)
+                                      migration_mode,
+                                      weight_chunk_size_mb,
+                                      fixed_num_gpu_blocks)
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)

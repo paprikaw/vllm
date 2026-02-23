@@ -13,7 +13,7 @@ import torch.nn as nn
 from vllm.config import (ObservabilityConfig, VllmConfig,
                          set_current_vllm_config)
 from vllm.distributed import broadcast_tensor_dict, get_pp_group, get_tp_group
-from vllm.logger import init_logger
+from vllm.logger import init_logger, reconfigure_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest, IntermediateTensors
@@ -540,6 +540,10 @@ class WorkerWrapperBase:
             # suppress the warning in `update_environment_variables`
             del os.environ[key]
         update_environment_variables(envs)
+        # Reconfigure logger with the new environment variables
+        # This is necessary because the logger is configured at module import
+        # time, which happens before environment variables are set in Ray workers
+        reconfigure_logger()
 
     def init_worker(self, all_kwargs: List[Dict[str, Any]]) -> None:
         """

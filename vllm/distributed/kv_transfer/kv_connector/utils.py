@@ -68,7 +68,7 @@ class model_aware_kv_ops_helper:
         # layer can be either a module or a global layer index.
         layer_module = layer
         if isinstance(layer, int):
-            # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
+            # DynamicModelBase.model is DynamicModel which has .layers
             layer_module = model_executable.model.layers[layer]
 
         if self.is_deepseek_mla and self.use_mla_opt:
@@ -123,7 +123,7 @@ class model_aware_kv_ops_helper:
         # layer can be either a module or a global layer index.
         layer_module = layer
         if isinstance(layer, int):
-            # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
+            # DynamicModelBase.model is DynamicModel which has .layers
             layer_module = model_executable.model.layers[layer]
 
         if self.is_deepseek_mla and self.use_mla_opt:

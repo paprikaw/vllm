@@ -4187,11 +4187,12 @@ class DynamicConfig:
     Used by DynamicLayerKVConnector for bidirectional control channels.
     This takes precedence over the VLLM_LAYERKV_RANK_TO_IP environment variable."""
 
-    allow_resize: bool = True
-    """Whether to allow KV cache resize during migration.
-    When False, resize operations (shrink/expand) are skipped at both start
-    and end of migration. If the migration would require a resize (e.g. not
-    enough free memory without compacting), a RuntimeError is raised."""
+    fixed_num_gpu_blocks: int = -1
+    """Fixed number of GPU KV cache blocks per layer. Default -1 (auto).
+    When set to a positive value, initializes the KV cache with exactly this
+    many blocks and prevents any block count changes during migration or
+    set_pp_config. This overrides the dynamic calculation based on available
+    GPU memory."""
 
     @property
     def is_migration(self) -> bool:
@@ -4220,7 +4221,7 @@ class DynamicConfig:
         factors.append(self.metrics_csv_path)
         factors.append(str(self.alternative_configs) if self.alternative_configs else None)
         factors.append(str(self.migration_steps) if self.migration_steps else None)
-        factors.append(self.allow_resize)
+        factors.append(self.fixed_num_gpu_blocks)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
 

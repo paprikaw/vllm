@@ -966,8 +966,8 @@ if envs.VLLM_SERVER_DEV_MODE:
             alternative_configs = body.get("alternative_configs")
             migration_steps = body.get("migration_steps")
             migration_mode = body.get("migration_mode")
-            allow_resize = body.get("allow_resize")
             weight_chunk_size_mb = body.get("weight_chunk_size_mb")
+            fixed_num_gpu_blocks = body.get("fixed_num_gpu_blocks")
             
             # Convert alternative_configs - handle both formats:
             # Format 1: {"pp_layer_configs": {"0": [...], "1": [...]}}
@@ -984,15 +984,15 @@ if envs.VLLM_SERVER_DEV_MODE:
                     for k, v in inner_configs.items()
                 }
             
-            logger.info("Setting pp_layer_config to: %s, alternative_configs: %s, migration_steps: %s, migration_mode: %s, allow_resize: %s, weight_chunk_size_mb: %s",
-                       pp_layer_config, alternative_configs, migration_steps, migration_mode, allow_resize, weight_chunk_size_mb)
+            logger.info("Setting pp_layer_config to: %s, alternative_configs: %s, migration_steps: %s, migration_mode: %s, weight_chunk_size_mb: %s, fixed_num_gpu_blocks: %s",
+                       pp_layer_config, alternative_configs, migration_steps, migration_mode, weight_chunk_size_mb, fixed_num_gpu_blocks)
             await engine_client(raw_request).set_pp_config(
                 pp_layer_config,
                 alternative_configs,
                 migration_steps,
                 migration_mode,
-                allow_resize,
-                weight_chunk_size_mb
+                weight_chunk_size_mb,
+                fixed_num_gpu_blocks
             )
             logger.info("PP config set successfully to: %s", pp_layer_config)
             return Response(status_code=200)

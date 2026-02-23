@@ -31,6 +31,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.utils import LayerFn
 from vllm.model_executor.models.utils import maybe_offload_to_cpu
 from vllm.config import set_current_vllm_config
+from .dynamic_model_base import DynamicModelBase
 import time
 logger = init_logger(__name__)
 
@@ -43,7 +44,7 @@ logger = init_logger(__name__)
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
     })
-class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
+class DynamicQwen3ForCausalLM(Qwen3ForCausalLM, DynamicModelBase):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         config = vllm_config.model_config.hf_config
@@ -151,7 +152,7 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM):
         return self.layer_weight_size
 
 class DynamicQwen3Model(Qwen3Model):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", ):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix)
         self.sched_start_layer = self.start_layer

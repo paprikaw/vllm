@@ -52,7 +52,7 @@ static_config:
     benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     profile: false
     print_outputs: true
-    num_total_requests: 100  # Shared across all sweep combinations
+    num_total_requests: 200  # Shared across all sweep combinations
     repetition: 1  # Shared across all sweep combinations
     warmup:
       enabled: false
@@ -69,6 +69,6 @@ sweep_configs:
     benchmark:
       # pp_layer_configs: ["36,28", "32, 32", "28,36", "24, 40", "20, 44"]  # pp_layer_partition strings
       pp_layer_configs: ["4, 60"]  # pp_layer_partition strings
-      request_rates: [2]  # float values
+      request_rates: [1.7]  # float values
       input_lens: [1024]  # int values
       output_lens: [64]  # int values

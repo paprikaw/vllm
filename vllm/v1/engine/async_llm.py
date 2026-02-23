@@ -504,8 +504,8 @@ class AsyncLLM(EngineClient):
         alternative_configs: Optional[dict] = None,
         migration_steps: Optional[list[int]] = None,
         migration_mode: Optional[str] = None,
-        allow_resize: Optional[bool] = None,
-        weight_chunk_size_mb: Optional[float] = None
+        weight_chunk_size_mb: Optional[float] = None,
+        fixed_num_gpu_blocks: Optional[int] = None
     ) -> None:
         """Set pipeline configuration to a specific target config.
         
@@ -517,13 +517,14 @@ class AsyncLLM(EngineClient):
             alternative_configs: Optional new migration targets.
             migration_steps: Optional new migration trigger points (request indices).
             migration_mode: Optional migration mode ('sync' or 'async').
+            fixed_num_gpu_blocks: Optional fixed KV cache block count (-1 to disable).
         """
         await self.engine_core.set_pp_config_async(pp_layer_config,
                                                    alternative_configs,
                                                    migration_steps,
                                                    migration_mode,
-                                                   allow_resize,
-                                                   weight_chunk_size_mb)
+                                                   weight_chunk_size_mb,
+                                                   fixed_num_gpu_blocks)
 
     async def sleep(self, level: int = 1) -> None:
         await self.engine_core.sleep_async(level)

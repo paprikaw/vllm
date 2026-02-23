@@ -59,7 +59,6 @@ static_config:
 sweep_configs:
   - vllm:
       attention_kernel: [direct]
-      allow_resize: [true]
       weight_chunk_size_mb: [1, 5, 10, 30, 1000]
       migration_approach: [async]
     benchmark_config:

@@ -83,7 +83,6 @@ class MigrationCfg(BaseModel):
     tester_start_step: Optional[int] = None
     memory_stress_tester: Optional[Dict[str, Any]] = None
     migration_mode: str = "async"  # "async" or "sync" - determines which migration method to use
-    allow_resize: bool = True  # Whether to allow KV cache resize during migration
 
 class WarmupBenchCfg(BaseModel):
     """Optional warmup stage config for vllm_exp.
@@ -360,8 +359,8 @@ class SweepVllmParams(BaseModel):
     """List of weight chunk sizes (MB) for sweep. Affects weight loading during migration."""
     migration_approach: Optional[List[str]] = None
     """List of migration approaches to sweep: 'sync' or 'async'. Determines which migration method to use."""
-    allow_resize: Optional[List[bool]] = None
-    """List of allow_resize values to sweep. Controls whether KV cache resize is allowed during migration."""
+    fixed_num_gpu_blocks: Optional[List[int]] = None
+    """List of fixed KV cache block counts to sweep. -1 means auto. Positive value fixes the block count."""
 
 
 class SweepConfig(BaseModel):
@@ -432,8 +431,8 @@ class SweepConfig(BaseModel):
                 axes['weight_chunk_size_mb'] = self.vllm.weight_chunk_size_mb
             if self.vllm.migration_approach is not None:
                 axes['migration_approach'] = self.vllm.migration_approach
-            if self.vllm.allow_resize is not None:
-                axes['allow_resize'] = self.vllm.allow_resize
+            if self.vllm.fixed_num_gpu_blocks is not None:
+                axes['fixed_num_gpu_blocks'] = self.vllm.fixed_num_gpu_blocks
         
         # Mode 1: benchmark_config provided directly in sweep_config
         if self.benchmark_config is not None:
@@ -539,8 +538,9 @@ class StaticVllmCfg(BaseModel):
     """Weight chunk size in MB for chunked weight loading during migration. Default 10 MB."""
     migration_approach: str = "async"
     """Migration approach: 'sync' or 'async'. Determines which migration method to use. Default 'async'."""
-    allow_resize: bool = True
-    """Whether to allow KV cache resize during migration. Default True."""
+    fixed_num_gpu_blocks: int = -1
+    """Fixed number of GPU KV cache blocks per layer. Default -1 (auto).
+    When positive, uses this exact block count and prevents changes during migration."""
 
 
 class StaticBenchCfg(BaseModel):
@@ -788,8 +788,8 @@ class ExpVllmConfig:
     """Weight chunk size in MB for chunked weight loading during migration."""
     migration_approach: str = "async"
     """Migration approach: 'sync' or 'async'. Determines which migration method to use."""
-    allow_resize: bool = True
-    """Whether to allow KV cache resize during migration."""
+    fixed_num_gpu_blocks: int = -1
+    """Fixed number of GPU KV cache blocks per layer. Default -1 (auto)."""
     pp_layer_config: Dict[int, str] = field(default_factory=dict)  # {0: "32,32", 100: "20,44"}
     
     @property
@@ -918,7 +918,8 @@ class ExperimentConfig:
         }
         vars_dict["chunk"] = self.vllm.weight_chunk_size_mb
         vars_dict["mig_mode"] = self.vllm.migration_approach
-        vars_dict["resize"] = 1 if self.vllm.allow_resize else 0
+        if self.vllm.fixed_num_gpu_blocks != -1:
+            vars_dict["fixed_blocks"] = self.vllm.fixed_num_gpu_blocks
         return vars_dict
     
     @classmethod
@@ -984,10 +985,10 @@ class ExperimentConfig:
                 attn_kernel: Optional[str] = combo_dict.get('attention_kernel')
                 weight_chunk_size: Optional[float] = combo_dict.get('weight_chunk_size_mb')
                 mig_approach: Optional[str] = combo_dict.get('migration_approach')
-                allow_resize: Optional[bool] = combo_dict.get('allow_resize')
+                fixed_blocks: Optional[int] = combo_dict.get('fixed_num_gpu_blocks')
                 
                 # Create ExperimentConfig from this combination
-                yield cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, allow_resize)
+                yield cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, fixed_blocks)
     
     @classmethod
     def _create_from_combo(
@@ -997,7 +998,7 @@ class ExperimentConfig:
         attention_kernel: Optional[str] = None,
         weight_chunk_size_mb: Optional[float] = None,
         migration_approach: Optional[str] = None,
-        allow_resize: Optional[bool] = None,
+        fixed_num_gpu_blocks: Optional[int] = None,
     ) -> 'ExperimentConfig':
         """Create a single ExperimentConfig from static config and one sweep combination.
         
@@ -1009,13 +1010,13 @@ class ExperimentConfig:
             attention_kernel: Override from sweep axis (if sweeping), otherwise use static
             weight_chunk_size_mb: Override from sweep axis (if sweeping), otherwise use static
             migration_approach: Override from sweep axis (if sweeping), otherwise use static
-            allow_resize: Override from sweep axis (if sweeping), otherwise use static
+            fixed_num_gpu_blocks: Override from sweep axis (if sweeping), otherwise use static
         """
         # Resolve sweep overrides: sweep values override static values
         kernel = attention_kernel if attention_kernel is not None else static_cfg.vllm.attention_kernel
         chunk_size = weight_chunk_size_mb if weight_chunk_size_mb is not None else static_cfg.vllm.weight_chunk_size_mb
         mig_approach = migration_approach if migration_approach is not None else static_cfg.vllm.migration_approach
-        resize = allow_resize if allow_resize is not None else static_cfg.vllm.allow_resize
+        fixed_blocks = fixed_num_gpu_blocks if fixed_num_gpu_blocks is not None else static_cfg.vllm.fixed_num_gpu_blocks
         
         # Get initial values from bench_cfg
         sorted_pp_keys = sorted(bench_cfg.pp_layer_config.keys())
@@ -1049,7 +1050,7 @@ class ExperimentConfig:
             enable_nsight=static_cfg.vllm.enable_nsight,
             weight_chunk_size_mb=chunk_size,
             migration_approach=mig_approach,
-            allow_resize=resize,
+            fixed_num_gpu_blocks=fixed_blocks,
             pp_layer_partition=initial_pp,
             pp_layer_config={k: v.replace(" ", "") for k, v in bench_cfg.pp_layer_config.items()},
         )
@@ -1140,8 +1141,8 @@ class VllmServerSpec:
     """Weight chunk size in MB for chunked weight loading during migration."""
     migration_approach: str = "async"
     """Migration approach: 'sync' or 'async'. Determines which migration method to use."""
-    allow_resize: bool = True
-    """Whether to allow KV cache resize during migration."""
+    fixed_num_gpu_blocks: int = -1
+    """Fixed number of GPU KV cache blocks per layer. Default -1 (auto)."""
     
     # Migration/Partition
     pp_layer_partition: str = ""
@@ -1174,7 +1175,7 @@ class VllmServerSpec:
             "alternative_configs": self.alternative_configs,
             "migration_steps": self.migration_steps,
             "migration_mode": self.migration_approach,
-            "allow_resize": self.allow_resize,
+            "fixed_num_gpu_blocks": self.fixed_num_gpu_blocks,
         }
         # Only include rank_to_ip if non-empty
         if self.rank_to_ip:

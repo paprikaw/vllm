@@ -44,7 +44,7 @@ from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.block_table import PtrTable
-from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
+from vllm.model_executor.models.dynamic_model_base import DynamicModelBase
 from vllm.model_executor.model_loader.dynamic_qwen3_loader import CustomModelLoader
 from collections import defaultdict
 from vllm.config import set_current_vllm_config
@@ -154,7 +154,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             kv_synchronizer: DynamicKVSynchronizer,
             layers: Tuple[int, int],
             ) -> None:
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model, DynamicModelBase)
         logger.info(f"before initialize_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
         assert len(self.attn_backends) == 1, "Only one attention backend is supported for now"
         kv_caches: dict[str, torch.Tensor] = {} 
@@ -215,8 +215,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         time_start = time.time()
         logger.info(f"getting forward lock taking {human_readable_duration(time.time() - time_start)}")
         with self.fbgate.foreground():
-            if not isinstance(self.model, DynamicQwen3ForCausalLM):
-                raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+            if not isinstance(self.model, DynamicModelBase):
+                raise AssertionError(f"model is not a DynamicModelBase: {self.model.__class__.__name__}")
             self.model.set_sched_layers(layer_config[0], layer_config[1])
             try:
                 result = self._execute_model(scheduler_output, intermediate_tensors)
@@ -910,9 +910,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
     #     线程安全：内部获取 forward_lock。
     #     """
-    #     if not isinstance(self.model, DynamicQwen3ForCausalLM):
+    #     if not isinstance(self.model, DynamicModelBase):
     #         raise AssertionError(
-    #             f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+    #             f"model is not a DynamicModelBase: {self.model.__class__.__name__}")
     #     # Determine local index in runner kv cache list
     #     start_layer: int = self.model.model.start_layer
     #     end_layer: int = self.model.model.end_layer
@@ -957,9 +957,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
     #     线程安全：内部获取 forward_lock。
     #     """
-    #     if not isinstance(self.model, DynamicQwen3ForCausalLM):
+    #     if not isinstance(self.model, DynamicModelBase):
     #         raise AssertionError(
-    #             f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+    #             f"model is not a DynamicModelBase: {self.model.__class__.__name__}")
     #     # Determine local index in runner kv cache list
     #     start_layer: int = self.model.model.start_layer
     #     end_layer: int = self.model.model.end_layer
@@ -1003,13 +1003,13 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # group.layer_names.insert(insert_idx, layer_name)
 
     def has_layer(self, layer_index: int) -> bool:
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model, DynamicModelBase)
         logger.info(f"debug: ---------------------has_layer: {layer_index} in range {self.model.model.start_layer} to {self.model.model.end_layer}")
         return layer_index in range(self.model.model.start_layer, self.model.model.end_layer)
 
     def add_layers(self, layers_list: list[Tuple[int, int]], device: torch.device) -> None:
-        if not isinstance(self.model, DynamicQwen3ForCausalLM):
-            raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+        if not isinstance(self.model, DynamicModelBase):
+            raise AssertionError(f"model is not a DynamicModelBase: {self.model.__class__.__name__}")
         time_start = time.time()
         # gc.collect()
         # torch.cuda.empty_cache()
@@ -1027,12 +1027,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # assert available_memory > num_added_layers * self.model.get_layer_weight_size(), \
         #     f"Available memory: {human_readable_size(available_memory)} is not enough for {num_added_layers} layers"
 
-        model: DynamicQwen3ForCausalLM = self.model
+        model: DynamicModelBase = self.model
         # Use the existing custom_loader that has preloaded weights
         with set_current_vllm_config(self.vllm_config):
             for layers in layers_list:
                 assert len(layers) == 2
-                self.custom_loader.load_qwen3_layers(self.vllm_config, self.model_config, layers, model, device)
+                self.custom_loader.load_dynamic_layers(self.vllm_config, self.model_config, layers, model, device)
         logger.info(f"Model Runner, Added layers {layers_list} to model on device {device}, took {time.time() - time_start:.2f} seconds")
 
     def reinitialize_kv_cache(self, kv_cache_config: KVCacheConfig, kv_synchronizer: DynamicKVSynchronizer) -> None:
@@ -1107,8 +1107,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def remove_layers(self, layers_list: list[Tuple[int, int]], device: torch.device) -> None:
         with device:
             torch.cuda.set_device(device)
-            if not isinstance(self.model, DynamicQwen3ForCausalLM):
-                raise AssertionError(f"model is not a DynamicQwen3ForCausalLM: {self.model.__class__.__name__}")
+            if not isinstance(self.model, DynamicModelBase):
+                raise AssertionError(f"model is not a DynamicModelBase: {self.model.__class__.__name__}")
             logger.info(f"before delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
             for layers in layers_list:
                 logger.info(f"Deleting layers {layers}")
@@ -1415,7 +1415,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         目前release_kv_cache依赖于model.start_layers来进行kv cache list的删除。
         因此只能先release kv cache再删除layers
         '''
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model, DynamicModelBase)
         logger.info(f"before release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
         # Delete the kv cache from kv_cache list
@@ -1471,7 +1471,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         the caller explicitly frees KV cache tensors, this function must release
         the GPU memory by removing references and calling gc.collect() + empty_cache().
         '''
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model, DynamicModelBase)
         
         logger.info(f"before atomic_switch_kv_cache_config_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, kv_caches length: {len(self.kv_caches)}")
 
@@ -1512,7 +1512,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         logger.info(f"after atomic_switch_kv_cache_config_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.kv_caches)}")
 
     def release_kv_cache(self) -> None:
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model, DynamicModelBase)
         logger.info(f"before release_kv_cache: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
         # 清除引用
@@ -1530,7 +1530,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
     def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         time_start = time.time()
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model, DynamicModelBase)
         logger.info(f"start to compact kv cache for layers {self.model.model.start_layer} to {self.model.model.end_layer}")
         num_blocks = len(bitmap)
         assert num_blocks == len(self.key_caches), f"bitmap length mismatch: num_blocks: {num_blocks} != kv_cache_tensor_length: {len(self.kv_caches[0][0])}"
@@ -1590,7 +1590,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # 还没有实现在无enginelock情况下的resize_kv_cache
         # assert False
         with self.forward_lock:
-            assert isinstance(self.model, DynamicQwen3ForCausalLM)
+            assert isinstance(self.model, DynamicModelBase)
             logger.info(f"resizing kv cache from {len(self.kv_caches[0][0])} to {new_length}")
             time_start = time.time()
             forward_context = self.vllm_config.compilation_config.static_forward_context
@@ -1613,7 +1613,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             time_end = time.time()
 
     # def flexi_resize_kv_cache(self, new_length: int) -> None:
-    #     assert isinstance(self.model, DynamicQwen3ForCausalLM)
+    #     assert isinstance(self.model, DynamicModelBase)
     #     logger.info(f"resizing kv cache from {len(self.key_caches)} to {new_length}")
     #     logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
     #     time_start = time.time()
@@ -1664,7 +1664,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
     #     logger.info(f"resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
 
     def _migrate_block_by_copy_data(self, old_block_id: int, new_block_id: int, migrate_record: dict[int, int]):
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model, DynamicModelBase)
         assert len(self.kv_caches) != 0
         for cache in self.kv_caches:
             # loop for k and v tensor
@@ -1673,7 +1673,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         migrate_record[old_block_id] = new_block_id
 
     def _migrate_block_by_swapping_ptrs(self, old_block_id: int, new_block_id: int, migrate_record: dict[int, int]):
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model, DynamicModelBase)
         assert len(self.key_caches) != 0
         assert len(self.key_cache_ptrs) != 0
         for key_cache in self.key_caches:
@@ -1683,7 +1683,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         migrate_record[old_block_id] = new_block_id
 
     def _update_start_layer(self) -> None:
-        assert isinstance(self.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model, DynamicModelBase)
         forward_context: dict[str, "Attention"] = self.vllm_config.compilation_config.static_forward_context
         new_start = min(extract_layer_index(layer_name) for layer_name in forward_context.keys())
         start_layer = self.model.model.start_layer
@@ -1712,8 +1712,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # dummy_scale = torch.tensor(1.0, device=self.device, dtype=torch.float32)
             assert gathered_kv_tensor.shape[-2:] == kv_cache_shape[-2:], f"gathered_kv_tensor shape {gathered_kv_tensor.shape} mismatch kv_cache_shape {kv_cache_shape}"
             model = self.model
-            assert isinstance(model, DynamicQwen3ForCausalLM)
-            # DynamicQwen3ForCausalLM.model is DynamicQwen3Model which has .layers
+            assert isinstance(model, DynamicModelBase)
+            # DynamicModelBase.model is DynamicQwen3Model which has .layers
             layer_module = model.model.layers[layer]
             logger.info(f"before gather kv tensor using kernal, device:{torch.cuda.current_device()}, stream:{torch.cuda.current_stream()}")
             # Only call the kernel if there are tokens to process - empty slot_mapping causes CUDA error

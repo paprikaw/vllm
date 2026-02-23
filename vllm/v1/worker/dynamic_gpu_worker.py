@@ -26,7 +26,7 @@ from vllm.lora import layers
 from vllm.model_executor import set_random_seed
 from vllm.v1.core.dynamic_kv_cache_utils import compact_cache_with_record
 from vllm.v1.worker.utils import get_total_gpu_memory
-from vllm.model_executor.models.dynamic_qwen3 import DynamicQwen3ForCausalLM
+from vllm.model_executor.models.dynamic_model_base import DynamicModelBase
 from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import create_ptr_tensor_from_list, dynamic_bind_single_kv_tensor, dynamic_flexi_bind_single_kv_cache, dynamic_flexi_bind_single_kv_tensor, get_layer_name_for_index, report_usage_stats, WorkerMemInfo
@@ -244,7 +244,7 @@ class DynamicGPUWorker(Worker):
            with DeadlockTimeoutContext(self._layer_loaded_cv, "_layer_loaded_cv", timeout=30):
            来自动检测和报告死锁
         """
-        assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model_runner.model, DynamicModelBase)
         logger.info(f"[operation]: Add Model Layers: {layer_list}")
         time_start = time.time()
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
@@ -422,7 +422,7 @@ class DynamicGPUWorker(Worker):
 
     def load_model(self) -> None:
         super().load_model()
-        assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model_runner.model, DynamicModelBase)
         self.model_runner.model.model.add_fbgate(self.model_runner.fbgate)
         # Wait for all ranks to finish loading model before initializing KV synchronizer
         # This prevents deadlock where faster ranks (fewer layers) enter barrier
@@ -480,7 +480,7 @@ class DynamicGPUWorker(Worker):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
         assert False, "This function is not used"
-        assert(isinstance(self.model_runner.model, DynamicQwen3ForCausalLM))
+        assert(isinstance(self.model_runner.model, DynamicModelBase))
         logger.info(f"start to execute_model in gpu worker")
         result = self.model_runner.execute_model(scheduler_output, layer_config, intermediate_tensors=intermediate_tensors)
         assert(len(self.model_runner.input_batch.block_table.block_tables) == 0) 
@@ -506,7 +506,7 @@ class DynamicGPUWorker(Worker):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model_runner.model, DynamicModelBase)
         # assert self.model_runner.model.get_sched_layers() == (self.model_runner.model.model.start_layer, self.model_runner.model.model.end_layer), "model should be in the initial state"
         self.model_runner.initialize_intermediate_states()
         torch.cuda.empty_cache()
@@ -667,7 +667,7 @@ class DynamicGPUWorker(Worker):
         # torch.cuda.empty_cache()
         logger.info(f" after empty cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         # Layer weight size (may raise if not recorded yet)
-        assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model_runner.model, DynamicModelBase)
         layer_size = int(self.model_runner.model.get_layer_weight_size())
 
         is_kv_cache_initialized = len(self.model_runner.kv_caches) != 0 and self.model_runner.kv_caches[0].numel() != 0
@@ -749,7 +749,7 @@ class DynamicGPUWorker(Worker):
         runner = self.model_runner
         start_layer, end_layer = runner.model.model.start_layer, runner.model.model.end_layer
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
-        assert isinstance(runner.model, DynamicQwen3ForCausalLM)
+        assert isinstance(runner.model, DynamicModelBase)
         logger.info(f"start to compact kv cache for layers {runner.model.model.start_layer} to {runner.model.model.end_layer}")
         time_start = time.time()
         num_blocks = len(bitmap)
@@ -927,7 +927,7 @@ class DynamicGPUWorker(Worker):
         assert new_length > 0
         with runner.forward_lock:
             time_start = time.time()
-            assert isinstance(runner.model, DynamicQwen3ForCausalLM)
+            assert isinstance(runner.model, DynamicModelBase)
             logger.info(f"resizing kv cache from {len(runner.kv_caches[0][0])} to {new_length}")
             forward_context = self.vllm_config.compilation_config.static_forward_context
             kv, kv_length, T, H, Dh = runner.kv_caches[0].shape
@@ -964,7 +964,7 @@ class DynamicGPUWorker(Worker):
         logger.info(f"[timeline]: resize kv cache within: {human_readable_duration(time.time() - time_start)}")
 
     def _flexi_resize_kv_cache(self, new_length: int) -> None:
-        assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model_runner.model, DynamicModelBase)
         use_direct_ptr = self.vllm_config.dynamic_config.use_direct_ptr
         time_start = time.time()
         torch.cuda.synchronize()
@@ -1209,7 +1209,7 @@ class DynamicGPUWorker(Worker):
         def migration_thread(rank: int, layer_ids: list[int]):
             # Set CUDA device for this thread - threads don't inherit CUDA context
             torch.cuda.set_device(self.device)
-            assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+            assert isinstance(self.model_runner.model, DynamicModelBase)
             time_start = time.time()
             with self.model_runner.forward_lock:
                 if self.rank not in src_to_plan:
@@ -1309,7 +1309,7 @@ class DynamicGPUWorker(Worker):
             with self._receive_finished_cv:
                 self.receive_in_process = True
 
-        assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model_runner.model, DynamicModelBase)
 
         # Sender Side, Send KV Cache
         logger.info(f"Enter sync migration process")
@@ -1362,7 +1362,7 @@ class DynamicGPUWorker(Worker):
         """
         异步监听指定 from_rank 的 KV：先接收完整 KV 张量，再持续接收小 patch，并按需同步。
         """
-        assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model_runner.model, DynamicModelBase)
         assert self.rank != from_rank, "The rank should not listen to its own kv cache"
 
         logger.info(f"Worker {self.rank} listening KV stream from rank {from_rank}")
@@ -1374,7 +1374,7 @@ class DynamicGPUWorker(Worker):
         # IMPORTANT: Set CUDA device for this thread - threads don't inherit CUDA context
         torch.cuda.set_device(self.device)
         
-        assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model_runner.model, DynamicModelBase)
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         time_start = None
         try:
@@ -1610,7 +1610,7 @@ class DynamicGPUWorker(Worker):
 
 
     def async_migration_after_execute_callback(self, scheduler_output: "DynamicSchedulerOutput"):
-        assert isinstance(self.model_runner.model, DynamicQwen3ForCausalLM)
+        assert isinstance(self.model_runner.model, DynamicModelBase)
 
         # target_device = self.device  # set in init_device to cuda:self.local_rank
         # if slot_mapping.device != target_device:
@@ -1682,11 +1682,11 @@ class DynamicGPUWorker(Worker):
                         # For receiver: this will be overwritten by _listen_loop when all patches are applied
                         if is_sender:
                             self.after_migration_applied_token_num = num_total_migration_tokens
-                        allow_resize = self.vllm_config.dynamic_config.allow_resize
-                        if allow_resize:
+                        fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
+                        if fixed_blocks <= 0:
                             self.resize_kv_cache(scheduler_output.new_kv_cache_block_num)
                         else:
-                            logger.info(f"allow_resize=False, skipping worker-side resize (would be {scheduler_output.new_kv_cache_block_num} blocks)")
+                            logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping worker-side resize (would be {scheduler_output.new_kv_cache_block_num} blocks)")
                         self.finish_migration()
                         self.kv_resizing_done = True
                     finally:

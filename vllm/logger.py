@@ -141,6 +141,24 @@ def init_logger(name: str) -> _VllmLogger:
     return cast(_VllmLogger, logger)
 
 
+def reconfigure_logger():
+    """Reconfigure the vLLM root logger with current environment variables.
+    
+    This is useful when environment variables are updated after the logger
+    module has been imported (e.g., in Ray worker processes where env vars
+    are set via update_environment_variables after module import).
+    """
+    global VLLM_LOGGING_LEVEL
+    # Re-read the logging level from the current environment
+    VLLM_LOGGING_LEVEL = envs.VLLM_LOGGING_LEVEL
+    
+    # Update the default config with the new level
+    DEFAULT_LOGGING_CONFIG["handlers"]["vllm"]["level"] = VLLM_LOGGING_LEVEL
+    
+    # Re-configure the logger
+    _configure_vllm_root_logger()
+
+
 # The root logger is initialized when the module is imported.
 # This is thread-safe as the module is only imported once,
 # guaranteed by the Python GIL.
