@@ -30,8 +30,10 @@ from torch import nn
 from transformers import LlamaConfig
 
 from vllm.attention import Attention, AttentionType
+from vllm.attention.dynamic_layer import FlexiAttention
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -46,6 +48,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
@@ -53,6 +56,8 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+
+logger = init_logger(__name__)
 
 
 class LlamaMLP(nn.Module):
@@ -179,17 +184,38 @@ class LlamaAttention(nn.Module):
         else:
             sliding_window = None
 
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            per_layer_sliding_window=sliding_window,
-            attn_type=attn_type,
-            prefix=f"{prefix}.attn",
-        )
+        vllm_config = get_current_vllm_config()
+        is_flexi = (vllm_config is not None and
+                    vllm_config.dynamic_config is not None and
+                    vllm_config.dynamic_config.use_flexi_kv)
+        logger.info(f"[LlamaAttention] layer={layer_idx} prefix={prefix} "
+                    f"is_flexi={is_flexi} vllm_config_exists={vllm_config is not None}")
+        if is_flexi:
+            logger.info(f"[LlamaAttention] Using FlexiAttention for layer {layer_idx}")
+            self.attn = FlexiAttention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                per_layer_sliding_window=sliding_window,
+                attn_type=attn_type,
+                prefix=f"{prefix}.attn",
+            )
+        else:
+            logger.info(f"[LlamaAttention] Using regular Attention for layer {layer_idx}")
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                per_layer_sliding_window=sliding_window,
+                attn_type=attn_type,
+                prefix=f"{prefix}.attn",
+            )
 
     def forward(
         self,
@@ -301,13 +327,16 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+            
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+            
         hidden_states = self.mlp(hidden_states)
+            
         return hidden_states, residual
 
 
@@ -551,6 +580,9 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+        
+        # Track layer weight size for dynamic PP infrastructure compatibility
+        self.layer_weight_size = -1
 
     def set_aux_hidden_state_layers(self, layers: tuple[int]) -> None:
         self.model.aux_hidden_state_layers = layers
@@ -586,12 +618,51 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
+        # DEBUG: Check hidden_states and logits values
+        logger.info(f"[DEBUG compute_logits] hidden_states shape: {hidden_states.shape}, "
+                   f"mean: {hidden_states.float().mean().item():.6f}, "
+                   f"std: {hidden_states.float().std().item():.6f}, "
+                   f"max: {hidden_states.float().max().item():.6f}, "
+                   f"min: {hidden_states.float().min().item():.6f}")
+        
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
+        
+        if logits is not None:
+            logger.info(f"[DEBUG compute_logits] logits shape: {logits.shape}, "
+                       f"argmax[0]: {logits[0].argmax().item()}, "
+                       f"max: {logits.float().max().item():.6f}, "
+                       f"min: {logits.float().min().item():.6f}")
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
+        # Track layer weight size during loading for dynamic PP infrastructure
+        def weight_size_record_generator(weights: Iterable[tuple[str, torch.Tensor]]):
+            if self.layer_weight_size != -1:
+                yield from weights
+                return
+
+            first_layer_index = -1
+            layer_weight_accumulator = 0
+            
+            for name, weight in weights:
+                layer_idx = extract_layer_index(name) if "layers" in name else None
+                
+                if layer_idx is not None:
+                    if first_layer_index == -1:
+                        first_layer_index = layer_idx
+                        layer_weight_accumulator = 0
+                    
+                    if layer_idx == first_layer_index:
+                        weight_size = weight.numel() * weight.element_size()
+                        layer_weight_accumulator += weight_size
+                
+                yield name, weight
+            
+            if first_layer_index != -1:
+                self.layer_weight_size = layer_weight_accumulator
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."]
@@ -599,7 +670,13 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         )
         return loader.load_weights(
             self.maybe_remap_mistral(name, loaded_weight)
-            for name, loaded_weight in weights)
+            for name, loaded_weight in weight_size_record_generator(weights))
+
+    def get_layer_weight_size(self) -> int:
+        """Return the weight size of a single layer in bytes."""
+        if self.layer_weight_size == -1:
+            raise ValueError("Layer weight size not recorded")
+        return self.layer_weight_size
 
     # This function is used to remap the mistral format as
     # used by Mistral and Llama <=2

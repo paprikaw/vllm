@@ -3,6 +3,9 @@
 Extends LlamaForCausalLM / LlamaModel with the same dynamic pipeline
 parallelism pattern used by DynamicQwen3 (add/delete layers, scheduled
 layer execution, fbgate-aware weight loading).
+
+Note: FlexiAttention support is now in LlamaAttention directly (in llama.py),
+so we can use LlamaDecoderLayer without modification.
 """
 from collections.abc import Iterable
 from typing import Optional, Tuple, Union
@@ -21,9 +24,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead)
+from vllm.model_executor.utils import extract_layer_index
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
-from vllm.model_executor.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
 from vllm.v1.utils import human_readable_duration
 

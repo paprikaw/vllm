@@ -204,7 +204,7 @@ class DynamicEngineCore(EngineCore):
     def _estimate_max_blocks_per_layer(self, gpu_total_memory: int, memory_after_adding_weight: int, num_layers_on_rank: int, block_size: int) -> int:
         safe_margin = (1 - self.vllm_config.cache_config.gpu_memory_utilization) * gpu_total_memory
         memory_after_adding_weight -=  math.ceil(safe_margin)
-        logger.info(f"debug ------- estimate max blocks per layer: {memory_after_adding_weight / 1024 ** 3:.2f} GB, num_layers_on_rank: {num_layers_on_rank}, safe_margin: {safe_margin / 1024 ** 3:.2f} GB, gpu_total_memory: {gpu_total_memory / 1024 ** 3:.2f} GB")
+        logger.info(f"[memory access] debug ------- estimate max blocks per layer: {memory_after_adding_weight / 1024 ** 3:.2f} GB, num_layers_on_rank: {num_layers_on_rank}, safe_margin: {safe_margin / 1024 ** 3:.2f} GB, gpu_total_memory: {gpu_total_memory / 1024 ** 3:.2f} GB")
         return math.floor(memory_after_adding_weight / (num_layers_on_rank * block_size))
 
 
@@ -247,7 +247,7 @@ class DynamicEngineCore(EngineCore):
 
         # 如果当前GPU的可用内存大于需要添加的layer的内存，则直接可用（包含余量）
         if (weight_size_per_layer + block_size * block_num)  * num_changed_layers <= free_gpu_memory:
-            logger.info(f"[operation]: assessed memory for adding layers: {num_changed_layers}, memory can directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
+            logger.info(f"[memory access] assessed memory for adding layers: {num_changed_layers}, memory can directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
             return LayerAddingAssessResult(True, True, max_blocks_per_layer)
 
         free_blocks = self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
@@ -255,17 +255,17 @@ class DynamicEngineCore(EngineCore):
 
         # 或许需要compact, 此时我们计算在加入当前layer之后，kv cache的最大block数量
         if max_blocks_per_layer > used_blocks:
-            logger.info(f"[operation]: assessed memory for adding layers: {num_changed_layers}, memory can fit after compact, max_blocks_per_layer: {max_blocks_per_layer}")
+            logger.info(f"[memory access] assessed memory for adding layers: {num_changed_layers}, memory can fit after compact, max_blocks_per_layer: {max_blocks_per_layer}")
             return LayerAddingAssessResult(False, True, max_blocks_per_layer)
 
-        logger.info(f"[operation]: assessed memory for adding layers: {num_changed_layers}, memory can not directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
+        logger.info(f"[memory access] assessed memory for adding layers: {num_changed_layers}, memory can not directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
         return LayerAddingAssessResult(False, False, max_blocks_per_layer)
 
     def _get_max_num_blocks(self, total_gpu_memory: int, weight_size_per_layer: int, page_size: int, num_layers: int) -> int:
         total_usable_memory = total_gpu_memory * self.vllm_config.cache_config.gpu_memory_utilization
         total_weight_size = weight_size_per_layer * num_layers
         total_kv_cache = total_usable_memory - total_weight_size
-        logger.info(f"debug ------- get max num blocks: {total_kv_cache / 1024 ** 3:.2f} GB, num_layers: {num_layers}, block_size: {page_size} , total_gpu_memory: {total_gpu_memory / 1024 ** 3:.2f} GB, total_usable_memory: {total_usable_memory / 1024 ** 3:.2f} GB, weight_size_per_layer: {weight_size_per_layer / 1024 ** 3:.2f} GB, total_weight_size: {total_weight_size / 1024 ** 3:.2f} GB")
+        logger.info(f"[memory access] debug ------- get max num blocks: {total_kv_cache / 1024 ** 3:.2f} GB, num_layers: {num_layers}, block_size: {page_size} , total_gpu_memory: {total_gpu_memory / 1024 ** 3:.2f} GB, total_usable_memory: {total_usable_memory / 1024 ** 3:.2f} GB, weight_size_per_layer: {weight_size_per_layer / 1024 ** 3:.2f} GB, total_weight_size: {total_weight_size / 1024 ** 3:.2f} GB")
         max_blocks_per_layer = math.floor(total_kv_cache / (num_layers * page_size))
         return max_blocks_per_layer
 
@@ -279,7 +279,7 @@ class DynamicEngineCore(EngineCore):
         """Assess whether the target rank has enough memory to add layers.
         Returns the maximum number of blocks one layer can have after deleting certain number of layers
         """
-        logger.info(f"rank {rank}: assessing memory for deleting layers: {deleting_layer_list}")
+        logger.info(f"[memory access] rank {rank}: assessing memory for deleting layers: {deleting_layer_list}")
         assert isinstance(self.scheduler, DynamicScheduler)
         assert len(deleting_layer_list) != 0, f"deleting_layer_list is empty for rank {rank}"
 
@@ -651,7 +651,7 @@ class DynamicEngineCore(EngineCore):
         fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
         allow_resize = (fixed_blocks <= 0)
         if not allow_resize:
-            logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, resize disabled for async migration")
+            logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, resize disabled for async migration")
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         # 先获取一次内存快照
@@ -715,7 +715,7 @@ class DynamicEngineCore(EngineCore):
             if allow_resize and need_compact:
                 time_start_compact_kv = time.time()
                 bitmap = self.scheduler.compact_kv_cache(compacted_length)
-                logger.info(f"[debug]: compacted_length for scheduler in {human_readable_duration(time.time() - time_start_compact_kv)}, compacted to: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
+                logger.info(f"[memory access] compacted_length for scheduler in {human_readable_duration(time.time() - time_start_compact_kv)}, compacted to: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
 
             if allow_resize and compacted_length < original_length:
                 self.scheduler.shrink_block_pool(compacted_length)
@@ -724,7 +724,7 @@ class DynamicEngineCore(EngineCore):
         if allow_resize and need_compact:
             time_start_compact_kv = time.time()
             self._compact_kv_cache(compacted_length, bitmap)
-            logger.info(f"debug -------------- KV cache compacted to {compacted_length} blocks before adding layers")
+            logger.info(f"[memory access] KV cache compacted to {compacted_length} blocks before adding layers")
             logger.info(f"[timeline]: compact kv cache take: {human_readable_duration(time.time() - time_start_compact_kv)}")
 
             logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
@@ -874,12 +874,12 @@ class DynamicEngineCore(EngineCore):
                 if not allow_resize:
                     # When fixed_num_gpu_blocks is set, keep the current block count
                     resized_block_num = self.scheduler.kv_cache_manager.num_gpu_blocks
-                    logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, keeping current block count: {resized_block_num}")
+                    logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, keeping current block count: {resized_block_num}")
                 else:
-                    logger.info(f"all tokens to be sent is less than the threshold, start to synchronize the kv cache, resized_block_num: {resized_block_num}")
+                    logger.info(f"[memory access] all tokens to be sent is less than the threshold, start to synchronize the kv cache, resized_block_num: {resized_block_num}")
                     if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
                         assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
-                        logger.info(f"[operation]: start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
+                        logger.info(f"[memory access] start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
 
                 self.scheduler.async_change_configuration(pp_layer_config, resized_block_num)
                 self.cur_pp_layer_config = pp_layer_config
@@ -927,7 +927,7 @@ class DynamicEngineCore(EngineCore):
         fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
         allow_resize = (fixed_blocks <= 0)
         if not allow_resize:
-            logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, resize disabled for sync migration")
+            logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, resize disabled for sync migration")
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         with self.engine_lock:
@@ -992,15 +992,15 @@ class DynamicEngineCore(EngineCore):
                     f"compacted_length={compacted_length}")
 
             if need_compact:
-                logger.info(f"[debug]: compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
+                logger.info(f"[memory access] compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
                 # Get bitmap from scheduler before compacting
                 bitmap = self.scheduler.compact_kv_cache(compacted_length)
                 self._compact_kv_cache(compacted_length, bitmap)
-                logger.info(f"debug -------------- KV cache compacted to {compacted_length} blocks before adding layers")
+                logger.info(f"[memory access] KV cache compacted to {compacted_length} blocks before adding layers")
                 logger.info(f"[timeline]: after compact kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
             else:
-                logger.info(f"[debug]: no need to compact kv cache")
-            logger.info(f"allow_resize: {allow_resize}, compacted_length: {compacted_length}, original_length: {original_length}") 
+                logger.info(f"[memory access] no need to compact kv cache")
+            logger.info(f"[memory access] allow_resize: {allow_resize}, compacted_length: {compacted_length}, original_length: {original_length}") 
 
             # 需要resize kv cache来进行migration，这里的resize一定是缩小
             # Only shrink when compacted_length < original_length.
@@ -1092,14 +1092,14 @@ class DynamicEngineCore(EngineCore):
             self.scheduler.sync_change_configuration(pp_layer_config)
             current_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
             if allow_resize and resized_block_num != current_blocks:
-                logger.info(f"[operation]: resizing KV cache from {current_blocks} to {resized_block_num} blocks")
+                logger.info(f"[memory access] resizing KV cache from {current_blocks} to {resized_block_num} blocks")
                 self.model_executor.resize_kv_cache(resized_block_num)
                 if resized_block_num > current_blocks:
                     self.scheduler.extend_block_pool(resized_block_num)
                 else:
                     self.scheduler.shrink_block_pool(resized_block_num)
             elif not allow_resize:
-                logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping end-of-migration resize (would be {resized_block_num} blocks)")
+                logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, skipping end-of-migration resize (would be {resized_block_num} blocks)")
             self.cur_pp_layer_config = pp_layer_config
             logger.info(f"[sync_migration]: updated cur_pp_layer_config to {self.cur_pp_layer_config}, time taken: {human_readable_duration(time.time() - time_start)}")
 

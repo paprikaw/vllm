@@ -419,10 +419,23 @@ class DynamicGPUWorker(Worker):
         else:
             self.memory_stress_tester = None
         
+    def _is_dynamic_model(self) -> bool:
+        """Check if the loaded model is a DynamicModelBase instance."""
+        return isinstance(self.model_runner.model, DynamicModelBase)
 
     def load_model(self) -> None:
         super().load_model()
-        assert isinstance(self.model_runner.model, DynamicModelBase)
+        
+        # Check if model supports dynamic features
+        if not self._is_dynamic_model():
+            logger.warning(
+                "Loaded model is not a DynamicModelBase instance. "
+                "Dynamic PP reconfiguration features will be disabled. "
+                f"Model type: {type(self.model_runner.model).__name__}"
+            )
+            self.dynamic_kv_synchronizer = None
+            return
+            
         self.model_runner.model.model.add_fbgate(self.model_runner.fbgate)
         # Wait for all ranks to finish loading model before initializing KV synchronizer
         # This prevents deadlock where faster ranks (fewer layers) enter barrier
@@ -450,6 +463,26 @@ class DynamicGPUWorker(Worker):
 
     def dynamic_initialize_from_config(self, kv_cache_configs: list[KVCacheConfig], num_blocks: int) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        # For non-dynamic models, use the parent class's standard initialization
+        if not self._is_dynamic_model():
+            logger.info("Using standard KV cache initialization for non-dynamic model")
+            # Recalculate num_blocks based on tensor_config to avoid assertion failure
+            # The dynamic core sets num_blocks globally, but we need to use what's
+            # actually available based on tensor_config.size
+            kv_cache_config = kv_cache_configs[self.rank]
+            min_num_blocks = float('inf')
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                kv_cache_spec = kv_cache_group.kv_cache_spec
+                for layer_name in kv_cache_group.layer_names:
+                    tensor_config = kv_cache_config.tensors[layer_name]
+                    local_num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
+                    min_num_blocks = min(min_num_blocks, local_num_blocks)
+            if min_num_blocks < float('inf'):
+                kv_cache_config.num_blocks = int(min_num_blocks)
+                logger.info(f"Recalculated num_blocks for non-dynamic model: {kv_cache_config.num_blocks}")
+            super().initialize_from_config(kv_cache_config)
+            return
+            
         self.block_size = kv_cache_configs[self.rank].kv_cache_groups[0].kv_cache_spec.block_size
         self.block_num = num_blocks
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -506,7 +539,7 @@ class DynamicGPUWorker(Worker):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        assert isinstance(self.model_runner.model, DynamicModelBase)
+        assert isinstance(self.model_runner.model, DynamicModelBase) or isinstance(self.model_runner.model, torch.nn.Module), "model should be an instance of DynamicModelBase or torch.nn.Module"
         # assert self.model_runner.model.get_sched_layers() == (self.model_runner.model.model.start_layer, self.model_runner.model.model.end_layer), "model should be in the initial state"
         self.model_runner.initialize_intermediate_states()
         torch.cuda.empty_cache()
@@ -667,8 +700,12 @@ class DynamicGPUWorker(Worker):
         # torch.cuda.empty_cache()
         logger.info(f" after empty cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         # Layer weight size (may raise if not recorded yet)
-        assert isinstance(self.model_runner.model, DynamicModelBase)
-        layer_size = int(self.model_runner.model.get_layer_weight_size())
+        if hasattr(self.model_runner.model, 'get_layer_weight_size'):
+            layer_size = int(self.model_runner.model.get_layer_weight_size())
+        else:
+            # Fallback for models without get_layer_weight_size
+            layer_size = 0
+            logger.warning("get_mem_info: Model has no get_layer_weight_size method, layer_size set to 0")
 
         is_kv_cache_initialized = len(self.model_runner.kv_caches) != 0 and self.model_runner.kv_caches[0].numel() != 0
 
@@ -1447,6 +1484,7 @@ class DynamicGPUWorker(Worker):
                         self._layer_loaded_cv.wait()
             time_start_bind_kv_cache = time.time()
             for layer_id in layer_ids:
+                logger.info(f"current memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB, start to bind kv cache for layer {layer_id}")
                 kv_tensor = tmp_kv_tensors_dict[layer_id]
                 if is_flexi:
                     slot_mapping = tmp_slot_mapping_dict[layer_id]
@@ -1476,6 +1514,8 @@ class DynamicGPUWorker(Worker):
                             kv_tensor=kv_tensor
                         )
                 tmp_kv_tensors_dict.pop(layer_id)
+                gc.collect()
+                torch.cuda.empty_cache()  # Free GPU memory occupied by received kv tensor before binding, to make room for new cache if needed
             torch.cuda.synchronize()
             logger.info(f"[timeline]: bind kv cache time taken: {human_readable_duration(time.time() - time_start_bind_kv_cache)}")
             
@@ -1610,7 +1650,8 @@ class DynamicGPUWorker(Worker):
 
 
     def async_migration_after_execute_callback(self, scheduler_output: "DynamicSchedulerOutput"):
-        assert isinstance(self.model_runner.model, DynamicModelBase)
+        if not isinstance(self.model_runner.model, DynamicModelBase):
+            return
 
         # target_device = self.device  # set in init_device to cuda:self.local_rank
         # if slot_mapping.device != target_device:
