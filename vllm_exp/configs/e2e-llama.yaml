@@ -1,7 +1,7 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "end-to-end-test-llama"
+project: "end-to-end-test-llama-debug"
 type: "sweep_test"
 
 envs:
@@ -38,7 +38,7 @@ static_config:
   vllm:
     head_addr: "localhost"
     pipeline_parallel_size: 2
-    gpu_memory_utilization: 0.85
+    gpu_memory_utilization: 0.9
     max_model_len: 4000
     chunked_prefill: true
     enable_cuda_graph: false
@@ -59,85 +59,86 @@ static_config:
 sweep_configs:
   - vllm:
       attention_kernel: [direct]
-      fixed_num_gpu_blocks: [-1] 
-      weight_chunk_size_mb: [5]
-      migration_approach: [async]
-    benchmark_config:
-      - num_total_requests: 200  # Small number for quick testing
-        repetition: 1           # 3 repetitions to test the feature
-        pp_layer_config:
-          0: "50, 30"           # Single config = no migration, only reset between reps
-          100: "40, 40"           # Single config = no migration, only reset between reps
-        requests:
-          0:
-            request_rate: 2
-            input_lens: 64
-            output_lens: 512
-          100:
-            request_rate: 2
-            input_lens: 512
-            output_lens: 64
-  # Baseline that disables chunked weight loading
-  - vllm:
-      attention_kernel: [direct]
-      weight_chunk_size_mb: [1000]
-      fixed_num_gpu_blocks: [-1]
-      migration_approach: [async]
-    benchmark_config:
-      - num_total_requests: 200  # Small number for quick testing
-        repetition: 1           # 3 repetitions to test the feature
-        pp_layer_config:
-          0: "50, 30"           # Single config = no migration, only reset between reps
-          100: "40, 40"           # Single config = no migration, only reset between reps
-        requests:
-          0:
-            request_rate: 2
-            input_lens: 64
-            output_lens: 512
-          100:
-            request_rate: 2
-            input_lens: 512
-            output_lens: 64
-  # Disable Resize
-  - vllm:
-      attention_kernel: [direct]
-      fixed_num_gpu_blocks: [2441] 
-      weight_chunk_size_mb: [5]
-      migration_approach: [async]
-    benchmark_config:
-      - num_total_requests: 200  # Small number for quick testing
-        repetition: 1           # 3 repetitions to test the feature
-        pp_layer_config:
-          0: "50, 30"           # Single config = no migration, only reset between reps
-          100: "40, 40"           # Single config = no migration, only reset between reps
-        requests:
-        requests:
-          0:
-            request_rate: 2
-            input_lens: 64
-            output_lens: 512
-          100:
-            request_rate: 2
-            input_lens: 512
-            output_lens: 64
-  # stop and go baseline 
-  - vllm:
-      attention_kernel: [direct]
       weight_chunk_size_mb: [1000]
       fixed_num_gpu_blocks: [-1] 
       migration_approach: [sync]
     benchmark_config:
-      - num_total_requests: 200  # Small number for quick testing
+      - num_total_requests: 100  # Small number for quick testing
         repetition: 1           # 3 repetitions to test the feature
         pp_layer_config:
           0: "50, 30"           # Single config = no migration, only reset between reps
-          100: "40, 40"           # Single config = no migration, only reset between reps
+          50: "40, 40"           # Single config = no migration, only reset between reps
         requests:
           0:
             request_rate: 2
             input_lens: 64
             output_lens: 512
-          100:
+          50:
             request_rate: 2
             input_lens: 512
             output_lens: 64
+  # Baseline that disables chunked weight loading
+  # - vllm:
+  #     attention_kernel: [direct]
+  #     weight_chunk_size_mb: [1000]
+  #     fixed_num_gpu_blocks: [-1]
+  #     migration_approach: [async]
+  #   benchmark_config:
+  #     - num_total_requests: 100  # Small number for quick testing
+  #       repetition: 1           # 3 repetitions to test the feature
+  #       pp_layer_config:
+  #         0: "50, 30"           # Single config = no migration, only reset between reps
+  #         50: "40, 40"           # Single config = no migration, only reset between reps
+  #       requests:
+  #         0:
+  #           request_rate: 2
+  #           input_lens: 64
+  #           output_lens: 512
+  #         50:
+  #           request_rate: 2
+  #           input_lens: 512
+  #           output_lens: 64
+
+  # - vllm:
+  #     attention_kernel: [direct]
+  #     fixed_num_gpu_blocks: [-1] 
+  #     weight_chunk_size_mb: [5]
+  #     migration_approach: [async]
+  #   benchmark_config:
+  #     - num_total_requests: 100  # Small number for quick testing
+  #       repetition: 2           # 3 repetitions to test the feature
+  #       pp_layer_config:
+  #         0: "50, 30"           # Single config = no migration, only reset between reps
+  #         50: "40, 40"           # Single config = no migration, only reset between reps
+  #       requests:
+  #         0:
+  #           request_rate: 2
+  #           input_lens: 64
+  #           output_lens: 512
+  #         50:
+  #           request_rate: 2
+  #           input_lens: 512
+  #           output_lens: 64
+  # Disable Resize
+  # - vllm:
+  #     attention_kernel: [direct]
+  #     fixed_num_gpu_blocks: [2441] 
+  #     weight_chunk_size_mb: [5]
+  #     migration_approach: [async]
+  #   benchmark_config:
+  #     - num_total_requests: 200  # Small number for quick testing
+  #       repetition: 1           # 3 repetitions to test the feature
+  #       pp_layer_config:
+  #         0: "50, 30"           # Single config = no migration, only reset between reps
+  #         100: "40, 40"           # Single config = no migration, only reset between reps
+  #       requests:
+  #       requests:
+  #         0:
+  #           request_rate: 2
+  #           input_lens: 64
+  #           output_lens: 512
+  #         100:
+  #           request_rate: 2
+  #           input_lens: 512
+  #           output_lens: 64
+  # # stop and go baseline 

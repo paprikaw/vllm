@@ -1,9 +1,8 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "end-to-end-test"
+project: "end-to-end-test-single-resize-debug"
 type: "sweep_test"
-
 envs:
   RAY_DEDUP_LOGS: "0"  # Disable Ray log deduplication for debugging
   NCCL_DEBUG: INFO
@@ -31,14 +30,14 @@ static_config:
   network:
     rank_to_ip:
       0: "spartan-gpgpu166"
-      1: "spartan-gpgpu010"
+      1: "spartan-gpgpu009"
     rank_to_node:
       0: "spartan-gpgpu166"
-      1: "spartan-gpgpu010"
+      1: "spartan-gpgpu009"
   vllm:
     head_addr: "localhost"
     pipeline_parallel_size: 2
-    gpu_memory_utilization: 0.8
+    gpu_memory_utilization: 0.85    
     max_model_len: 8000
     chunked_prefill: true
     enable_cuda_graph: false
@@ -58,27 +57,40 @@ static_config:
       output_length: 50
       request_rate: 25
 sweep_configs:
-  # Best one
+  # stop and go baseline 
   # - vllm:
   #     attention_kernel: [direct]
+  #     weight_chunk_size_mb: [1000]
   #     fixed_num_gpu_blocks: [-1] 
+  #     migration_approach: [sync]
+  #   benchmark_config:
+  #     - num_total_requests: 200  # Small number for quick testing
+  #       repetition: 1           # 3 repetitions to test the feature
+  #       pp_layer_config:
+  #         0: "16, 48"           # Single config = no migration, only reset between reps
+  #         100: "32, 32"           # Single config = no migration, only reset between reps
+  #       requests:
+  #         0:
+  #           request_rate: 4
+  #           input_lens: 512
+  #           output_lens: 128
+  # Disable Resize
+  # - vllm:
+  #     attention_kernel: [direct]
+  #     fixed_num_gpu_blocks: [5475] 
   #     weight_chunk_size_mb: [5]
   #     migration_approach: [async]
   #   benchmark_config:
   #     - num_total_requests: 200  # Small number for quick testing
   #       repetition: 1           # 3 repetitions to test the feature
   #       pp_layer_config:
-  #         0: "32, 32"           # Single config = no migration, only reset between reps
-  #         100: "16, 48"           # Single config = no migration, only reset between reps
+  #         0: "16, 48"           # Single config = no migration, only reset between reps
+  #         100: "32, 32"           # Single config = no migration, only reset between reps
   #       requests:
   #         0:
   #           request_rate: 4
-  #           input_lens: 64
-  #           output_lens: 1024
-  #         100:
-  #           request_rate: 2
-  #           input_lens: 1024
-  #           output_lens: 64
+  #           input_lens: 512
+  #           output_lens: 128
   # # Baseline that disables chunked weight loading
   # - vllm:
   #     attention_kernel: [direct]
@@ -89,57 +101,27 @@ sweep_configs:
   #     - num_total_requests: 200  # Small number for quick testing
   #       repetition: 1           # 3 repetitions to test the feature
   #       pp_layer_config:
-  #         0: "32, 32"           # Single config = no migration, only reset between reps
-  #         100: "16, 48"           # Single config = no migration, only reset between reps
+  #         0: "16, 48"           # Single config = no migration, only reset between reps
+  #         100: "32, 32"           # Single config = no migration, only reset between reps
   #       requests:
   #         0:
   #           request_rate: 4
-  #           input_lens: 64
-  #           output_lens: 1024
-  #         100:
-  #           request_rate: 2
-  #           input_lens: 1024
-  #           output_lens: 64
-  # # Disable Resize
-  # - vllm:
-  #     attention_kernel: [direct]
-  #     fixed_num_gpu_blocks: [3000] 
-  #     weight_chunk_size_mb: [5]
-  #     migration_approach: [async]
-  #   benchmark_config:
-  #     - num_total_requests: 200  # Small number for quick testing
-  #       repetition: 1           # 3 repetitions to test the feature
-  #       pp_layer_config:
-  #         0: "32, 32"           # Single config = no migration, only reset between reps
-  #         100: "16, 48"           # Single config = no migration, only reset between reps
-  #       requests:
-  #       requests:
-  #         0:
-  #           request_rate: 4
-  #           input_lens: 64
-  #           output_lens: 1024
-  #         100:
-  #           request_rate: 2
-  #           input_lens: 1024
-  #           output_lens: 64
-  # stop and go baseline 
+  #           input_lens: 512
+  #           output_lens: 128
+  # Best one
   - vllm:
       attention_kernel: [direct]
-      weight_chunk_size_mb: [1000]
       fixed_num_gpu_blocks: [-1] 
-      migration_approach: [sync]
+      weight_chunk_size_mb: [5]
+      migration_approach: [async]
     benchmark_config:
       - num_total_requests: 200  # Small number for quick testing
         repetition: 1           # 3 repetitions to test the feature
         pp_layer_config:
-          0: "32, 32"           # Single config = no migration, only reset between reps
-          100: "16, 48"           # Single config = no migration, only reset between reps
+          0: "16, 48"           # Single config = no migration, only reset between reps
+          100: "32, 32"           # Single config = no migration, only reset between reps
         requests:
           0:
             request_rate: 4
-            input_lens: 64
-            output_lens: 1024
-          100:
-            request_rate: 2
-            input_lens: 1024
-            output_lens: 64
+            input_lens: 512
+            output_lens: 128

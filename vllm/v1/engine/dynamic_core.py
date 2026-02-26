@@ -887,6 +887,8 @@ class DynamicEngineCore(EngineCore):
 
         assert resized_block_num != 0
         if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
+            logger.info(f"no need to resize kv cache during migration, directly synchronize the kv cache, sleep for 4 seconds")
+            time.sleep(4)
             logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
             self.migration_status = MigrationStatus.NOT_MIGRATING
             self._migration_done_event.set()

@@ -13,6 +13,7 @@ This repository is an **extended version of vLLM** that addresses limitations in
 - **Additional Features**: Includes experimental environment code for testing and validation
 
 ## Basic Rules
+1. When answering me or when generating a report, use *Chinese*
 1. You should always follows the user defines basic setup above. 
 2. If you have come to a conclusion for a problem, please generate a reports under ./reports directory
 3. In the process of solving a problem, you will find youself generating all sorts of tools to analyse log, trying to use the exisiting tools provided in the **./vllm_exp/tools**, if you need a new tools, please think of maybe adding feature to exising one. Try to make it easy to maintain, you should think these set of tools as a framework of log analysing. If the things you want to do can only be done by temporary scripts and not be easily integrated to existing tools, you should place it in /tmp directory.

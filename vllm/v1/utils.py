@@ -455,8 +455,8 @@ def create_ptr_tensor_from_list(ptr_list: list[int], device: torch.device) -> to
         logger.info(f"[create_ptr_tensor] len={len(ptr_list)}, target_device={device}, current_cuda_device={current_device}")
         # Ensure correct CUDA device context before tensor operations
         torch.cuda.set_device(device)
-        # Sync to ensure no pending errors
-        torch.cuda.synchronize(device)
+        # # Sync to ensure no pending errors
+        # torch.cuda.synchronize(device)
     
     # Create tensor on CPU first then move to GPU (more reliable for cross-node Ray)
     try:

@@ -748,9 +748,10 @@ async def run_multi_stage_benchmark(
             stage_tasks.append(t)
             tasks.append(t)
 
-        # Wait for this stage to fully finish before continuing.
-        if stage_tasks:
-            await asyncio.gather(*stage_tasks, return_exceptions=True)
+        # Only wait for warmup stage to fully finish; other stages proceed immediately.
+        if warmup_stage_count > 0 and (stage_idx + 1) <= warmup_stage_count:
+            if stage_tasks:
+                await asyncio.gather(*stage_tasks, return_exceptions=True)
 
         # Emit boundary marker after warmup stage fully completes.
         if warmup_stage_count > 0 and (stage_idx + 1) == warmup_stage_count:

@@ -947,7 +947,7 @@ class DynamicGPUWorker(Worker):
             torch.cuda.set_device(self.device)
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         if new_length == self.block_num:
-            logger.info(f"kv cache length is already {new_length}, no need to resize")
+            logger.info(f"kv cache length is already {new_length}, no need to resize, sleep 2 seconds")
             return
         self.block_num = new_length
         # logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
@@ -1128,10 +1128,7 @@ class DynamicGPUWorker(Worker):
                 key_cache = self.model_runner.key_caches[local_idx]
                 value_cache = self.model_runner.value_caches[local_idx]
 
-                # NOTE: Don't use fbgate.background() here - it can deadlock with compiled DAG
-                # resize_kv_cache is called via collective_rpc during sync migration when
-                # the engine has already drained all requests, so no foreground work should be active.
-                # However, compiled DAG may hold foreground lock while waiting for input.
+                # NOTE: Don't use fbgate.background() here - async allocate use fb gate internally 
                 new_allocated_key_cache, new_allocated_value_cache, _, _, _ = kv_allocator.allocate_with_cuda_async(new_allocated_block_num, list(extended_kv_cache_shape), self.model_runner.kv_cache_dtype, self.model_runner.device)
                 new_key_cache = key_cache + new_allocated_key_cache
                 new_value_cache = value_cache + new_allocated_value_cache
@@ -1727,7 +1724,7 @@ class DynamicGPUWorker(Worker):
                         if fixed_blocks <= 0:
                             self.resize_kv_cache(scheduler_output.new_kv_cache_block_num)
                         else:
-                            logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping worker-side resize (would be {scheduler_output.new_kv_cache_block_num} blocks)")
+                            logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping worker-side resize (would be {scheduler_output.new_kv_cache_block_num} blocks), sleep for 4 seconds")
                         self.finish_migration()
                         self.kv_resizing_done = True
                     finally:
