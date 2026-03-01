@@ -272,6 +272,7 @@ class PairPipe:
             Received tensor on local GPU.
         """
         logger.info(f"[PairPipe.recv_data] Starting recv from peer {self.peer_rank}, shape={shape}, dtype={dtype}, is_use_nccl={self.is_use_nccl}, send_ack={send_ack}")
+        time_start = time.time()
         if self.is_use_nccl:
             assert self._nccl is not None, "The nccl communicator should be initialized"
             buf = self._prepare_recv_buffer(dtype, shape)
@@ -310,7 +311,7 @@ class PairPipe:
             # For non-NCCL mode, send ACK after recv if needed
             if send_ack:
                 self.meta_group.send_obj("ACK", dst=self.peer_rank)
-
+        logger.info(f"[PairPipe.recv_data] Finished recv from peer {self.peer_rank}, tensor_shape={buf.shape}, duration={time.time() - time_start:.2f}s")
         return buf
 
     # ===================== request/response helpers (token range) =====================
@@ -867,49 +868,119 @@ class DynamicKVSynchronizer():
         recv_pipe.notify_ready_for_kv_patch()
 
     def send_kv_tensor_to_rank(self, rank: int, kv_tensor_meta: Union[KVTensorMeta, FlexiKVTensorMeta], kv_tensor: torch.Tensor, slot_mapping: Optional[torch.Tensor] = None) -> None:
-        """Send a single KV tensor to a peer rank.
-
-        Args:
-            rank: peer global rank to send to.
-            kv_tensor_meta: metadata of the KV tensor.
-            kv_tensor: tensor to send (GPU or CPU tensor; will be moved to local GPU).
+        """Send a single KV tensor to a peer rank with deadlock-free protocol.
+        
+        Protocol:
+        1. Acquire nccl_lock
+        2. Send meta
+        3. Wait for ACCEPT/REJECT from receiver
+        4. If ACCEPT: NCCL send, then release lock
+        5. If REJECT: release lock, backoff, retry from step 1
         """
         self.kv_cache_transfer_in_process[rank] = True
-        if isinstance(kv_tensor_meta, KVTensorMeta):
-            assert self._nccl_lock is not None, "NCCL lock should be provided for FlexiKVTensorMeta transfer"
-            with self._nccl_lock:
+        # Ensure pipe exists before using it
+        self._ensure_pipe_and_buffer(rank, 'send')
+        pipe = self._pair_pipes_send[rank]
+        
+        retry_delay = 0.005  # 5ms fixed retry delay
+        
+        while True:
+            # Step 1: Acquire lock
+            self._nccl_lock.acquire()
+            
+            try:
+                # Step 2: Send meta
                 self._send_meta_to_rank(rank, kv_tensor_meta)
-                self._send_data_to_rank(rank, kv_tensor, wait_for_ack=True)
-        else:
-            assert slot_mapping is not None, "slot_mapping should be provided when sending FlexiKVTensorMeta"
-            assert self._nccl_lock is not None, "NCCL lock should be provided for FlexiKVTensorMeta transfer"
-            with self._nccl_lock:
-                self._send_meta_to_rank(rank, kv_tensor_meta)
-                logger.info(f"[debug]: sent kv tensor meta to rank {rank}")
-                self._send_data_to_rank(rank, slot_mapping, wait_for_ack=True)
-                logger.info(f"[debug]: sent slot mapping to rank {rank}")
-                self._send_data_to_rank(rank, kv_tensor, wait_for_ack=True)
-                logger.info(f"[debug]: sent kv tensor to rank {rank}")
+                logger.info(f"[send_kv_tensor_to_rank]: sent meta to rank {rank}, waiting for ACCEPT/REJECT")
+                
+                # Step 3: Wait for ACCEPT/REJECT
+                response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
+                
+                if response == "ACCEPT":
+                    # Step 4a: Receiver has lock, do NCCL send
+                    logger.info(f"[send_kv_tensor_to_rank]: received ACCEPT from rank {rank}")
+                    if isinstance(kv_tensor_meta, KVTensorMeta):
+                        self._send_data_to_rank(rank, kv_tensor, wait_for_ack=False)
+                    else:
+                        assert slot_mapping is not None, "slot_mapping should be provided when sending FlexiKVTensorMeta"
+                        self._send_data_to_rank(rank, slot_mapping, wait_for_ack=False)
+                        logger.info(f"[send_kv_tensor_to_rank]: sent slot mapping to rank {rank}")
+                        self._send_data_to_rank(rank, kv_tensor, wait_for_ack=False)
+                        logger.info(f"[send_kv_tensor_to_rank]: sent kv tensor to rank {rank}")
+                    break  # Success
+                elif response == "REJECT":
+                    # Step 4b: Retry after fixed delay
+                    logger.info(f"[send_kv_tensor_to_rank]: received REJECT from rank {rank}, retry in 5ms")
+                    self._nccl_lock.release()
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    raise RuntimeError(f"Unexpected response: {response}")
+            except Exception as e:
+                self._nccl_lock.release()
+                raise e
+        
+        self._nccl_lock.release()
+        logger.info(f"[send_kv_tensor_to_rank]: completed sending to rank {rank}")
     
     def send_kv_patch_to_rank(self, 
             target_rank: int,
             kv_patches: KVPatch) -> None:
-
+        """Send KV patch to target rank with deadlock-free protocol.
+        
+        Protocol:
+        1. Acquire nccl_lock
+        2. Send meta
+        3. Wait for ACCEPT/REJECT from receiver
+        4. If ACCEPT: NCCL send, then release lock
+        5. If REJECT: release lock, backoff, retry from step 1
+        """
         assert self.kv_cache_transfer_in_process[target_rank] == True, "The kv cache transfer in process of the rank should be True."
-        # if target_rank not in self.last_patch_ids:
-        #     self.last_patch_ids[target_rank] = 0
-        # self.last_patch_ids[target_rank] += 1
         meta, kv_payload, slot_mapping = kv_patches.meta, kv_patches.kv_payload, kv_patches.slot_mapping
         time_start = time.time()
-        with self._nccl_lock:
-            time_in = time.time() 
-            self._send_meta_to_rank(target_rank, meta)
-            logger.info(f"sent meta to rank {target_rank}, patch id: {meta.id}, layer ids: {meta.layer_ids}, num tokens: {meta.num_tokens}, time taken: {time.time() - time_in}")
-            self._send_data_to_rank(target_rank, slot_mapping, wait_for_ack=True)
-            logger.info(f"sent slot mapping to rank {target_rank}, patch id: {meta.id}, time taken: {time.time() - time_in}")
-            self._send_data_to_rank(target_rank, kv_payload, wait_for_ack=True)
-            logger.info(f"sent kv payload to rank {target_rank}, patch id: {meta.id}, pyload_shape:{kv_payload.shape} time taken: {time.time() - time_in}")
-        logger.info(f"Time got lock for send kv patch: {time_in - time_start}, time within lock: {time.time() - time_in}, total time: {time.time() - time_start}")
+        # Ensure pipe exists (should already exist from send_kv_tensor_to_rank, but be safe)
+        self._ensure_pipe_and_buffer(target_rank, 'send')
+        pipe = self._pair_pipes_send[target_rank]
+        
+        retry_delay = 0.005  # 5ms fixed retry delay
+        
+        while True:
+            # Step 1: Acquire lock
+            self._nccl_lock.acquire()
+            time_lock_acquired = time.time()
+            
+            try:
+                # Step 2: Send meta
+                self._send_meta_to_rank(target_rank, meta)
+                logger.info(f"sent meta to rank {target_rank}, patch id: {meta.id}, waiting for ACCEPT/REJECT")
+                
+                # Step 3: Wait for ACCEPT/REJECT
+                response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
+                
+                if response == "ACCEPT":
+                    # Step 4a: Receiver has lock, do NCCL send
+                    logger.info(f"received ACCEPT from rank {target_rank}, sending data")
+                    self._send_data_to_rank(target_rank, slot_mapping, wait_for_ack=False)
+                    logger.info(f"sent slot mapping to rank {target_rank}, patch id: {meta.id}")
+                    self._send_data_to_rank(target_rank, kv_payload, wait_for_ack=False)
+                    logger.info(f"sent kv payload to rank {target_rank}, patch id: {meta.id}, shape:{kv_payload.shape}")
+                    break  # Success, exit loop
+                elif response == "REJECT":
+                    # Step 4b: Retry after fixed delay
+                    logger.info(f"received REJECT from rank {target_rank}, retry in 5ms")
+                    self._nccl_lock.release()
+                    time.sleep(retry_delay)
+                    continue  # Retry
+                else:
+                    raise RuntimeError(f"Unexpected response: {response}")
+            except Exception as e:
+                self._nccl_lock.release()
+                raise e
+        
+        # Release lock after successful send
+        self._nccl_lock.release()
+        
+        logger.info(f"send_kv_patch_to_rank completed: time to acquire lock: {time_lock_acquired - time_start}, total time: {time.time() - time_start}")
         if meta.type == "kv_patch_finished":
             self.kv_cache_transfer_in_process[target_rank] = False
 
@@ -1109,33 +1180,105 @@ class DynamicKVSynchronizer():
         meta_obj = pipe.recv_meta()
         return self._control_adapter.validate_python(meta_obj)
 
-    def recv_kv_tensor(self,from_rank: int, meta: Union[KVTensorMeta, FlexiKVTensorMeta]) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if isinstance(meta, FlexiKVTensorMeta):
-            time_start = time.time()
-            with self._nccl_lock:
-                logger.info(f"rev tensor getting lock took{time.time() - time_start} seconds")
-                slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape, send_ack=True)
-                logger.info(f"rev tensor received slot mapping took{time.time() - time_start} seconds")
-                kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape, send_ack=True)
-                logger.info(f"rev tensor received kv payload took{time.time() - time_start} seconds")
-            assert kv_payload.dim() == 4 and kv_payload.size(0) == 2 
+    def recv_kv_tensor(self, from_rank: int, meta: Union[KVTensorMeta, FlexiKVTensorMeta]) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Receive KV tensor from sender with deadlock-free protocol.
+        
+        Protocol:
+        1. Meta already received by caller
+        2. Try to acquire nccl_lock (non-blocking)
+        3. If failed: send REJECT, receive new meta (sender will retry), go to step 2
+        4. If acquired: send ACCEPT, do NCCL recv, release lock
+        """
+        time_start = time.time()
+        pipe = self._pair_pipes_recv[from_rank]
+        
+        current_meta: Union[KVTensorMeta, FlexiKVTensorMeta] = meta
+        while True:
+            # Step 2: Try to acquire lock (non-blocking)
+            lock_acquired = self._nccl_lock.acquire(blocking=False)
+            
+            if not lock_acquired:
+                # Step 3: Lock held by others - send REJECT immediately
+                logger.info(f"recv_kv_tensor: lock held by others, sending REJECT")
+                pipe.signal_group.send_obj("REJECT", dst=pipe.peer_rank)
+                # Sender will backoff and resend meta, we need to receive it
+                new_meta = self.recv_controller(from_rank)
+                assert isinstance(new_meta, (KVTensorMeta, FlexiKVTensorMeta)), f"Expected KVTensorMeta or FlexiKVTensorMeta, got {type(new_meta)}"
+                current_meta = new_meta
+                continue
+            
+            try:
+                # Step 4: Lock acquired - send ACCEPT and recv
+                time_lock_acquired = time.time()
+                pipe.signal_group.send_obj("ACCEPT", dst=pipe.peer_rank)
+                logger.info(f"recv_kv_tensor: lock acquired in {time_lock_acquired - time_start}s, sent ACCEPT")
+                
+                if isinstance(current_meta, FlexiKVTensorMeta):
+                    slot_mapping = self._recv_data_from_rank(from_rank, current_meta.slot_mapping_dtype, current_meta.slot_mapping_shape, send_ack=False)
+                    logger.info(f"recv_kv_tensor: received slot mapping, took {time.time() - time_start}s")
+                    kv_payload = self._recv_data_from_rank(from_rank, current_meta.kv_payload_dtype, current_meta.kv_payload_shape, send_ack=False)
+                    logger.info(f"recv_kv_tensor: received kv payload, took {time.time() - time_start}s")
+                else:
+                    kv_payload = self._recv_data_from_rank(from_rank, current_meta.dtype, current_meta.shape, send_ack=False)
+                    slot_mapping = None
+                break  # Success, exit loop
+            finally:
+                self._nccl_lock.release()
+        
+        logger.info(f"recv_kv_tensor completed: lock wait: {time_lock_acquired - time_start}, total: {time.time() - time_start}")
+        
+        if isinstance(current_meta, FlexiKVTensorMeta):
+            assert slot_mapping is not None, "slot_mapping should not be None for FlexiKVTensorMeta"
+            assert kv_payload.dim() == 4 and kv_payload.size(0) == 2
             return slot_mapping, kv_payload
         else:
-            with self._nccl_lock:
-                kv_payload = self._recv_data_from_rank(from_rank, meta.dtype, meta.shape, send_ack=True)
             assert kv_payload.dim() == 5 and kv_payload.size(0) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
             return kv_payload
 
-    def recv_kv_patch(self, from_rank: int,meta: KVPatchMeta) -> Tuple[torch.Tensor, torch.Tensor]:
+    def recv_kv_patch(self, from_rank: int, meta: KVPatchMeta) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Receive KV patch from sender with deadlock-free protocol.
+        
+        Protocol:
+        1. Meta already received by caller
+        2. Try to acquire nccl_lock (non-blocking)
+        3. If failed: send REJECT, receive new meta (sender will retry), go to step 2
+        4. If acquired: send ACCEPT, do NCCL recv, release lock
+        """
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         time_start = time.time()
-        with self._nccl_lock:
-            time_in = time.time()
-            slot_mapping = self._recv_data_from_rank(from_rank, meta.slot_mapping_dtype, meta.slot_mapping_shape, True)
-            kv_payload = self._recv_data_from_rank(from_rank, meta.kv_payload_dtype, meta.kv_payload_shape, True)
-        logger.info(f"Time got lock for recv kv patch: {time_in - time_start}, time within lock: {time.time() - time_in}, total time: {time.time() - time_start}") 
+        pipe = self._pair_pipes_recv[from_rank]
+        
+        current_meta = meta
+        while True:
+            # Step 2: Try to acquire lock (non-blocking)
+            lock_acquired = self._nccl_lock.acquire(blocking=False)
+            
+            if not lock_acquired:
+                # Step 3: Lock held by others - send REJECT immediately
+                logger.info(f"recv_kv_patch: lock held by others, sending REJECT")
+                pipe.signal_group.send_obj("REJECT", dst=pipe.peer_rank)
+                # Sender will backoff and resend meta, we need to receive it
+                new_meta = self.recv_controller(from_rank)
+                assert isinstance(new_meta, KVPatchMeta), f"Expected KVPatchMeta, got {type(new_meta)}"
+                current_meta = new_meta
+                continue
+            
+            try:
+                # Step 4: Lock acquired - send ACCEPT and recv
+                time_lock_acquired = time.time()
+                pipe.signal_group.send_obj("ACCEPT", dst=pipe.peer_rank)
+                logger.info(f"recv_kv_patch: lock acquired in {time_lock_acquired - time_start}s, sent ACCEPT")
+                
+                slot_mapping = self._recv_data_from_rank(from_rank, current_meta.slot_mapping_dtype, current_meta.slot_mapping_shape, False)
+                kv_payload = self._recv_data_from_rank(from_rank, current_meta.kv_payload_dtype, current_meta.kv_payload_shape, False)
+                break  # Success, exit loop
+            finally:
+                self._nccl_lock.release()
+        
+        logger.info(f"recv_kv_patch completed: lock wait: {time_lock_acquired - time_start}, total: {time.time() - time_start}")
+        
         # For kv_patch_finished with empty data, skip the dimension assertion
-        if meta.type == 'kv_patch_finished' and kv_payload.numel() == 0:
+        if current_meta.type == 'kv_patch_finished' and kv_payload.numel() == 0:
             logger.info(f"[recv_kv_patch]: received empty kv_patch_finished from rank {from_rank}")
             return slot_mapping, kv_payload
         

@@ -176,6 +176,9 @@ class PyNcclCommunicator:
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
         if self.disabled:
             return
+        # Skip NCCL operation for empty tensors to avoid cuda errors
+        if tensor.numel() == 0:
+            return
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}")
@@ -187,6 +190,9 @@ class PyNcclCommunicator:
 
     def recv(self, tensor: torch.Tensor, src: int, stream=None):
         if self.disabled:
+            return
+        # Skip NCCL operation for empty tensors to avoid cuda errors
+        if tensor.numel() == 0:
             return
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "

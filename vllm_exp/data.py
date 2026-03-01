@@ -68,7 +68,7 @@ class VllmCfg(BaseModel):
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
     attention_kernel: str = "direct"  # "flash", "flexi", or "direct"
-    block_size: Optional[int] = None  # KV cache block size (1, 8, 16, 32, 64, 128), None means use vLLM default
+    block_size: Optional[int] = None  # KV cache block size (1, 8, 16, 32, 64, 128, 256, 512), None means use vLLM default. V0 only supports up to 32.
     head_addr: str = "head"
     port: int = 8000
     ray_port: int = 6379
@@ -926,12 +926,16 @@ class ExperimentConfig:
     def iter_from_sweep_test_config(
         cls,
         sweep_test_cfg: 'SweepTestConfig',
-    ) -> 'Iterator[ExperimentConfig]':
+    ) -> 'Iterator[tuple[int, ExperimentConfig]]':
         """Iterate over all ExperimentConfigs from Cartesian product of sweep axes.
         
         This is the main entry point for generating experiment configurations.
         It combines static_config with each sweep combination to produce
         ExperimentConfig instances.
+        
+        Returns tuples of (sweep_config_index, ExperimentConfig) to allow
+        grouping experiments by their source sweep_config block for server
+        restart isolation.
         
         Supports both sweep_config (singular) and sweep_configs (list) modes.
         When sweep_configs is used, experiments from each SweepConfig are
@@ -955,7 +959,8 @@ class ExperimentConfig:
         static_cfg = sweep_test_cfg.static_config
         
         # Iterate over all resolved sweep configs (handles both singular and list)
-        for sweep_config in sweep_test_cfg.get_resolved_sweep_configs():
+        # Each sweep_config block gets its own index for server restart isolation
+        for sweep_config_index, sweep_config in enumerate(sweep_test_cfg.get_resolved_sweep_configs()):
             sweep_axes = sweep_config.get_sweep_axes(
                 static_benchmark_cfg=static_cfg.benchmark
             )
@@ -988,7 +993,8 @@ class ExperimentConfig:
                 fixed_blocks: Optional[int] = combo_dict.get('fixed_num_gpu_blocks')
                 
                 # Create ExperimentConfig from this combination
-                yield cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, fixed_blocks)
+                # Yield (sweep_config_index, experiment_config) tuple for server restart isolation
+                yield (sweep_config_index, cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, fixed_blocks))
     
     @classmethod
     def _create_from_combo(

@@ -127,6 +127,59 @@ def extract_values_from_file(filepath: str, pattern: str) -> List[Tuple[float, s
     return results
 
 
+def extract_integer_values_from_file(filepath: str, pattern: str, with_timestamp: bool = False) -> List[Tuple]:
+    """
+    Extract integer values following the pattern from a file.
+    
+    Args:
+        filepath: Path to the log file
+        pattern: Text pattern to search for (value should follow this text)
+        with_timestamp: If True, also extract timestamp from log line
+    
+    Returns:
+        List of tuples: (value, line_number) or (value, line_number, timestamp) if with_timestamp=True
+    """
+    results = []
+    
+    # Escape special regex characters in pattern
+    escaped_pattern = re.escape(pattern)
+    # Pattern: look for the text followed by whitespace and then an integer
+    value_pattern = escaped_pattern + r'\s+(\d+)'
+    # Timestamp pattern: INFO MM-DD HH:MM:SS
+    timestamp_pattern = r'INFO\s+(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})'
+    
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            for line_num, line in enumerate(f, 1):
+                match = re.search(value_pattern, line)
+                if match:
+                    value = int(match.group(1))
+                    if with_timestamp:
+                        ts_match = re.search(timestamp_pattern, line)
+                        timestamp = ts_match.group(1) if ts_match else None
+                        results.append((value, line_num, timestamp))
+                    else:
+                        results.append((value, line_num))
+    except Exception as e:
+        print(f"Warning: Error reading {filepath}: {e}", file=sys.stderr)
+    
+    return results
+
+
+def extract_scheduled_tokens(log_path: str) -> List[int]:
+    """
+    Extract scheduled tokens values from a vLLM server log.
+    
+    Args:
+        log_path: Path to the server log file
+    
+    Returns:
+        List of scheduled token counts in order of occurrence
+    """
+    results = extract_integer_values_from_file(log_path, "Scheduled tokens:")
+    return [r[0] for r in results]
+
+
 def compute_statistics(values: List[float]) -> dict:
     """Compute statistics for a list of values."""
     if not values:

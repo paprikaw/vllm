@@ -171,21 +171,19 @@ std::tuple<int64_t, int64_t> prepare_flexi_kv_ptrs(
     const std::vector<int64_t>& k_list,
     const std::vector<int64_t>& v_list
 ) {
-    // Allocate device memory for pointer arrays
-    void** k_ptrs_dev;
-    void** v_ptrs_dev;
+    void** k_ptrs_dev = nullptr;
+    void** v_ptrs_dev = nullptr;
     
-    cudaMalloc(&k_ptrs_dev, k_list.size() * sizeof(void*));
-    cudaMemcpy(k_ptrs_dev, k_list.data(),
-               k_list.size() * sizeof(void*),
-               cudaMemcpyHostToDevice);
+    size_t k_size = k_list.size() * sizeof(void*);
+    size_t v_size = v_list.size() * sizeof(void*);
     
-    cudaMalloc(&v_ptrs_dev, v_list.size() * sizeof(void*));
-    cudaMemcpy(v_ptrs_dev, v_list.data(),
-               v_list.size() * sizeof(void*),
-               cudaMemcpyHostToDevice);
+    // Allocate and copy key pointers
+    CUDA_CHECK(cudaMalloc(&k_ptrs_dev, k_size));
+    CUDA_CHECK(cudaMemcpy(k_ptrs_dev, k_list.data(), k_size, cudaMemcpyHostToDevice));
     
-    printf("DEBUG: Cached GPU pointers - k_ptrs_dev=%p, v_ptrs_dev=%p\n", k_ptrs_dev, v_ptrs_dev);
+    // Allocate and copy value pointers
+    CUDA_CHECK(cudaMalloc(&v_ptrs_dev, v_size));
+    CUDA_CHECK(cudaMemcpy(v_ptrs_dev, v_list.data(), v_size, cudaMemcpyHostToDevice));
     
     // Return as int64 to be Python-compatible
     return std::make_tuple(reinterpret_cast<int64_t>(k_ptrs_dev), 
@@ -244,6 +242,21 @@ void free_cache(
 }
 
 // ============================================================================
+// Trim CUDA Memory Pool - Force release retained memory
+// ============================================================================
+
+void trim_memory_pool(int device_id, size_t min_bytes_to_keep) {
+    CUDA_CHECK(cudaSetDevice(device_id));
+    
+    cudaMemPool_t mempool;
+    CUDA_CHECK(cudaDeviceGetDefaultMemPool(&mempool, device_id));
+    
+    // Trim the pool to release retained memory back to the OS
+    // min_bytes_to_keep: minimum bytes the pool should keep (0 = release all)
+    CUDA_CHECK(cudaMemPoolTrimTo(mempool, min_bytes_to_keep));
+}
+
+// ============================================================================
 // Python Bindings
 // ============================================================================
 
@@ -286,4 +299,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("ptrs"),
           py::arg("device_id"),
           py::arg("stream_ptr"));
+
+    m.def("trim_memory_pool",
+          &trim_memory_pool,
+          "Trim CUDA memory pool to release retained memory back to OS",
+          py::arg("device_id"),
+          py::arg("min_bytes_to_keep") = 0);
 }

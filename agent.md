@@ -1,5 +1,13 @@
 # vLLM Extended Agent Guide
 
+## 命令执行规则
+
+1. **永远追踪命令**: 执行命令时必须使用 `timeout: 0`，确保完整等待命令执行完成
+2. **禁止擅自后台运行**: 如果认为必须使用 `isBackground: true` 或不追踪命令，**必须先询问用户**
+3. **原因**: 提前跳出等待状态会导致需要反复检查命令是否执行成功，影响工作效率
+
+---
+
 ## vllm_exp Experimental Framework Usage
 
 ### Overview

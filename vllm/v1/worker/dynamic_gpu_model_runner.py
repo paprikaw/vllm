@@ -99,6 +99,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self.inference_stream = stream
         logger.info(f"Inference stream set: {stream}")
     
+    def _is_dynamic_model(self) -> bool:
+        """Check if the loaded model is a DynamicModelBase instance."""
+        return isinstance(self.model, DynamicModelBase)
+    
     def stream_synchronize(self) -> None:
         """Synchronize only the inference stream, not the entire device.
         
@@ -212,11 +216,14 @@ class DynamicGPUModelRunner(GPUModelRunner):
         Execute model with flexi_direct support.
         Builds k_ptr_tables/v_ptr_tables from block_table and passes them to forward context.
         """
+        # For non-dynamic models, fall back to parent's execute_model
+        if not self._is_dynamic_model():
+            logger.debug("Using parent execute_model for non-dynamic model")
+            return super().execute_model(scheduler_output, intermediate_tensors)
+        
         time_start = time.time()
         logger.info(f"getting forward lock taking {human_readable_duration(time.time() - time_start)}")
         with self.fbgate.foreground():
-            if not isinstance(self.model, DynamicModelBase):
-                raise AssertionError(f"model is not a DynamicModelBase: {self.model.__class__.__name__}")
             self.model.set_sched_layers(layer_config[0], layer_config[1])
             try:
                 result = self._execute_model(scheduler_output, intermediate_tensors)

@@ -52,6 +52,10 @@ from vllm.distributed.kv_transfer.kv_connector.dynamic_kv_synchronizer import KV
 from bitarray import bitarray
 import time
 from vllm.distributed.kv_transfer.kv_connector.dynamic_kv_synchronizer import DynamicKVSynchronizer
+from vllm.v1.worker.gpu_memory_monitor import (
+    get_gpu_memory_monitor, memory_snapshot, 
+    get_checkpoint_tracker, reset_checkpoint_tracker
+)
 import signal
 import sys
 import traceback
@@ -251,6 +255,25 @@ class DynamicGPUWorker(Worker):
         torch.cuda.synchronize() 
         gc.collect()
         torch.cuda.empty_cache()
+        
+        # Calculate expected memory change for adding layers
+        num_added_layers = sum([layer[1] - layer[0] + 1 for layer in layer_list])
+        weight_size_per_layer_gb = self.model_runner.model.get_layer_weight_size() / (1024**3)
+        expected_weight_delta_gb = -weight_size_per_layer_gb * num_added_layers  # Negative = less free mem
+        
+        # Memory checkpoint: track expected weight loading impact
+        tracker = get_checkpoint_tracker(self.rank, self.device)
+        before_idx = tracker.checkpoint_before(
+            tag=f"add_layers_{layer_list}",
+            operation="add_layers_weights",
+            expected_delta_gb=expected_weight_delta_gb,
+            details={
+                'num_layers': num_added_layers, 
+                'weight_per_layer_gb': weight_size_per_layer_gb,
+                'layer_list': layer_list
+            }
+        )
+        memory_snapshot(f"rank{self.rank}_before_add_layers_{layer_list}", self.device)
 
         with DeadlockTimeoutContext(self._layer_loaded_cv, "_layer_loaded_cv", timeout=2):
             assert self.migration_stream is not None
@@ -265,6 +288,15 @@ class DynamicGPUWorker(Worker):
 
             self.migration_stream.synchronize()
             logger.info(f"[timeline]: after weight loading, time taken: {human_readable_duration(time.time() - time_start)}")
+            memory_snapshot(f"rank{self.rank}_after_weight_loading_{layer_list}", self.device)
+            
+            # Verify memory change after weight loading
+            tracker.checkpoint_after(
+                tag=f"add_layers_{layer_list}_weights_loaded",
+                operation="add_layers_weights",
+                before_idx=before_idx,
+                expected_delta_gb=expected_weight_delta_gb
+            )
 
             # 接收完weights之后，在这里进行kv cache数据结构的扩展，保证后续kv cache tensor绑定的正确性
             new_start_layer = self.model_runner.model.model.start_layer
@@ -419,10 +451,23 @@ class DynamicGPUWorker(Worker):
         else:
             self.memory_stress_tester = None
         
+    def _is_dynamic_model(self) -> bool:
+        """Check if the loaded model is a DynamicModelBase instance."""
+        return isinstance(self.model_runner.model, DynamicModelBase)
 
     def load_model(self) -> None:
         super().load_model()
-        assert isinstance(self.model_runner.model, DynamicModelBase)
+        
+        # Check if model supports dynamic features
+        if not self._is_dynamic_model():
+            logger.warning(
+                "Loaded model is not a DynamicModelBase instance. "
+                "Dynamic PP reconfiguration features will be disabled. "
+                f"Model type: {type(self.model_runner.model).__name__}"
+            )
+            self.dynamic_kv_synchronizer = None
+            return
+            
         self.model_runner.model.model.add_fbgate(self.model_runner.fbgate)
         # Wait for all ranks to finish loading model before initializing KV synchronizer
         # This prevents deadlock where faster ranks (fewer layers) enter barrier
@@ -450,6 +495,26 @@ class DynamicGPUWorker(Worker):
 
     def dynamic_initialize_from_config(self, kv_cache_configs: list[KVCacheConfig], num_blocks: int) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        # For non-dynamic models, use the parent class's standard initialization
+        if not self._is_dynamic_model():
+            logger.info("Using standard KV cache initialization for non-dynamic model")
+            # Recalculate num_blocks based on tensor_config to avoid assertion failure
+            # The dynamic core sets num_blocks globally, but we need to use what's
+            # actually available based on tensor_config.size
+            kv_cache_config = kv_cache_configs[self.rank]
+            min_num_blocks = float('inf')
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                kv_cache_spec = kv_cache_group.kv_cache_spec
+                for layer_name in kv_cache_group.layer_names:
+                    tensor_config = kv_cache_config.tensors[layer_name]
+                    local_num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
+                    min_num_blocks = min(min_num_blocks, local_num_blocks)
+            if min_num_blocks < float('inf'):
+                kv_cache_config.num_blocks = int(min_num_blocks)
+                logger.info(f"Recalculated num_blocks for non-dynamic model: {kv_cache_config.num_blocks}")
+            super().initialize_from_config(kv_cache_config)
+            return
+            
         self.block_size = kv_cache_configs[self.rank].kv_cache_groups[0].kv_cache_spec.block_size
         self.block_num = num_blocks
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -466,6 +531,16 @@ class DynamicGPUWorker(Worker):
                 logger.info("Using standard flash attention dynamic initialize kv cache")
                 self.model_runner.dynamic_initialize_kv_cache(kv_cache_configs[self.rank], self.dynamic_kv_synchronizer, num_blocks)
             self.dynamic_kv_synchronizer.create_slot_mappings(num_blocks * self.block_size)
+            
+            # Record initial GPU memory for this configuration
+            # This establishes a baseline to detect memory leaks after migration
+            if isinstance(self.model_runner.model, DynamicModelBase):
+                start_layer = self.model_runner.model.model.start_layer
+                end_layer = self.model_runner.model.model.end_layer
+                memory_monitor = get_gpu_memory_monitor()
+                memory_monitor.record_initial_memory_local(
+                    start_layer, end_layer, self.rank, self.device
+                )
 
     def set_env_var(self, key: str, value: str) -> None:
         """Update an environment variable in this worker process."""
@@ -506,7 +581,7 @@ class DynamicGPUWorker(Worker):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        assert isinstance(self.model_runner.model, DynamicModelBase)
+        assert isinstance(self.model_runner.model, DynamicModelBase) or isinstance(self.model_runner.model, torch.nn.Module), "model should be an instance of DynamicModelBase or torch.nn.Module"
         # assert self.model_runner.model.get_sched_layers() == (self.model_runner.model.model.start_layer, self.model_runner.model.model.end_layer), "model should be in the initial state"
         self.model_runner.initialize_intermediate_states()
         torch.cuda.empty_cache()
@@ -561,7 +636,35 @@ class DynamicGPUWorker(Worker):
             return None
         logger.info(f"Remove Model Layers: {layer_list}")
         assert self.device is not None
+        
+        # Calculate expected memory change for removing layers
+        num_removed_layers = sum([layer[1] - layer[0] + 1 for layer in layer_list])
+        assert isinstance(self.model_runner.model, DynamicModelBase)
+        weight_size_per_layer_gb = self.model_runner.model.get_layer_weight_size() / (1024**3)
+        expected_weight_delta_gb = weight_size_per_layer_gb * num_removed_layers  # Positive = more free mem
+        
+        # Memory checkpoint: track expected weight removal impact
+        tracker = get_checkpoint_tracker(self.rank, self.device)
+        before_idx = tracker.checkpoint_before(
+            tag=f"remove_layers_{layer_list}",
+            operation="remove_layers",
+            expected_delta_gb=expected_weight_delta_gb,
+            details={
+                'num_layers': num_removed_layers, 
+                'weight_per_layer_gb': weight_size_per_layer_gb,
+                'layer_list': layer_list
+            }
+        )
+        
         self.model_runner.remove_layers(layer_list, self.device)
+        
+        # Verify memory change after removing layers (weights should be freed)
+        tracker.checkpoint_after(
+            tag=f"remove_layers_{layer_list}_done",
+            operation="remove_layers",
+            before_idx=before_idx,
+            expected_delta_gb=expected_weight_delta_gb
+        )
 
     def atomic_shelve_kv_cache(self, rank: int, layers_list: list[Tuple[int, int]]) ->Tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         if self.rank != rank:
@@ -627,6 +730,42 @@ class DynamicGPUWorker(Worker):
         is_flexi = vllm_config.dynamic_config.use_flexi_kv
         free_before, total = torch.cuda.mem_get_info()
         logger.info(f"before release_kv_cache_for_layers: free={free_before / 1024 ** 3:.2f} GB, total={total / 1024 ** 3:.2f} GB")
+        
+        # Calculate expected memory freed from KV cache using page_meta
+        kv_cache_bytes_to_free = 0
+        ptr_bytes_to_free = 0
+        num_layers = len(caches_to_free_key) if caches_to_free_key else 0
+        num_blocks = len(caches_to_free_key[0]) if caches_to_free_key and len(caches_to_free_key) > 0 else 0
+        
+        if is_flexi and caches_to_free_key and self.model_runner.page_meta is not None:
+            # Use page_meta to calculate block size: (block_size, num_heads, head_size)
+            page_meta = self.model_runner.page_meta
+            T, H, Dh = page_meta.shape
+            dtype_size = page_meta.element_size()
+            bytes_per_block = T * H * Dh * dtype_size  # Size of one K or V block
+            
+            # Total KV cache bytes = num_layers * num_blocks * bytes_per_block * 2 (K+V)
+            kv_cache_bytes_to_free = num_layers * num_blocks * bytes_per_block * 2
+            
+            # Pointer arrays: num_blocks * sizeof(void*) = num_blocks * 8 bytes per layer
+            ptr_bytes_to_free = num_layers * num_blocks * 8 * 2  # 2 for K+V pointer arrays
+        
+        expected_delta_gb = (kv_cache_bytes_to_free + ptr_bytes_to_free) / (1024**3)
+        
+        # Memory checkpoint: track expected KV cache release impact
+        tracker = get_checkpoint_tracker(self.rank, self.device)
+        before_idx = tracker.checkpoint_before(
+            tag=f"release_kv_cache_{num_layers}layers_{num_blocks}blocks",
+            operation="release_kv_cache_for_layers",
+            expected_delta_gb=expected_delta_gb,
+            details={
+                'num_layers': num_layers, 
+                'num_blocks': num_blocks,
+                'kv_cache_bytes': kv_cache_bytes_to_free,
+                'ptr_bytes': ptr_bytes_to_free
+            }
+        )
+        
         if is_flexi:
             assert len(caches_to_free_key) != 0
             assert len(caches_to_free_value) != 0
@@ -646,6 +785,18 @@ class DynamicGPUWorker(Worker):
                 with self.model_runner.fbgate.background():
                     kv_allocator.free_page_list(k_ptr, self.device)
                     kv_allocator.free_page_list(v_ptr, self.device)
+        
+        # Synchronize to ensure all frees complete before measuring
+        torch.cuda.synchronize()
+        
+        # Verify memory change after release
+        tracker.checkpoint_after(
+            tag=f"release_kv_cache_{num_layers}layers_{num_blocks}blocks_done",
+            operation="release_kv_cache_for_layers",
+            before_idx=before_idx,
+            expected_delta_gb=expected_delta_gb
+        )
+        
         final_free, _ = torch.cuda.mem_get_info()
         logger.info(f"after release_kv_cache_for_layers: free={final_free / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.model_runner.kv_caches)}")
 
@@ -667,8 +818,12 @@ class DynamicGPUWorker(Worker):
         # torch.cuda.empty_cache()
         logger.info(f" after empty cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         # Layer weight size (may raise if not recorded yet)
-        assert isinstance(self.model_runner.model, DynamicModelBase)
-        layer_size = int(self.model_runner.model.get_layer_weight_size())
+        if hasattr(self.model_runner.model, 'get_layer_weight_size'):
+            layer_size = int(self.model_runner.model.get_layer_weight_size())
+        else:
+            # Fallback for models without get_layer_weight_size
+            layer_size = 0
+            logger.warning("get_mem_info: Model has no get_layer_weight_size method, layer_size set to 0")
 
         is_kv_cache_initialized = len(self.model_runner.kv_caches) != 0 and self.model_runner.kv_caches[0].numel() != 0
 
@@ -909,9 +1064,51 @@ class DynamicGPUWorker(Worker):
         if self.device is not None:
             torch.cuda.set_device(self.device)
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
-        if new_length == self.block_num:
-            logger.info(f"kv cache length is already {new_length}, no need to resize")
+        old_length = self.block_num
+        if new_length == old_length:
+            logger.info(f"kv cache length is already {new_length}, no need to resize, sleep 2 seconds")
             return
+        
+        # Calculate expected memory change for KV cache resize
+        # Each block contains: 2 (K+V) * tokens_per_block * num_heads * head_size * dtype_size
+        # For flexi mode: num_layers * num_blocks_diff * page_size
+        assert isinstance(self.model_runner.model, DynamicModelBase)
+        num_layers = len(self.model_runner.key_caches) if is_flexi else len(self.model_runner.kv_caches)
+        
+        if is_flexi:
+            # Flexi mode: each block is T * H * Dh * dtype_size bytes
+            T, H, Dh = self.model_runner.page_meta.shape
+            dtype_size = self.model_runner.page_meta.dtype.itemsize
+            bytes_per_block = T * H * Dh * dtype_size * 2  # 2 for K+V
+        else:
+            # Non-flexi mode: full tensor shape
+            if len(self.model_runner.kv_caches) > 0:
+                kv_tensor = self.model_runner.kv_caches[0]
+                numel_per_block = kv_tensor[0][0].numel()  # Single block size
+                dtype_size = kv_tensor.element_size()
+                bytes_per_block = numel_per_block * dtype_size * 2  # 2 for K+V in [2, blocks, ...]
+            else:
+                bytes_per_block = 0
+        
+        block_diff = old_length - new_length  # Positive if shrinking
+        kv_cache_delta_gb = (block_diff * num_layers * bytes_per_block) / (1024**3)
+        
+        # Memory checkpoint: track expected KV cache resize impact
+        tracker = get_checkpoint_tracker(self.rank, self.device)
+        before_idx = tracker.checkpoint_before(
+            tag=f"resize_kv_{old_length}_to_{new_length}",
+            operation="resize_kv_cache",
+            expected_delta_gb=kv_cache_delta_gb,
+            details={
+                'old_length': old_length, 
+                'new_length': new_length,
+                'num_layers': num_layers,
+                'bytes_per_block': bytes_per_block,
+                'block_diff': block_diff
+            }
+        )
+        
+        memory_snapshot(f"rank{self.rank}_before_resize_{old_length}_to_{new_length}", self.device)
         self.block_num = new_length
         # logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         if is_flexi:
@@ -919,6 +1116,14 @@ class DynamicGPUWorker(Worker):
         else:
             self._resize_kv_cache(new_length)
 
+        # Verify memory change after resize
+        tracker.checkpoint_after(
+            tag=f"resize_kv_{old_length}_to_{new_length}_done",
+            operation="resize_kv_cache",
+            before_idx=before_idx,
+            expected_delta_gb=kv_cache_delta_gb
+        )
+        
         self.dynamic_kv_synchronizer.create_slot_mappings(new_length * self.block_size)
         logger.info(f"[timeline]: total resize kv cache time taken: {human_readable_duration(time.time() - start_time)}")
 
@@ -1058,6 +1263,7 @@ class DynamicGPUWorker(Worker):
 
             assert self.device is not None
             # Free old GPU pointer arrays (needed by both flexi and direct)
+            memory_snapshot(f"rank{self.rank}_before_free_old_ptrs_and_caches_shrink", self.device)
             for old_key_ptr, old_value_ptr in zip(tmp_old_key_cache_ptr_list, tmp_old_value_cache_ptr_list):
                 with self.model_runner.fbgate.background():
                     kv_allocator.free_page_list(old_key_ptr, self.device)
@@ -1068,6 +1274,7 @@ class DynamicGPUWorker(Worker):
                 with self.model_runner.fbgate.background():
                     kv_allocator.free_cache(old_key_cache, self.device)
                     kv_allocator.free_cache(old_value_cache, self.device)
+            memory_snapshot(f"rank{self.rank}_after_free_old_ptrs_and_caches_shrink", self.device)
             time_after_free = time.time()
 
         elif new_length > cache_length:
@@ -1091,10 +1298,7 @@ class DynamicGPUWorker(Worker):
                 key_cache = self.model_runner.key_caches[local_idx]
                 value_cache = self.model_runner.value_caches[local_idx]
 
-                # NOTE: Don't use fbgate.background() here - it can deadlock with compiled DAG
-                # resize_kv_cache is called via collective_rpc during sync migration when
-                # the engine has already drained all requests, so no foreground work should be active.
-                # However, compiled DAG may hold foreground lock while waiting for input.
+                # NOTE: Don't use fbgate.background() here - async allocate use fb gate internally 
                 new_allocated_key_cache, new_allocated_value_cache, _, _, _ = kv_allocator.allocate_with_cuda_async(new_allocated_block_num, list(extended_kv_cache_shape), self.model_runner.kv_cache_dtype, self.model_runner.device)
                 new_key_cache = key_cache + new_allocated_key_cache
                 new_value_cache = value_cache + new_allocated_value_cache
@@ -1156,6 +1360,7 @@ class DynamicGPUWorker(Worker):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
+        memory_snapshot(f"rank{self.rank}_after_resize_to_{new_length}", self.device)
         logger.info(f"[forward]: resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         logger.info(f"[timeline]: time before in lock: {time_after_in_lock - time_before_in_lock:.4f} seconds")
         logger.info(f"[timeline]: time after free: {time_after_free - time_after_in_lock:.4f} seconds")
@@ -1250,7 +1455,7 @@ class DynamicGPUWorker(Worker):
                 time_start = time.time()
                 kv_tensor_meta, kv_tensor_data = self.dynamic_kv_synchronizer.get_kv_tensor_from_cache(layer_ids, layer_id, start_layer_id, self.model_runner.page_meta,  slot_mapping_dev)
                 logger.info(f"start to send kv tensor for layer {layer_id} to rank {rank}, kv_tensor_meta: {kv_tensor_meta}, kv_tensor_data shape: {kv_tensor_data.shape}, time taken to get kv tensor: {human_readable_duration(time.time() - time_start)} seconds")
-                with self.model_runner.fbgate.foreground():
+                with self.model_runner.fbgate.background():
                     self.dynamic_kv_synchronizer.send_kv_tensor_to_rank(rank, kv_tensor_meta, kv_tensor_data, slot_mapping_dev)
                 logger.info(f"[debug]: sent kv tensor for layer {layer_id} to rank {rank}")
 
@@ -1301,6 +1506,13 @@ class DynamicGPUWorker(Worker):
         """
 
         time_start = time.time()
+        
+        # Reset checkpoint tracker for this migration to track memory changes
+        old_config = (self.model_runner.model.model.start_layer, self.model_runner.model.model.end_layer)
+        new_config = pp_layer_config[self.rank] if self.rank < len(pp_layer_config) else old_config
+        tracker = reset_checkpoint_tracker(self.rank, self.device)
+        logger.info(f"[MEM_CHECKPOINT] Starting sync migration: rank{self.rank} config {old_config} -> {new_config}")
+        
         with self._receive_finished_cv:
             assert self.receive_in_process == False, "The receiving kv cache should not be in process"
 
@@ -1310,6 +1522,7 @@ class DynamicGPUWorker(Worker):
                 self.receive_in_process = True
 
         assert isinstance(self.model_runner.model, DynamicModelBase)
+        memory_snapshot(f"rank{self.rank}_sync_migration_entry", self.device)
 
         # Sender Side, Send KV Cache
         logger.info(f"Enter sync migration process")
@@ -1337,8 +1550,22 @@ class DynamicGPUWorker(Worker):
             for _, ranges in sending_layers_plans.items():
                 all_layer_ranges.extend(ranges)
             caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value = self.atomic_shelve_kv_cache(self.rank, all_layer_ranges)
+            memory_snapshot(f"rank{self.rank}_after_atomic_shelve", self.device)
             self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value)
+            memory_snapshot(f"rank{self.rank}_after_release_kv_cache", self.device)
             self.remove_layers(self.rank, all_layer_ranges)
+            memory_snapshot(f"rank{self.rank}_after_remove_layers", self.device)
+            
+            # Check GPU memory after removing layers (sender side of sync migration)
+            if isinstance(self.model_runner.model, DynamicModelBase):
+                new_start_layer = self.model_runner.model.model.start_layer
+                new_end_layer = self.model_runner.model.model.end_layer
+                memory_monitor = get_gpu_memory_monitor()
+                memory_monitor.check_memory_after_migration_local(
+                    new_start_layer, new_end_layer, self.rank, self.device,
+                    migration_type="sync_sender"
+                )
+                
         start_layer = pp_layer_config[self.rank][0]
         # Receiver Side, Wait for receive to finish
         if self.rank not in src_to_sending_layers:
@@ -1351,7 +1578,14 @@ class DynamicGPUWorker(Worker):
             logger.info(f"[timeline]: after start kv cache migration sync, time taken: {human_readable_duration(time.time() - time_start)}")
         is_direct = self.vllm_config.dynamic_config.use_direct_ptr  
         if is_direct:
+            memory_snapshot(f"rank{self.rank}_before_commit_ptr_tables", self.device)
             self.model_runner.commit_ptr_tables(self.model_runner.k_ptr_tensors, self.model_runner.v_ptr_tensors, target_start_layer=start_layer)
+            memory_snapshot(f"rank{self.rank}_after_commit_ptr_tables", self.device)
+        
+        # Print checkpoint summary for this migration
+        tracker = get_checkpoint_tracker(self.rank, self.device)
+        logger.info(f"\n{tracker.get_summary()}")
+        
         logger.info(f"finish sync migration in {time.time() - time_start:.2f}")
         return None
 
@@ -1447,6 +1681,7 @@ class DynamicGPUWorker(Worker):
                         self._layer_loaded_cv.wait()
             time_start_bind_kv_cache = time.time()
             for layer_id in layer_ids:
+                logger.info(f"current memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB, start to bind kv cache for layer {layer_id}")
                 kv_tensor = tmp_kv_tensors_dict[layer_id]
                 if is_flexi:
                     slot_mapping = tmp_slot_mapping_dict[layer_id]
@@ -1476,7 +1711,10 @@ class DynamicGPUWorker(Worker):
                             kv_tensor=kv_tensor
                         )
                 tmp_kv_tensors_dict.pop(layer_id)
+                gc.collect()
+                torch.cuda.empty_cache()  # Free GPU memory occupied by received kv tensor before binding, to make room for new cache if needed
             torch.cuda.synchronize()
+            memory_snapshot(f"rank{self.rank}_after_bind_all_kv_caches_from_rank{from_rank}", self.device)
             logger.info(f"[timeline]: bind kv cache time taken: {human_readable_duration(time.time() - time_start_bind_kv_cache)}")
             
             logger.info(f"[operation]: start to listen to kv cache patches")
@@ -1498,6 +1736,17 @@ class DynamicGPUWorker(Worker):
                 with self._receive_finished_cv:
                     self.receive_in_process = False
                     self._receive_finished_cv.notify_all()
+                
+                # Check GPU memory after sync migration to detect memory leaks
+                if isinstance(self.model_runner.model, DynamicModelBase):
+                    start_layer = self.model_runner.model.model.start_layer
+                    end_layer = self.model_runner.model.model.end_layer
+                    memory_monitor = get_gpu_memory_monitor()
+                    memory_monitor.check_memory_after_migration_local(
+                        start_layer, end_layer, self.rank, self.device,
+                        migration_type="sync"
+                    )
+                
                 logger.info(f"[timeline]: sync migration complete, time taken: {human_readable_duration(time.time() - time_start)}")
                 continue  # Go back to outer loop, ready for next migration
             self.receiver_num_applied_token_dict[from_rank] = tmp_slot_token_num
@@ -1546,6 +1795,17 @@ class DynamicGPUWorker(Worker):
                         self._all_patch_applied_cv.notify_all()
                         logger.info(f"after notify, all applied status: {self.is_all_patch_applied}, applied_token_num: {self.after_migration_applied_token_num}")
                     logger.info(f"[num tokens]: num of applied tokens from rank {from_rank}: {self.receiver_num_applied_token_dict[from_rank]}")
+                    
+                    # Check GPU memory after async migration to detect memory leaks (receiver side)
+                    if isinstance(self.model_runner.model, DynamicModelBase):
+                        start_layer = self.model_runner.model.model.start_layer
+                        end_layer = self.model_runner.model.model.end_layer
+                        memory_monitor = get_gpu_memory_monitor()
+                        memory_monitor.check_memory_after_migration_local(
+                            start_layer, end_layer, self.rank, self.device,
+                            migration_type="async"
+                        )
+                    
                     break # Exit point from current migration listening loop
                 else:
                     assert False, f"Unexpected message type: {meta.type}"
@@ -1610,7 +1870,8 @@ class DynamicGPUWorker(Worker):
 
 
     def async_migration_after_execute_callback(self, scheduler_output: "DynamicSchedulerOutput"):
-        assert isinstance(self.model_runner.model, DynamicModelBase)
+        if not isinstance(self.model_runner.model, DynamicModelBase):
+            return
 
         # target_device = self.device  # set in init_device to cuda:self.local_rank
         # if slot_mapping.device != target_device:
@@ -1686,7 +1947,7 @@ class DynamicGPUWorker(Worker):
                         if fixed_blocks <= 0:
                             self.resize_kv_cache(scheduler_output.new_kv_cache_block_num)
                         else:
-                            logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping worker-side resize (would be {scheduler_output.new_kv_cache_block_num} blocks)")
+                            logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping worker-side resize (would be {scheduler_output.new_kv_cache_block_num} blocks), sleep for 4 seconds")
                         self.finish_migration()
                         self.kv_resizing_done = True
                     finally:
@@ -1712,5 +1973,16 @@ class DynamicGPUWorker(Worker):
             time_start = time.time()
             logger.info(f"[timeline]: commit ptr tables after migration take {human_readable_duration(time.time() - time_start)}")
             logger.info(f"finish_migration: committed ptr_tables for flexi_direct")
+
+        # Check GPU memory after migration to detect memory leaks
+        # Compare with recorded baseline for this configuration
+        if isinstance(self.model_runner.model, DynamicModelBase):
+            start_layer = self.model_runner.model.model.start_layer
+            end_layer = self.model_runner.model.model.end_layer
+            memory_monitor = get_gpu_memory_monitor()
+            memory_monitor.check_memory_after_migration_local(
+                start_layer, end_layer, self.rank, self.device, 
+                migration_type="async"
+            )
 
         # assert self.dynamic_layer_kv_connector.is_all_patch_applied(), "All patch should be applied"

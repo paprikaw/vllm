@@ -19,8 +19,21 @@ This repository is an **extended version of vLLM** that addresses limitations in
 4. If you are going to test a vllm inferencing process without migration, simply set the migration_step higher than the total number of requests, so that no migration will happen.
 5. Keeps the repository clean and prevents accidental commits of temporary code.
 6. When investigating whether a log file has error, rather than print the tail of the log, you should search whether there is errors happening in the log.
-7: When investigating a benchmark file, you should **only** consider it as normal when all the output has <think> as begining and produce full sentence with requred num of tokens.
-8: When running any commands, you should always try to add | head at the end to prevent copilot from interupting your commands.
+7. When investigating a benchmark file, you should **only** consider it as normal when all the output has <think> as begining and produce full sentence with requred num of tokens.
+9. When answering me or when generating a report, use *Chinese*
+10: Whenever you want to run a command, please figure out which node you are going to run, use squeue --me to check the status of the reserved node and its related GPU type.
+10. Every time you checkout a log file, you should not only tell what configuration this log is represent merely by its name, but also explicitly check the benchmark_config.json and constants.json
+
+## 命令执行规则
+
+1. **永远追踪命令**: 执行命令时必须使用 `timeout: 0`，确保完整等待命令执行完成
+2. **禁止擅自后台运行**: 如果认为必须使用 `isBackground: true` 或不追踪命令，**必须先询问用户**
+3. 不要使用&来后台运行任务
+4. 永远不要重启ray cluster，当你觉得需要重启的时候，请你pass给我让我手动进行这个操作。
+5. If you want to compile the vllm, please use the script: /home/bxb1/vllm_workbench/scripts/running_compile_vllm.sh
+6. Anytime you run any experiments or recompile anything, you need to activate /home/bxb1/vllm_workbench/.venv 
+7. Don't recompile anything if you are not changing the C++ code.
+8. If the rank 0 in the config is on remote log, you should ssh to the remote server and run the commands.
 
 ## Development
 ### Code Modification Guidelines
@@ -44,9 +57,7 @@ Python Environment: /data/gpfs/projects/punim2715/vllm_workbench/.venv/bin/pytho
 1. Checking out current gpu cluster status: ```ray status```
 2. running a experiment:
 ```bash
-python3 -m vllm_exp.run \
-  --config /home/bxb1/data/vllm_workbench/vllm/vllm_exp/configs/config.yaml \
-  --log-dir /home/bxb1/data/vllm_workbench/vllm/logs/agent/
+python -m vllm_exp.run sweep-test     --config path/to/configfile  --log-dir new-logs/     --single-server
 ```
 3. using log analysis tools:
 ```bash
@@ -54,13 +65,6 @@ python /home/bxb1/vllm_workbench/vllm/logs/analyze_log_metrics.py "/home/bxb1/vl
 ```
 ### Experiment Guidelines
 1. You should also output the log to a individual log directory such as: /home/bxb1/data/vllm_workbench/vllm/logs/agent/
-2. If you need to run the experiments, you should reference the existing using configuration  migration_test_A100.yaml create and use your own configurations like "vllm_exp/configs/debug_cross_node.yaml vllm_exp/configs/debug_single_node_l40.yaml vllm_exp/configs/debug_single_node.yaml/'"
-3. There are different test types for the experiment, currently, please only use one_off_test as the test type
-4. When `is_migration: false`: Do NOT include `migration_steps` or `alternative_configs`
-5. When `is_migration: true`: Must include `migration_steps` (list of request numbers when migration occurs) and `alternative_configs` (pipeline configurations to switch to). Note: `start_pp_layer_partitions` defines the initial config, while `alternative_configs` defines ONLY the migration target configs (starting from "0" as the first migration target).
-6. When adding new args to config, please use dynamic_config to pass it to vllm and benchmark.
-
-
 
 
 ### Code Architecture

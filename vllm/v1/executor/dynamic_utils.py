@@ -72,17 +72,27 @@ try:
                     else:
                         scheduler_output, intermediate_tensors = scheduler_output, None
 
-                    # DIAG: Log receiver-side consistency check
-                    if intermediate_tensors is not None:
-                        _diag_total = scheduler_output.total_num_scheduled_tokens
-                        _diag_shapes = {k: v.shape for k, v in intermediate_tensors.tensors.items()}
-                        logger.info(f"[DIAG_RECV] rank={self.rpc_rank} "
-                                   f"sched_total_tokens={_diag_total} "
-                                   f"tensor_shapes={_diag_shapes} "
-                                   f"pp_layer_config={scheduler_output.pp_layer_config}")
-                        if any(v.shape[0] != _diag_total for v in intermediate_tensors.tensors.values()):
-                            logger.error(f"[DIAG_RECV] MISMATCH DETECTED at receiver! "
-                                        f"sched_total={_diag_total} but tensor dim0={[v.shape[0] for v in intermediate_tensors.tensors.values()]}")
+                    # DIAG: Log receiver-side consistency check with NaN detection
+                    # if intermediate_tensors is not None:
+                        # _diag_total = scheduler_output.total_num_scheduled_tokens
+                        # _diag_shapes = {k: v.shape for k, v in intermediate_tensors.tensors.items()}
+                        # # Check for NaN in received tensors
+                        # _recv_nan_info = {}
+                        # for k, v in intermediate_tensors.tensors.items():
+                        #     _has_nan = torch.isnan(v).any().item()
+                        #     _nan_count = torch.isnan(v).sum().item() if _has_nan else 0
+                        #     _recv_nan_info[k] = {"has_nan": _has_nan, "nan_count": _nan_count}
+                        #     if _has_nan:
+                        #         logger.error(f"[DIAG_RECV_NAN] rank={self.rpc_rank} "
+                        #                    f"tensor '{k}' has {_nan_count} NaN values! "
+                        #                    f"shape={v.shape} dtype={v.dtype}")
+                        # logger.info(f"[DIAG_RECV] rank={self.rpc_rank} "
+                        #            f"sched_total_tokens={_diag_total} "
+                        #            f"tensor_shapes={_diag_shapes} "
+                        #            f"pp_layer_config={scheduler_output.pp_layer_config}")
+                        # if any(v.shape[0] != _diag_total for v in intermediate_tensors.tensors.values()):
+                        #     logger.error(f"[DIAG_RECV] MISMATCH DETECTED at receiver! "
+                        #                 f"sched_total={_diag_total} but tensor dim0={[v.shape[0] for v in intermediate_tensors.tensors.values()]}")
 
                     # DEBUG: Generate unique step_id for cross-rank tracking
                     # Use sorted req_ids to ensure deterministic step_id
@@ -144,16 +154,26 @@ try:
                     # 在发送给下游前，打包时间戳
                     if isinstance(output, IntermediateTensors):
                         send_time = time.time()  # 记录发送时间
-                        # DIAG: Log sender-side consistency check
-                        _diag_total = scheduler_output.total_num_scheduled_tokens
-                        _diag_shapes = {k: v.shape for k, v in output.tensors.items()}
-                        logger.info(f"[DIAG_SEND] rank={self.rpc_rank} "
-                                   f"sched_total_tokens={_diag_total} "
-                                   f"tensor_shapes={_diag_shapes} "
-                                   f"pp_layer_config={scheduler_output.pp_layer_config}")
-                        if any(v.shape[0] != _diag_total for v in output.tensors.values()):
-                            logger.error(f"[DIAG_SEND] MISMATCH DETECTED at sender! "
-                                        f"sched_total={_diag_total} but tensor dim0={[v.shape[0] for v in output.tensors.values()]}")
+                        # _diag_total = scheduler_output.total_num_scheduled_tokens
+                        # _diag_shapes = {k: v.shape for k, v in output.tensors.items()}
+                        # # Check for NaN in tensors being sent
+                        # _send_nan_info = {}
+                        # for k, v in output.tensors.items():
+                        #     _has_nan = torch.isnan(v).any().item()
+                        #     _nan_count = torch.isnan(v).sum().item() if _has_nan else 0
+                        #     _send_nan_info[k] = {"has_nan": _has_nan, "nan_count": _nan_count}
+                        #     if _has_nan:
+                        #         logger.error(f"[DIAG_SEND_NAN] rank={self.rpc_rank} "
+                        #                    f"Sending tensor '{k}' with {_nan_count} NaN values! "
+                        #                    f"shape={v.shape} dtype={v.dtype}")
+                        # logger.info(f"[DIAG_SEND] rank={self.rpc_rank} "
+                        #            f"sched_total_tokens={_diag_total} "
+                        #            f"tensor_shapes={_diag_shapes} "
+                        #            f"nan_check={_send_nan_info} "
+                        #            f"pp_layer_config={scheduler_output.pp_layer_config}")
+                        # if any(v.shape[0] != _diag_total for v in output.tensors.values()):
+                        #     logger.error(f"[DIAG_SEND] MISMATCH DETECTED at sender! "
+                        #                 f"sched_total={_diag_total} but tensor dim0={[v.shape[0] for v in output.tensors.values()]}")
                         output = (scheduler_output, output, send_time)
 
                     if upstream_send_time is not None:

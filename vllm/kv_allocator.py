@@ -225,4 +225,30 @@ class KVAllocator():
             stream_ptr = current_stream.cuda_stream
         _cpp_module.free_page_list(ptrs, device_id, stream_ptr)
 
+    def trim_memory_pool(
+        self,
+        device: torch.device,
+        min_bytes_to_keep: int = 0
+    ) -> None:
+        """
+        Trim CUDA memory pool to release retained memory back to OS.
+
+        cudaMallocAsync uses a memory pool that retains freed memory for
+        future allocations. This function forces the pool to release
+        retained memory back to the operating system.
+
+        Args:
+            device: CUDA device
+            min_bytes_to_keep: Minimum bytes the pool should keep (default 0 = release all)
+
+        Raises:
+            RuntimeError: If kv_cache_allocator extension is not available
+        """
+        if not kv_allocator_available:
+            logger.warning("kv_cache_allocator extension not available, cannot trim memory pool")
+            return
+
+        device_id = device.index
+        _cpp_module.trim_memory_pool(device_id, min_bytes_to_keep)
+
 kv_allocator = KVAllocator()

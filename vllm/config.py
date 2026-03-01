@@ -1388,7 +1388,7 @@ class ModelConfig:
         return getattr(self.hf_config, "matryoshka_dimensions", None)
 
 
-BlockSize = Literal[1, 8, 16, 32, 64, 128]
+BlockSize = Literal[1, 8, 16, 32, 64, 128, 256, 512]
 CacheDType = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]
 PrefixCachingHashAlgo = Literal["builtin", "sha256"]
 
@@ -1400,8 +1400,11 @@ class CacheConfig:
 
     block_size: BlockSize = None  # type: ignore
     """Size of a contiguous cache block in number of tokens. This is ignored on
-    neuron devices and set to `--max-model-len`. On CUDA devices, only block
-    sizes up to 32 are supported. On HPU devices, block size defaults to 128.
+    neuron devices and set to `--max-model-len`. On CUDA devices using V0 engine,
+    only block sizes up to 32 are supported (limited by paged_attention kernel).
+    On V1 engine with FlashAttention/FlashInfer backend, block sizes up to 512
+    are supported (must be a multiple of 16). On HPU devices, block size defaults
+    to 128.
 
     This config has no static default. If left unspecified by the user, it will
     be set in `Platform.check_and_update_configs()` based on the current

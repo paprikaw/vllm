@@ -33,11 +33,30 @@ def sparse_cutlass_supported() -> bool:
 
 
 def cutlass_fp8_supported() -> bool:
+    """Check if cutlass FP8 is supported and working correctly.
+    
+    Note: cutlass FP8 produces incorrect results (zeros/NaN) on Ada architecture
+    (L40s, RTX 4090, etc. - compute capability 8.9). This is likely due to a bug
+    in the cutlass implementation or incorrect scale handling for per-channel weights.
+    torch._scaled_mm works correctly on these GPUs, so we disable cutlass for Ada.
+    """
+    import os
+    if os.environ.get("VLLM_DISABLE_CUTLASS_FP8", "0") == "1":
+        return False
+    
     if not current_platform.is_cuda():
         return False
 
     capability_tuple = current_platform.get_device_capability()
-    capability = -1 if capability_tuple is None else capability_tuple.to_int()
+    if capability_tuple is None:
+        return False
+    
+    capability = capability_tuple.to_int()
+    
+    # Disable cutlass on Ada architecture (8.9) due to incorrect results
+    # TODO: Investigate root cause - likely related to per-channel weight scales
+    if capability == 89:
+        return False
 
     return ops.cutlass_scaled_mm_supports_fp8(capability)
 
@@ -137,7 +156,6 @@ def cutlass_w8a8_scaled_mm(*, qinput: torch.Tensor, weight: torch.Tensor,
                            out_dtype: torch.dtype, scale_a: torch.Tensor,
                            scale_b: torch.Tensor, bias: torch.Tensor,
                            output_shape: list, **kwargs) -> torch.Tensor:
-
     # Fused GEMM_DQ
     output = ops.cutlass_scaled_mm(qinput,
                                    weight,
@@ -145,6 +163,7 @@ def cutlass_w8a8_scaled_mm(*, qinput: torch.Tensor, weight: torch.Tensor,
                                    scale_a=scale_a,
                                    scale_b=scale_b,
                                    bias=bias)
+    
     return output.view(*output_shape)
 
 

@@ -637,6 +637,9 @@ def _extract_timestamp_metrics_by_time_range(
 def _get_time_range_from_request_metrics(request_metrics_path: Path) -> tuple[Optional[float], Optional[float]]:
     """Get the time range of an experiment from its request_metrics.csv.
     
+    The start time is the earliest request send time (timestamp column).
+    The end time is the latest request completion time (timestamp + e2el).
+    
     Args:
         request_metrics_path: Path to the request_metrics.csv file
     
@@ -649,6 +652,10 @@ def _get_time_range_from_request_metrics(request_metrics_path: Path) -> tuple[Op
     start_ts = None
     end_ts = None
     
+    # CSV columns: timestamp, datetime, tpots, ttfts, e2els, repetition
+    # e2els is the end-to-end latency in seconds
+    E2EL_COL_INDEX = 4
+    
     with open(request_metrics_path, "r", newline="", encoding="utf-8", errors="ignore") as f:
         reader = csv.reader(f)
         for row in reader:
@@ -656,10 +663,15 @@ def _get_time_range_from_request_metrics(request_metrics_path: Path) -> tuple[Op
                 continue
             try:
                 ts = float(row[0])
+                # Calculate completion time: send_time + e2el
+                e2el = float(row[E2EL_COL_INDEX]) if len(row) > E2EL_COL_INDEX else 0.0
+                completion_ts = ts + e2el
+                
                 if start_ts is None or ts < start_ts:
                     start_ts = ts
-                if end_ts is None or ts > end_ts:
-                    end_ts = ts
+                # Use completion time for end_ts to capture all generation activity
+                if end_ts is None or completion_ts > end_ts:
+                    end_ts = completion_ts
             except Exception:
                 continue
     
@@ -1216,6 +1228,7 @@ class SweepExperimentSpec:
     vars_mapping: Dict[str, Any]
     experiment_index: int
     total_experiments: int
+    sweep_config_index: int = 0  # Index of the sweep_config block this experiment belongs to
 
 
 # =========================
@@ -1240,10 +1253,11 @@ def generate_experiment_specs(
         SweepExperimentSpec containing specs and metadata for each experiment
     """
     # First pass to count total experiments
-    exp_configs = list(ExperimentConfig.iter_from_sweep_test_config(sweep_test_cfg))
-    total = len(exp_configs)
+    # iter_from_sweep_test_config now returns (sweep_config_index, exp_cfg) tuples
+    exp_configs_with_index = list(ExperimentConfig.iter_from_sweep_test_config(sweep_test_cfg))
+    total = len(exp_configs_with_index)
     
-    for i, exp_cfg in enumerate(exp_configs):
+    for i, (sweep_config_index, exp_cfg) in enumerate(exp_configs_with_index):
         # Get vars_mapping from ExperimentConfig
         vars_mapping = exp_cfg.get_naming_vars()
         
@@ -1316,6 +1330,7 @@ def generate_experiment_specs(
             vars_mapping=vars_mapping,
             experiment_index=i,
             total_experiments=total,
+            sweep_config_index=sweep_config_index,
         )
 
 
@@ -1984,21 +1999,22 @@ def _run_single_experiment_on_running_server(
 
 
 def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
-    """Run sweep test with a single server instance per kernel mode.
+    """Run sweep test with a single server instance per sweep_config block.
     
     Unlike sweep_test which starts/stops the server for each experiment,
-    this function starts the server once per kernel mode and switches PP 
-    configurations between experiments using the set_pp_config API.
+    this function starts the server once per sweep_config block (each - vllm:
+    entry in sweep_configs list) and switches PP configurations between 
+    experiments within that block using the set_pp_config API.
     
-    IMPORTANT: Switching between kernel modes requires a server
-    restart. This function ensures attention_kernel is the outermost
-    loop, and restarts the server when kernel mode changes.
+    IMPORTANT: Different sweep_config blocks (different - vllm: entries in 
+    sweep_configs) will cause a server restart to ensure complete isolation
+    between different experiment configurations.
     
     This provides:
-    1. Faster experiment iteration (no server restart overhead within same flexi mode)
-    2. Separate log files for each experiment via DynamicLogRedirector
-    3. Dynamic PP config switching via set_pp_config API
-    4. Automatic server restart when flexi mode changes
+    1. Complete isolation between different sweep_config blocks (server restart)
+    2. Faster experiment iteration within the same sweep_config block
+    3. Separate log files for each experiment via DynamicLogRedirector
+    4. Dynamic PP config switching via set_pp_config API
     
     If cfg.overwrite is False, experiments that have already completed
     successfully will be skipped.
@@ -2044,45 +2060,47 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
         
         C.print(f"[bold cyan]Starting single-server sweep test with {len(experiments_to_run)} experiments[/]")
         
-        # Group experiments by attention_kernel value
-        # Since we ensured kernel is the outermost loop in iter_from_sweep_test_config,
-        # experiments are already sorted by kernel value. But we group explicitly for clarity.
+        # Group experiments by sweep_config_index to isolate different sweep_configs blocks
+        # Each - vllm: block in sweep_configs gets its own server instance
         from itertools import groupby
         
-        def get_kernel_value(exp: SweepExperimentSpec) -> str:
-            return exp.vllm_spec.attention_kernel
+        def get_sweep_config_index(exp: SweepExperimentSpec) -> int:
+            return exp.sweep_config_index
         
-        # Group experiments by kernel value (maintains order since kernel is outermost loop)
-        kernel_groups = []
-        for kernel_val, group_iter in groupby(experiments_to_run, key=get_kernel_value):
-            kernel_groups.append((kernel_val, list(group_iter)))
+        # Group experiments by sweep_config_index (maintains order since sweep_configs are processed sequentially)
+        sweep_config_groups = []
+        for sweep_idx, group_iter in groupby(experiments_to_run, key=get_sweep_config_index):
+            sweep_config_groups.append((sweep_idx, list(group_iter)))
         
-        C.print(f"[bold cyan]Experiments grouped by kernel mode: {[(k, len(g)) for k, g in kernel_groups]}[/]")
+        C.print(f"[bold cyan]Experiments grouped by sweep_config block: {[(idx, len(g)) for idx, g in sweep_config_groups]}[/]")
         
-        # Run experiments group by group, restarting server when kernel mode changes
-        for kernel_val, group_experiments in kernel_groups:
+        # Run experiments group by group, restarting server for each sweep_config block
+        for sweep_idx, group_experiments in sweep_config_groups:
             proc = None
             log_redirector = None
             
             try:
+                # Get kernel value for logging (from first experiment in this group)
+                kernel_val = group_experiments[0].vllm_spec.attention_kernel
+                
                 C.print(f"\n[bold blue]{'='*60}[/]")
-                C.print(f"[bold blue]Starting server with attention_kernel={kernel_val}[/]")
+                C.print(f"[bold blue]Starting server for sweep_config[{sweep_idx}] (kernel={kernel_val})[/]")
                 C.print(f"[bold blue]This group has {len(group_experiments)} experiments[/]")
                 C.print(f"[bold blue]{'='*60}[/]\n")
                 
                 # Get the first experiment in this group to start the server
                 first_exp = group_experiments[0]
                 
-                # Create a global metrics path for the server (per flexi group)
-                kernel_suffix = kernel_val
-                global_metrics_path = logm.get_dir() / f"global_metrics_raw_{kernel_suffix}.csv"
+                # Create a global metrics path for the server (per sweep_config group)
+                group_suffix = f"sweep{sweep_idx}_{kernel_val}"
+                global_metrics_path = logm.get_dir() / f"global_metrics_raw_{group_suffix}.csv"
                 first_exp.vllm_spec.metrics_csv_path = str(global_metrics_path)
                 
                 # Create initial log path (per-experiment)
                 initial_log_path = Path(first_exp.vllm_spec.server_raw_log_path) if first_exp.vllm_spec.server_raw_log_path else None
                 
-                # Create global log path for this kernel group
-                global_log_path = logm.get_dir() / f"server_global_{kernel_suffix}.log"
+                # Create global log path for this sweep_config group
+                global_log_path = logm.get_dir() / f"server_global_{group_suffix}.log"
                 
                 # Start the server for this kernel group
                 proc, log_redirector, metrics_path = start_vllm_single_instance(
@@ -2092,13 +2110,13 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 )
                 
                 # Wait for server to be ready
-                C.print(f"[bold cyan]Waiting for server to be ready (kernel={kernel_val})...[/]")
+                C.print(f"[bold cyan]Waiting for server to be ready (sweep_config[{sweep_idx}], kernel={kernel_val})...[/]")
                 C.print(f"[bold cyan]Monitor server status: tail -f {global_log_path}[/]")
                 if not wait_ready(first_exp.bench_spec.base_url, 300):
-                    C.print(f"[red]ERROR: vLLM server not ready in time (kernel={kernel_val})[/]")
+                    C.print(f"[red]ERROR: vLLM server not ready in time (sweep_config[{sweep_idx}])[/]")
                     continue
                 
-                C.print(f"[green]vLLM server is ready (kernel={kernel_val})[/]")
+                C.print(f"[green]vLLM server is ready (sweep_config[{sweep_idx}], kernel={kernel_val})[/]")
                 
                 # Run each experiment in this kernel group
                 for i, exp in enumerate(group_experiments):
@@ -2106,7 +2124,7 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                     is_first = (i == 0)
                     
                     C.print(f"\n[bold magenta]{'='*60}[/]")
-                    C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)} (kernel={kernel_val})[/]")
+                    C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)} (sweep_config[{sweep_idx}], kernel={kernel_val})[/]")
                     C.print(f"[bold magenta]vars: {exp.vars_mapping}[/]")
                     C.print(f"[bold magenta]PP partition: {exp.vllm_spec.pp_layer_partition}[/]")
                     C.print(f"[bold magenta]{'='*60}[/]\n")
@@ -2128,9 +2146,9 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                         continue
                 
             finally:
-                # Clean up server for this flexi group before starting next group
+                # Clean up server for this sweep_config group before starting next group
                 if proc:
-                    C.print(f"[bold cyan]Stopping vLLM server (kernel={kernel_val})...[/]")
+                    C.print(f"[bold cyan]Stopping vLLM server (sweep_config[{sweep_idx}])...[/]")
                     stop_tree(proc)
                 if log_redirector:
                     log_redirector.close()

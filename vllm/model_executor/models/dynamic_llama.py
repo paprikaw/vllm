@@ -3,6 +3,9 @@
 Extends LlamaForCausalLM / LlamaModel with the same dynamic pipeline
 parallelism pattern used by DynamicQwen3 (add/delete layers, scheduled
 layer execution, fbgate-aware weight loading).
+
+Note: FlexiAttention support is now in LlamaAttention directly (in llama.py),
+so we can use LlamaDecoderLayer without modification.
 """
 from collections.abc import Iterable
 from typing import Optional, Tuple, Union
@@ -21,9 +24,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead)
+from vllm.model_executor.utils import extract_layer_index
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
-from vllm.model_executor.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
 from vllm.v1.utils import human_readable_duration
 
@@ -331,22 +334,45 @@ class DynamicLlamaModel(LlamaModel):
                     self.sched_start_layer, self.sched_end_layer,
                     len(self.layers))
                 fwd_t0 = time.time()
+                
+                # Diagnostic: Track NaN propagation through layers
+                _nan_first_detected_layer = -1
+                
                 for layer_idx, layer in enumerate(
                         self.layers[self.sched_start_layer:
                                     self.sched_end_layer],
                         start=self.sched_start_layer):
                     layer_t0 = time.time()
+                    
+                    # Check input for NaN before layer
+                    input_has_nan = torch.isnan(hidden_states).any().item()
+                    
                     try:
                         hidden_states, residual = layer(
                             positions, hidden_states, residual)
                     except Exception as e:
                         logger.error("Error in layer %d: %s", layer_idx, e)
                         raise
+                    
+                    # # Check output for NaN after layer
+                    # output_has_nan = torch.isnan(hidden_states).any().item()
+                    
+                    # # Log if NaN first appears in this layer
+                    # if output_has_nan and not input_has_nan and _nan_first_detected_layer == -1:
+                    #     _nan_first_detected_layer = layer_idx
+                    #     device = hidden_states.device
+                    #     gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
+                    #     capability = torch.cuda.get_device_capability(device) if device.type == "cuda" else (0, 0)
+                    #     logger.error(f"[LAYER_NAN] NaN FIRST APPEARED in layer {layer_idx}! "
+                    #                 f"device={device} gpu={gpu_name} SM={capability[0]}{capability[1]} "
+                    #                 f"hidden_shape={hidden_states.shape} "
+                    #                 f"nan_count={torch.isnan(hidden_states).sum().item()}")
+                    
                     logger.debug(
                         "Layer %d took %s", layer_idx,
                         human_readable_duration(time.time() - layer_t0))
-                logger.info("forwarding took %s",
-                            human_readable_duration(time.time() - fwd_t0))
+                logger.info("forwarding took long time: %s, calculated token: %d",
+                            human_readable_duration(time.time() - fwd_t0), hidden_states.size(1))
 
                 if not get_pp_group().is_last_rank:
                     return IntermediateTensors({

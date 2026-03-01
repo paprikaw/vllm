@@ -64,6 +64,27 @@ class CustomModelLoader(DefaultModelLoader):
                 for name in f.keys():
                     # Load tensor into memory
                     param = f.get_tensor(name)
+                    # Use madvise to prefetch/populate mmap pages
+                    # This avoids page faults during first migration (2ms->700µs/chunk)
+                    import ctypes
+                    import os
+                    ptr = param.data_ptr()
+                    nbytes = param.numel() * param.element_size()
+                    # Align to page boundary
+                    page_size = 4096
+                    aligned_ptr = ptr & ~(page_size - 1)
+                    aligned_len = nbytes + (ptr - aligned_ptr)
+                    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+                    # MADV_POPULATE_READ = 22 (Linux 5.14+), fallback to MADV_WILLNEED = 3
+                    MADV_POPULATE_READ = 22
+                    MADV_WILLNEED = 3
+                    ret = libc.madvise(ctypes.c_void_p(aligned_ptr), 
+                                       ctypes.c_size_t(aligned_len), 
+                                       MADV_POPULATE_READ)
+                    if ret != 0 and ctypes.get_errno() == 22:  # EINVAL - not supported
+                        libc.madvise(ctypes.c_void_p(aligned_ptr),
+                                     ctypes.c_size_t(aligned_len),
+                                     MADV_WILLNEED)
                     self._preloaded_weights[name] = param
                     total_size += param.numel() * param.element_size()
         
