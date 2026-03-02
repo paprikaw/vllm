@@ -82,14 +82,13 @@ sweep_configs:
       fixed_num_gpu_blocks: [-1] 
       weight_chunk_size_mb: [5]
       migration_approach: [sync]
+      block_size: [512]
     benchmark_config:
-      - num_total_requests: 30  # Small number for quick testing
-        repetition: 1           # Single repetition, 3 migrations
+      - num_total_requests:   # Small number for quick testing
+        repetition: 3           # 3 repetitions to see if leak accumulates
         pp_layer_config:
-          0: "40, 40"           # Initial config
-          10: "25, 55"          # 1st migration: rank0 sends layers 25-39 to rank1
-          20: "40, 40"          # 2nd migration: rank1 sends layers 25-39 back to rank0
-          # Request 30 will trigger the 3rd check when benchmark ends
+          0: "40, 40"           # Single config = no migration, only reset between reps
+          10: "25, 55"           # Single config = no migration, only reset between reps
         requests:
           0:
             request_rate: 2

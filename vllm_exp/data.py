@@ -361,6 +361,8 @@ class SweepVllmParams(BaseModel):
     """List of migration approaches to sweep: 'sync' or 'async'. Determines which migration method to use."""
     fixed_num_gpu_blocks: Optional[List[int]] = None
     """List of fixed KV cache block counts to sweep. -1 means auto. Positive value fixes the block count."""
+    block_size: Optional[List[int]] = None
+    """List of KV cache block sizes to sweep (1, 8, 16, 32, 64, 128, 256, 512). V0 only supports up to 32."""
 
 
 class SweepConfig(BaseModel):
@@ -392,6 +394,7 @@ class SweepConfig(BaseModel):
     # Naming aliases for file naming - only for actual sweep parameters
     NAMING_ALIASES: ClassVar[Dict[str, str]] = {
         "attention_kernel": "kernel",
+        "block_size": "blk",
     }
     
     # Mode 1: Complete benchmark_config list
@@ -433,6 +436,8 @@ class SweepConfig(BaseModel):
                 axes['migration_approach'] = self.vllm.migration_approach
             if self.vllm.fixed_num_gpu_blocks is not None:
                 axes['fixed_num_gpu_blocks'] = self.vllm.fixed_num_gpu_blocks
+            if self.vllm.block_size is not None:
+                axes['block_size'] = self.vllm.block_size
         
         # Mode 1: benchmark_config provided directly in sweep_config
         if self.benchmark_config is not None:
@@ -991,10 +996,11 @@ class ExperimentConfig:
                 weight_chunk_size: Optional[float] = combo_dict.get('weight_chunk_size_mb')
                 mig_approach: Optional[str] = combo_dict.get('migration_approach')
                 fixed_blocks: Optional[int] = combo_dict.get('fixed_num_gpu_blocks')
+                block_sz: Optional[int] = combo_dict.get('block_size')
                 
                 # Create ExperimentConfig from this combination
                 # Yield (sweep_config_index, experiment_config) tuple for server restart isolation
-                yield (sweep_config_index, cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, fixed_blocks))
+                yield (sweep_config_index, cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, fixed_blocks, block_sz))
     
     @classmethod
     def _create_from_combo(
@@ -1005,6 +1011,7 @@ class ExperimentConfig:
         weight_chunk_size_mb: Optional[float] = None,
         migration_approach: Optional[str] = None,
         fixed_num_gpu_blocks: Optional[int] = None,
+        block_size: Optional[int] = None,
     ) -> 'ExperimentConfig':
         """Create a single ExperimentConfig from static config and one sweep combination.
         
@@ -1017,12 +1024,14 @@ class ExperimentConfig:
             weight_chunk_size_mb: Override from sweep axis (if sweeping), otherwise use static
             migration_approach: Override from sweep axis (if sweeping), otherwise use static
             fixed_num_gpu_blocks: Override from sweep axis (if sweeping), otherwise use static
+            block_size: Override from sweep axis (if sweeping), otherwise use static
         """
         # Resolve sweep overrides: sweep values override static values
         kernel = attention_kernel if attention_kernel is not None else static_cfg.vllm.attention_kernel
         chunk_size = weight_chunk_size_mb if weight_chunk_size_mb is not None else static_cfg.vllm.weight_chunk_size_mb
         mig_approach = migration_approach if migration_approach is not None else static_cfg.vllm.migration_approach
         fixed_blocks = fixed_num_gpu_blocks if fixed_num_gpu_blocks is not None else static_cfg.vllm.fixed_num_gpu_blocks
+        blk_size = block_size if block_size is not None else static_cfg.vllm.block_size
         
         # Get initial values from bench_cfg
         sorted_pp_keys = sorted(bench_cfg.pp_layer_config.keys())
@@ -1047,7 +1056,7 @@ class ExperimentConfig:
             gpu_memory_utilization=static_cfg.vllm.gpu_memory_utilization,
             max_model_len=static_cfg.vllm.max_model_len,
             max_num_batched_tokens=static_cfg.vllm.max_num_batched_tokens,
-            block_size=static_cfg.vllm.block_size,
+            block_size=blk_size,
             head_addr=static_cfg.vllm.head_addr,
             port=static_cfg.vllm.port,
             attention_kernel=kernel,
