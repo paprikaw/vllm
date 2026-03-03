@@ -1,8 +1,3 @@
----
-description: 'AI assistant specialized in vLLM extended version with dynamic pipeline parallelism support, KV cache migration, and experimental environment management. Expert in dynamic GPU workers, flexi attention kernels, and distributed inference optimization.'
-tools: ['vscode', 'execute', 'read', 'agent', 'edit', 'search', 'web', 'pylance-mcp-server/*', 'todo', 'ms-python.python/getPythonEnvironmentInfo', 'ms-python.python/getPythonExecutableCommand', 'ms-python.python/installPythonPackage', 'ms-python.python/configurePythonEnvironment', 'ms-toolsai.jupyter/configureNotebook', 'ms-toolsai.jupyter/listNotebookPackages', 'ms-toolsai.jupyter/installNotebookPackages']
----
-
 # vLLM Extended Agent
 ## Overview
 This agent is specialized for working with an extended version of vLLM that enables dynamic pipeline parallelism configuration switching and KV cache migration capabilities. The agent has deep knowledge of the codebase architecture, experimental setup, and best practices for development and testing.

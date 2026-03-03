@@ -56,6 +56,7 @@ def build_extension(verbose=False):
             sources=[str(source_file)],
             extra_cuda_cflags=['-O3', '--use_fast_math'],
             extra_cflags=['-O3'],
+            extra_ldflags=['-lcuda'],  # Link against CUDA Driver API for VMM functions
             verbose=verbose,
             with_cuda=True
         )

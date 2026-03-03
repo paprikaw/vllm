@@ -1,0 +1,50 @@
+# BurstGPT 数据集配置示例
+# BurstGPT 是基于真实 GPT-4 请求的工作负载数据集
+# 包含真实的输入/输出 token 长度分布
+
+project: burstgpt-benchmark-example
+type: sweep_test
+
+static_config:
+  model:
+    path: "/data/gpfs/projects/punim2715/models/Qwen3-32B-AWQ"
+    name: "Qwen3-32B-AWQ"
+
+  vllm:
+    pipeline_parallel_size: 2
+    gpu_memory_utilization: 0.9
+    max_model_len: 8000
+    chunked_prefill: true
+    enable_cuda_graph: false
+    attention_kernel: "flash"
+    head_addr: "localhost"
+    port: 8000
+
+  network:
+    delays: [0]
+
+  benchmark:
+    pattern_batch_size: 150
+    profile: false
+    print_outputs: false
+    benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+    burstiness: 100.0
+    num_total_requests: 200
+    repetition: 1
+    
+    # BurstGPT 数据集配置
+    dataset_name: "burstgpt"
+    dataset_path: "/home/bxb1/data/datasets/BurstGPT_without_fails_2.csv"
+    
+    # 固定 benchmark 配置
+    pp_layer_config:
+      0: "32, 32"
+    requests:
+      0:
+        request_rate: 2.0
+        input_lens: 512  # BurstGPT 会使用数据集中的实际长度
+        output_lens: 256
+
+sweep_config:
+  vllm:
+    attention_kernel: ["flash"]

@@ -896,6 +896,12 @@ def start_benchmark(
 
     benchmark_config_path = os.environ.get("BENCHMARK_CONFIG_PATH")
     assert benchmark_config_path is not None
+    
+    # Get dataset configuration
+    dataset_name = getattr(cfg.benchmark, 'dataset_name', 'pattern')
+    dataset_path = getattr(cfg.benchmark, 'dataset_path', None)
+    sharegpt_output_len = getattr(cfg.benchmark, 'sharegpt_output_len', None)
+    
     bench_args = [
         "python3", cfg.benchmark.benchmark_script_path,
         "--request-rate", str(spec.request_rate),
@@ -903,7 +909,7 @@ def start_benchmark(
         "--model", cfg.model.path,
         "--endpoint", "/v1/chat/completions",
         "--base-url", base_url,
-        "--dataset-name", "pattern",
+        "--dataset-name", dataset_name,
         "--served-model-name", cfg.model.name,
         "--goodput", "tpot:300", "ttft:5000",
         "--temperature", "0",
@@ -911,6 +917,13 @@ def start_benchmark(
         "--pattern-batch-size", str(cfg.benchmark.pattern_batch_size),
         "--benchmark-config", str(benchmark_config_path),
     ]
+    
+    # Add dataset-specific arguments
+    if dataset_path:
+        bench_args.extend(["--dataset-path", dataset_path])
+    if dataset_name == "sharegpt" and sharegpt_output_len is not None:
+        bench_args.extend(["--sharegpt-output-len", str(sharegpt_output_len)])
+    
     C.print(f"start to run benchmark with args: {bench_args}")
     if cfg.benchmark.print_outputs:
         bench_args.append("--print-outputs")
@@ -1321,6 +1334,10 @@ def generate_experiment_specs(
             alternative_configs=exp_cfg.vllm.get_alternative_configs(),
             migration_steps=exp_cfg.vllm.get_migration_steps(),
             migration_mode=exp_cfg.vllm.migration_approach,
+            # Dataset configuration
+            dataset_name=exp_cfg.benchmark.dataset_name,
+            dataset_path=exp_cfg.benchmark.dataset_path,
+            sharegpt_output_len=exp_cfg.benchmark.sharegpt_output_len,
         )
         
         yield SweepExperimentSpec(
@@ -1438,6 +1455,11 @@ def start_benchmark_for_sweep(
         C.print("[red]ERROR[/] vLLM not ready in time")
         return False
     
+    # Get dataset configuration from spec
+    dataset_name = getattr(spec, 'dataset_name', 'pattern')
+    dataset_path = getattr(spec, 'dataset_path', None)
+    sharegpt_output_len = getattr(spec, 'sharegpt_output_len', None)
+    
     bench_args = [
         "python3", spec.benchmark_script_path,
         "--request-rate", "0",  # Use config-based rates
@@ -1445,7 +1467,7 @@ def start_benchmark_for_sweep(
         "--model", spec.model_path,
         "--endpoint", "/v1/chat/completions",
         "--base-url", spec.base_url,
-        "--dataset-name", "pattern",
+        "--dataset-name", dataset_name,
         "--served-model-name", spec.model_name,
         "--goodput", "tpot:300", "ttft:5000",
         "--temperature", "0",
@@ -1453,6 +1475,12 @@ def start_benchmark_for_sweep(
         "--pattern-batch-size", str(spec.pattern_batch_size),
         "--benchmark-config", str(spec.benchmark_config_path),
     ]
+    
+    # Add dataset-specific arguments
+    if dataset_path:
+        bench_args.extend(["--dataset-path", dataset_path])
+    if dataset_name == "sharegpt" and sharegpt_output_len is not None:
+        bench_args.extend(["--sharegpt-output-len", str(sharegpt_output_len)])
     
     if spec.print_outputs:
         bench_args.append("--print-outputs")
@@ -2060,49 +2088,59 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
         
         C.print(f"[bold cyan]Starting single-server sweep test with {len(experiments_to_run)} experiments[/]")
         
-        # Group experiments by sweep_config_index to isolate different sweep_configs blocks
-        # Each - vllm: block in sweep_configs gets its own server instance
+        # Group experiments by parameters that require server restart:
+        # - sweep_config_index (each - vllm: block gets its own server)
+        # - attention_kernel (switching kernel requires restart)
+        # - block_size (changing KV cache block size requires restart)
         from itertools import groupby
         
-        def get_sweep_config_index(exp: SweepExperimentSpec) -> int:
-            return exp.sweep_config_index
+        def get_server_group_key(exp: SweepExperimentSpec) -> tuple:
+            """Return a tuple of parameters that require server restart when changed."""
+            return (
+                exp.sweep_config_index,
+                exp.vllm_spec.attention_kernel,
+                exp.vllm_spec.block_size,
+            )
         
-        # Group experiments by sweep_config_index (maintains order since sweep_configs are processed sequentially)
-        sweep_config_groups = []
-        for sweep_idx, group_iter in groupby(experiments_to_run, key=get_sweep_config_index):
-            sweep_config_groups.append((sweep_idx, list(group_iter)))
+        # Group experiments by server restart parameters
+        # Experiments are already ordered with restart-requiring params in outermost loops
+        server_groups = []
+        for group_key, group_iter in groupby(experiments_to_run, key=get_server_group_key):
+            server_groups.append((group_key, list(group_iter)))
         
-        C.print(f"[bold cyan]Experiments grouped by sweep_config block: {[(idx, len(g)) for idx, g in sweep_config_groups]}[/]")
+        C.print(f"[bold cyan]Experiments grouped by server config: {len(server_groups)} groups[/]")
+        for group_key, group_exps in server_groups:
+            sweep_idx, kernel, blk_size = group_key
+            C.print(f"  sweep[{sweep_idx}] kernel={kernel} block_size={blk_size}: {len(group_exps)} experiments")
         
-        # Run experiments group by group, restarting server for each sweep_config block
-        for sweep_idx, group_experiments in sweep_config_groups:
+        # Run experiments group by group, restarting server for each group
+        for group_key, group_experiments in server_groups:
+            sweep_idx, kernel_val, block_size_val = group_key
             proc = None
             log_redirector = None
             
             try:
-                # Get kernel value for logging (from first experiment in this group)
-                kernel_val = group_experiments[0].vllm_spec.attention_kernel
-                
                 C.print(f"\n[bold blue]{'='*60}[/]")
-                C.print(f"[bold blue]Starting server for sweep_config[{sweep_idx}] (kernel={kernel_val})[/]")
+                C.print(f"[bold blue]Starting server for sweep[{sweep_idx}] kernel={kernel_val} block_size={block_size_val}[/]")
                 C.print(f"[bold blue]This group has {len(group_experiments)} experiments[/]")
                 C.print(f"[bold blue]{'='*60}[/]\n")
                 
                 # Get the first experiment in this group to start the server
                 first_exp = group_experiments[0]
                 
-                # Create a global metrics path for the server (per sweep_config group)
-                group_suffix = f"sweep{sweep_idx}_{kernel_val}"
+                # Create a global metrics path for the server (per server group)
+                blk_str = f"_blk{block_size_val}" if block_size_val else ""
+                group_suffix = f"sweep{sweep_idx}_{kernel_val}{blk_str}"
                 global_metrics_path = logm.get_dir() / f"global_metrics_raw_{group_suffix}.csv"
                 first_exp.vllm_spec.metrics_csv_path = str(global_metrics_path)
                 
                 # Create initial log path (per-experiment)
                 initial_log_path = Path(first_exp.vllm_spec.server_raw_log_path) if first_exp.vllm_spec.server_raw_log_path else None
                 
-                # Create global log path for this sweep_config group
+                # Create global log path for this server group
                 global_log_path = logm.get_dir() / f"server_global_{group_suffix}.log"
                 
-                # Start the server for this kernel group
+                # Start the server for this group
                 proc, log_redirector, metrics_path = start_vllm_single_instance(
                     first_exp.vllm_spec,
                     initial_log_path=initial_log_path,
@@ -2110,21 +2148,21 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 )
                 
                 # Wait for server to be ready
-                C.print(f"[bold cyan]Waiting for server to be ready (sweep_config[{sweep_idx}], kernel={kernel_val})...[/]")
+                C.print(f"[bold cyan]Waiting for server to be ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val})...[/]")
                 C.print(f"[bold cyan]Monitor server status: tail -f {global_log_path}[/]")
                 if not wait_ready(first_exp.bench_spec.base_url, 300):
-                    C.print(f"[red]ERROR: vLLM server not ready in time (sweep_config[{sweep_idx}])[/]")
+                    C.print(f"[red]ERROR: vLLM server not ready in time (sweep[{sweep_idx}])[/]")
                     continue
                 
-                C.print(f"[green]vLLM server is ready (sweep_config[{sweep_idx}], kernel={kernel_val})[/]")
+                C.print(f"[green]vLLM server is ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val})[/]")
                 
-                # Run each experiment in this kernel group
+                # Run each experiment in this server group
                 for i, exp in enumerate(group_experiments):
                     experiment_count += 1
                     is_first = (i == 0)
                     
                     C.print(f"\n[bold magenta]{'='*60}[/]")
-                    C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)} (sweep_config[{sweep_idx}], kernel={kernel_val})[/]")
+                    C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)} (sweep[{sweep_idx}], kernel={kernel_val}, blk={block_size_val})[/]")
                     C.print(f"[bold magenta]vars: {exp.vars_mapping}[/]")
                     C.print(f"[bold magenta]PP partition: {exp.vllm_spec.pp_layer_partition}[/]")
                     C.print(f"[bold magenta]{'='*60}[/]\n")

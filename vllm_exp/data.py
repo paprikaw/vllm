@@ -123,6 +123,8 @@ class WarmupBenchCfg(BaseModel):
         return v
 
 class BenchCfg(BaseModel):
+    num_total_requests: Optional[int] = None
+    """Total number of requests to sample from dataset. Used by sharegpt/burstgpt datasets."""
     running_num_requests: list[int] = []
     data_num_requests: list[int] = []
     pattern_batch_size: int = 150
@@ -137,6 +139,15 @@ class BenchCfg(BaseModel):
     # Burstiness factor for request generation (default 1.0 = Poisson process)
     # Higher values (e.g., 100) result in more uniform/constant request rate
     burstiness: float = 100.0
+    # Dataset configuration
+    dataset_name: str = "pattern"
+    """Dataset type: 'pattern' (default), 'sharegpt', 'burstgpt', 'random', 'sonnet'."""
+    dataset_path: Optional[str] = None
+    """Path to dataset file. Required for: sharegpt (JSON), burstgpt (CSV), sonnet (TXT).
+    Default paths: ShareGPT=/home/bxb1/data/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+                   BurstGPT=/home/bxb1/data/datasets/BurstGPT_without_fails_2.csv"""
+    sharegpt_output_len: Optional[int] = None
+    """Output length for ShareGPT dataset. If None, uses actual completion length."""
     # Optional metrics output path when running via vllm_exp
     metrics_file_name: Optional[str] = None
     # Number of times to repeat the benchmark (default 1 = single run)
@@ -583,6 +594,15 @@ class StaticBenchCfg(BaseModel):
     benchmark_script_path: str = "/root/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     burstiness: float = 100.0
     warmup: Optional[WarmupBenchCfg] = None
+    # Dataset configuration
+    dataset_name: str = "pattern"
+    """Dataset type: 'pattern' (default), 'sharegpt', 'burstgpt', 'random', 'sonnet'."""
+    dataset_path: Optional[str] = None
+    """Path to dataset file. Required for: sharegpt (JSON), burstgpt (CSV), sonnet (TXT).
+    Default paths: ShareGPT=/home/bxb1/data/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+                   BurstGPT=/home/bxb1/data/datasets/BurstGPT_without_fails_2.csv"""
+    sharegpt_output_len: Optional[int] = None
+    """Output length for ShareGPT dataset. If None, uses actual completion length."""
     
     # Shared parameters for parameter-sweep mode
     num_total_requests: int = 100
@@ -874,6 +894,13 @@ class ExpBenchmarkConfig:
     profile: bool = False
     benchmark_script_path: str = ""
     warmup: Optional[WarmupBenchCfg] = None
+    # Dataset configuration
+    dataset_name: str = "pattern"
+    """Dataset type: 'pattern' (default), 'sharegpt', 'burstgpt', 'random', 'sonnet'."""
+    dataset_path: Optional[str] = None
+    """Path to dataset file. Required for: sharegpt (JSON), burstgpt (CSV), sonnet (TXT)."""
+    sharegpt_output_len: Optional[int] = None
+    """Output length for ShareGPT dataset. If None, uses actual completion length."""
 
 
 @dataclass
@@ -902,6 +929,7 @@ class ExperimentConfig:
         "repetition": "rep",
         "weight_chunk_size_mb": "chunk",
         "migration_approach": "mig_mode",
+        "block_size": "blk",
     }
     
     model: ExpModelConfig
@@ -923,6 +951,8 @@ class ExperimentConfig:
         }
         vars_dict["chunk"] = self.vllm.weight_chunk_size_mb
         vars_dict["mig_mode"] = self.vllm.migration_approach
+        if self.vllm.block_size is not None:
+            vars_dict["blk"] = self.vllm.block_size
         if self.vllm.fixed_num_gpu_blocks != -1:
             vars_dict["fixed_blocks"] = self.vllm.fixed_num_gpu_blocks
         return vars_dict
@@ -974,15 +1004,19 @@ class ExperimentConfig:
                 continue
             
             # Build Cartesian product of all sweep axes
-            # IMPORTANT: Ensure attention_kernel is the OUTERMOST loop
-            # because switching kernel mode requires server restart.
-            # We reorder axes so that 'attention_kernel' comes first if present.
+            # IMPORTANT: Ensure parameters requiring server restart are OUTERMOST loops
+            # because switching these requires server restart.
+            # Parameters requiring restart: attention_kernel, block_size
+            # We reorder axes so that restart-requiring params come first.
             axis_names = list(sweep_axes.keys())
             
-            # Reorder: put attention_kernel first (outermost loop)
-            if 'attention_kernel' in axis_names:
-                axis_names.remove('attention_kernel')
-                axis_names.insert(0, 'attention_kernel')
+            # Reorder: put restart-requiring params first (outermost loops)
+            # Order: block_size -> attention_kernel (block_size outermost)
+            restart_params = ['block_size', 'attention_kernel']
+            for param in restart_params:
+                if param in axis_names:
+                    axis_names.remove(param)
+                    axis_names.insert(0, param)
             
             axis_values = [sweep_axes[name] for name in axis_names]
             
@@ -1084,6 +1118,9 @@ class ExperimentConfig:
             profile=static_cfg.benchmark.profile,
             benchmark_script_path=static_cfg.benchmark.benchmark_script_path,
             warmup=static_cfg.benchmark.warmup,
+            dataset_name=static_cfg.benchmark.dataset_name,
+            dataset_path=static_cfg.benchmark.dataset_path,
+            sharegpt_output_len=static_cfg.benchmark.sharegpt_output_len,
         )
         
         return cls(
@@ -1244,6 +1281,14 @@ class BenchmarkSpec:
     
     # Optional warmup
     warmup: Optional[WarmupBenchCfg] = None
+    
+    # Dataset configuration
+    dataset_name: str = "pattern"
+    """Dataset type: 'pattern' (default), 'sharegpt', 'burstgpt', 'random', 'sonnet'."""
+    dataset_path: Optional[str] = None
+    """Path to dataset file. Required for: sharegpt (JSON), burstgpt (CSV), sonnet (TXT)."""
+    sharegpt_output_len: Optional[int] = None
+    """Output length for ShareGPT dataset. If None, uses actual completion length."""
 
     def build_benchmark_config(self) -> Dict[str, Any]:
         """Assemble benchmark config payload to be written to disk."""

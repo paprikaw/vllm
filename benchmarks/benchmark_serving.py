@@ -1627,20 +1627,26 @@ def main(args: argparse.Namespace):
             )
     else:
         # For datasets that follow a similar structure, use a mapping.
+        # Use benchmark_config.num_total_requests if available, otherwise fall back to args.num_prompts
+        num_requests = args.num_prompts
+        if benchmark_config is not None and getattr(benchmark_config, 'num_total_requests', None) is not None:
+            num_requests = benchmark_config.num_total_requests
+            print(f"Using num_requests from benchmark_config: {num_requests}")
+        
         dataset_mapping = {
             "sharegpt": lambda: ShareGPTDataset(
                 random_seed=args.seed, dataset_path=args.dataset_path
             ).sample(
                 tokenizer=tokenizer,
-                num_requests=args.num_prompts,
+                num_requests=num_requests,
                 output_len=args.sharegpt_output_len,
             ),
             "burstgpt": lambda: BurstGPTDataset(
                 random_seed=args.seed, dataset_path=args.dataset_path
-            ).sample(tokenizer=tokenizer, num_requests=args.num_prompts),
+            ).sample(tokenizer=tokenizer, num_requests=num_requests),
             "random": lambda: RandomDataset(dataset_path=args.dataset_path).sample(
                 tokenizer=tokenizer,
-                num_requests=args.num_prompts,
+                num_requests=num_requests,
                 prefix_len=args.random_prefix_len,
                 input_len=args.random_input_len,
                 output_len=args.random_output_len,

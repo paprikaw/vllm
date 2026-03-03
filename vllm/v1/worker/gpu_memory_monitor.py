@@ -56,15 +56,6 @@ def memory_snapshot(tag: str, device: Optional[torch.device] = None) -> Dict[str
     
     torch.cuda.synchronize()
     
-    # Trim CUDA memory pool to release retained memory before measuring
-    # This ensures cudaMemGetInfo reflects true free memory
-    try:
-        from vllm.kv_allocator import kv_allocator
-        if device is not None:
-            kv_allocator.trim_memory_pool(device)
-    except Exception as e:
-        logger.debug(f"Could not trim memory pool: {e}")
-    
     free_mem, total_mem = torch.cuda.mem_get_info()
     allocated = torch.cuda.memory_allocated()
     reserved = torch.cuda.memory_reserved()
@@ -135,15 +126,6 @@ class MemoryCheckpointTracker:
         
         torch.cuda.synchronize()
         gc_and_empty_cache()
-        
-        # Trim CUDA memory pool to release retained memory before measuring
-        # This ensures cudaMemGetInfo reflects true free memory
-        try:
-            from vllm.kv_allocator import kv_allocator
-            if self.device is not None:
-                kv_allocator.trim_memory_pool(self.device)
-        except Exception as e:
-            logger.debug(f"Could not trim memory pool: {e}")
         
         free_mem, total_mem = torch.cuda.mem_get_info()
         allocated = torch.cuda.memory_allocated()

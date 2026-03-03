@@ -320,6 +320,11 @@ class DynamicGPUWorker(Worker):
                                                         self.model_runner.key_cache_ptrs
                         self.model_runner.value_cache_ptrs = [0] * left_added_layer_num + \
                                                         self.model_runner.value_cache_ptrs
+                        # Pad key_handles and value_handles for VMM mode
+                        self.model_runner.key_handles = [[] for _ in range(left_added_layer_num)] + \
+                                                        self.model_runner.key_handles
+                        self.model_runner.value_handles = [[] for _ in range(left_added_layer_num)] + \
+                                                        self.model_runner.value_handles
                         # Pad k_ptr_tensors and v_ptr_tensors with empty tensors (direct mode only)
                         if self.vllm_config.dynamic_config.use_direct_ptr:
                             empty_tensor = torch.tensor([], dtype=torch.uint64, device=self.device)
@@ -344,6 +349,9 @@ class DynamicGPUWorker(Worker):
                         self.model_runner.value_caches.extend([[] for _ in range(pad_right)])
                         self.model_runner.key_cache_ptrs.extend([0] * pad_right)
                         self.model_runner.value_cache_ptrs.extend([0] * pad_right)
+                        # Pad key_handles and value_handles for VMM mode
+                        self.model_runner.key_handles.extend([[] for _ in range(pad_right)])
+                        self.model_runner.value_handles.extend([[] for _ in range(pad_right)])
                         # Pad k_ptr_tensors and v_ptr_tensors with empty tensors (direct mode only)
                         if self.vllm_config.dynamic_config.use_direct_ptr:
                             empty_tensor = torch.tensor([], dtype=torch.uint64, device=self.device)
@@ -637,39 +645,46 @@ class DynamicGPUWorker(Worker):
         logger.info(f"Remove Model Layers: {layer_list}")
         assert self.device is not None
         
-        # Calculate expected memory change for removing layers
-        num_removed_layers = sum([layer[1] - layer[0] + 1 for layer in layer_list])
-        assert isinstance(self.model_runner.model, DynamicModelBase)
-        weight_size_per_layer_gb = self.model_runner.model.get_layer_weight_size() / (1024**3)
-        expected_weight_delta_gb = weight_size_per_layer_gb * num_removed_layers  # Positive = more free mem
+        # # Calculate expected memory change for removing layers
+        # num_removed_layers = sum([layer[1] - layer[0] + 1 for layer in layer_list])
+        # assert isinstance(self.model_runner.model, DynamicModelBase)
+        # weight_size_per_layer_gb = self.model_runner.model.get_layer_weight_size() / (1024**3)
+        # expected_weight_delta_gb = weight_size_per_layer_gb * num_removed_layers  # Positive = more free mem
         
-        # Memory checkpoint: track expected weight removal impact
-        tracker = get_checkpoint_tracker(self.rank, self.device)
-        before_idx = tracker.checkpoint_before(
-            tag=f"remove_layers_{layer_list}",
-            operation="remove_layers",
-            expected_delta_gb=expected_weight_delta_gb,
-            details={
-                'num_layers': num_removed_layers, 
-                'weight_per_layer_gb': weight_size_per_layer_gb,
-                'layer_list': layer_list
-            }
-        )
+        # # Memory checkpoint: track expected weight removal impact
+        # tracker = get_checkpoint_tracker(self.rank, self.device)
+        # before_idx = tracker.checkpoint_before(
+        #     tag=f"remove_layers_{layer_list}",
+        #     operation="remove_layers",
+        #     expected_delta_gb=expected_weight_delta_gb,
+        #     details={
+        #         'num_layers': num_removed_layers, 
+        #         'weight_per_layer_gb': weight_size_per_layer_gb,
+        #         'layer_list': layer_list
+        #     }
+        # )
         
         self.model_runner.remove_layers(layer_list, self.device)
         
-        # Verify memory change after removing layers (weights should be freed)
-        tracker.checkpoint_after(
-            tag=f"remove_layers_{layer_list}_done",
-            operation="remove_layers",
-            before_idx=before_idx,
-            expected_delta_gb=expected_weight_delta_gb
-        )
+        # # Verify memory change after removing layers (weights should be freed)
+        # tracker.checkpoint_after(
+        #     tag=f"remove_layers_{layer_list}_done",
+        #     operation="remove_layers",
+        #     before_idx=before_idx,
+        #     expected_delta_gb=expected_weight_delta_gb
+        # )
 
-    def atomic_shelve_kv_cache(self, rank: int, layers_list: list[Tuple[int, int]]) ->Tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    def atomic_shelve_kv_cache(self, rank: int, layers_list: list[Tuple[int, int]]) ->Tuple[list[list[int]], list[list[int]], list[int], list[int], list[list[int]], list[list[int]]]:
+        """
+        Atomically shelve KV cache for specified layers.
+        
+        Returns:
+            Tuple of (caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value,
+                      handles_to_free_key, handles_to_free_value)
+        """
         if self.rank != rank:
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip releasing kv cache for layers")
-            return [], [], [], []
+            return [], [], [], [], [], []
         # self.model_runner.release_kv_cache_for_layers(layers_list)
         from vllm.config import get_current_vllm_config
         vllm_config = get_current_vllm_config()
@@ -677,16 +692,27 @@ class DynamicGPUWorker(Worker):
         start_layer = self.model_runner.model.model.start_layer
         free_before, total = torch.cuda.mem_get_info()
         logger.info(f"before release_kv_cache_for_layers: free={free_before / 1024 ** 3:.2f} GB, total={total / 1024 ** 3:.2f} GB")
-        caches_to_free_key = []
-        caches_to_free_value = []
-        ptrs_to_free_key = []
-        ptrs_to_free_value = []
+        caches_to_free_key: list[list[int]] = []
+        caches_to_free_value: list[list[int]] = []
+        ptrs_to_free_key: list[int] = []
+        ptrs_to_free_value: list[int] = []
+        handles_to_free_key: list[list[int]] = []
+        handles_to_free_value: list[list[int]] = []
         if is_flexi:
-            # Collect the key/value caches and ptrs to be freed BEFORE removing from lists
+            # Collect the key/value caches, ptrs, and handles to be freed BEFORE removing from lists
             for idx, (key_cache, value_cache) in enumerate(zip(self.model_runner.key_caches, self.model_runner.value_caches)):
                 if any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list):
                     caches_to_free_key.append(key_cache)
                     caches_to_free_value.append(value_cache)
+                    # Also collect VMM handles if available
+                    if self.model_runner.key_handles and idx < len(self.model_runner.key_handles):
+                        handles_to_free_key.append(self.model_runner.key_handles[idx])
+                    else:
+                        handles_to_free_key.append([])
+                    if self.model_runner.value_handles and idx < len(self.model_runner.value_handles):
+                        handles_to_free_value.append(self.model_runner.value_handles[idx])
+                    else:
+                        handles_to_free_value.append([])
             for idx, (k_ptr, v_ptr) in enumerate(zip(self.model_runner.key_cache_ptrs, self.model_runner.value_cache_ptrs)):
                 if any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list):
                     ptrs_to_free_key.append(k_ptr)
@@ -717,10 +743,19 @@ class DynamicGPUWorker(Worker):
                 if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
             ]
         logger.info(f"after atomic shelve kv cache for layers, kv ptr tensor:{self.model_runner.k_ptr_tensors}, {self.model_runner.v_ptr_tensors}")
-        return caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value
+        return caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value
 
 
-    def release_kv_cache_for_layers(self, rank: int,  caches_to_free_key: list[torch.Tensor], caches_to_free_value: list[torch.Tensor], ptrs_to_free_key: list[torch.Tensor], ptrs_to_free_value: list[torch.Tensor]) -> None:
+    def release_kv_cache_for_layers(
+        self, 
+        rank: int,  
+        caches_to_free_key: list[list[int]], 
+        caches_to_free_value: list[list[int]], 
+        ptrs_to_free_key: list[int], 
+        ptrs_to_free_value: list[int],
+        handles_to_free_key: Optional[list[list[int]]] = None,
+        handles_to_free_value: Optional[list[list[int]]] = None
+    ) -> None:
         if self.rank != rank:
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip releasing kv cache for layers")
             return None
@@ -737,34 +772,34 @@ class DynamicGPUWorker(Worker):
         num_layers = len(caches_to_free_key) if caches_to_free_key else 0
         num_blocks = len(caches_to_free_key[0]) if caches_to_free_key and len(caches_to_free_key) > 0 else 0
         
-        if is_flexi and caches_to_free_key and self.model_runner.page_meta is not None:
-            # Use page_meta to calculate block size: (block_size, num_heads, head_size)
-            page_meta = self.model_runner.page_meta
-            T, H, Dh = page_meta.shape
-            dtype_size = page_meta.element_size()
-            bytes_per_block = T * H * Dh * dtype_size  # Size of one K or V block
+        # if is_flexi and caches_to_free_key and self.model_runner.page_meta is not None:
+        #     # Use page_meta to calculate block size: (block_size, num_heads, head_size)
+        #     page_meta = self.model_runner.page_meta
+        #     T, H, Dh = page_meta.shape
+        #     dtype_size = page_meta.element_size()
+        #     bytes_per_block = T * H * Dh * dtype_size  # Size of one K or V block
             
-            # Total KV cache bytes = num_layers * num_blocks * bytes_per_block * 2 (K+V)
-            kv_cache_bytes_to_free = num_layers * num_blocks * bytes_per_block * 2
+        #     # Total KV cache bytes = num_layers * num_blocks * bytes_per_block * 2 (K+V)
+        #     kv_cache_bytes_to_free = num_layers * num_blocks * bytes_per_block * 2
             
-            # Pointer arrays: num_blocks * sizeof(void*) = num_blocks * 8 bytes per layer
-            ptr_bytes_to_free = num_layers * num_blocks * 8 * 2  # 2 for K+V pointer arrays
+        #     # Pointer arrays: num_blocks * sizeof(void*) = num_blocks * 8 bytes per layer
+        #     ptr_bytes_to_free = num_layers * num_blocks * 8 * 2  # 2 for K+V pointer arrays
         
-        expected_delta_gb = (kv_cache_bytes_to_free + ptr_bytes_to_free) / (1024**3)
+        # expected_delta_gb = (kv_cache_bytes_to_free + ptr_bytes_to_free) / (1024**3)
         
-        # Memory checkpoint: track expected KV cache release impact
-        tracker = get_checkpoint_tracker(self.rank, self.device)
-        before_idx = tracker.checkpoint_before(
-            tag=f"release_kv_cache_{num_layers}layers_{num_blocks}blocks",
-            operation="release_kv_cache_for_layers",
-            expected_delta_gb=expected_delta_gb,
-            details={
-                'num_layers': num_layers, 
-                'num_blocks': num_blocks,
-                'kv_cache_bytes': kv_cache_bytes_to_free,
-                'ptr_bytes': ptr_bytes_to_free
-            }
-        )
+        # # Memory checkpoint: track expected KV cache release impact
+        # tracker = get_checkpoint_tracker(self.rank, self.device)
+        # before_idx = tracker.checkpoint_before(
+        #     tag=f"release_kv_cache_{num_layers}layers_{num_blocks}blocks",
+        #     operation="release_kv_cache_for_layers",
+        #     expected_delta_gb=expected_delta_gb,
+        #     details={
+        #         'num_layers': num_layers, 
+        #         'num_blocks': num_blocks,
+        #         'kv_cache_bytes': kv_cache_bytes_to_free,
+        #         'ptr_bytes': ptr_bytes_to_free
+        #     }
+        # )
         
         if is_flexi:
             assert len(caches_to_free_key) != 0
@@ -775,27 +810,59 @@ class DynamicGPUWorker(Worker):
             assert self.device is not None
             logger.info(f"[release_kv_cache_for_layers] Freeing {len(caches_to_free_key)} layers of KV cache GPU memory")
             logger.info(f"[release_kv_cache_for_layers] Each layer has {len(caches_to_free_key[0]) if caches_to_free_key else 0} blocks to free")
+            
+            # Check allocation mode to use correct free function
+            use_vmm = self.model_runner.vmm_aligned_bytes > 0
+            combined_mode = getattr(self.model_runner, 'vmm_combined_mode', False)
+            aligned_bytes = self.model_runner.vmm_aligned_bytes
+            
+            # Ensure handles lists have correct length
+            if handles_to_free_key is None:
+                handles_to_free_key = [[] for _ in caches_to_free_key]
+            if handles_to_free_value is None:
+                handles_to_free_value = [[] for _ in caches_to_free_value]
+            
             for i, (key_cache, value_cache) in enumerate(zip(caches_to_free_key, caches_to_free_value)):
-                logger.info(f"[release_kv_cache_for_layers] Freeing layer {i}: key_cache len={len(key_cache)}, value_cache len={len(value_cache)}")
+                key_handles = handles_to_free_key[i] if i < len(handles_to_free_key) else []
+                value_handles = handles_to_free_value[i] if i < len(handles_to_free_value) else []
+                logger.info(f"[release_kv_cache_for_layers] Freeing layer {i}: key_cache len={len(key_cache)}, "
+                           f"value_cache len={len(value_cache)}, use_vmm={use_vmm}, combined_mode={combined_mode}, "
+                           f"key_handles len={len(key_handles)}, value_handles len={len(value_handles)}")
                 with self.model_runner.fbgate.background():
-                    kv_allocator.free_cache(key_cache, self.device)
-                    kv_allocator.free_cache(value_cache, self.device)
+                    if use_vmm and key_handles:
+                        # VMM mode with handles available
+                        if combined_mode:
+                            # Combined mode: K and V share same physical page, only free once using K ptr and handle
+                            kv_allocator.free_vmm_blocks_combined(key_cache, key_handles, aligned_bytes, self.device)
+                        else:
+                            # Separate mode: free K and V independently
+                            kv_allocator.free_vmm_blocks(key_cache, key_handles, aligned_bytes, self.device)
+                            if value_handles:
+                                kv_allocator.free_vmm_blocks(value_cache, value_handles, aligned_bytes, self.device)
+                    elif use_vmm:
+                        # VMM mode but no handles - warn and skip (memory leak)
+                        logger.warning(f"[release_kv_cache_for_layers] VMM mode but no handles for layer {i}. "
+                                       f"Memory will be leaked.")
+                    else:
+                        # cudaMallocAsync mode
+                        kv_allocator.free_cache(key_cache, self.device)
+                        kv_allocator.free_cache(value_cache, self.device)
             
             for k_ptr, v_ptr in zip(ptrs_to_free_key, ptrs_to_free_value):
                 with self.model_runner.fbgate.background():
                     kv_allocator.free_page_list(k_ptr, self.device)
                     kv_allocator.free_page_list(v_ptr, self.device)
         
-        # Synchronize to ensure all frees complete before measuring
-        torch.cuda.synchronize()
+        # # Synchronize to ensure all frees complete before measuring
+        # torch.cuda.synchronize()
         
-        # Verify memory change after release
-        tracker.checkpoint_after(
-            tag=f"release_kv_cache_{num_layers}layers_{num_blocks}blocks_done",
-            operation="release_kv_cache_for_layers",
-            before_idx=before_idx,
-            expected_delta_gb=expected_delta_gb
-        )
+        # # Verify memory change after release
+        # tracker.checkpoint_after(
+        #     tag=f"release_kv_cache_{num_layers}layers_{num_blocks}blocks_done",
+        #     operation="release_kv_cache_for_layers",
+        #     before_idx=before_idx,
+        #     expected_delta_gb=expected_delta_gb
+        # )
         
         final_free, _ = torch.cuda.mem_get_info()
         logger.info(f"after release_kv_cache_for_layers: free={final_free / 1024 ** 3:.2f} GB, model runner's kv cache length: {len(self.model_runner.kv_caches)}")
@@ -1069,46 +1136,46 @@ class DynamicGPUWorker(Worker):
             logger.info(f"kv cache length is already {new_length}, no need to resize, sleep 2 seconds")
             return
         
-        # Calculate expected memory change for KV cache resize
-        # Each block contains: 2 (K+V) * tokens_per_block * num_heads * head_size * dtype_size
-        # For flexi mode: num_layers * num_blocks_diff * page_size
-        assert isinstance(self.model_runner.model, DynamicModelBase)
-        num_layers = len(self.model_runner.key_caches) if is_flexi else len(self.model_runner.kv_caches)
+        # # Calculate expected memory change for KV cache resize
+        # # Each block contains: 2 (K+V) * tokens_per_block * num_heads * head_size * dtype_size
+        # # For flexi mode: num_layers * num_blocks_diff * page_size
+        # assert isinstance(self.model_runner.model, DynamicModelBase)
+        # num_layers = len(self.model_runner.key_caches) if is_flexi else len(self.model_runner.kv_caches)
         
-        if is_flexi:
-            # Flexi mode: each block is T * H * Dh * dtype_size bytes
-            T, H, Dh = self.model_runner.page_meta.shape
-            dtype_size = self.model_runner.page_meta.dtype.itemsize
-            bytes_per_block = T * H * Dh * dtype_size * 2  # 2 for K+V
-        else:
-            # Non-flexi mode: full tensor shape
-            if len(self.model_runner.kv_caches) > 0:
-                kv_tensor = self.model_runner.kv_caches[0]
-                numel_per_block = kv_tensor[0][0].numel()  # Single block size
-                dtype_size = kv_tensor.element_size()
-                bytes_per_block = numel_per_block * dtype_size * 2  # 2 for K+V in [2, blocks, ...]
-            else:
-                bytes_per_block = 0
+        # if is_flexi:
+        #     # Flexi mode: each block is T * H * Dh * dtype_size bytes
+        #     T, H, Dh = self.model_runner.page_meta.shape
+        #     dtype_size = self.model_runner.page_meta.dtype.itemsize
+        #     bytes_per_block = T * H * Dh * dtype_size * 2  # 2 for K+V
+        # else:
+        #     # Non-flexi mode: full tensor shape
+        #     if len(self.model_runner.kv_caches) > 0:
+        #         kv_tensor = self.model_runner.kv_caches[0]
+        #         numel_per_block = kv_tensor[0][0].numel()  # Single block size
+        #         dtype_size = kv_tensor.element_size()
+        #         bytes_per_block = numel_per_block * dtype_size * 2  # 2 for K+V in [2, blocks, ...]
+        #     else:
+        #         bytes_per_block = 0
         
-        block_diff = old_length - new_length  # Positive if shrinking
-        kv_cache_delta_gb = (block_diff * num_layers * bytes_per_block) / (1024**3)
+        # block_diff = old_length - new_length  # Positive if shrinking
+        # kv_cache_delta_gb = (block_diff * num_layers * bytes_per_block) / (1024**3)
         
-        # Memory checkpoint: track expected KV cache resize impact
-        tracker = get_checkpoint_tracker(self.rank, self.device)
-        before_idx = tracker.checkpoint_before(
-            tag=f"resize_kv_{old_length}_to_{new_length}",
-            operation="resize_kv_cache",
-            expected_delta_gb=kv_cache_delta_gb,
-            details={
-                'old_length': old_length, 
-                'new_length': new_length,
-                'num_layers': num_layers,
-                'bytes_per_block': bytes_per_block,
-                'block_diff': block_diff
-            }
-        )
+        # # Memory checkpoint: track expected KV cache resize impact
+        # tracker = get_checkpoint_tracker(self.rank, self.device)
+        # before_idx = tracker.checkpoint_before(
+        #     tag=f"resize_kv_{old_length}_to_{new_length}",
+        #     operation="resize_kv_cache",
+        #     expected_delta_gb=kv_cache_delta_gb,
+        #     details={
+        #         'old_length': old_length, 
+        #         'new_length': new_length,
+        #         'num_layers': num_layers,
+        #         'bytes_per_block': bytes_per_block,
+        #         'block_diff': block_diff
+        #     }
+        # )
         
-        memory_snapshot(f"rank{self.rank}_before_resize_{old_length}_to_{new_length}", self.device)
+        # memory_snapshot(f"rank{self.rank}_before_resize_{old_length}_to_{new_length}", self.device)
         self.block_num = new_length
         # logger.info(f"before resize kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         if is_flexi:
@@ -1117,12 +1184,12 @@ class DynamicGPUWorker(Worker):
             self._resize_kv_cache(new_length)
 
         # Verify memory change after resize
-        tracker.checkpoint_after(
-            tag=f"resize_kv_{old_length}_to_{new_length}_done",
-            operation="resize_kv_cache",
-            before_idx=before_idx,
-            expected_delta_gb=kv_cache_delta_gb
-        )
+        # tracker.checkpoint_after(
+        #     tag=f"resize_kv_{old_length}_to_{new_length}_done",
+        #     operation="resize_kv_cache",
+        #     before_idx=before_idx,
+        #     expected_delta_gb=kv_cache_delta_gb
+        # )
         
         self.dynamic_kv_synchronizer.create_slot_mappings(new_length * self.block_size)
         logger.info(f"[timeline]: total resize kv cache time taken: {human_readable_duration(time.time() - start_time)}")
@@ -1200,7 +1267,16 @@ class DynamicGPUWorker(Worker):
         tmp_old_value_cache_list = []
         tmp_old_key_cache_ptr_list = []
         tmp_old_value_cache_ptr_list = []
+        # VMM handle tracking for shrinking
+        tmp_old_key_handles_list: list[list[int]] = []
+        tmp_old_value_handles_list: list[list[int]] = []
+        tmp_new_key_handles_list: list[list[int]] = []
+        tmp_new_value_handles_list: list[list[int]] = []
         if new_length < cache_length:
+            # Check if we should use VMM (block_size >= 2MB)
+            # vmm_aligned_bytes > 0 means initialization used VMM
+            use_vmm = self.model_runner.vmm_aligned_bytes > 0
+            
             for layer_name, _ in sorted_forward_context:
                 logger.info(f"resizing kv cache for layer {layer_name}")
                 idx = extract_layer_index(layer_name)
@@ -1211,10 +1287,56 @@ class DynamicGPUWorker(Worker):
                 old_key_cache = self.model_runner.key_caches[local_idx][new_length:]
                 old_value_cache = self.model_runner.value_caches[local_idx][new_length:]
                 
+                # Track VMM handles only when using VMM allocation
+                # Check both existence AND length to avoid IndexError after layer reconfiguration
+                handles_len = len(self.model_runner.key_handles[local_idx]) if (self.model_runner.key_handles and local_idx < len(self.model_runner.key_handles)) else 0
+                cache_len = len(self.model_runner.key_caches[local_idx])
+                
+                if use_vmm and handles_len > 0:
+                    # VMM mode: only track handles that actually exist
+                    # handles may be shorter than cache if some blocks were received via migration (non-VMM)
+                    if handles_len < cache_len:
+                        logger.warning(f"[VMM shrink] layer {layer_name}: handles_len={handles_len} < cache_len={cache_len}, some blocks not VMM allocated")
+                    
+                    # Calculate how many handles we can actually free
+                    # Only blocks allocated with VMM have handles
+                    if handles_len > new_length:
+                        old_key_handles = self.model_runner.key_handles[local_idx][new_length:handles_len]
+                        old_value_handles = self.model_runner.value_handles[local_idx][new_length:handles_len] if self.model_runner.value_handles else []
+                        new_key_handles = self.model_runner.key_handles[local_idx][:min(new_length, handles_len)]
+                        new_value_handles = self.model_runner.value_handles[local_idx][:min(new_length, handles_len)] if self.model_runner.value_handles else []
+                        
+                        # Adjust old_key_cache to match old_key_handles length for VMM freeing
+                        # The remaining blocks without handles will be freed by GC
+                        vmm_free_count = len(old_key_handles)
+                        old_key_cache_for_vmm = self.model_runner.key_caches[local_idx][new_length:new_length + vmm_free_count]
+                        old_value_cache_for_vmm = self.model_runner.value_caches[local_idx][new_length:new_length + vmm_free_count]
+                    else:
+                        # All handles are kept, nothing to free with VMM
+                        old_key_handles = []
+                        old_value_handles = []
+                        new_key_handles = self.model_runner.key_handles[local_idx][:handles_len]
+                        new_value_handles = self.model_runner.value_handles[local_idx][:handles_len] if self.model_runner.value_handles else []
+                        old_key_cache_for_vmm = []
+                        old_value_cache_for_vmm = []
+                else:
+                    # cudaMallocAsync mode or no handles: no VMM freeing needed
+                    old_key_handles = []
+                    old_value_handles = []
+                    new_key_handles = []
+                    new_value_handles = []
+                    old_key_cache_for_vmm = []
+                    old_value_cache_for_vmm = []
+                
                 tmp_old_key_cache_ptr_list.append(old_k_ptrs)
                 tmp_old_value_cache_ptr_list.append(old_v_ptrs)
                 tmp_old_key_cache_list.append(old_key_cache)
                 tmp_old_value_cache_list.append(old_value_cache)
+                # Store VMM-specific cache/handles pairs for proper freeing
+                tmp_old_key_handles_list.append((old_key_cache_for_vmm, old_key_handles))
+                tmp_old_value_handles_list.append((old_value_cache_for_vmm, old_value_handles))
+                tmp_new_key_handles_list.append(new_key_handles)
+                tmp_new_value_handles_list.append(new_value_handles)
 
                 new_key_cache = self.model_runner.key_caches[local_idx][:new_length]
                 new_value_cache = self.model_runner.value_caches[local_idx][:new_length]
@@ -1254,6 +1376,10 @@ class DynamicGPUWorker(Worker):
                     dynamic_flexi_bind_single_kv_cache(start_layer, end_layer,idx, key_cache, value_cache, new_k_ptrs, new_v_ptrs,  new_key_ptrs_tensor, new_value_ptrs_tensor, forward_context, self.dynamic_kv_synchronizer, self.model_runner)
 
                     logger.info(f"[timeline]: bind single kv cache for layer {layer_name} take {human_readable_duration(time.time() - before_bind_time)}")
+                    # Update VMM handles in model_runner
+                    if self.model_runner.key_handles:
+                        self.model_runner.key_handles[local_idx] = tmp_new_key_handles_list[local_idx]
+                        self.model_runner.value_handles[local_idx] = tmp_new_value_handles_list[local_idx]
                 if use_direct_ptr:
                     self.model_runner.update_kv_ptr_tensor(tmp_new_key_ptr_tensors, tmp_new_value_ptr_tensors)
             time_after_in_lock = time.time()
@@ -1263,18 +1389,44 @@ class DynamicGPUWorker(Worker):
 
             assert self.device is not None
             # Free old GPU pointer arrays (needed by both flexi and direct)
-            memory_snapshot(f"rank{self.rank}_before_free_old_ptrs_and_caches_shrink", self.device)
+            # memory_snapshot(f"rank{self.rank}_before_free_old_ptrs_and_caches_shrink", self.device)
             for old_key_ptr, old_value_ptr in zip(tmp_old_key_cache_ptr_list, tmp_old_value_cache_ptr_list):
                 with self.model_runner.fbgate.background():
                     kv_allocator.free_page_list(old_key_ptr, self.device)
                     kv_allocator.free_page_list(old_value_ptr, self.device)
 
-            # Free old key and value cache tensors
-            for old_key_cache, old_value_cache in zip( tmp_old_key_cache_list, tmp_old_value_cache_list):
-                with self.model_runner.fbgate.background():
-                    kv_allocator.free_cache(old_key_cache, self.device)
-                    kv_allocator.free_cache(old_value_cache, self.device)
-            memory_snapshot(f"rank{self.rank}_after_free_old_ptrs_and_caches_shrink", self.device)
+            # Free old key and value cache based on allocation mode
+            if use_vmm:
+                # Use VMM freeing for fine-grained 2MB release
+                aligned_bytes = self.model_runner.vmm_aligned_bytes
+                combined_mode = getattr(self.model_runner, 'vmm_combined_mode', False)
+                vmm_freed_layers = 0
+                for (old_key_cache_vmm, old_key_handles), (old_value_cache_vmm, old_value_handles) in zip(
+                    tmp_old_key_handles_list, tmp_old_value_handles_list
+                ):
+                    with self.model_runner.fbgate.background():
+                        if combined_mode:
+                            # Combined mode: key_handles contains kv_handles
+                            # K and V share same physical page, only need to free once
+                            if old_key_handles and old_key_cache_vmm:
+                                kv_allocator.free_vmm_blocks_combined(old_key_cache_vmm, old_key_handles, aligned_bytes, self.device)
+                                vmm_freed_layers += 1
+                        else:
+                            # Separate mode: free K and V independently
+                            if old_key_handles and old_key_cache_vmm:
+                                kv_allocator.free_vmm_blocks(old_key_cache_vmm, old_key_handles, aligned_bytes, self.device)
+                                vmm_freed_layers += 1
+                            if old_value_handles and old_value_cache_vmm:
+                                kv_allocator.free_vmm_blocks(old_value_cache_vmm, old_value_handles, aligned_bytes, self.device)
+                logger.info(f"[VMM] Freed {vmm_freed_layers} layers using VMM API with aligned_bytes={aligned_bytes}, combined_mode={combined_mode}")
+            else:
+                # Use cudaFreeAsync for smaller blocks
+                for old_key_cache, old_value_cache in zip(tmp_old_key_cache_list, tmp_old_value_cache_list):
+                    with self.model_runner.fbgate.background():
+                        kv_allocator.free_cache(old_key_cache, self.device)
+                        kv_allocator.free_cache(old_value_cache, self.device)
+                logger.info(f"[cudaFreeAsync] Freed {len(tmp_old_key_cache_list)} layers using cudaFreeAsync")
+            # memory_snapshot(f"rank{self.rank}_after_free_old_ptrs_and_caches_shrink", self.device)
             time_after_free = time.time()
 
         elif new_length > cache_length:
@@ -1283,9 +1435,16 @@ class DynamicGPUWorker(Worker):
             tmp_new_allocated_value_cache = []
             tmp_new_key_ptr_tensors: list[Optional[torch.Tensor]] = []
             tmp_new_value_ptr_tensors: list[Optional[torch.Tensor]] = []
+            # VMM handle tracking for new allocations
+            tmp_new_key_handles: list[list[int]] = []
+            tmp_new_value_handles: list[list[int]] = []
 
             tmp_old_key_cache_ptr_list = []
             tmp_old_value_cache_ptr_list = []
+            
+            # Check if we should use VMM (block_size >= 2MB)
+            # vmm_aligned_bytes > 0 means initialization used VMM
+            use_vmm = self.model_runner.vmm_aligned_bytes > 0
 
             # torch.cuda.empty_cache()
             for layer_name, attn_module in sorted_forward_context:
@@ -1297,12 +1456,60 @@ class DynamicGPUWorker(Worker):
 
                 key_cache = self.model_runner.key_caches[local_idx]
                 value_cache = self.model_runner.value_caches[local_idx]
+                # Get existing handles (may be empty for non-VMM allocations or after migration)
+                # Check both existence AND length to avoid IndexError after layer reconfiguration
+                old_key_handles = self.model_runner.key_handles[local_idx] if (self.model_runner.key_handles and local_idx < len(self.model_runner.key_handles)) else []
+                old_value_handles = self.model_runner.value_handles[local_idx] if (self.model_runner.value_handles and local_idx < len(self.model_runner.value_handles)) else []
 
-                # NOTE: Don't use fbgate.background() here - async allocate use fb gate internally 
-                new_allocated_key_cache, new_allocated_value_cache, _, _, _ = kv_allocator.allocate_with_cuda_async(new_allocated_block_num, list(extended_kv_cache_shape), self.model_runner.kv_cache_dtype, self.model_runner.device)
+                if use_vmm:
+                    # Use VMM API for fine-grained 2MB release support
+                    combined_mode = getattr(self.model_runner, 'vmm_combined_mode', False)
+                    if combined_mode:
+                        # Combined mode: K and V share same 2MB physical page
+                        vmm_result = kv_allocator.allocate_with_cuda_vmm_combined(
+                            new_allocated_block_num, 
+                            list(extended_kv_cache_shape), 
+                            self.model_runner.kv_cache_dtype, 
+                            self.model_runner.device
+                        )
+                        new_allocated_key_cache = vmm_result[0]  # k_ptrs
+                        new_allocated_value_cache = vmm_result[1]  # v_ptrs
+                        new_allocated_key_handles = vmm_result[6]  # kv_handles (combined)
+                        new_allocated_value_handles = []  # Empty for combined mode
+                        aligned_bytes = vmm_result[4]  # aligned_combined_bytes
+                        self.model_runner.vmm_aligned_bytes = aligned_bytes
+                    else:
+                        # Separate mode: K and V each have their own 2MB pages
+                        vmm_result = kv_allocator.allocate_with_cuda_vmm(
+                            new_allocated_block_num, 
+                            list(extended_kv_cache_shape), 
+                            self.model_runner.kv_cache_dtype, 
+                            self.model_runner.device
+                        )
+                        new_allocated_key_cache = vmm_result[0]  # k_ptrs
+                        new_allocated_value_cache = vmm_result[1]  # v_ptrs
+                        new_allocated_key_handles = vmm_result[5]  # k_handles
+                        new_allocated_value_handles = vmm_result[6]  # v_handles
+                        aligned_bytes = vmm_result[4]  # aligned_bytes
+                        self.model_runner.vmm_aligned_bytes = aligned_bytes
+                else:
+                    # Use cudaMallocAsync for smaller blocks
+                    new_allocated_key_cache, new_allocated_value_cache, _, _, _ = kv_allocator.allocate_with_cuda_async(
+                        new_allocated_block_num, 
+                        list(extended_kv_cache_shape), 
+                        self.model_runner.kv_cache_dtype, 
+                        self.model_runner.device
+                    )
+                    new_allocated_key_handles = []
+                    new_allocated_value_handles = []
+                
                 new_key_cache = key_cache + new_allocated_key_cache
                 new_value_cache = value_cache + new_allocated_value_cache
-                logger.info(f"[resize_kv_cache debug] new_key_cache len={len(new_key_cache)}, new_value_cache len={len(new_value_cache)}, device={self.model_runner.device}")
+                # Combine old and new handles
+                new_key_handles = old_key_handles + list(new_allocated_key_handles)
+                new_value_handles = old_value_handles + list(new_allocated_value_handles)
+                
+                logger.info(f"[resize_kv_cache] use_vmm={use_vmm}, new_key_cache len={len(new_key_cache)}, handles len={len(new_key_handles)}")
                 with self.model_runner.fbgate.background():
                     # Both flexi and direct need GPU pointer arrays for the kernel
                     new_k_ptrs, new_v_ptrs = kv_allocator.prepare_flexi_kv_ptrs(new_key_cache, new_value_cache)
@@ -1320,6 +1527,8 @@ class DynamicGPUWorker(Worker):
                 tmp_new_value_ptr_tensors.append(new_value_ptr_tensor)
                 tmp_key_cache_ptr_list.append(new_k_ptrs)
                 tmp_value_cache_ptr_list.append(new_v_ptrs)
+                tmp_new_key_handles.append(new_key_handles)
+                tmp_new_value_handles.append(new_value_handles)
                 
                 # Track old ptrs for freeing later
                 old_k_ptrs, old_v_ptrs = self.model_runner.key_cache_ptrs[local_idx], self.model_runner.value_cache_ptrs[local_idx]
@@ -1343,6 +1552,12 @@ class DynamicGPUWorker(Worker):
                     dynamic_flexi_bind_single_kv_cache(start_layer, end_layer, idx, new_key_cache, new_value_cache, new_k_ptrs, new_v_ptrs, new_k_ptr_tensor, new_v_ptr_tensor, forward_context, self.dynamic_kv_synchronizer, self.model_runner)
                     new_key_ptr_tensor_list.append(new_k_ptr_tensor)
                     new_value_ptr_tensor_list.append(new_v_ptr_tensor)
+                    # Update VMM handles in model_runner
+                    if len(self.model_runner.key_handles) <= local_idx:
+                        self.model_runner.key_handles.extend([[] for _ in range(local_idx + 1 - len(self.model_runner.key_handles))])
+                        self.model_runner.value_handles.extend([[] for _ in range(local_idx + 1 - len(self.model_runner.value_handles))])
+                    self.model_runner.key_handles[local_idx] = tmp_new_key_handles[local_idx]
+                    self.model_runner.value_handles[local_idx] = tmp_new_value_handles[local_idx]
                 # Update stacked tensors cache to reflect new ptr_tensors (direct mode only)
                 if use_direct_ptr:
                     self.model_runner.update_kv_ptr_tensor(new_key_ptr_tensor_list, new_value_ptr_tensor_list)
@@ -1360,7 +1575,7 @@ class DynamicGPUWorker(Worker):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-        memory_snapshot(f"rank{self.rank}_after_resize_to_{new_length}", self.device)
+        # memory_snapshot(f"rank{self.rank}_after_resize_to_{new_length}", self.device)
         logger.info(f"[forward]: resized kv cache ,available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         logger.info(f"[timeline]: time before in lock: {time_after_in_lock - time_before_in_lock:.4f} seconds")
         logger.info(f"[timeline]: time after free: {time_after_free - time_after_in_lock:.4f} seconds")
@@ -1549,12 +1764,12 @@ class DynamicGPUWorker(Worker):
             all_layer_ranges = []
             for _, ranges in sending_layers_plans.items():
                 all_layer_ranges.extend(ranges)
-            caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value = self.atomic_shelve_kv_cache(self.rank, all_layer_ranges)
-            memory_snapshot(f"rank{self.rank}_after_atomic_shelve", self.device)
-            self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value)
-            memory_snapshot(f"rank{self.rank}_after_release_kv_cache", self.device)
+            caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value = self.atomic_shelve_kv_cache(self.rank, all_layer_ranges)
+            # memory_snapshot(f"rank{self.rank}_after_atomic_shelve", self.device)
+            self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value)
+            # memory_snapshot(f"rank{self.rank}_after_release_kv_cache", self.device)
             self.remove_layers(self.rank, all_layer_ranges)
-            memory_snapshot(f"rank{self.rank}_after_remove_layers", self.device)
+            # memory_snapshot(f"rank{self.rank}_after_remove_layers", self.device)
             
             # Check GPU memory after removing layers (sender side of sync migration)
             if isinstance(self.model_runner.model, DynamicModelBase):
@@ -1680,12 +1895,24 @@ class DynamicGPUWorker(Worker):
                         logger.info(f"[debug]: rank {self.rank} waiting for layer {layer_id} to be loaded")
                         self._layer_loaded_cv.wait()
             time_start_bind_kv_cache = time.time()
+            
+            # Pre-allocate KV cache memory for all layers before binding
+            preallocated_caches: dict[int, tuple] = {}
+            if is_flexi:
+                logger.info(f"[timeline]: pre-allocating KV cache for {len(layer_ids)} layers")
+                preallocated_caches = self.model_runner.preallocate_flexi_kv_caches_for_migration(
+                    layer_ids, self.block_num
+                )
+                logger.info(f"[timeline]: pre-allocation done in {human_readable_duration(time.time() - time_start_bind_kv_cache)}")
+            
             for layer_id in layer_ids:
                 logger.info(f"current memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB, start to bind kv cache for layer {layer_id}")
                 kv_tensor = tmp_kv_tensors_dict[layer_id]
                 if is_flexi:
                     slot_mapping = tmp_slot_mapping_dict[layer_id]
                     assert self.device is not None
+                    # Use pre-allocated memory
+                    preallocated = preallocated_caches.get(layer_id)
                     dynamic_flexi_bind_single_kv_tensor(
                         self.model_runner.model.model.start_layer,
                         self.model_runner.model.model.end_layer,
@@ -1697,6 +1924,7 @@ class DynamicGPUWorker(Worker):
                         self.dynamic_kv_synchronizer,
                         self.model_runner,
                         self.device,
+                        preallocated=preallocated,
                     )
                 else:
                     # dynamic_bind_single_kv_tensor内部不使用所，因此我们需要在外面加锁
@@ -1714,7 +1942,7 @@ class DynamicGPUWorker(Worker):
                 gc.collect()
                 torch.cuda.empty_cache()  # Free GPU memory occupied by received kv tensor before binding, to make room for new cache if needed
             torch.cuda.synchronize()
-            memory_snapshot(f"rank{self.rank}_after_bind_all_kv_caches_from_rank{from_rank}", self.device)
+            # memory_snapshot(f"rank{self.rank}_after_bind_all_kv_caches_from_rank{from_rank}", self.device)
             logger.info(f"[timeline]: bind kv cache time taken: {human_readable_duration(time.time() - time_start_bind_kv_cache)}")
             
             logger.info(f"[operation]: start to listen to kv cache patches")
@@ -1916,8 +2144,10 @@ class DynamicGPUWorker(Worker):
                     layer_ranges.append((layers[0], layers[-1]))
 
                 assert self.target_pp_layer_config is not None, "target_pp_layer_config must be set"
+                handles_to_free_key: list[list[int]] = []
+                handles_to_free_value: list[list[int]] = []
                 if layer_ranges:
-                    caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value = self.atomic_shelve_kv_cache(self.rank, layer_ranges)
+                    caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value = self.atomic_shelve_kv_cache(self.rank, layer_ranges)
 
                 start_layer = self.target_pp_layer_config[self.rank][0]
                 is_direct = self.vllm_config.dynamic_config.use_direct_ptr
@@ -1936,7 +2166,7 @@ class DynamicGPUWorker(Worker):
                         torch.cuda.set_device(self.device)
                         if is_sender:
                             self.remove_layers(self.rank, layer_ranges)
-                            self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value)
+                            self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value)
                             logger.info(f"[timeline]: after remove layers, time taken: {human_readable_duration(time.time() - time_start)}")
                         self.after_migration_total_token = num_total_migration_tokens
                         # For sender: directly set applied token count since sender doesn't receive patches

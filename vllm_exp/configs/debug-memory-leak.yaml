@@ -38,7 +38,7 @@ static_config:
   vllm:
     head_addr: "localhost"
     pipeline_parallel_size: 2
-    gpu_memory_utilization: 0.85
+    gpu_memory_utilization: 0.9
     max_model_len: 4000
     chunked_prefill: true
     enable_cuda_graph: false
@@ -84,16 +84,16 @@ sweep_configs:
       migration_approach: [sync]
       block_size: [512]
     benchmark_config:
-      - num_total_requests:   # Small number for quick testing
-        repetition: 3           # 3 repetitions to see if leak accumulates
+      - num_total_requests: 40   # Small number for quick testing
+        repetition: 2           # 3 repetitions to see if leak accumulates
         pp_layer_config:
-          0: "40, 40"           # Single config = no migration, only reset between reps
-          10: "25, 55"           # Single config = no migration, only reset between reps
+          0: "44, 36"           # Single config = no migration, only reset between reps
+          10: "24, 56"           # Single config = no migration, only reset between reps
         requests:
           0:
             request_rate: 2
             input_lens: 512
-            output_lens: 8
+            output_lens: 32
   # Disable Resize
   # - vllm:
   #     attention_kernel: [direct]

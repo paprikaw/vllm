@@ -22,8 +22,22 @@
 #include <cstdint>
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <cuda.h>  // For VMM APIs (cuMemCreate, cuMemMap, etc.)
 #include <vector>
 #include <chrono>
+
+// CUDA Driver API error checking macro
+#define CU_CHECK(call)                                                       \
+    do {                                                                     \
+        CUresult err = call;                                                 \
+        if (err != CUDA_SUCCESS) {                                           \
+            const char* errStr;                                              \
+            cuGetErrorString(err, &errStr);                                  \
+            throw std::runtime_error(                                        \
+                std::string("CUDA Driver error in ") + __FILE__ + ":" +      \
+                std::to_string(__LINE__) + " - " + errStr);                  \
+        }                                                                    \
+    } while (0)
 
 // ============================================================================
 // Helper Functions
@@ -166,6 +180,296 @@ allocate_with_cuda_async(
                           get_elapsed_ms(start, end));
 }
 
+// ============================================================================
+// VMM API allocation (CUDA Driver API - supports fine-grained 2MB release)
+// This enables non-contiguous memory release at 2MB granularity
+// ============================================================================
+
+std::tuple<std::vector<int64_t>, std::vector<int64_t>, int64_t, int64_t, 
+           int64_t, std::vector<int64_t>, std::vector<int64_t>, double>
+allocate_with_cuda_vmm(
+    int64_t size,
+    const std::vector<int64_t>& block_shape,
+    torch::ScalarType dtype,
+    torch::Device device
+) {
+    // Set the correct CUDA device
+    int device_id = device.is_cuda() ? device.index() : 0;
+    CUDA_CHECK(cudaSetDevice(device_id));
+    
+    // Initialize CUDA Driver API
+    CU_CHECK(cuInit(0));
+    
+    // Get CUDA device handle
+    CUdevice cu_device;
+    CU_CHECK(cuDeviceGet(&cu_device, device_id));
+    
+    // Calculate tensor size in bytes
+    int64_t numel = 1;
+    for (auto dim : block_shape) {
+        numel *= dim;
+    }
+    size_t element_size = torch::elementSize(dtype);
+    size_t bytes_per_tensor = numel * element_size;
+    
+    // VMM requires 2MB alignment (GPU minimum allocation granularity)
+    const size_t VMM_GRANULARITY = 2 * 1024 * 1024;  // 2MB
+    size_t aligned_bytes = ((bytes_per_tensor + VMM_GRANULARITY - 1) / VMM_GRANULARITY) * VMM_GRANULARITY;
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    // Setup allocation properties
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device_id;
+    
+    // Setup access descriptor
+    CUmemAccessDesc access_desc = {};
+    access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access_desc.location.id = device_id;
+    access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    
+    // Reserve virtual address space for all K and V tensors
+    size_t total_k_size = size * aligned_bytes;
+    size_t total_v_size = size * aligned_bytes;
+    
+    CUdeviceptr k_va_base, v_va_base;
+    CU_CHECK(cuMemAddressReserve(&k_va_base, total_k_size, VMM_GRANULARITY, 0, 0));
+    CU_CHECK(cuMemAddressReserve(&v_va_base, total_v_size, VMM_GRANULARITY, 0, 0));
+    
+    // Allocate physical memory handles and map for each tensor
+    std::vector<int64_t> k_ptrs(size);
+    std::vector<int64_t> v_ptrs(size);
+    std::vector<int64_t> k_handles(size);
+    std::vector<int64_t> v_handles(size);
+    
+    for (int64_t i = 0; i < size; ++i) {
+        CUmemGenericAllocationHandle k_handle, v_handle;
+        
+        // Allocate physical memory
+        CU_CHECK(cuMemCreate(&k_handle, aligned_bytes, &prop, 0));
+        CU_CHECK(cuMemCreate(&v_handle, aligned_bytes, &prop, 0));
+        
+        // Calculate virtual addresses
+        CUdeviceptr k_va = k_va_base + i * aligned_bytes;
+        CUdeviceptr v_va = v_va_base + i * aligned_bytes;
+        
+        // Map physical to virtual
+        CU_CHECK(cuMemMap(k_va, aligned_bytes, 0, k_handle, 0));
+        CU_CHECK(cuMemMap(v_va, aligned_bytes, 0, v_handle, 0));
+        
+        // Store pointers and handles
+        k_ptrs[i] = static_cast<int64_t>(k_va);
+        v_ptrs[i] = static_cast<int64_t>(v_va);
+        k_handles[i] = static_cast<int64_t>(k_handle);
+        v_handles[i] = static_cast<int64_t>(v_handle);
+    }
+    
+    // Set access permissions for the entire ranges
+    CU_CHECK(cuMemSetAccess(k_va_base, total_k_size, &access_desc, 1));
+    CU_CHECK(cuMemSetAccess(v_va_base, total_v_size, &access_desc, 1));
+    
+    // Prepare GPU pointer arrays for flexi attention
+    void** k_ptrs_dev;
+    void** v_ptrs_dev;
+    CUDA_CHECK(cudaMalloc(&k_ptrs_dev, size * sizeof(void*)));
+    CUDA_CHECK(cudaMemcpy(k_ptrs_dev, k_ptrs.data(), size * sizeof(void*), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&v_ptrs_dev, size * sizeof(void*)));
+    CUDA_CHECK(cudaMemcpy(v_ptrs_dev, v_ptrs.data(), size * sizeof(void*), cudaMemcpyHostToDevice));
+    
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    // Returns: k_ptrs, v_ptrs, k_ptrs_dev, v_ptrs_dev, aligned_bytes, k_handles, v_handles, time_ms
+    return std::make_tuple(
+        k_ptrs, v_ptrs,
+        reinterpret_cast<int64_t>(k_ptrs_dev),
+        reinterpret_cast<int64_t>(v_ptrs_dev),
+        static_cast<int64_t>(aligned_bytes),
+        k_handles, v_handles,
+        get_elapsed_ms(start, end)
+    );
+}
+
+// ============================================================================
+// VMM Combined API - K and V share the same 2MB physical page
+// Each handle maps to both K and V (K at offset 0, V at offset bytes_per_tensor)
+// This avoids memory waste when K/V blocks are smaller than 2MB
+// ============================================================================
+
+std::tuple<std::vector<int64_t>, std::vector<int64_t>, int64_t, int64_t, 
+           int64_t, int64_t, std::vector<int64_t>, double>
+allocate_with_cuda_vmm_combined(
+    int64_t size,
+    const std::vector<int64_t>& block_shape,
+    torch::ScalarType dtype,
+    torch::Device device
+) {
+    // Set the correct CUDA device
+    int device_id = device.is_cuda() ? device.index() : 0;
+    CUDA_CHECK(cudaSetDevice(device_id));
+    
+    // Initialize CUDA Driver API
+    CU_CHECK(cuInit(0));
+    
+    // Get CUDA device handle
+    CUdevice cu_device;
+    CU_CHECK(cuDeviceGet(&cu_device, device_id));
+    
+    // Calculate tensor size in bytes (for one K or V block)
+    int64_t numel = 1;
+    for (auto dim : block_shape) {
+        numel *= dim;
+    }
+    size_t element_size = torch::elementSize(dtype);
+    size_t bytes_per_tensor = numel * element_size;  // Size of one K or V block
+    
+    // Combined size: K + V in one allocation
+    size_t combined_bytes = 2 * bytes_per_tensor;
+    
+    // VMM requires 2MB alignment (GPU minimum allocation granularity)
+    const size_t VMM_GRANULARITY = 2 * 1024 * 1024;  // 2MB
+    size_t aligned_combined_bytes = ((combined_bytes + VMM_GRANULARITY - 1) / VMM_GRANULARITY) * VMM_GRANULARITY;
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    // Setup allocation properties
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device_id;
+    
+    // Setup access descriptor
+    CUmemAccessDesc access_desc = {};
+    access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access_desc.location.id = device_id;
+    access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    
+    // Reserve virtual address space for all combined KV tensors
+    size_t total_size = size * aligned_combined_bytes;
+    
+    CUdeviceptr va_base;
+    CU_CHECK(cuMemAddressReserve(&va_base, total_size, VMM_GRANULARITY, 0, 0));
+    
+    // Allocate physical memory handles and map for each combined KV block
+    std::vector<int64_t> k_ptrs(size);
+    std::vector<int64_t> v_ptrs(size);
+    std::vector<int64_t> kv_handles(size);  // One handle per combined KV block
+    
+    for (int64_t i = 0; i < size; ++i) {
+        CUmemGenericAllocationHandle kv_handle;
+        
+        // Allocate physical memory for combined K+V
+        CU_CHECK(cuMemCreate(&kv_handle, aligned_combined_bytes, &prop, 0));
+        
+        // Calculate virtual address for this combined block
+        CUdeviceptr kv_va = va_base + i * aligned_combined_bytes;
+        
+        // Map physical to virtual
+        CU_CHECK(cuMemMap(kv_va, aligned_combined_bytes, 0, kv_handle, 0));
+        
+        // K is at the start, V is offset by bytes_per_tensor
+        k_ptrs[i] = static_cast<int64_t>(kv_va);
+        v_ptrs[i] = static_cast<int64_t>(kv_va + bytes_per_tensor);
+        kv_handles[i] = static_cast<int64_t>(kv_handle);
+    }
+    
+    // Set access permissions for the entire range
+    CU_CHECK(cuMemSetAccess(va_base, total_size, &access_desc, 1));
+    
+    // Prepare GPU pointer arrays for flexi attention
+    void** k_ptrs_dev;
+    void** v_ptrs_dev;
+    CUDA_CHECK(cudaMalloc(&k_ptrs_dev, size * sizeof(void*)));
+    CUDA_CHECK(cudaMemcpy(k_ptrs_dev, k_ptrs.data(), size * sizeof(void*), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&v_ptrs_dev, size * sizeof(void*)));
+    CUDA_CHECK(cudaMemcpy(v_ptrs_dev, v_ptrs.data(), size * sizeof(void*), cudaMemcpyHostToDevice));
+    
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    // Returns: k_ptrs, v_ptrs, k_ptrs_dev, v_ptrs_dev, aligned_combined_bytes, bytes_per_tensor, kv_handles, time_ms
+    return std::make_tuple(
+        k_ptrs, v_ptrs,
+        reinterpret_cast<int64_t>(k_ptrs_dev),
+        reinterpret_cast<int64_t>(v_ptrs_dev),
+        static_cast<int64_t>(aligned_combined_bytes),
+        static_cast<int64_t>(bytes_per_tensor),
+        kv_handles,
+        get_elapsed_ms(start, end)
+    );
+}
+
+// ============================================================================
+// Free VMM combined allocated memory (K and V share the same physical page)
+// ============================================================================
+
+void free_vmm_blocks_combined(
+    const std::vector<int64_t>& k_ptrs,  // K pointers (start of combined block)
+    const std::vector<int64_t>& handles,
+    int64_t aligned_combined_bytes,
+    int device_id
+) {
+    if (k_ptrs.empty()) return;
+    
+    // Validate that k_ptrs and handles have the same length
+    if (k_ptrs.size() != handles.size()) {
+        throw std::runtime_error(
+            "free_vmm_blocks_combined: k_ptrs.size() (" + std::to_string(k_ptrs.size()) + 
+            ") != handles.size() (" + std::to_string(handles.size()) + ")"
+        );
+    }
+    
+    CUDA_CHECK(cudaSetDevice(device_id));
+    
+    for (size_t i = 0; i < k_ptrs.size(); ++i) {
+        // K pointer is at the start of the combined block
+        CUdeviceptr va = static_cast<CUdeviceptr>(k_ptrs[i]);
+        CUmemGenericAllocationHandle handle = static_cast<CUmemGenericAllocationHandle>(handles[i]);
+        
+        // Unmap the entire combined block and release physical memory
+        CU_CHECK(cuMemUnmap(va, aligned_combined_bytes));
+        CU_CHECK(cuMemRelease(handle));
+    }
+}
+
+// ============================================================================
+// Free VMM allocated memory (supports non-contiguous release)
+// ============================================================================
+
+void free_vmm_blocks(
+    const std::vector<int64_t>& ptrs,
+    const std::vector<int64_t>& handles,
+    int64_t aligned_bytes,
+    int device_id
+) {
+    if (ptrs.empty()) return;
+    
+    CUDA_CHECK(cudaSetDevice(device_id));
+    
+    for (size_t i = 0; i < ptrs.size(); ++i) {
+        CUdeviceptr va = static_cast<CUdeviceptr>(ptrs[i]);
+        CUmemGenericAllocationHandle handle = static_cast<CUmemGenericAllocationHandle>(handles[i]);
+        
+        // Unmap and release physical memory
+        CU_CHECK(cuMemUnmap(va, aligned_bytes));
+        CU_CHECK(cuMemRelease(handle));
+    }
+}
+
+// Free VMM virtual address range
+void free_vmm_va_range(
+    int64_t va_base,
+    int64_t total_size,
+    int device_id
+) {
+    CUDA_CHECK(cudaSetDevice(device_id));
+    CU_CHECK(cuMemAddressFree(static_cast<CUdeviceptr>(va_base), total_size));
+}
+
 // Prepare and cache KV pointers on GPU for flexi attention
 std::tuple<int64_t, int64_t> prepare_flexi_kv_ptrs(
     const std::vector<int64_t>& k_list,
@@ -242,21 +546,6 @@ void free_cache(
 }
 
 // ============================================================================
-// Trim CUDA Memory Pool - Force release retained memory
-// ============================================================================
-
-void trim_memory_pool(int device_id, size_t min_bytes_to_keep) {
-    CUDA_CHECK(cudaSetDevice(device_id));
-    
-    cudaMemPool_t mempool;
-    CUDA_CHECK(cudaDeviceGetDefaultMemPool(&mempool, device_id));
-    
-    // Trim the pool to release retained memory back to the OS
-    // min_bytes_to_keep: minimum bytes the pool should keep (0 = release all)
-    CUDA_CHECK(cudaMemPoolTrimTo(mempool, min_bytes_to_keep));
-}
-
-// ============================================================================
 // Python Bindings
 // ============================================================================
 
@@ -300,9 +589,42 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("device_id"),
           py::arg("stream_ptr"));
 
-    m.def("trim_memory_pool",
-          &trim_memory_pool,
-          "Trim CUDA memory pool to release retained memory back to OS",
-          py::arg("device_id"),
-          py::arg("min_bytes_to_keep") = 0);
+    m.def("allocate_with_cuda_vmm",
+          &allocate_with_cuda_vmm,
+          "VMM API allocation (supports fine-grained 2MB release)",
+          py::arg("size"),
+          py::arg("block_shape"),
+          py::arg("dtype"),
+          py::arg("device"));
+
+    m.def("allocate_with_cuda_vmm_combined",
+          &allocate_with_cuda_vmm_combined,
+          "VMM API allocation with K and V combined in same physical page (saves memory)",
+          py::arg("size"),
+          py::arg("block_shape"),
+          py::arg("dtype"),
+          py::arg("device"));
+
+    m.def("free_vmm_blocks",
+          &free_vmm_blocks,
+          "Free VMM allocated blocks (supports non-contiguous release)",
+          py::arg("ptrs"),
+          py::arg("handles"),
+          py::arg("aligned_bytes"),
+          py::arg("device_id"));
+
+    m.def("free_vmm_blocks_combined",
+          &free_vmm_blocks_combined,
+          "Free VMM combined blocks (K and V share same physical page)",
+          py::arg("k_ptrs"),
+          py::arg("handles"),
+          py::arg("aligned_combined_bytes"),
+          py::arg("device_id"));
+
+    m.def("free_vmm_va_range",
+          &free_vmm_va_range,
+          "Free VMM virtual address range",
+          py::arg("va_base"),
+          py::arg("total_size"),
+          py::arg("device_id"));
 }

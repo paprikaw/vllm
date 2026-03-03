@@ -154,6 +154,178 @@ class KVAllocator():
         _cpp_module.free_cache(ptrs, device_id, stream_ptr)
 
 
+    def allocate_with_cuda_vmm(
+        self,
+        size: int,
+        block_shape: List[int],
+        dtype: torch.dtype,
+        device: torch.device
+    ) -> Tuple[List[int], List[int], int, int, int, List[int], List[int], float]:
+        """
+        VMM API allocation (supports fine-grained 2MB release).
+
+        Uses CUDA Virtual Memory Management API for allocation, which allows
+        non-contiguous memory release at 2MB granularity. This is useful for
+        dynamic KV cache management where blocks need to be freed independently.
+
+        Args:
+            size: Number of blocks to allocate
+            block_shape: Shape of each block [num_blocks, block_size, ...]
+            dtype: PyTorch data type for the tensors
+            device: Target CUDA device
+
+        Returns:
+            Tuple of (k_ptrs, v_ptrs, k_ptrs_dev, v_ptrs_dev, aligned_bytes, 
+                      k_handles, v_handles, allocation_time_ms)
+            - k_ptrs, v_ptrs: Lists of virtual addresses for K/V blocks
+            - k_ptrs_dev, v_ptrs_dev: Device pointers to pointer arrays
+            - aligned_bytes: Size of each block (2MB aligned)
+            - k_handles, v_handles: Physical memory handles for each block
+            - allocation_time_ms: Allocation time in milliseconds
+
+        Raises:
+            RuntimeError: If kv_cache_allocator extension is not available
+        """
+        if not kv_allocator_available:
+            raise RuntimeError("kv_cache_allocator extension not available")
+        
+        start_time = time.perf_counter()
+        
+        if self.fb_gate is not None:
+            with self.fb_gate.background():
+                results = _cpp_module.allocate_with_cuda_vmm(size, block_shape, dtype, device)
+        else:
+            results = _cpp_module.allocate_with_cuda_vmm(size, block_shape, dtype, device)
+        
+        torch.cuda.synchronize(device)
+        alloc_time_ms = (time.perf_counter() - start_time) * 1000
+        logger.info(f"VMM kv allocation: alloc_time={alloc_time_ms:.2f}ms, aligned_bytes={results[4]}")
+        return results
+
+    def free_vmm_blocks(
+        self,
+        ptrs: List[int],
+        handles: List[int],
+        aligned_bytes: int,
+        device: torch.device
+    ) -> None:
+        """
+        Free VMM allocated blocks (supports non-contiguous release).
+
+        Frees individual KV cache blocks allocated with allocate_with_cuda_vmm.
+        Can release blocks independently at 2MB granularity.
+
+        Args:
+            ptrs: List of virtual addresses to free
+            handles: Corresponding physical memory handles
+            aligned_bytes: Size of each block (from allocation)
+            device: Target CUDA device
+        """
+        if not kv_allocator_available:
+            raise RuntimeError("kv_cache_allocator extension not available")
+        
+        device_id = device.index
+        _cpp_module.free_vmm_blocks(ptrs, handles, aligned_bytes, device_id)
+
+    def free_vmm_va_range(
+        self,
+        va_base: int,
+        total_size: int,
+        device: torch.device
+    ) -> None:
+        """
+        Free VMM virtual address range.
+
+        Should be called after all blocks in the range have been freed.
+
+        Args:
+            va_base: Base virtual address of the range
+            total_size: Total size of the virtual address range
+            device: Target CUDA device
+        """
+        if not kv_allocator_available:
+            raise RuntimeError("kv_cache_allocator extension not available")
+        
+        device_id = device.index
+        _cpp_module.free_vmm_va_range(va_base, total_size, device_id)
+
+    def allocate_with_cuda_vmm_combined(
+        self,
+        size: int,
+        block_shape: List[int],
+        dtype: torch.dtype,
+        device: torch.device
+    ) -> Tuple[List[int], List[int], int, int, int, int, List[int], float]:
+        """
+        VMM API allocation with K and V combined in same physical page.
+
+        This method saves memory by placing K and V in the same 2MB VMM page.
+        K occupies the first half, V occupies the second half.
+        This avoids memory waste when K/V blocks are smaller than 2MB.
+
+        Args:
+            size: Number of blocks to allocate
+            block_shape: Shape of each block [num_blocks, block_size, ...]
+            dtype: PyTorch data type for the tensors
+            device: Target CUDA device
+
+        Returns:
+            Tuple of (k_ptrs, v_ptrs, k_ptrs_dev, v_ptrs_dev, aligned_combined_bytes,
+                      bytes_per_tensor, kv_handles, allocation_time_ms)
+            - k_ptrs: List of virtual addresses for K blocks
+            - v_ptrs: List of virtual addresses for V blocks (offset by bytes_per_tensor)
+            - k_ptrs_dev, v_ptrs_dev: Device pointers to pointer arrays
+            - aligned_combined_bytes: Size of each combined KV block (2MB aligned)
+            - bytes_per_tensor: Size of one K or V tensor (for offset calculation)
+            - kv_handles: Physical memory handles for combined KV blocks
+            - allocation_time_ms: Allocation time in milliseconds
+
+        Raises:
+            RuntimeError: If kv_cache_allocator extension is not available
+        """
+        if not kv_allocator_available:
+            raise RuntimeError("kv_cache_allocator extension not available")
+        
+        start_time = time.perf_counter()
+        
+        if self.fb_gate is not None:
+            with self.fb_gate.background():
+                results = _cpp_module.allocate_with_cuda_vmm_combined(size, block_shape, dtype, device)
+        else:
+            results = _cpp_module.allocate_with_cuda_vmm_combined(size, block_shape, dtype, device)
+        
+        torch.cuda.synchronize(device)
+        alloc_time_ms = (time.perf_counter() - start_time) * 1000
+        logger.info(f"VMM combined kv allocation: alloc_time={alloc_time_ms:.2f}ms, "
+                    f"aligned_combined_bytes={results[4]}, bytes_per_tensor={results[5]}")
+        return results
+
+    def free_vmm_blocks_combined(
+        self,
+        k_ptrs: List[int],
+        handles: List[int],
+        aligned_combined_bytes: int,
+        device: torch.device
+    ) -> None:
+        """
+        Free VMM combined blocks (K and V share same physical page).
+
+        Frees combined KV cache blocks allocated with allocate_with_cuda_vmm_combined.
+        Each handle represents a combined KV block.
+
+        Args:
+            k_ptrs: List of K virtual addresses (start of combined block)
+            handles: Corresponding physical memory handles
+            aligned_combined_bytes: Size of each combined block (from allocation)
+            device: Target CUDA device
+        """
+        if not kv_allocator_available:
+            raise RuntimeError("kv_cache_allocator extension not available")
+        
+        device_id = device.index
+        _cpp_module.free_vmm_blocks_combined(k_ptrs, handles, aligned_combined_bytes, device_id)
+
+
     def prepare_flexi_kv_ptrs(
         self,
         k_list: List[int],
@@ -224,31 +396,5 @@ class KVAllocator():
             current_stream = torch.cuda.current_stream(device_id)
             stream_ptr = current_stream.cuda_stream
         _cpp_module.free_page_list(ptrs, device_id, stream_ptr)
-
-    def trim_memory_pool(
-        self,
-        device: torch.device,
-        min_bytes_to_keep: int = 0
-    ) -> None:
-        """
-        Trim CUDA memory pool to release retained memory back to OS.
-
-        cudaMallocAsync uses a memory pool that retains freed memory for
-        future allocations. This function forces the pool to release
-        retained memory back to the operating system.
-
-        Args:
-            device: CUDA device
-            min_bytes_to_keep: Minimum bytes the pool should keep (default 0 = release all)
-
-        Raises:
-            RuntimeError: If kv_cache_allocator extension is not available
-        """
-        if not kv_allocator_available:
-            logger.warning("kv_cache_allocator extension not available, cannot trim memory pool")
-            return
-
-        device_id = device.index
-        _cpp_module.trim_memory_pool(device_id, min_bytes_to_keep)
 
 kv_allocator = KVAllocator()

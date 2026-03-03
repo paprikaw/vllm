@@ -1,0 +1,73 @@
+# 数据集配置示例
+# 此配置文件展示如何使用 ShareGPT 和 BurstGPT 数据集进行 benchmark 测试
+# 
+# 支持的数据集类型:
+#   - pattern: (默认) 合成数据，使用 input_output_lens 生成固定长度请求
+#   - sharegpt: ShareGPT 对话数据集，从真实对话中采样
+#   - burstgpt: BurstGPT 工作负载数据集，基于真实 GPT-4 请求分布
+#   - random: 随机生成数据
+#   - sonnet: 诗歌数据集
+#
+# 数据集文件路径:
+#   ShareGPT: /home/bxb1/data/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+#   BurstGPT: /home/bxb1/data/datasets/BurstGPT_without_fails_2.csv
+
+project: dataset-benchmark-example
+type: sweep_test
+
+static_config:
+  model:
+    path: "/data/gpfs/projects/punim2715/models/Qwen3-32B-AWQ"
+    name: "Qwen3-32B-AWQ"
+
+  vllm:
+    pipeline_parallel_size: 2
+    gpu_memory_utilization: 0.9
+    max_model_len: 8000
+    chunked_prefill: true
+    enable_cuda_graph: false
+    attention_kernel: "flash"
+    head_addr: "localhost"
+    port: 8000
+
+  network:
+    delays: [0]
+
+  benchmark:
+    pattern_batch_size: 150
+    profile: false
+    print_outputs: false
+    benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+    burstiness: 100.0
+    num_total_requests: 100
+    repetition: 1
+    
+    # ========== 数据集配置 ==========
+    # 选项 1: ShareGPT 数据集
+    dataset_name: "sharegpt"
+    dataset_path: "/home/bxb1/data/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+    sharegpt_output_len: 256  # 可选: 固定输出长度，不设置则使用实际对话长度
+    
+    # 选项 2: BurstGPT 数据集 (取消注释下面两行，注释上面的)
+    # dataset_name: "burstgpt"
+    # dataset_path: "/home/bxb1/data/datasets/BurstGPT_without_fails_2.csv"
+    
+    # 选项 3: Pattern 数据集 (默认，合成固定长度请求)
+    # dataset_name: "pattern"  # 不需要 dataset_path
+    
+    # 固定 benchmark 配置 (当使用非 pattern 数据集时，input_output_lens 可能被数据集本身的分布覆盖)
+    pp_layer_config:
+      0: "32, 32"
+    requests:
+      0:
+        request_rate: 2.0
+        input_lens: 512  # 对于 sharegpt/burstgpt，这是最小输入长度过滤
+        output_lens: 256  # 对于 sharegpt，可以被 sharegpt_output_len 覆盖
+
+# sweep_config 为空表示只运行一个固定配置
+# 也可以添加 sweep 参数来对比不同配置
+# 注意：当 static_config.benchmark 定义了 pp_layer_config 和 requests 时（固定 benchmark 模式），
+# 不能同时定义 sweep_config.benchmark_config
+sweep_config:
+  vllm:
+    attention_kernel: ["flash"]

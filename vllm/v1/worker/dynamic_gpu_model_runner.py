@@ -75,6 +75,13 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self.value_caches: list[list[int]] = []
         self.key_cache_ptrs: list[int] = []
         self.value_cache_ptrs: list[int] = []
+        # VMM handles for fine-grained 2MB release
+        self.key_handles: list[list[int]] = []
+        self.value_handles: list[list[int]] = []
+        self.vmm_aligned_bytes: int = 0
+        # VMM combined mode: K and V share same 2MB physical page
+        self.vmm_combined_mode: bool = False
+        self.vmm_bytes_per_tensor: int = 0
         self.page_meta: Optional[torch.Tensor] = None
         # For flexi_direct implementation: per-layer pointer tensors
         # Each tensor has shape (num_blocks,) and dtype uint64, containing pointers to KV pages
@@ -1260,10 +1267,50 @@ class DynamicGPUModelRunner(GPUModelRunner):
         logger.info(f"page_meta initialized: shape={self.page_meta.shape}, strides={self.page_meta.stride()}, dtype={self.page_meta.dtype}")
 
         start_time = time.time()
-        for layer_name in kv_cache_group.layer_names:
-            key_caches[layer_name], value_caches[layer_name], key_cache_ptrs[layer_name], value_cache_ptrs[layer_name], _ = kv_allocator.allocate_with_cuda_async(kv_cache_shape[1], list(block_shape), self.kv_cache_dtype, self.device)
+        # VMM has 2MB granularity. To avoid memory waste:
+        # - Combined mode: K+V share same 2MB page (block_size >= 512 => K+V = 2MB)
+        # - Separate mode: K and V each need >= 2MB (block_size >= 1024)
+        # We use combined mode for block_size >= 512 to maximize efficiency
+        VMM_COMBINED_MIN_BLOCK_SIZE = 512  # tokens (K+V = 2MB for typical config)
+        use_vmm_combined = block_size >= VMM_COMBINED_MIN_BLOCK_SIZE
+        logger.info(f"[KV Alloc] block_size={block_size}, VMM_COMBINED_MIN_BLOCK_SIZE={VMM_COMBINED_MIN_BLOCK_SIZE}, use_vmm_combined={use_vmm_combined}")
         
-        logger.info(f"time to intialize kv blocks:{human_readable_duration(time.time() - start_time)}")
+        # Track VMM handles for fine-grained 2MB release
+        # For combined mode: one handle per KV pair (stored in key_handles, value_handles empty)
+        key_handles_dict: dict[str, list[int]] = {}
+        value_handles_dict: dict[str, list[int]] = {}
+        for layer_name in kv_cache_group.layer_names:
+            if use_vmm_combined:
+                # Use VMM combined API: K and V share same 2MB physical page
+                # This saves memory by avoiding 2MB alignment waste
+                vmm_result = kv_allocator.allocate_with_cuda_vmm_combined(
+                    kv_cache_shape[1], 
+                    list(block_shape), 
+                    self.kv_cache_dtype, 
+                    self.device
+                )
+                key_caches[layer_name] = vmm_result[0]  # k_ptrs
+                value_caches[layer_name] = vmm_result[1]  # v_ptrs (offset by bytes_per_tensor)
+                key_cache_ptrs[layer_name] = vmm_result[2]  # k_ptrs_dev
+                value_cache_ptrs[layer_name] = vmm_result[3]  # v_ptrs_dev
+                aligned_combined_bytes = vmm_result[4]  # aligned_combined_bytes
+                self.vmm_bytes_per_tensor = vmm_result[5]  # bytes_per_tensor
+                key_handles_dict[layer_name] = list(vmm_result[6])  # kv_handles (combined)
+                value_handles_dict[layer_name] = []  # Empty for combined mode
+                self.vmm_aligned_bytes = aligned_combined_bytes
+                self.vmm_combined_mode = True
+            else:
+                # Use cudaMallocAsync for smaller blocks (no handles)
+                key_caches[layer_name], value_caches[layer_name], key_cache_ptrs[layer_name], value_cache_ptrs[layer_name], _ = kv_allocator.allocate_with_cuda_async(
+                    kv_cache_shape[1], list(block_shape), self.kv_cache_dtype, self.device
+                )
+                key_handles_dict[layer_name] = []  # No handles for cudaMallocAsync
+                value_handles_dict[layer_name] = []
+                self.vmm_aligned_bytes = 0  # Indicate not using VMM
+                self.vmm_combined_mode = False
+                self.vmm_bytes_per_tensor = 0
+        
+        logger.info(f"[VMM init] time to intialize kv blocks:{human_readable_duration(time.time() - start_time)}, aligned_bytes={self.vmm_aligned_bytes}, combined_mode={getattr(self, 'vmm_combined_mode', False)}")
         # logger.info(f"key cache shape: {key_caches[kv_cache_group.layer_names[0]][0].shape}, value cache shape:{value_caches[kv_cache_group.layer_names[0]][0].shape}")
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
@@ -1287,6 +1334,13 @@ class DynamicGPUModelRunner(GPUModelRunner):
             self.v_ptr_tensors,
             use_direct_ptr=self.vllm_config.dynamic_config.use_direct_ptr,
         )
+        
+        # Store VMM handles after binding (order matches self.key_caches/value_caches)
+        # For combined mode: key_handles contains kv_handles, value_handles is empty
+        self.key_handles = [key_handles_dict[layer_name] for layer_name in kv_cache_group.layer_names]
+        self.value_handles = [value_handles_dict[layer_name] for layer_name in kv_cache_group.layer_names]
+        logger.info(f"[VMM init] Stored handles for {len(self.key_handles)} layers, first layer has {len(self.key_handles[0]) if self.key_handles else 0} handles, combined_mode={getattr(self, 'vmm_combined_mode', False)}")
+        
         # Initialize PtrTable stacked tensors after binding all KV caches (direct mode only)
         if self.vllm_config.dynamic_config.use_direct_ptr:
             self.commit_ptr_tables(self.k_ptr_tensors, self.v_ptr_tensors, is_first_time=True)
@@ -1441,6 +1495,16 @@ class DynamicGPUModelRunner(GPUModelRunner):
         ]
         self.value_cache_ptrs = [
             ptr for idx, ptr in enumerate(self.value_cache_ptrs)
+            if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+        ]
+        
+        # Also update key_handles and value_handles for VMM freeing
+        self.key_handles = [
+            handles for idx, handles in enumerate(self.key_handles)
+            if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
+        ]
+        self.value_handles = [
+            handles for idx, handles in enumerate(self.value_handles)
             if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
         ]
         
@@ -1699,35 +1763,178 @@ class DynamicGPUModelRunner(GPUModelRunner):
         if new_start != start_layer:
             self.model.model.start_layer = new_start
     
+    def allocate_flexi_kv_cache_for_migration(
+        self, 
+        block_num: int, 
+        stream: Optional[torch.cuda.Stream] = None
+    ) -> Tuple[list[int], list[int], int, int, list[int], bool]:
+        """
+        Allocate KV cache memory for a single layer, choosing VMM combined or async based on block_size.
+        
+        This method separates the memory allocation from data writing, allowing the caller
+        to first allocate memory and then write data to it.
+        
+        Args:
+            block_num: Number of blocks to allocate
+            stream: Optional CUDA stream for allocation
+            
+        Returns:
+            Tuple of (key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, vmm_combined)
+            - key_cache_list: List of key cache block pointers
+            - value_cache_list: List of value cache block pointers  
+            - key_cache_ptr: Device pointer for key cache
+            - value_cache_ptr: Device pointer for value cache
+            - handles: VMM handles (empty list if using async allocation)
+            - vmm_combined: Whether VMM combined mode was used
+        """
+        kv_cache_shape = self.kv_cache_shape
+        assert len(kv_cache_shape) == 5  # (2, nkvblocks, blockdim, n_head, headdim)
+        block_shape = kv_cache_shape[2:]  # (blockdim, n_head, headdim)
+        block_size = block_shape[0]  # blockdim
+        kv_dtype = self.kv_cache_dtype
+        
+        # Same threshold as in _init_kv_cache_for_flexi_attention
+        VMM_COMBINED_MIN_BLOCK_SIZE = 512
+        use_vmm_combined = block_size >= VMM_COMBINED_MIN_BLOCK_SIZE
+        
+        start_time = time.time()
+        
+        with torch.cuda.stream(stream):
+            if use_vmm_combined:
+                # VMM combined: K and V share same 2MB physical page
+                vmm_result = kv_allocator.allocate_with_cuda_vmm_combined(
+                    block_num,
+                    list(block_shape),
+                    kv_dtype,
+                    self.device
+                )
+                key_cache_list = vmm_result[0]  # k_ptrs
+                value_cache_list = vmm_result[1]  # v_ptrs
+                key_cache_ptr = vmm_result[2]  # k_ptrs_dev
+                value_cache_ptr = vmm_result[3]  # v_ptrs_dev
+                # aligned_combined_bytes = vmm_result[4]
+                # bytes_per_tensor = vmm_result[5]
+                handles = list(vmm_result[6])  # kv_handles (combined)
+                logger.info(f"[Migration] VMM combined allocation: block_num={block_num}, handles={len(handles)}, "
+                           f"time={human_readable_duration(time.time() - start_time)}")
+            else:
+                # cudaMallocAsync for smaller blocks
+                key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, _ = \
+                    kv_allocator.allocate_with_cuda_async(block_num, list(block_shape), kv_dtype, self.device)
+                handles = []  # No handles for cudaMallocAsync
+                logger.info(f"[Migration] Async allocation: block_num={block_num}, "
+                           f"time={human_readable_duration(time.time() - start_time)}")
+        
+        return key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, use_vmm_combined
+
+    def preallocate_flexi_kv_caches_for_migration(
+        self, 
+        layer_ids: list[int],
+        block_num: int, 
+        stream: Optional[torch.cuda.Stream] = None
+    ) -> dict[int, Tuple[list[int], list[int], int, int, list[int], bool]]:
+        """
+        Pre-allocate KV cache memory for multiple layers before binding.
+        
+        This method allocates memory for all specified layers upfront, allowing
+        subsequent bind operations to use pre-allocated memory instead of allocating
+        on-the-fly.
+        
+        Args:
+            layer_ids: List of layer indices to allocate for
+            block_num: Number of blocks to allocate per layer
+            stream: Optional CUDA stream for allocation
+            
+        Returns:
+            Dict mapping layer_id to allocation result tuple:
+            (key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, vmm_combined)
+        """
+        time_start = time.time()
+        allocations: dict[int, Tuple[list[int], list[int], int, int, list[int], bool]] = {}
+        
+        for layer_id in layer_ids:
+            allocation = self.allocate_flexi_kv_cache_for_migration(block_num, stream)
+            allocations[layer_id] = allocation
+        
+        logger.info(f"[Migration] Pre-allocated {len(layer_ids)} layers in {human_readable_duration(time.time() - time_start)}")
+        return allocations
+
+    def apply_kv_tensor_to_allocated_cache(
+        self,
+        slot_mapping: torch.Tensor,
+        layer: int,
+        gathered_kv_tensor: torch.Tensor,
+        key_cache_ptr: int,
+        value_cache_ptr: int,
+        stream: Optional[torch.cuda.Stream] = None
+    ) -> None:
+        """
+        Apply (write) KV tensor data to pre-allocated cache using flexi_reshape_and_cache_flash kernel.
+        
+        This is the second step after allocate_flexi_kv_cache_for_migration().
+        
+        Args:
+            slot_mapping: Tensor mapping tokens to cache slots
+            layer: Layer index
+            gathered_kv_tensor: KV tensor data to write (shape: [2, ...])
+            key_cache_ptr: Device pointer for key cache (from allocation)
+            value_cache_ptr: Device pointer for value cache (from allocation)
+            stream: Optional CUDA stream for the operation
+        """
+        kv_cache_shape = self.kv_cache_shape
+        assert gathered_kv_tensor.shape[-2:] == kv_cache_shape[-2:], \
+            f"gathered_kv_tensor shape {gathered_kv_tensor.shape} mismatch kv_cache_shape {kv_cache_shape}"
+        
+        model = self.model
+        assert isinstance(model, DynamicModelBase)
+        layer_module = model.model.layers[layer]
+        
+        with torch.cuda.stream(stream):
+            # Only call the kernel if there are tokens to process
+            if slot_mapping.numel() > 0:
+                flexi_reshape_and_cache_flash(
+                    gathered_kv_tensor[0], 
+                    gathered_kv_tensor[1], 
+                    key_cache_ptr,
+                    value_cache_ptr,  
+                    self.page_meta, 
+                    self.page_meta, 
+                    slot_mapping,
+                    "auto",
+                    layer_module.self_attn.attn._k_scale, 
+                    layer_module.self_attn.attn._v_scale
+                )
+
     def get_flexi_kv_cache_from_gathered_kv_tensor(self, slot_mapping: torch.Tensor, layer: int,
                                  gathered_kv_tensor: torch.Tensor,
-                                 block_num: int, stream: Optional[torch.cuda.Stream] = None) -> Tuple[list[int], list[int], int, int]:
+                                 block_num: int, stream: Optional[torch.cuda.Stream] = None) -> Tuple[list[int], list[int], int, int, list[int], bool]:
         '''
-        Based on current kv cache list shape and dtype, we allocate a new kv cache list
-        and extract the data from gathered_kv_tensor to the new kv cache list.
-        after that, we also flush the new kv cache to GPU ptrs.
+        Allocate KV cache and apply gathered KV tensor data to it.
+        
+        This is a convenience method that combines allocation and data writing.
+        For more control, use allocate_flexi_kv_cache_for_migration() and 
+        apply_kv_tensor_to_allocated_cache() separately.
+        
+        Returns:
+            Tuple of (key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, vmm_combined)
         '''
         time_start = time.time()
-        kv_cache_shape = self.kv_cache_shape
-        assert len(kv_cache_shape) == 5 # (2, nkvblocks, blockdim, n_head, headdim)
-        block_shape = kv_cache_shape[2:]
-        kv_dtype = self.kv_cache_dtype
-        with torch.cuda.stream(stream):
-            key_cache, value_cache, key_cache_page_list, value_cache_page_list, _ = kv_allocator.allocate_with_cuda_async(block_num, list(block_shape), kv_dtype, self.device)
-            logger.info(f"gathered_kv_tensor shape: {gathered_kv_tensor.shape}, kv_cache_shape: {kv_cache_shape}, block_shape:{block_shape}, block_num:{block_num}, key_cache length:{len(key_cache)}, value_cache length:{len(value_cache)}, slot_mapping shape:{slot_mapping.shape}, time spent: {human_readable_duration(time.time() - time_start)}")
-            logger.info(f"key_cache_list_ptr {key_cache_page_list}, value cache list ptr:{value_cache_page_list}")
-            # dummy_scale = torch.tensor(1.0, device=self.device, dtype=torch.float32)
-            assert gathered_kv_tensor.shape[-2:] == kv_cache_shape[-2:], f"gathered_kv_tensor shape {gathered_kv_tensor.shape} mismatch kv_cache_shape {kv_cache_shape}"
-            model = self.model
-            assert isinstance(model, DynamicModelBase)
-            # DynamicModelBase.model is DynamicQwen3Model which has .layers
-            layer_module = model.model.layers[layer]
-            logger.info(f"before gather kv tensor using kernal, device:{torch.cuda.current_device()}, stream:{torch.cuda.current_stream()}")
-            # Only call the kernel if there are tokens to process - empty slot_mapping causes CUDA error
-            if slot_mapping.numel() > 0:
-                flexi_reshape_and_cache_flash(gathered_kv_tensor[0], gathered_kv_tensor[1], key_cache_page_list,value_cache_page_list,  self.page_meta, self.page_meta, slot_mapping,"auto",layer_module.self_attn.attn._k_scale, layer_module.self_attn.attn._v_scale)
-
-        return key_cache, value_cache, key_cache_page_list, value_cache_page_list
+        
+        # Step 1: Allocate memory (VMM combined or async based on block_size)
+        key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, vmm_combined = \
+            self.allocate_flexi_kv_cache_for_migration(block_num, stream)
+        
+        logger.info(f"gathered_kv_tensor shape: {gathered_kv_tensor.shape}, block_num:{block_num}, "
+                   f"key_cache length:{len(key_cache_list)}, value_cache length:{len(value_cache_list)}, "
+                   f"slot_mapping shape:{slot_mapping.shape}, vmm_combined:{vmm_combined}, "
+                   f"time spent: {human_readable_duration(time.time() - time_start)}")
+        
+        # Step 2: Write data to allocated memory
+        self.apply_kv_tensor_to_allocated_cache(
+            slot_mapping, layer, gathered_kv_tensor, key_cache_ptr, value_cache_ptr, stream
+        )
+        
+        return key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, vmm_combined
 
 
 # def bind_kv_cache_for_layers(

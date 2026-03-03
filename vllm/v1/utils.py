@@ -6,7 +6,7 @@ import weakref
 from collections import defaultdict
 from collections.abc import Sequence
 from multiprocessing import Process, connection
-from typing import (TYPE_CHECKING, Callable, Generic, Optional, TypeVar, Union,
+from typing import (TYPE_CHECKING, Callable, Generic, Optional, Tuple, TypeVar, Union,
                     overload)
 from dataclasses import dataclass
 from datetime import timedelta
@@ -622,12 +622,19 @@ def dynamic_flexi_bind_single_kv_tensor(
     kv_synchronizer: "DynamicKVSynchronizer",
     runner: "DynamicGPUModelRunner",
     device: torch.device,
-    stream: Optional[torch.cuda.streams.Stream] = None) -> None:
+    stream: Optional[torch.cuda.streams.Stream] = None,
+    preallocated: Optional[Tuple[list[int], list[int], int, int, list[int], bool]] = None) -> None:
     """Bind a single layer's KV tensor to runner caches and forward context.
 
     - 更新本 runner 的 `self.kv_caches`
     - 将 forward context 中对应 Attention 的 `kv_cache[ve]` 指向该张量
     - 如有必要，补齐 kv_cache_config 的 layer_names，确保后续 attn_metadata 构建覆盖到该层
+    - 如果使用 VMM combined 分配，则更新 VMM handles
+
+    Args:
+        preallocated: Optional pre-allocated memory tuple from preallocate_flexi_kv_caches_for_migration().
+                      If provided, uses this memory instead of allocating new memory.
+                      Format: (key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, vmm_combined)
 
     线程安全：内部获取 forward_lock。
     """
@@ -637,8 +644,24 @@ def dynamic_flexi_bind_single_kv_tensor(
         assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
         local_index = layer_index - start_layer
         assert local_index < len(runner.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(runner.key_caches)}"
-        key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr = runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping,layer_index, kv_tensor, block_num, stream)
-        logger.info(f"bind single kv tensor for {layer_index}, slot_mapping:{slot_mapping}, key_cache_ptr:{key_cache_ptr}, value_cache_ptr:{value_cache_ptr}")
+        
+        if preallocated is not None:
+            # Use pre-allocated memory
+            key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, vmm_combined = preallocated
+            # Apply KV tensor data to pre-allocated cache
+            runner.apply_kv_tensor_to_allocated_cache(
+                slot_mapping, layer_index, kv_tensor, key_cache_ptr, value_cache_ptr, stream
+            )
+            logger.info(f"bind single kv tensor for {layer_index} using preallocated memory, "
+                       f"key_cache_ptr:{key_cache_ptr}, value_cache_ptr:{value_cache_ptr}, "
+                       f"vmm_combined:{vmm_combined}, handles_count:{len(handles)}")
+        else:
+            # Allocate and apply in one call (legacy path)
+            key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, vmm_combined = \
+                runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping, layer_index, kv_tensor, block_num, stream)
+            logger.info(f"bind single kv tensor for {layer_index}, slot_mapping:{slot_mapping}, "
+                       f"key_cache_ptr:{key_cache_ptr}, value_cache_ptr:{value_cache_ptr}, "
+                       f"vmm_combined:{vmm_combined}, handles_count:{len(handles)}")
         
         # PtrTensors only needed by direct kernel
         use_direct_ptr = runner.vllm_config.dynamic_config.use_direct_ptr
@@ -651,6 +674,14 @@ def dynamic_flexi_bind_single_kv_tensor(
             runner.value_caches[local_index] = value_cache_list
             runner.key_cache_ptrs[local_index] = key_cache_ptr
             runner.value_cache_ptrs[local_index] = value_cache_ptr
+            
+            # Update VMM handles based on allocation type
+            # VMM combined: key_handles contains kv_handles, value_handles is empty
+            # Async allocation: both key_handles and value_handles are empty
+            if runner.key_handles and local_index < len(runner.key_handles):
+                runner.key_handles[local_index] = handles if vmm_combined else []
+            if runner.value_handles and local_index < len(runner.value_handles):
+                runner.value_handles[local_index] = []  # Always empty for combined mode
         
             # Update k_ptr_tensor/v_ptr_tensor only in direct mode
             if use_direct_ptr:
