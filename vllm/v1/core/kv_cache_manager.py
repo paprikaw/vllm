@@ -104,6 +104,36 @@ class KVCacheManager:
         """
         return self.block_pool.get_usage()
 
+    def get_kv_memory_stats(self, requests_dict: dict, 
+                            page_size_bytes: int,
+                            num_layers: int) -> tuple[int, int]:
+        """Get global KV memory stats for all layers.
+        
+        Args:
+            requests_dict: Dict mapping request_id -> Request object.
+            page_size_bytes: Size of a KV cache page (block) in bytes (K+V per block per layer).
+            num_layers: Total number of model layers.
+            
+        Returns:
+            Tuple of (actual_kv_memory_bytes, allocated_kv_memory_bytes):
+            - actual_kv_memory_bytes: Memory used by computed tokens across all layers
+            - allocated_kv_memory_bytes: Memory capacity of allocated blocks across all layers
+        """
+        # Iterate over req_to_blocks to ensure allocated and actual are from the same request set
+        total_allocated_blocks = 0
+        total_computed_tokens = 0
+        
+        for req_id, blocks in self.single_type_manager.req_to_blocks.items():
+            total_allocated_blocks += len(blocks)
+            if req_id in requests_dict:
+                total_computed_tokens += requests_dict[req_id].num_computed_tokens
+        
+        allocated_kv_memory_bytes = total_allocated_blocks * page_size_bytes * num_layers
+        kv_bytes_per_token = page_size_bytes // self.block_size
+        actual_kv_memory_bytes = total_computed_tokens * kv_bytes_per_token * num_layers
+        
+        return actual_kv_memory_bytes, allocated_kv_memory_bytes
+
     def make_prefix_cache_stats(self) -> Optional[PrefixCacheStats]:
         """Get (and reset) the prefix cache stats.
 

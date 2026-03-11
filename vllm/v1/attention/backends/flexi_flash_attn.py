@@ -222,8 +222,10 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
                                v_ptr_tables is not None and 
                                k_ptr_tables.numel() > 0)
 
+            import threading
             try:
                 if use_flexi_direct:
+                    logger.debug(f"[DEBUG ATTN] flexi_direct thread_id={threading.get_ident()}, k_ptr_tables.shape={k_ptr_tables.shape}")
                     # Extract layer index from layer name to get the correct ptr_table
                     from vllm.v1.utils import extract_layer_index
                     # layer has layer_name attribute from Attention base class

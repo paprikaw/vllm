@@ -374,6 +374,10 @@ class SweepVllmParams(BaseModel):
     """List of fixed KV cache block counts to sweep. -1 means auto. Positive value fixes the block count."""
     block_size: Optional[List[int]] = None
     """List of KV cache block sizes to sweep (1, 8, 16, 32, 64, 128, 256, 512). V0 only supports up to 32."""
+    use_vmm: Optional[List[bool]] = None
+    """List of use_vmm values to sweep. True=VMM, False=cudaMallocAsync (has memory leak, for testing)."""
+    enable_kv_resize: Optional[List[bool]] = None
+    """List of enable_kv_resize values to sweep. True=allow resize during migration, False=disable."""
 
 
 class SweepConfig(BaseModel):
@@ -406,6 +410,7 @@ class SweepConfig(BaseModel):
     NAMING_ALIASES: ClassVar[Dict[str, str]] = {
         "attention_kernel": "kernel",
         "block_size": "blk",
+        "use_vmm": "vmm",
     }
     
     # Mode 1: Complete benchmark_config list
@@ -449,6 +454,10 @@ class SweepConfig(BaseModel):
                 axes['fixed_num_gpu_blocks'] = self.vllm.fixed_num_gpu_blocks
             if self.vllm.block_size is not None:
                 axes['block_size'] = self.vllm.block_size
+            if self.vllm.use_vmm is not None:
+                axes['use_vmm'] = self.vllm.use_vmm
+            if self.vllm.enable_kv_resize is not None:
+                axes['enable_kv_resize'] = self.vllm.enable_kv_resize
         
         # Mode 1: benchmark_config provided directly in sweep_config
         if self.benchmark_config is not None:
@@ -557,6 +566,17 @@ class StaticVllmCfg(BaseModel):
     fixed_num_gpu_blocks: int = -1
     """Fixed number of GPU KV cache blocks per layer. Default -1 (auto).
     When positive, uses this exact block count and prevents changes during migration."""
+    use_vmm: bool = True
+    """Use CUDA VMM for KV cache allocation. Default True.
+    When False, uses cudaMallocAsync (has memory leak, for testing memory leak size)."""
+    enable_kv_resize: bool = True
+    """Whether to allow KV cache resize during migration. Default True.
+    When False, disables KV cache resize during migration (compact/shrink/expand).
+    Note: set_pp_config can still resize when changing PP config."""
+    log_kv_memory_stats: bool = False
+    """Whether to log detailed KV cache memory statistics. Default False.
+    When True, calculates actual_kv_memory_bytes and allocated_kv_memory_bytes.
+    May have slight performance impact on schedule()."""
 
 
 class StaticBenchCfg(BaseModel):
@@ -815,6 +835,18 @@ class ExpVllmConfig:
     """Migration approach: 'sync' or 'async'. Determines which migration method to use."""
     fixed_num_gpu_blocks: int = -1
     """Fixed number of GPU KV cache blocks per layer. Default -1 (auto)."""
+    use_vmm: bool = True
+    """Use CUDA VMM for KV cache allocation. Default True.
+    When False, uses cudaMallocAsync (has memory leak, for testing)."""
+    enable_kv_resize: bool = True
+    """Whether to allow KV cache resize during migration. Default True.
+    When False, disables resize during migration (compact/shrink/expand)."""
+    log_kv_memory_stats: bool = False
+    """Whether to log detailed KV cache memory statistics. Default False.
+    When True, calculates actual_kv_memory_bytes and allocated_kv_memory_bytes."""
+    disable_memory_overhead_monitor: bool = False
+    """Disable memory overhead monitoring during migration. Default False.
+    Set to True to avoid performance impact from GC and memory measurements."""
     pp_layer_config: Dict[int, str] = field(default_factory=dict)  # {0: "32,32", 100: "20,44"}
     
     @property
@@ -955,6 +987,10 @@ class ExperimentConfig:
             vars_dict["blk"] = self.vllm.block_size
         if self.vllm.fixed_num_gpu_blocks != -1:
             vars_dict["fixed_blocks"] = self.vllm.fixed_num_gpu_blocks
+        # Add vmm to naming when it's part of the sweep
+        vars_dict["vmm"] = self.vllm.use_vmm
+        # Add kv_resize to naming to distinguish experiments with/without resize
+        vars_dict["kv_resize"] = self.vllm.enable_kv_resize
         return vars_dict
     
     @classmethod
@@ -1031,10 +1067,12 @@ class ExperimentConfig:
                 mig_approach: Optional[str] = combo_dict.get('migration_approach')
                 fixed_blocks: Optional[int] = combo_dict.get('fixed_num_gpu_blocks')
                 block_sz: Optional[int] = combo_dict.get('block_size')
+                vmm_flag: Optional[bool] = combo_dict.get('use_vmm')
+                kv_resize_flag: Optional[bool] = combo_dict.get('enable_kv_resize')
                 
                 # Create ExperimentConfig from this combination
                 # Yield (sweep_config_index, experiment_config) tuple for server restart isolation
-                yield (sweep_config_index, cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, fixed_blocks, block_sz))
+                yield (sweep_config_index, cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, fixed_blocks, block_sz, vmm_flag, kv_resize_flag))
     
     @classmethod
     def _create_from_combo(
@@ -1046,6 +1084,8 @@ class ExperimentConfig:
         migration_approach: Optional[str] = None,
         fixed_num_gpu_blocks: Optional[int] = None,
         block_size: Optional[int] = None,
+        use_vmm: Optional[bool] = None,
+        enable_kv_resize: Optional[bool] = None,
     ) -> 'ExperimentConfig':
         """Create a single ExperimentConfig from static config and one sweep combination.
         
@@ -1059,6 +1099,8 @@ class ExperimentConfig:
             migration_approach: Override from sweep axis (if sweeping), otherwise use static
             fixed_num_gpu_blocks: Override from sweep axis (if sweeping), otherwise use static
             block_size: Override from sweep axis (if sweeping), otherwise use static
+            use_vmm: Override from sweep axis (if sweeping), otherwise use static
+            enable_kv_resize: Override from sweep axis (if sweeping), otherwise use static
         """
         # Resolve sweep overrides: sweep values override static values
         kernel = attention_kernel if attention_kernel is not None else static_cfg.vllm.attention_kernel
@@ -1066,6 +1108,8 @@ class ExperimentConfig:
         mig_approach = migration_approach if migration_approach is not None else static_cfg.vllm.migration_approach
         fixed_blocks = fixed_num_gpu_blocks if fixed_num_gpu_blocks is not None else static_cfg.vllm.fixed_num_gpu_blocks
         blk_size = block_size if block_size is not None else static_cfg.vllm.block_size
+        vmm = use_vmm if use_vmm is not None else static_cfg.vllm.use_vmm
+        kv_resize = enable_kv_resize if enable_kv_resize is not None else static_cfg.vllm.enable_kv_resize
         
         # Get initial values from bench_cfg
         sorted_pp_keys = sorted(bench_cfg.pp_layer_config.keys())
@@ -1100,6 +1144,9 @@ class ExperimentConfig:
             weight_chunk_size_mb=chunk_size,
             migration_approach=mig_approach,
             fixed_num_gpu_blocks=fixed_blocks,
+            use_vmm=vmm,
+            enable_kv_resize=kv_resize,
+            log_kv_memory_stats=static_cfg.vllm.log_kv_memory_stats,
             pp_layer_partition=initial_pp,
             pp_layer_config={k: v.replace(" ", "") for k, v in bench_cfg.pp_layer_config.items()},
         )
@@ -1195,6 +1242,15 @@ class VllmServerSpec:
     """Migration approach: 'sync' or 'async'. Determines which migration method to use."""
     fixed_num_gpu_blocks: int = -1
     """Fixed number of GPU KV cache blocks per layer. Default -1 (auto)."""
+    use_vmm: bool = True
+    """Use CUDA VMM for KV cache allocation. Default True.
+    When False, uses cudaMallocAsync (has memory leak, for testing)."""
+    enable_kv_resize: bool = True
+    """Whether to allow KV cache resize during migration. Default True.
+    When False, disables resize during migration (compact/shrink/expand)."""
+    log_kv_memory_stats: bool = False
+    """Whether to log detailed KV cache memory statistics. Default False.
+    When True, calculates actual_kv_memory_bytes and allocated_kv_memory_bytes."""
     
     # Migration/Partition
     pp_layer_partition: str = ""
@@ -1228,6 +1284,9 @@ class VllmServerSpec:
             "migration_steps": self.migration_steps,
             "migration_mode": self.migration_approach,
             "fixed_num_gpu_blocks": self.fixed_num_gpu_blocks,
+            "use_vmm": self.use_vmm,
+            "enable_kv_resize": self.enable_kv_resize,
+            "log_kv_memory_stats": self.log_kv_memory_stats,
         }
         # Only include rank_to_ip if non-empty
         if self.rank_to_ip:

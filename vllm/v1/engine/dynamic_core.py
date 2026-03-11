@@ -231,7 +231,7 @@ class DynamicEngineCore(EngineCore):
         # 计算在加入当前layer之后，kv cache的最大block数量
         total_layer_num = num_changed_layers + num_layers_on_rank
         block_size = self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        max_blocks_per_layer = self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, block_size, total_layer_num)
+        max_blocks_per_layer = self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, block_size, total_layer_num, mem_info.runtime_overhead_bytes)
 
 
         total_gpu_memory = int(mem_info.total_gpu_memory)
@@ -261,11 +261,28 @@ class DynamicEngineCore(EngineCore):
         logger.info(f"[memory access] assessed memory for adding layers: {num_changed_layers}, memory can not directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
         return LayerAddingAssessResult(False, False, max_blocks_per_layer)
 
-    def _get_max_num_blocks(self, total_gpu_memory: int, weight_size_per_layer: int, page_size: int, num_layers: int) -> int:
+    def _get_max_num_blocks(self, total_gpu_memory: int, weight_size_per_layer: int, page_size: int, num_layers: int, runtime_overhead: int = 0) -> int:
+        """Calculate max number of KV blocks per layer.
+        
+        Args:
+            total_gpu_memory: Total GPU memory in bytes
+            weight_size_per_layer: Weight size per layer in bytes
+            page_size: KV cache page/block size in bytes
+            num_layers: Number of layers
+            runtime_overhead: Runtime overhead measured by profile_run (activations,
+                CUDA context, NCCL buffers, etc.) in bytes
+        
+        Returns:
+            Maximum number of blocks per layer
+        
+        Formula:
+            total_kv_cache = total_gpu_memory * gpu_utilization - total_weight_size - runtime_overhead
+            max_blocks_per_layer = floor(total_kv_cache / (num_layers * page_size))
+        """
         total_usable_memory = total_gpu_memory * self.vllm_config.cache_config.gpu_memory_utilization
         total_weight_size = weight_size_per_layer * num_layers
-        total_kv_cache = total_usable_memory - total_weight_size
-        logger.info(f"[memory access] debug ------- get max num blocks: {total_kv_cache / 1024 ** 3:.2f} GB, num_layers: {num_layers}, block_size: {page_size} , total_gpu_memory: {total_gpu_memory / 1024 ** 3:.2f} GB, total_usable_memory: {total_usable_memory / 1024 ** 3:.2f} GB, weight_size_per_layer: {weight_size_per_layer / 1024 ** 3:.2f} GB, total_weight_size: {total_weight_size / 1024 ** 3:.2f} GB")
+        total_kv_cache = total_usable_memory - total_weight_size - runtime_overhead
+        logger.info(f"[memory access] debug ------- get max num blocks: {total_kv_cache / 1024 ** 3:.2f} GB, num_layers: {num_layers}, block_size: {page_size}, total_gpu_memory: {total_gpu_memory / 1024 ** 3:.2f} GB, total_usable_memory: {total_usable_memory / 1024 ** 3:.2f} GB, weight_size_per_layer: {weight_size_per_layer / 1024 ** 3:.2f} GB, total_weight_size: {total_weight_size / 1024 ** 3:.2f} GB, runtime_overhead: {runtime_overhead / 1024 ** 3:.2f} GB")
         max_blocks_per_layer = math.floor(total_kv_cache / (num_layers * page_size))
         return max_blocks_per_layer
 
@@ -374,7 +391,7 @@ class DynamicEngineCore(EngineCore):
             max_blocks_per_layer = 6666666666
             for rank, mem_info in enumerate(mem_infos):
                 num_layers_on_rank = self.cur_pp_layer_config[rank][1] - self.cur_pp_layer_config[rank][0] + 1
-                max_blocks_per_layer = min(max_blocks_per_layer, self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes, num_layers_on_rank))
+                max_blocks_per_layer = min(max_blocks_per_layer, self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes, num_layers_on_rank, mem_info.runtime_overhead_bytes))
             logger.info(f"[operation]: initialize kv cache with max blocks per layer: {max_blocks_per_layer}")
         
         # Update kv_cache_configs with the calculated max_blocks_per_layer
@@ -650,9 +667,16 @@ class DynamicEngineCore(EngineCore):
         assert isinstance(self.scheduler, DynamicScheduler)
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
-        allow_resize = (fixed_blocks <= 0)
+        enable_kv_resize = self.vllm_config.dynamic_config.enable_kv_resize
+        # allow_resize is True only when both conditions are met:
+        # 1. fixed_num_gpu_blocks <= 0 (not fixed)
+        # 2. enable_kv_resize is True (resize allowed during migration)
+        allow_resize = (fixed_blocks <= 0) and enable_kv_resize
         if not allow_resize:
-            logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, resize disabled for async migration")
+            if not enable_kv_resize:
+                logger.info(f"[memory access] enable_kv_resize=False, resize disabled for async migration")
+            else:
+                logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, resize disabled for async migration")
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         # 先获取一次内存快照
@@ -710,7 +734,8 @@ class DynamicEngineCore(EngineCore):
 
             if need_compact and not allow_resize:
                 raise RuntimeError(
-                    "Migration requires KV cache compact/resize but fixed_num_gpu_blocks is set (resize disabled). "
+                    "Migration requires KV cache compact/resize but resize is disabled "
+                    f"(enable_kv_resize={enable_kv_resize}, fixed_num_gpu_blocks={fixed_blocks}). "
                     f"compacted_length={compacted_length}, original_length={original_length}")
 
             if allow_resize and need_compact:
@@ -928,9 +953,16 @@ class DynamicEngineCore(EngineCore):
         time_start = time.time()
         engine_core_outputs = []
         fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
-        allow_resize = (fixed_blocks <= 0)
+        enable_kv_resize = self.vllm_config.dynamic_config.enable_kv_resize
+        # allow_resize is True only when both conditions are met:
+        # 1. fixed_num_gpu_blocks <= 0 (not fixed)
+        # 2. enable_kv_resize is True (resize allowed during migration)
+        allow_resize = (fixed_blocks <= 0) and enable_kv_resize
         if not allow_resize:
-            logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, resize disabled for sync migration")
+            if not enable_kv_resize:
+                logger.info(f"[memory access] enable_kv_resize=False, resize disabled for sync migration")
+            else:
+                logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, resize disabled for sync migration")
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         with self.engine_lock:
@@ -991,7 +1023,8 @@ class DynamicEngineCore(EngineCore):
 
             if need_compact and not allow_resize:
                 raise RuntimeError(
-                    "Sync migration requires KV cache compact/resize but fixed_num_gpu_blocks is set (resize disabled). "
+                    "Sync migration requires KV cache compact/resize but resize is disabled "
+                    f"(enable_kv_resize={enable_kv_resize}, fixed_num_gpu_blocks={fixed_blocks}). "
                     f"compacted_length={compacted_length}")
 
             if need_compact:
@@ -1211,11 +1244,15 @@ class DynamicEngineCore(EngineCore):
                 logger.info(f"set_pp_config: KV cache already at {current_blocks} blocks, no resize needed")
         else:
             logger.info(f"set_pp_config: changing from {self.cur_pp_layer_config} to {pp_layer_config}, target_kv_blocks={target_kv}")
-            # Temporarily set fixed_num_gpu_blocks=-1 so sync migration
+            # Temporarily set fixed_num_gpu_blocks=-1 and enable_kv_resize=True so sync migration
             # can freely compact/shrink/expand.  target_kv_blocks tells it
             # the desired final KV block count.
+            # Note: enable_kv_resize only affects migration triggered by migration_steps,
+            # but set_pp_config should always be able to resize.
             saved_fixed = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
+            saved_enable_kv_resize = self.vllm_config.dynamic_config.enable_kv_resize
             self.vllm_config.dynamic_config.fixed_num_gpu_blocks = -1
+            self.vllm_config.dynamic_config.enable_kv_resize = True
             try:
                 outputs.extend(self.change_model_configuration_by_kv_transfer_sync(
                     pp_layer_config,
@@ -1225,6 +1262,7 @@ class DynamicEngineCore(EngineCore):
                 # Restore to the NEW target value (already set by the
                 # "Update fixed_num_gpu_blocks" block above)
                 self.vllm_config.dynamic_config.fixed_num_gpu_blocks = fixed_blocks
+                self.vllm_config.dynamic_config.enable_kv_resize = saved_enable_kv_resize
         
         # Signal migration_thread to reset request counter for next benchmark run
         logger.info("set_pp_config: Signaling migration_thread to reset request counter")

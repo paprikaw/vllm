@@ -230,6 +230,12 @@ def flexi_unified_attention_with_output(
     from vllm.v1.attention.backends.flexi_flash_attn import FlexiFlashAttentionImpl
     assert isinstance(self.impl, FlexiFlashAttentionImpl)
     
+    # During profile_run, KV cache is not yet initialized, so key_dev_ptr may not exist.
+    # In this case, skip the actual attention computation and return zeros.
+    if not hasattr(self, 'key_dev_ptr') or self.key_dev_ptr is None:
+        output.zero_()
+        return
+    
     # Get ptr_tables and start_layer from forward_context for flexi_direct
     k_ptr_tables = forward_context.k_ptr_tables
     v_ptr_tables = forward_context.v_ptr_tables

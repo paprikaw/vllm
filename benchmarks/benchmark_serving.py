@@ -110,6 +110,8 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
+    # Normalized latency per token: mean of (e2e_latency / output_len) per request
+    mean_normalized_latency_ms: float
 
 
 async def get_request(
@@ -213,6 +215,16 @@ def calculate_metrics(
             completed += 1
         else:
             actual_output_lens.append(0)
+    
+    # Compute normalized latency per token for each request: e2e_latency / output_len
+    normalized_latencies = []
+    for i in range(len(outputs)):
+        if isinstance(outputs[i], Exception):
+            continue
+        if outputs[i].success:
+            output_len = actual_output_lens[i]
+            if output_len > 0:
+                normalized_latencies.append(outputs[i].latency / output_len)
 
     # 将以上这些metrics作为csv输出到文件中
     file_name = metrics_file_name
@@ -318,6 +330,7 @@ def calculate_metrics(
         percentiles_e2el_ms=[
             (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
         ],
+        mean_normalized_latency_ms=np.mean(normalized_latencies or 0) * 1000,
     )
 
     return metrics, actual_output_lens
@@ -432,6 +445,7 @@ def _print_final_summary(repetition: int, all_metrics_list: list[BenchmarkMetric
     mean_tpots = [m.mean_tpot_ms for m in all_metrics_list]
     mean_itls = [m.mean_itl_ms for m in all_metrics_list]
     mean_e2els = [m.mean_e2el_ms for m in all_metrics_list]
+    mean_normalized_latencies = [m.mean_normalized_latency_ms for m in all_metrics_list]
     
     total_completed = sum(m.completed for m in all_metrics_list)
     total_input = sum(m.total_input for m in all_metrics_list)
@@ -501,6 +515,13 @@ def _print_final_summary(repetition: int, all_metrics_list: list[BenchmarkMetric
     print(f"    Average:          {np.mean(mean_e2els):.2f}")
     print(f"    Median:           {np.median(mean_e2els):.2f}")
     print(f"    Std Dev:          {np.std(mean_e2els):.2f}")
+    
+    print(f"\n  MEAN NORMALIZED LATENCY ACROSS REPETITIONS (ms/tok):")
+    print(f"    Average:          {np.mean(mean_normalized_latencies):.2f}")
+    print(f"    Median:           {np.median(mean_normalized_latencies):.2f}")
+    print(f"    Std Dev:          {np.std(mean_normalized_latencies):.2f}")
+    print(f"    Min:              {np.min(mean_normalized_latencies):.2f}")
+    print(f"    Max:              {np.max(mean_normalized_latencies):.2f}")
     
     print(f"\n{'═' * 70}")
 
@@ -605,6 +626,9 @@ async def run_repetition_benchmark(
     avg_median_e2el = np.median([m.mean_e2el_ms for m in all_metrics_list])
     avg_std_e2el = np.std([m.mean_e2el_ms for m in all_metrics_list])
     
+    # For normalized latency
+    avg_mean_normalized_latency = np.mean([m.mean_normalized_latency_ms for m in all_metrics_list])
+    
     # For percentiles, take the average across repetitions
     avg_percentiles_ttft = [(p, np.mean([m.percentiles_ttft_ms[i][1] for m in all_metrics_list])) 
                            for i, (p, _) in enumerate(all_metrics_list[0].percentiles_ttft_ms)]
@@ -639,6 +663,7 @@ async def run_repetition_benchmark(
         median_e2el_ms=float(avg_median_e2el),
         std_e2el_ms=float(avg_std_e2el),
         percentiles_e2el_ms=avg_percentiles_e2el,
+        mean_normalized_latency_ms=float(avg_mean_normalized_latency),
     )
     
     return aggregated_metrics, all_output_lens
@@ -855,6 +880,9 @@ async def run_multi_stage_benchmark(
         process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
         process_one_metric("itl", "ITL", "Inter-token Latency")
         process_one_metric("e2el", "E2EL", "End-to-end Latency")
+        # Print normalized latency per token
+        print("{s:{c}^{n}}".format(s="Normalized Latency", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean Normalized Latency (ms/tok):", m.mean_normalized_latency_ms))
 
     # Print summary for full run
     print("{s:{c}^{n}}".format(s=" Benchmark Result (Total) ", n=50, c="-"))
@@ -947,6 +975,7 @@ async def run_multi_stage_benchmark(
             "request_goodput": metrics.request_goodput if goodput_config_dict else None,
             "output_throughput": metrics.output_throughput,
             "total_token_throughput": metrics.total_token_throughput,
+            "mean_normalized_latency_ms": metrics.mean_normalized_latency_ms,
         },
         "warmup": None,
         "main": None,
@@ -962,6 +991,7 @@ async def run_multi_stage_benchmark(
             "request_goodput": warmup_metrics.request_goodput if goodput_config_dict else None,
             "output_throughput": warmup_metrics.output_throughput,
             "total_token_throughput": warmup_metrics.total_token_throughput,
+            "mean_normalized_latency_ms": warmup_metrics.mean_normalized_latency_ms,
         }
     if main_metrics is not None:
         result["main"] = {
@@ -972,6 +1002,7 @@ async def run_multi_stage_benchmark(
             "request_goodput": main_metrics.request_goodput if goodput_config_dict else None,
             "output_throughput": main_metrics.output_throughput,
             "total_token_throughput": main_metrics.total_token_throughput,
+            "mean_normalized_latency_ms": main_metrics.mean_normalized_latency_ms,
         }
         
     print("-" * 50)
@@ -1373,7 +1404,7 @@ async def benchmark(
     process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
-
+    
     print("=" * 50)
 
     return result

@@ -127,3 +127,79 @@ class KVBufferStatus:
     used_tokens: dict[int, int]
     free_tokens: dict[int, int]
     capacity_tokens: dict[int, int]
+
+
+def validate_layers_granularity(
+    layers_list: list[Tuple[int, int]], 
+    start_layer: int, 
+    granularity: int,
+    operation: str = "operation"
+) -> None:
+    """
+    验证 layers_list 是否符合 combined_layers 的 granularity 约束。
+    
+    要求：
+    1. 每个 layer range 的本地起始索引必须对齐到 group 边界 (local_start % granularity == 0)
+    2. 每个 layer range 的本地结束索引+1 必须对齐到 group 边界 ((local_end + 1) % granularity == 0)
+    
+    Args:
+        layers_list: 要操作的全局 layer 范围列表，如 [(36, 39)]
+        start_layer: 当前 rank 的起始 layer 索引
+        granularity: combined_layers 的 granularity 值
+        operation: 操作名称（用于错误信息）
+    
+    Raises:
+        ValueError: 如果 layers_list 不符合 granularity 约束
+    """
+    if granularity <= 1:
+        return  # 非 combined_layers 模式，不需要验证
+    
+    for layers in layers_list:
+        local_start = layers[0] - start_layer
+        local_end = layers[1] - start_layer
+        
+        # 检查本地起始索引是否对齐到 group 边界
+        if local_start % granularity != 0:
+            raise ValueError(
+                f"[{operation}] combined_layers mode requires layers aligned to group boundary. "
+                f"layers={layers}, local_start={local_start}, granularity={granularity}, "
+                f"local_start % granularity = {local_start % granularity} != 0"
+            )
+        
+        # 检查本地结束索引+1是否对齐到 group 边界（确保删除完整的 groups）
+        if (local_end + 1) % granularity != 0:
+            raise ValueError(
+                f"[{operation}] combined_layers mode requires layers aligned to group boundary. "
+                f"layers={layers}, local_end={local_end}, granularity={granularity}, "
+                f"(local_end + 1) % granularity = {(local_end + 1) % granularity} != 0"
+            )
+
+
+def validate_layers_count_granularity(
+    layers_list: list[Tuple[int, int]],
+    granularity: int,
+    operation: str = "operation"
+) -> None:
+    """
+    验证 layers_list 的总层数是否符合 granularity 约束。
+    
+    用于添加层操作：确保添加的层数是完整的 groups。
+    
+    Args:
+        layers_list: 要操作的 layer 范围列表，如 [(36, 39)]
+        granularity: combined_layers 的 granularity 值
+        operation: 操作名称（用于错误信息）
+    
+    Raises:
+        ValueError: 如果总层数不是 granularity 的整数倍
+    """
+    if granularity <= 1:
+        return  # 非 combined_layers 模式，不需要验证
+    
+    total_layers = sum(layers[1] - layers[0] + 1 for layers in layers_list)
+    if total_layers % granularity != 0:
+        raise ValueError(
+            f"[{operation}] combined_layers mode requires complete groups. "
+            f"layers_list={layers_list}, total_layers={total_layers}, granularity={granularity}, "
+            f"total_layers % granularity = {total_layers % granularity} != 0"
+        )

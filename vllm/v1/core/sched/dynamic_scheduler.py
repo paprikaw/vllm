@@ -610,10 +610,23 @@ class DynamicScheduler(Scheduler):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
+        
+        # Get KV memory stats only if enabled (may have performance impact)
+        actual_kv_mem = 0
+        allocated_kv_mem = 0
+        if self.vllm_config.dynamic_config.log_kv_memory_stats:
+            page_size_bytes = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+            num_layers = self.vllm_config.model_config.hf_text_config.num_hidden_layers
+            # Use self.requests dict to ensure consistency with req_to_blocks
+            actual_kv_mem, allocated_kv_mem = self.kv_cache_manager.get_kv_memory_stats(
+                self.requests, page_size_bytes, num_layers)
+        
         return SchedulerStats(
             num_running_reqs=self.running_controller.get_total_length(),
             num_waiting_reqs=self.waiting_controller.get_total_length(),
             gpu_cache_usage=self.kv_cache_manager.usage,
+            actual_kv_memory_bytes=actual_kv_mem,
+            allocated_kv_memory_bytes=allocated_kv_mem,
             prefix_cache_stats=prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,
         )

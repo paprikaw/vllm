@@ -765,6 +765,7 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
         "pattern_batch_size": cfg.benchmark.pattern_batch_size,
         "alternative_configs": alternative_configs_dict,
         "migration_steps": cfg.migration.migration_steps,
+        "disable_memory_overhead_monitor": cfg.vllm.disable_memory_overhead_monitor,
         })
     serve_args.extend(["-D", dynamic_cfg])
     
@@ -839,6 +840,7 @@ def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManag
         "pattern_batch_size": cfg.benchmark.pattern_batch_size,
         "alternative_configs": alternative_configs_dict,
         "migration_steps": cfg.migration.migration_steps,
+        "disable_memory_overhead_monitor": cfg.vllm.disable_memory_overhead_monitor,
     })
     serve_args.extend(["-D", dynamic_cfg])
 
@@ -1300,6 +1302,9 @@ def generate_experiment_specs(
             weight_chunk_size_mb=exp_cfg.vllm.weight_chunk_size_mb,
             migration_approach=exp_cfg.vllm.migration_approach,
             fixed_num_gpu_blocks=exp_cfg.vllm.fixed_num_gpu_blocks,
+            use_vmm=exp_cfg.vllm.use_vmm,
+            enable_kv_resize=exp_cfg.vllm.enable_kv_resize,
+            log_kv_memory_stats=exp_cfg.vllm.log_kv_memory_stats,
             pp_layer_partition=exp_cfg.vllm.pp_layer_partition,
             pp_layer_config=exp_cfg.vllm.pp_layer_config,
             alternative_configs=exp_cfg.vllm.get_alternative_configs(),
@@ -2100,6 +2105,7 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 exp.sweep_config_index,
                 exp.vllm_spec.attention_kernel,
                 exp.vllm_spec.block_size,
+                exp.vllm_spec.use_vmm,
             )
         
         # Group experiments by server restart parameters
@@ -2110,18 +2116,18 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
         
         C.print(f"[bold cyan]Experiments grouped by server config: {len(server_groups)} groups[/]")
         for group_key, group_exps in server_groups:
-            sweep_idx, kernel, blk_size = group_key
-            C.print(f"  sweep[{sweep_idx}] kernel={kernel} block_size={blk_size}: {len(group_exps)} experiments")
+            sweep_idx, kernel, blk_size, use_vmm = group_key
+            C.print(f"  sweep[{sweep_idx}] kernel={kernel} block_size={blk_size} vmm={use_vmm}: {len(group_exps)} experiments")
         
         # Run experiments group by group, restarting server for each group
         for group_key, group_experiments in server_groups:
-            sweep_idx, kernel_val, block_size_val = group_key
+            sweep_idx, kernel_val, block_size_val, use_vmm_val = group_key
             proc = None
             log_redirector = None
             
             try:
                 C.print(f"\n[bold blue]{'='*60}[/]")
-                C.print(f"[bold blue]Starting server for sweep[{sweep_idx}] kernel={kernel_val} block_size={block_size_val}[/]")
+                C.print(f"[bold blue]Starting server for sweep[{sweep_idx}] kernel={kernel_val} block_size={block_size_val} vmm={use_vmm_val}[/]")
                 C.print(f"[bold blue]This group has {len(group_experiments)} experiments[/]")
                 C.print(f"[bold blue]{'='*60}[/]\n")
                 
@@ -2130,7 +2136,8 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 
                 # Create a global metrics path for the server (per server group)
                 blk_str = f"_blk{block_size_val}" if block_size_val else ""
-                group_suffix = f"sweep{sweep_idx}_{kernel_val}{blk_str}"
+                vmm_str = f"_vmm{1 if use_vmm_val else 0}"
+                group_suffix = f"sweep{sweep_idx}_{kernel_val}{blk_str}{vmm_str}"
                 global_metrics_path = logm.get_dir() / f"global_metrics_raw_{group_suffix}.csv"
                 first_exp.vllm_spec.metrics_csv_path = str(global_metrics_path)
                 
@@ -2148,13 +2155,13 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 )
                 
                 # Wait for server to be ready
-                C.print(f"[bold cyan]Waiting for server to be ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val})...[/]")
+                C.print(f"[bold cyan]Waiting for server to be ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val}, vmm={use_vmm_val})...[/]")
                 C.print(f"[bold cyan]Monitor server status: tail -f {global_log_path}[/]")
                 if not wait_ready(first_exp.bench_spec.base_url, 300):
                     C.print(f"[red]ERROR: vLLM server not ready in time (sweep[{sweep_idx}])[/]")
                     continue
                 
-                C.print(f"[green]vLLM server is ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val})[/]")
+                C.print(f"[green]vLLM server is ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val}, vmm={use_vmm_val})[/]")
                 
                 # Run each experiment in this server group
                 for i, exp in enumerate(group_experiments):
@@ -2162,7 +2169,7 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                     is_first = (i == 0)
                     
                     C.print(f"\n[bold magenta]{'='*60}[/]")
-                    C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)} (sweep[{sweep_idx}], kernel={kernel_val}, blk={block_size_val})[/]")
+                    C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)} (sweep[{sweep_idx}], kernel={kernel_val}, blk={block_size_val}, vmm={use_vmm_val})[/]")
                     C.print(f"[bold magenta]vars: {exp.vars_mapping}[/]")
                     C.print(f"[bold magenta]PP partition: {exp.vllm_spec.pp_layer_partition}[/]")
                     C.print(f"[bold magenta]{'='*60}[/]\n")

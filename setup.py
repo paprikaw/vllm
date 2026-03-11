@@ -688,7 +688,6 @@ if _is_cuda():
     
     # kv_cache_allocator: Use CUDAExtension for Python 3.12 compatibility
     # (torch.utils.cpp_extension handles pybind11 compatibility automatically)
-    # NOTE: libraries=['cuda'] is required for CUDA Driver API (VMM functions like cuMemCreate/cuMemAddressFree)
     kv_cache_ext = CUDAExtension(
         name='vllm.kv_cache_allocator',
         sources=['csrc/kv_cache_allocator_optimized.cpp'],

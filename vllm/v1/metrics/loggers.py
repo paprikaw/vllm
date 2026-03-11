@@ -130,6 +130,7 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg generation throughput: %.1f tokens/s, "
             "Running: %d reqs, Waiting: %d reqs, "
             "GPU KV cache usage: %.1f%%, "
+            "KV memory (actual/allocated): %.2f/%.2f GB, "
             "Prefix cache hit rate: %.1f%%",
             self.engine_index,
             prompt_throughput,
@@ -137,6 +138,8 @@ class LoggingStatLogger(StatLoggerBase):
             scheduler_stats.num_running_reqs,
             scheduler_stats.num_waiting_reqs,
             scheduler_stats.gpu_cache_usage * 100,
+            scheduler_stats.actual_kv_memory_bytes / (1024**3),
+            scheduler_stats.allocated_kv_memory_bytes / (1024**3),
             self.prefix_caching_metrics.hit_rate * 100,
         )
         self.spec_decoding_logging.log(log_fn=log_fn)
@@ -162,6 +165,8 @@ class LoggingStatLogger(StatLoggerBase):
                             "running_reqs",
                             "waiting_reqs",
                             "gpu_kv_cache_usage_percent",
+                            "actual_kv_memory_bytes",
+                            "allocated_kv_memory_bytes",
                             "prefix_cache_hit_rate_percent",
                         ])
                     # Use wall clock time for CSV timestamp.
@@ -174,6 +179,8 @@ class LoggingStatLogger(StatLoggerBase):
                         scheduler_stats.num_running_reqs,
                         scheduler_stats.num_waiting_reqs,
                         f"{scheduler_stats.gpu_cache_usage * 100:.4f}",
+                        scheduler_stats.actual_kv_memory_bytes,
+                        scheduler_stats.allocated_kv_memory_bytes,
                         f"{self.prefix_caching_metrics.hit_rate * 100:.4f}",
                     ])
             except Exception:

@@ -1,7 +1,7 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "kernal_cmp_third"
+project: "kernal_cmp_decode_direct"
 type: "sweep_test"
 
 envs:
@@ -26,9 +26,8 @@ envs:
 is_log_cover: true
 static_config:
   model:
-    path: "/home/bxb1/data/huggingface/Qwen3-32B"
-    name: "Qwen3-32B"
-  
+    path: "/data/gpfs/projects/punim2715/huggingface/Llama-3.3-70B-Instruct-FP8"
+    name: "Llama-3.3-70B-Instruct-FP8"
   network:
     rank_to_ip:
       0: "spartan-gpgpu166"
@@ -39,8 +38,9 @@ static_config:
   
   vllm:
     head_addr: "localhost"
+    disable_memory_overhead_monitor: true
     pipeline_parallel_size: 2
-    gpu_memory_utilization: 0.8
+    gpu_memory_utilization: 0.95
     max_model_len: 8000
     chunked_prefill: true
     enable_cuda_graph: false
@@ -61,121 +61,39 @@ static_config:
       request_rate: 25
 
 # No sweep variables - single experiment with benchmark_config inside sweep_config
-sweep_config:
-  # Test repetition with 3 repetitions, no migration
-  vllm:
-    attention_kernel: [flash, direct]
-  benchmark_config:
-    - num_total_requests: 50  # Small number for quick testing
-      repetition: 10           # 3 repetitions to test the feature
-      pp_layer_config:
-        0: "32, 32"           # Single config = no migration, only reset between reps
-        # 100: "16, 48"           # Single config = no migration, only reset between reps
-      requests:
-        0:
-          request_rate: 10.0
-          input_lens: 64
-          output_lens: 512
-    # - num_total_requests: 50  # Small number for quick testing
-    #   repetition: 10           # 3 repetitions to test the feature
-    #   pp_layer_config:
-    #     0: "32, 32"           # Single config = no migration, only reset between reps
-    #     # 100: "16, 48"           # Single config = no migration, only reset between reps
-    #   requests:
-    #     0:
-    #       request_rate: 5.0
-    #       input_lens: 5000
-    #       output_lens: 16
-
-    # - num_total_requests: 100  # Small number for quick testing
-    #   repetition: 10           # 3 repetitions to test the feature
-    #   pp_layer_config:
-    #     0: "16, 48"           # Single config = no migration, only reset between reps
-    #   requests:
-    #     0:
-    #       request_rate: 5.0
-    #       input_lens: 64 
-    #       output_lens: 64
-    #     100:
-    #       request_rate: 2.0
-    #       input_lens: 1024
-    #       output_lens: 16 
-    # - num_total_requests: 200  # Small number for quick testing
-    #   repetition: 1           # 3 repetitions to test the feature
-    #   pp_layer_config:
-    #     0: "20, 44"           # Single config = no migration, only reset between reps
-    #   requests:
-    #     0:
-    #       request_rate: 5.0
-    #       input_lens: 64 
-    #       output_lens: 64
-    #     100:
-    #       request_rate: 2.0
-    #       input_lens: 1024
-    #       output_lens: 16 
-    # - num_total_requests: 200  # Small number for quick testing
-    #   repetition: 1           # 3 repetitions to test the feature
-    #   pp_layer_config:
-    #     0: "24, 40"           # Single config = no migration, only reset between reps
-    #   requests:
-    #     0:
-    #       request_rate: 5.0
-    #       input_lens: 64 
-    #       output_lens: 64
-    #     100:
-    #       request_rate: 2.0
-    #       input_lens: 1024
-    #       output_lens: 16 
-    # - num_total_requests: 200  # Small number for quick testing
-    #   repetition: 1           # 3 repetitions to test the feature
-    #   pp_layer_config:
-    #     0: "28, 36"           # Single config = no migration, only reset between reps
-    #   requests:
-    #     0:
-    #       request_rate: 5.0
-    #       input_lens: 64 
-    #       output_lens: 64
-    #     100:
-    #       request_rate: 2.0
-    #       input_lens: 1024
-    #       output_lens: 16 
-    # - num_total_requests: 200  # Small number for quick testing
-    #   repetition: 1           # 3 repetitions to test the feature
-    #   pp_layer_config:
-    #     0: "32, 32"           # Single config = no migration, only reset between reps
-    #   requests:
-    #     0:
-    #       request_rate: 5.0
-    #       input_lens: 64 
-    #       output_lens: 64
-    #     100:
-    #       request_rate: 2.0
-    #       input_lens: 1024
-    #       output_lens: 16 
-    # - num_total_requests: 200  # Small number for quick testing
-    #   repetition: 1           # 3 repetitions to test the feature
-    #   pp_layer_config:
-    #     0: "36, 28"           # Single config = no migration, only reset between reps
-    #   requests:
-    #     0:
-    #       request_rate: 5.0
-    #       input_lens: 64 
-    #       output_lens: 64
-    #     100:
-    #       request_rate: 2.0
-    #       input_lens: 1024
-    #       output_lens: 16 
-    # - num_total_requests: 200  # Small number for quick testing
-    #   repetition: 1           # 3 repetitions to test the feature
-    #   pp_layer_config:
-    #     0: "26, 38"           # Single config = no migration, only reset between reps
-    #   requests:
-    #     0:
-    #       request_rate: 5.0
-    #       input_lens: 64 
-    #       output_lens: 64
-    #     100:
-    #       request_rate: 2.0
-    #       input_lens: 1024
-    #       output_lens: 16 
-overwrite: true
+sweep_configs:
+  - vllm:
+      attention_kernel: [direct]
+      fixed_num_gpu_blocks: [-1] 
+      weight_chunk_size_mb: [5]
+      migration_approach: [async]
+      use_vmm: [true]
+      block_size: [32]
+    benchmark_config:
+      - num_total_requests: 100  # Small number for quick testing
+        repetition: 3          # 3 repetitions to test the feature
+        pp_layer_config:
+          0: "32, 48"           # Single config = no migration, only reset between reps
+        requests:
+          0:
+            request_rate: 4
+            input_lens: 128
+            output_lens: 512
+ # Test repetition with 3 repetitions, no migration
+  - vllm:
+      attention_kernel: [direct]
+      fixed_num_gpu_blocks: [-1] 
+      weight_chunk_size_mb: [5]
+      migration_approach: [async]
+      use_vmm: [false]
+      block_size: [32]
+    benchmark_config:
+      - num_total_requests: 100  # Small number for quick testing
+        repetition: 3          # 3 repetitions to test the feature
+        pp_layer_config:
+          0: "32, 48"           # Single config = no migration, only reset between reps
+        requests:
+          0:
+            request_rate: 4
+            input_lens: 128
+            output_lens: 512

@@ -460,6 +460,180 @@ void free_vmm_blocks(
     }
 }
 
+// ============================================================================
+// VMM Combined Layers API - Multiple layers share the same VMM physical pages
+// This reduces internal fragmentation by packing multiple layers' KV cache
+// into each 2MB VMM allocation.
+// 
+// Memory layout for granularity=4:
+//   Each VMM block: [K0][V0][K1][V1][K2][V2][K3][V3]
+//   where Ki/Vi are the KV cache for layer i within the group
+// ============================================================================
+
+std::tuple<std::vector<std::vector<int64_t>>, std::vector<std::vector<int64_t>>,
+           std::vector<int64_t>, std::vector<int64_t>,
+           int64_t, int64_t, std::vector<int64_t>, double>
+allocate_with_cuda_vmm_combined_layers(
+    int64_t num_blocks,           // Number of blocks per layer
+    const std::vector<int64_t>& block_shape,  // [block_size, num_heads, head_dim]
+    torch::ScalarType dtype,
+    torch::Device device,
+    int64_t granularity           // Number of layers to pack per VMM block
+) {
+    if (granularity < 1) {
+        throw std::runtime_error("granularity must be >= 1");
+    }
+    
+    // Set the correct CUDA device
+    int device_id = device.is_cuda() ? device.index() : 0;
+    CUDA_CHECK(cudaSetDevice(device_id));
+    
+    // Initialize CUDA Driver API
+    CU_CHECK(cuInit(0));
+    
+    // Get CUDA device handle
+    CUdevice cu_device;
+    CU_CHECK(cuDeviceGet(&cu_device, device_id));
+    
+    // Calculate tensor size in bytes (for one K or V block of one layer)
+    int64_t numel = 1;
+    for (auto dim : block_shape) {
+        numel *= dim;
+    }
+    size_t element_size = torch::elementSize(dtype);
+    size_t bytes_per_kv = numel * element_size;  // Size of one K or V block
+    
+    // Combined size: granularity * (K + V) in one allocation
+    size_t combined_bytes = granularity * 2 * bytes_per_kv;
+    
+    // VMM requires 2MB alignment (GPU minimum allocation granularity)
+    const size_t VMM_GRANULARITY = 2 * 1024 * 1024;  // 2MB
+    size_t aligned_combined_bytes = ((combined_bytes + VMM_GRANULARITY - 1) / VMM_GRANULARITY) * VMM_GRANULARITY;
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    // Setup allocation properties
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device_id;
+    
+    // Setup access descriptor
+    CUmemAccessDesc access_desc = {};
+    access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access_desc.location.id = device_id;
+    access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    
+    // Reserve virtual address space for all combined KV tensors
+    size_t total_size = num_blocks * aligned_combined_bytes;
+    
+    CUdeviceptr va_base;
+    CU_CHECK(cuMemAddressReserve(&va_base, total_size, VMM_GRANULARITY, 0, 0));
+    
+    // Prepare output structures: [granularity][num_blocks] for each layer's pointers
+    std::vector<std::vector<int64_t>> k_ptrs_per_layer(granularity, std::vector<int64_t>(num_blocks));
+    std::vector<std::vector<int64_t>> v_ptrs_per_layer(granularity, std::vector<int64_t>(num_blocks));
+    std::vector<int64_t> kv_handles(num_blocks);  // Shared handles
+    
+    // Allocate physical memory handles and map for each block
+    for (int64_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+        CUmemGenericAllocationHandle kv_handle;
+        
+        // Allocate physical memory for combined layers K+V
+        CU_CHECK(cuMemCreate(&kv_handle, aligned_combined_bytes, &prop, 0));
+        
+        // Calculate virtual address for this combined block
+        CUdeviceptr block_va = va_base + block_idx * aligned_combined_bytes;
+        
+        // Map physical to virtual
+        CU_CHECK(cuMemMap(block_va, aligned_combined_bytes, 0, kv_handle, 0));
+        
+        // Calculate pointers for each layer within this block
+        // Layout: [K0][V0][K1][V1][K2][V2][K3][V3]
+        for (int64_t layer_in_group = 0; layer_in_group < granularity; ++layer_in_group) {
+            size_t k_offset = layer_in_group * 2 * bytes_per_kv;
+            size_t v_offset = k_offset + bytes_per_kv;
+            k_ptrs_per_layer[layer_in_group][block_idx] = static_cast<int64_t>(block_va + k_offset);
+            v_ptrs_per_layer[layer_in_group][block_idx] = static_cast<int64_t>(block_va + v_offset);
+        }
+        
+        kv_handles[block_idx] = static_cast<int64_t>(kv_handle);
+    }
+    
+    // Set access permissions for the entire range
+    CU_CHECK(cuMemSetAccess(va_base, total_size, &access_desc, 1));
+    
+    // Prepare GPU pointer arrays for each layer
+    std::vector<int64_t> k_ptrs_dev_per_layer(granularity);
+    std::vector<int64_t> v_ptrs_dev_per_layer(granularity);
+    
+    for (int64_t layer_in_group = 0; layer_in_group < granularity; ++layer_in_group) {
+        void** k_ptrs_dev;
+        void** v_ptrs_dev;
+        CUDA_CHECK(cudaMalloc(&k_ptrs_dev, num_blocks * sizeof(void*)));
+        CUDA_CHECK(cudaMemcpy(k_ptrs_dev, k_ptrs_per_layer[layer_in_group].data(), 
+                              num_blocks * sizeof(void*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&v_ptrs_dev, num_blocks * sizeof(void*)));
+        CUDA_CHECK(cudaMemcpy(v_ptrs_dev, v_ptrs_per_layer[layer_in_group].data(),
+                              num_blocks * sizeof(void*), cudaMemcpyHostToDevice));
+        k_ptrs_dev_per_layer[layer_in_group] = reinterpret_cast<int64_t>(k_ptrs_dev);
+        v_ptrs_dev_per_layer[layer_in_group] = reinterpret_cast<int64_t>(v_ptrs_dev);
+    }
+    
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    // Returns: k_ptrs_per_layer, v_ptrs_per_layer, k_ptrs_dev_per_layer, v_ptrs_dev_per_layer,
+    //          aligned_combined_bytes, bytes_per_kv, kv_handles, time_ms
+    return std::make_tuple(
+        k_ptrs_per_layer, v_ptrs_per_layer,
+        k_ptrs_dev_per_layer, v_ptrs_dev_per_layer,
+        static_cast<int64_t>(aligned_combined_bytes),
+        static_cast<int64_t>(bytes_per_kv),
+        kv_handles,
+        get_elapsed_ms(start, end)
+    );
+}
+
+// ============================================================================
+// Free VMM combined layers allocated memory
+// Must free complete layer groups (granularity layers at a time)
+// The handles are shared across layers, so only need to free once per block
+// ============================================================================
+
+void free_vmm_blocks_combined_layers(
+    const std::vector<int64_t>& base_k_ptrs,  // K pointers of first layer (block base addresses)
+    const std::vector<int64_t>& handles,
+    int64_t aligned_combined_bytes,
+    int device_id,
+    int64_t granularity,
+    int64_t bytes_per_kv
+) {
+    if (base_k_ptrs.empty()) return;
+    
+    // Validate that base_k_ptrs and handles have the same length
+    if (base_k_ptrs.size() != handles.size()) {
+        throw std::runtime_error(
+            "free_vmm_blocks_combined_layers: base_k_ptrs.size() (" + std::to_string(base_k_ptrs.size()) + 
+            ") != handles.size() (" + std::to_string(handles.size()) + ")"
+        );
+    }
+    
+    CUDA_CHECK(cudaSetDevice(device_id));
+    
+    // Calculate the base VA from K0's pointer (K0 is at offset 0)
+    for (size_t i = 0; i < base_k_ptrs.size(); ++i) {
+        // K0 pointer is at the start of the combined block
+        CUdeviceptr va = static_cast<CUdeviceptr>(base_k_ptrs[i]);
+        CUmemGenericAllocationHandle handle = static_cast<CUmemGenericAllocationHandle>(handles[i]);
+        
+        // Unmap the entire combined block and release physical memory
+        CU_CHECK(cuMemUnmap(va, aligned_combined_bytes));
+        CU_CHECK(cuMemRelease(handle));
+    }
+}
+
 // Free VMM virtual address range
 void free_vmm_va_range(
     int64_t va_base,
@@ -620,6 +794,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("handles"),
           py::arg("aligned_combined_bytes"),
           py::arg("device_id"));
+
+    m.def("allocate_with_cuda_vmm_combined_layers",
+          &allocate_with_cuda_vmm_combined_layers,
+          "VMM API allocation with multiple layers combined in same physical pages",
+          py::arg("num_blocks"),
+          py::arg("block_shape"),
+          py::arg("dtype"),
+          py::arg("device"),
+          py::arg("granularity"));
+
+    m.def("free_vmm_blocks_combined_layers",
+          &free_vmm_blocks_combined_layers,
+          "Free VMM combined layers blocks (multiple layers share same physical pages)",
+          py::arg("base_k_ptrs"),
+          py::arg("handles"),
+          py::arg("aligned_combined_bytes"),
+          py::arg("device_id"),
+          py::arg("granularity"),
+          py::arg("bytes_per_kv"));
 
     m.def("free_vmm_va_range",
           &free_vmm_va_range,

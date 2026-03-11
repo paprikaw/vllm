@@ -4197,6 +4197,39 @@ class DynamicConfig:
     set_pp_config. This overrides the dynamic calculation based on available
     GPU memory."""
 
+    use_vmm: bool = True
+    """Whether to use CUDA Virtual Memory Management (VMM) for KV cache allocation.
+    - True (default): Use VMM for efficient memory management with 2MB blocks
+    - False: Use cudaMallocAsync instead (has memory leak, for testing only)
+    
+    WTruehen use_vmm=False:
+    - granularity is forced to 1 (no layer grouping)
+    - block_size uses the value from config (not auto-aligned to VMM)
+    - Memory leaks will occur but allows measuring leak size for analysis
+    """
+
+    disable_memory_overhead_monitor: bool = True
+    """Whether to disable memory overhead monitoring during migration.
+    - False (default): Monitor memory overhead before/after operations
+    - True: Skip overhead monitoring to avoid performance impact from GC
+    """
+
+    enable_kv_resize: bool = True
+    """Whether to allow KV cache resize during migration.
+    - True (default): Allow KV cache compact/shrink/expand during migration
+    - False: Disable KV cache resize during migration. Migration will fail if
+      resize is required (e.g., not enough memory without compaction).
+      Note: set_pp_config can still perform resize when changing PP config,
+      this only affects the migration process triggered by migration_steps.
+    """
+
+    log_kv_memory_stats: bool = False
+    """Whether to log detailed KV cache memory statistics.
+    - False (default): Skip KV memory stats calculation for better performance
+    - True: Calculate actual_kv_memory_bytes and allocated_kv_memory_bytes
+      in SchedulerStats. May have slight performance impact on schedule().
+    """
+
     @property
     def is_migration(self) -> bool:
         """Whether migration is enabled (derived from migration_steps)."""

@@ -53,7 +53,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from bitarray import bitarray
 from vllm.v1.core.dynamic_kv_cache_utils import compact_cache_with_record
 from vllm.distributed.kv_transfer.kv_connector.dynamic_kv_synchronizer import DynamicKVSynchronizer
-from vllm.v1.worker.utils import get_flexi_kv_cache, get_flexi_kv_cache_multi_stream
+from vllm.v1.worker.utils import get_flexi_kv_cache, get_flexi_kv_cache_multi_stream, validate_layers_granularity
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -1247,8 +1247,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # Create page_meta tensor with correct shape [block_size, num_heads]
         # This tensor's dtype AND strides are used by flexi flash attention kernels
         # to understand the KV cache memory layout
-        # block_shape is (block_size, num_heads, head_size)
-        block_size, num_heads, head_size = block_shape
+        # block_shape is (block_token_num, num_heads, head_size)
+        # NOTE: block_token_num is the number of tokens per KV cache block, NOT the byte size
+        block_token_num, num_heads, head_size = block_shape
         
         # Get the actual KV cache dtype (not the string "auto")
         from vllm.utils import get_kv_cache_torch_dtype
@@ -1263,52 +1264,163 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # 2. CUDA illegal memory access errors
         # This is especially critical during migration when page_meta is reused
         # for apply_one_patch_to_kv_cache operations.
-        self.page_meta = torch.zeros((block_size, num_heads, head_size), dtype=kv_cache_torch_dtype, device=self.device)
+        self.page_meta = torch.zeros((block_token_num, num_heads, head_size), dtype=kv_cache_torch_dtype, device=self.device)
         logger.info(f"page_meta initialized: shape={self.page_meta.shape}, strides={self.page_meta.stride()}, dtype={self.page_meta.dtype}")
 
         start_time = time.time()
-        # VMM has 2MB granularity. To avoid memory waste:
-        # - Combined mode: K+V share same 2MB page (block_size >= 512 => K+V = 2MB)
-        # - Separate mode: K and V each need >= 2MB (block_size >= 1024)
-        # We use combined mode for block_size >= 512 to maximize efficiency
-        VMM_COMBINED_MIN_BLOCK_SIZE = 512  # tokens (K+V = 2MB for typical config)
-        use_vmm_combined = block_size >= VMM_COMBINED_MIN_BLOCK_SIZE
-        logger.info(f"[KV Alloc] block_size={block_size}, VMM_COMBINED_MIN_BLOCK_SIZE={VMM_COMBINED_MIN_BLOCK_SIZE}, use_vmm_combined={use_vmm_combined}")
+        # VMM has 2MB granularity. To avoid memory waste, we always use combined_layers mode:
+        # - Multiple layers share VMM blocks (layer_group_granularity > 1)
+        # - K+V share same 2MB physical page
+        # - block_token_num * granularity >= VMM_MIN_TOKENS_PER_BLOCK
+        # 
+        # NOTE: We NO LONGER support VMM mode with granularity=1 (single layer per VMM block).
+        # If block_token_num is large enough to fill 2MB alone, use_vmm should be False.
+        VMM_GRANULARITY_BYTES = 2 * 1024 * 1024  # 2MB
+        
+        # Calculate tokens needed to fill one VMM block based on model config
+        # bytes_per_token_kv = num_heads * head_size * dtype_bytes * 2 (K+V)
+        from vllm.utils import get_kv_cache_torch_dtype
+        kv_dtype = get_kv_cache_torch_dtype(self.kv_cache_dtype, self.model_config.dtype)
+        dtype_bytes = kv_dtype.itemsize  # 2 for bf16/fp16, 1 for fp8
+        bytes_per_token_kv = num_heads * head_size * dtype_bytes * 2  # K+V for one layer
+        VMM_MIN_TOKENS_PER_BLOCK = VMM_GRANULARITY_BYTES // bytes_per_token_kv
+        
+        # Check if VMM is disabled via config (use_vmm=False means use cudaMallocAsync)
+        use_vmm_config = getattr(self.vllm_config.dynamic_config, 'use_vmm', True)
+        if not use_vmm_config:
+            logger.info("[KV Alloc] use_vmm=False: forcing cudaMallocAsync mode (no VMM), "
+                        f"block_token_num={block_token_num} (from config)")
+        
+        # Layer group granularity: auto-calculate to pack multiple layers into each VMM 2MB block
+        # Formula: granularity = (2MB / bytes_per_token_kv) / block_size
+        num_layers = len(kv_cache_group.layer_names)
+        
+        # Force granularity=1 if VMM is disabled
+        if not use_vmm_config:
+            layer_group_granularity = 1
+        else:
+            # Validate: VMM mode requires combined_layers (granularity > 1)
+            # If block_token_num >= VMM_MIN_TOKENS_PER_BLOCK, a single layer can fill 2MB,
+            # which means we don't need layer grouping. This configuration is invalid for VMM.
+            if block_token_num >= VMM_MIN_TOKENS_PER_BLOCK:
+                raise ValueError(
+                    f"Invalid configuration: use_vmm=True with block_token_num={block_token_num} >= "
+                    f"VMM_MIN_TOKENS_PER_BLOCK={VMM_MIN_TOKENS_PER_BLOCK}. "
+                    f"When block_token_num is large enough to fill a 2MB VMM block alone, "
+                    f"VMM mode is not needed. Please set use_vmm=False or reduce block_token_num."
+                )
+            
+            # Calculate required granularity based on block_token_num
+            # granularity = ceil(VMM_MIN_TOKENS_PER_BLOCK / block_token_num)
+            layer_group_granularity = (VMM_MIN_TOKENS_PER_BLOCK + block_token_num - 1) // block_token_num
+            
+            # Validate: num_layers must be divisible by granularity
+            if num_layers % layer_group_granularity != 0:
+                raise ValueError(
+                    f"Invalid configuration for VMM mode: num_layers ({num_layers}) is not divisible by "
+                    f"required layer_group_granularity ({layer_group_granularity}). "
+                    f"block_token_num={block_token_num}, VMM_MIN_TOKENS_PER_BLOCK={VMM_MIN_TOKENS_PER_BLOCK}. "
+                    f"Please adjust block_token_num so that the resulting granularity divides num_layers, "
+                    f"or set use_vmm=False."
+                )
+                
+            logger.info(f"[KV Alloc] layer_group_granularity={layer_group_granularity} "
+                        f"(block_token_num={block_token_num}, num_layers={num_layers}, "
+                        f"num_heads={num_heads}, head_size={head_size}, dtype={kv_dtype}, dtype_bytes={dtype_bytes}, "
+                        f"bytes_per_token_kv={bytes_per_token_kv}, VMM_MIN_TOKENS_PER_BLOCK={VMM_MIN_TOKENS_PER_BLOCK})")
+        
+        # Calculate effective block size (total tokens per VMM block = block_token_num * granularity)
+        effective_block_token_num = block_token_num * layer_group_granularity
+        # use_vmm_combined is True only if: use_vmm config is True AND we have layer grouping
+        # (Since we validated above, if use_vmm_config is True, granularity > 1 is guaranteed)
+        use_vmm_combined = use_vmm_config and layer_group_granularity > 1
+        
+        # Validate granularity (num_layers must be divisible)
+        if layer_group_granularity > 1:
+            if num_layers % layer_group_granularity != 0:
+                raise ValueError(
+                    f"num_layers ({num_layers}) must be divisible by layer_group_granularity ({layer_group_granularity})"
+                )
+        
+        logger.info(f"[KV Alloc] block_token_num={block_token_num}, effective_block_token_num={effective_block_token_num}, "
+                    f"VMM_MIN_TOKENS_PER_BLOCK={VMM_MIN_TOKENS_PER_BLOCK}, "
+                    f"use_vmm_combined={use_vmm_combined}, layer_group_granularity={layer_group_granularity}")
         
         # Track VMM handles for fine-grained 2MB release
         # For combined mode: one handle per KV pair (stored in key_handles, value_handles empty)
+        # For combined_layers mode: handles are shared across layer groups
         key_handles_dict: dict[str, list[int]] = {}
         value_handles_dict: dict[str, list[int]] = {}
-        for layer_name in kv_cache_group.layer_names:
-            if use_vmm_combined:
-                # Use VMM combined API: K and V share same 2MB physical page
-                # This saves memory by avoiding 2MB alignment waste
-                vmm_result = kv_allocator.allocate_with_cuda_vmm_combined(
-                    kv_cache_shape[1], 
-                    list(block_shape), 
-                    self.kv_cache_dtype, 
-                    self.device
+        
+        # Track grouped handles for combined_layers mode
+        # grouped_handles[group_idx] = list of handles for that group
+        self.grouped_handles: list[list[int]] = []
+        self.layer_group_granularity = layer_group_granularity
+        self.vmm_bytes_per_kv = 0
+        
+        if use_vmm_combined:
+            # VMM combined layers mode: multiple layers share VMM blocks (guaranteed granularity > 1)
+            num_groups = num_layers // layer_group_granularity
+            
+            for group_idx in range(num_groups):
+                # Get layer names for this group
+                group_start = group_idx * layer_group_granularity
+                group_layer_names = kv_cache_group.layer_names[group_start:group_start + layer_group_granularity]
+                
+                # Allocate for this group
+                vmm_result = kv_allocator.allocate_with_cuda_vmm_combined_layers(
+                    kv_cache_shape[1],  # num_blocks
+                    list(block_shape),
+                    self.kv_cache_dtype,
+                    self.device,
+                    layer_group_granularity
                 )
-                key_caches[layer_name] = vmm_result[0]  # k_ptrs
-                value_caches[layer_name] = vmm_result[1]  # v_ptrs (offset by bytes_per_tensor)
-                key_cache_ptrs[layer_name] = vmm_result[2]  # k_ptrs_dev
-                value_cache_ptrs[layer_name] = vmm_result[3]  # v_ptrs_dev
-                aligned_combined_bytes = vmm_result[4]  # aligned_combined_bytes
-                self.vmm_bytes_per_tensor = vmm_result[5]  # bytes_per_tensor
-                key_handles_dict[layer_name] = list(vmm_result[6])  # kv_handles (combined)
-                value_handles_dict[layer_name] = []  # Empty for combined mode
+                
+                # vmm_result: (k_ptrs_per_layer, v_ptrs_per_layer, k_ptrs_dev_per_layer, v_ptrs_dev_per_layer,
+                #              aligned_combined_bytes, bytes_per_kv, kv_handles, time_ms)
+                k_ptrs_per_layer = vmm_result[0]  # [granularity][num_blocks]
+                v_ptrs_per_layer = vmm_result[1]
+                k_ptrs_dev_per_layer = vmm_result[2]  # [granularity]
+                v_ptrs_dev_per_layer = vmm_result[3]
+                aligned_combined_bytes = vmm_result[4]
+                bytes_per_kv = vmm_result[5]
+                kv_handles = vmm_result[6]  # [num_blocks] shared handles
+                
+                # Store metadata
                 self.vmm_aligned_bytes = aligned_combined_bytes
+                self.vmm_bytes_per_kv = bytes_per_kv
                 self.vmm_combined_mode = True
-            else:
-                # Use cudaMallocAsync for smaller blocks (no handles)
+                self.vmm_bytes_per_tensor = bytes_per_kv  # For compatibility
+                
+                # Store handles for this group
+                self.grouped_handles.append(list(kv_handles))
+                
+                # Populate per-layer structures
+                for layer_in_group in range(layer_group_granularity):
+                    layer_name = group_layer_names[layer_in_group]
+                    key_caches[layer_name] = list(k_ptrs_per_layer[layer_in_group])
+                    value_caches[layer_name] = list(v_ptrs_per_layer[layer_in_group])
+                    key_cache_ptrs[layer_name] = k_ptrs_dev_per_layer[layer_in_group]
+                    value_cache_ptrs[layer_name] = v_ptrs_dev_per_layer[layer_in_group]
+                    # For combined_layers mode, we don't store per-layer handles
+                    # because handles are shared across the group
+                    key_handles_dict[layer_name] = []  # Empty - use grouped_handles instead
+                    value_handles_dict[layer_name] = []
+            
+            logger.info(f"[VMM combined layers] Allocated {num_groups} groups with granularity={layer_group_granularity}, "
+                        f"aligned_bytes={self.vmm_aligned_bytes}, bytes_per_kv={self.vmm_bytes_per_kv}")
+        else:
+            # Non-VMM allocation: use cudaMallocAsync for each layer
+            # This path is taken when use_vmm=False in config
+            for layer_name in kv_cache_group.layer_names:
                 key_caches[layer_name], value_caches[layer_name], key_cache_ptrs[layer_name], value_cache_ptrs[layer_name], _ = kv_allocator.allocate_with_cuda_async(
                     kv_cache_shape[1], list(block_shape), self.kv_cache_dtype, self.device
                 )
                 key_handles_dict[layer_name] = []  # No handles for cudaMallocAsync
                 value_handles_dict[layer_name] = []
-                self.vmm_aligned_bytes = 0  # Indicate not using VMM
-                self.vmm_combined_mode = False
-                self.vmm_bytes_per_tensor = 0
+            self.vmm_aligned_bytes = 0  # Indicate not using VMM
+            self.vmm_combined_mode = False
+            self.vmm_bytes_per_tensor = 0
         
         logger.info(f"[VMM init] time to intialize kv blocks:{human_readable_duration(time.time() - start_time)}, aligned_bytes={self.vmm_aligned_bytes}, combined_mode={getattr(self, 'vmm_combined_mode', False)}")
         # logger.info(f"key cache shape: {key_caches[kv_cache_group.layer_names[0]][0].shape}, value cache shape:{value_caches[kv_cache_group.layer_names[0]][0].shape}")
@@ -1337,9 +1449,18 @@ class DynamicGPUModelRunner(GPUModelRunner):
         
         # Store VMM handles after binding (order matches self.key_caches/value_caches)
         # For combined mode: key_handles contains kv_handles, value_handles is empty
+        # For combined_layers mode: key_handles is empty, use grouped_handles instead
         self.key_handles = [key_handles_dict[layer_name] for layer_name in kv_cache_group.layer_names]
         self.value_handles = [value_handles_dict[layer_name] for layer_name in kv_cache_group.layer_names]
-        logger.info(f"[VMM init] Stored handles for {len(self.key_handles)} layers, first layer has {len(self.key_handles[0]) if self.key_handles else 0} handles, combined_mode={getattr(self, 'vmm_combined_mode', False)}")
+        
+        if layer_group_granularity > 1:
+            logger.info(f"[VMM init] Combined layers mode: {len(self.grouped_handles)} groups with "
+                        f"{len(self.grouped_handles[0]) if self.grouped_handles else 0} handles each, "
+                        f"granularity={layer_group_granularity}")
+        else:
+            logger.info(f"[VMM init] Stored handles for {len(self.key_handles)} layers, "
+                        f"first layer has {len(self.key_handles[0]) if self.key_handles else 0} handles, "
+                        f"combined_mode={getattr(self, 'vmm_combined_mode', False)}")
         
         # Initialize PtrTable stacked tensors after binding all KV caches (direct mode only)
         if self.vllm_config.dynamic_config.use_direct_ptr:
@@ -1481,6 +1602,14 @@ class DynamicGPUModelRunner(GPUModelRunner):
 
         # Delete the kv cache from kv_cache list
         start_layer = self.model.model.start_layer
+        
+        # Validate granularity for combined_layers mode
+        if hasattr(self, 'layer_group_granularity') and self.layer_group_granularity > 1:
+            validate_layers_granularity(
+                layers_list, start_layer, self.layer_group_granularity,
+                operation="flexi_atomic_switch"
+            )
+        
         self.key_caches = [
             key_cache for idx, key_cache in enumerate(self.key_caches) 
             if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
@@ -1507,6 +1636,29 @@ class DynamicGPUModelRunner(GPUModelRunner):
             handles for idx, handles in enumerate(self.value_handles)
             if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
         ]
+        
+        # Update grouped_handles for combined_layers mode
+        if hasattr(self, 'layer_group_granularity') and self.layer_group_granularity > 1 and hasattr(self, 'grouped_handles'):
+            granularity = self.layer_group_granularity
+            # Calculate which groups to delete based on layers_list
+            groups_to_delete = set()
+            for layers in layers_list:
+                local_start = layers[0] - start_layer
+                local_end = layers[1] - start_layer
+                start_group = local_start // granularity
+                end_group = local_end // granularity
+                for g in range(start_group, end_group + 1):
+                    groups_to_delete.add(g)
+            groups_to_delete = sorted(groups_to_delete, reverse=True)  # Delete from end to preserve indices
+            num_groups_to_delete = len(groups_to_delete)
+            
+            # Remove the correct groups (delete from end to preserve indices)
+            if num_groups_to_delete > 0:
+                for g in groups_to_delete:
+                    if g < len(self.grouped_handles):
+                        del self.grouped_handles[g]
+                logger.info(f"flexi_atomic_switch: updated grouped_handles, removed groups {sorted(groups_to_delete)}, "
+                            f"remaining groups: {len(self.grouped_handles)}")
         
         # Also update k_ptr_tensors and v_ptr_tensors for flexi_direct
         self.k_ptr_tensors = [
@@ -1628,6 +1780,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 attn_module.key_dev_ptr = self.key_cache_ptrs[idx]
                 attn_module.value_dev_ptr = self.value_cache_ptrs[idx]
             logger.info(f"Updated GPU pointer arrays after compact")
+            # Note: grouped_handles are already swapped in _migrate_block_by_swapping_ptrs
         else:
             compact_cache_with_record(self._migrate_block_by_copy_data, is_used, compacted_length, num_blocks, migrate_record)
         logger.info(f"[debug]: migrate_record: {migrate_record}")
@@ -1751,6 +1904,13 @@ class DynamicGPUModelRunner(GPUModelRunner):
             key_cache[new_block_id], key_cache[old_block_id] = key_cache[ old_block_id], key_cache[ new_block_id]
         for value_cache in self.value_caches:
             value_cache[ new_block_id], value_cache[ old_block_id] = value_cache[ old_block_id], value_cache[ new_block_id]
+        
+        # Also swap grouped_handles for combined_layers mode
+        if hasattr(self, 'layer_group_granularity') and self.layer_group_granularity > 1 and hasattr(self, 'grouped_handles'):
+            for group_handles in self.grouped_handles:
+                if old_block_id < len(group_handles) and new_block_id < len(group_handles):
+                    group_handles[new_block_id], group_handles[old_block_id] = group_handles[old_block_id], group_handles[new_block_id]
+        
         migrate_record[old_block_id] = new_block_id
 
     def _update_start_layer(self) -> None:
@@ -1769,7 +1929,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         stream: Optional[torch.cuda.Stream] = None
     ) -> Tuple[list[int], list[int], int, int, list[int], bool]:
         """
-        Allocate KV cache memory for a single layer, choosing VMM combined or async based on block_size.
+        Allocate KV cache memory for a single layer, using the same allocation mode
+        as determined during initialization.
         
         This method separates the memory allocation from data writing, allowing the caller
         to first allocate memory and then write data to it.
@@ -1790,12 +1951,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
         kv_cache_shape = self.kv_cache_shape
         assert len(kv_cache_shape) == 5  # (2, nkvblocks, blockdim, n_head, headdim)
         block_shape = kv_cache_shape[2:]  # (blockdim, n_head, headdim)
-        block_size = block_shape[0]  # blockdim
         kv_dtype = self.kv_cache_dtype
         
-        # Same threshold as in _init_kv_cache_for_flexi_attention
-        VMM_COMBINED_MIN_BLOCK_SIZE = 512
-        use_vmm_combined = block_size >= VMM_COMBINED_MIN_BLOCK_SIZE
+        # Use the same allocation mode as determined during initialization
+        # This ensures consistency: if init used VMM (via layer_group_granularity),
+        # migration should also use VMM
+        use_vmm_combined = getattr(self, 'vmm_combined_mode', False)
         
         start_time = time.time()
         
@@ -1840,6 +2001,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
         subsequent bind operations to use pre-allocated memory instead of allocating
         on-the-fly.
         
+        IMPORTANT: When layer_group_granularity > 1, this method uses grouped allocation
+        (allocate_with_cuda_vmm_combined_layers) to match the initialization pattern.
+        This ensures migration doesn't use 'granularity' times more memory than init.
+        
         Args:
             layer_ids: List of layer indices to allocate for
             block_num: Number of blocks to allocate per layer
@@ -1851,12 +2016,102 @@ class DynamicGPUModelRunner(GPUModelRunner):
         """
         time_start = time.time()
         allocations: dict[int, Tuple[list[int], list[int], int, int, list[int], bool]] = {}
-        
-        for layer_id in layer_ids:
-            allocation = self.allocate_flexi_kv_cache_for_migration(block_num, stream)
-            allocations[layer_id] = allocation
-        
-        logger.info(f"[Migration] Pre-allocated {len(layer_ids)} layers in {human_readable_duration(time.time() - time_start)}")
+        granularity = getattr(self, 'layer_group_granularity', 1)
+        use_vmm_combined = getattr(self, 'vmm_combined_mode', False)
+        logger.info(f"preallocate_flexi_kv_caches_for_migration: layer_ids={layer_ids}, block_num={block_num}, granularity={granularity}, use_vmm_combined={use_vmm_combined}") 
+        if use_vmm_combined and granularity > 1:
+            # Use grouped allocation to match initialization pattern
+            # This uses 'granularity' times LESS memory than per-layer allocation
+            num_layers = len(layer_ids)
+            
+            # Check if layer count is divisible by granularity
+            if num_layers % granularity != 0:
+                # Fall back to per-layer allocation if layer count doesn't match granularity
+                # This can happen in edge cases, though migration configs should align properly
+                logger.warning(
+                    f"[Migration] Layer count ({num_layers}) not divisible by granularity ({granularity}). "
+                    f"Falling back to per-layer allocation (uses {granularity}x more memory)"
+                )
+                for layer_id in layer_ids:
+                    allocation = self.allocate_flexi_kv_cache_for_migration(block_num, stream)
+                    allocations[layer_id] = allocation
+                
+                logger.info(f"[Migration] Per-layer allocation (fallback): {num_layers} layers, "
+                            f"time={human_readable_duration(time.time() - time_start)}")
+                return allocations
+            
+            kv_cache_shape = self.kv_cache_shape
+            block_shape = kv_cache_shape[2:]
+            kv_dtype = self.kv_cache_dtype
+            
+            num_groups = num_layers // granularity
+            logger.info(f"[Migration] Using combined_layers allocation: {num_layers} layers -> "
+                        f"{num_groups} groups (granularity={granularity})")
+            
+            # Track new grouped handles for later release
+            new_grouped_handles: list[list[int]] = []
+            
+            for group_idx in range(num_groups):
+                group_start = group_idx * granularity
+                group_layer_ids = layer_ids[group_start:group_start + granularity]
+                
+                with torch.cuda.stream(stream):
+                    vmm_result = kv_allocator.allocate_with_cuda_vmm_combined_layers(
+                        block_num,
+                        list(block_shape),
+                        kv_dtype,
+                        self.device,
+                        granularity
+                    )
+                
+                # vmm_result: (k_ptrs_per_layer, v_ptrs_per_layer, k_ptrs_dev_per_layer, v_ptrs_dev_per_layer,
+                #              aligned_combined_bytes, bytes_per_kv, kv_handles, time_ms)
+                k_ptrs_per_layer = vmm_result[0]  # [granularity][num_blocks]
+                v_ptrs_per_layer = vmm_result[1]
+                k_ptrs_dev_per_layer = vmm_result[2]  # [granularity]
+                v_ptrs_dev_per_layer = vmm_result[3]
+                # aligned_combined_bytes = vmm_result[4]
+                # bytes_per_kv = vmm_result[5]
+                kv_handles = vmm_result[6]  # [num_blocks] shared handles
+                
+                # Store grouped handles for proper release later
+                new_grouped_handles.append(list(kv_handles))
+                
+                # Distribute allocation results to each layer in the group
+                for layer_in_group in range(granularity):
+                    layer_id = group_layer_ids[layer_in_group]
+                    # For combined_layers mode, handles are shared across the group
+                    # Only the first layer in the group stores the handles (for non-grouped release path)
+                    layer_handles = list(kv_handles) if layer_in_group == 0 else []
+                    allocations[layer_id] = (
+                        list(k_ptrs_per_layer[layer_in_group]),
+                        list(v_ptrs_per_layer[layer_in_group]),
+                        k_ptrs_dev_per_layer[layer_in_group],
+                        v_ptrs_dev_per_layer[layer_in_group],
+                        layer_handles,
+                        True  # vmm_combined
+                    )
+            
+            # Append new grouped handles to runner's grouped_handles list
+            # This is critical for proper memory release during future layer removal
+            if hasattr(self, 'grouped_handles'):
+                self.grouped_handles.extend(new_grouped_handles)
+                logger.info(f"[Migration] Updated grouped_handles: added {len(new_grouped_handles)} groups, "
+                            f"total groups now: {len(self.grouped_handles)}")
+            else:
+                self.grouped_handles = new_grouped_handles
+                logger.info(f"[Migration] Created grouped_handles: {len(new_grouped_handles)} groups")
+            
+            logger.info(f"[Migration] Combined_layers allocation: {num_groups} groups, "
+                        f"block_num={block_num}, time={human_readable_duration(time.time() - time_start)}")
+        else:
+            # Original per-layer allocation (non-VMM or granularity=1)
+            for layer_id in layer_ids:
+                allocation = self.allocate_flexi_kv_cache_for_migration(block_num, stream)
+                allocations[layer_id] = allocation
+            
+            logger.info(f"[Migration] Per-layer allocation: {len(layer_ids)} layers, "
+                        f"time={human_readable_duration(time.time() - time_start)})")
         return allocations
 
     def apply_kv_tensor_to_allocated_cache(

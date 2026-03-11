@@ -140,11 +140,14 @@ class WorkerMemInfo:
     block_size: bytes of a single block of a KV cache
     free_mem: current free GPU memory reported by driver (bytes)
     kv_tensor_size: bytes of a single layer's KV cache tensor
+    runtime_overhead_bytes: runtime overhead measured by profile_run (includes
+        activations during forward pass, CUDA context, NCCL buffers, etc.)
     """
     layer_size: int
     kv_tensor_size: int
     free_mem: int
     total_gpu_memory: int
+    runtime_overhead_bytes: int = 0
 
 
 @dataclass

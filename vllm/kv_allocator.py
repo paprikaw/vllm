@@ -325,6 +325,102 @@ class KVAllocator():
         device_id = device.index
         _cpp_module.free_vmm_blocks_combined(k_ptrs, handles, aligned_combined_bytes, device_id)
 
+    def allocate_with_cuda_vmm_combined_layers(
+        self,
+        num_blocks: int,
+        block_shape: List[int],
+        dtype: torch.dtype,
+        device: torch.device,
+        granularity: int
+    ) -> Tuple[List[List[int]], List[List[int]], List[int], List[int], int, int, List[int], float]:
+        """
+        VMM API allocation with multiple layers combined in same physical pages.
+
+        This method saves memory by placing multiple layers' K and V caches in the
+        same VMM pages. Each 2MB VMM block contains `granularity` layers' KV cache.
+
+        Memory layout for granularity=4:
+            Each block: [K0][V0][K1][V1][K2][V2][K3][V3]
+
+        Args:
+            num_blocks: Number of blocks to allocate per layer
+            block_shape: Shape of each block [block_size, num_heads, head_dim]
+            dtype: PyTorch data type for the tensors
+            device: Target CUDA device
+            granularity: Number of layers to pack per VMM block
+
+        Returns:
+            Tuple of (k_ptrs_per_layer, v_ptrs_per_layer, k_ptrs_dev_per_layer, 
+                      v_ptrs_dev_per_layer, aligned_combined_bytes, bytes_per_kv,
+                      kv_handles, allocation_time_ms)
+            - k_ptrs_per_layer: [granularity][num_blocks] K virtual addresses
+            - v_ptrs_per_layer: [granularity][num_blocks] V virtual addresses
+            - k_ptrs_dev_per_layer: [granularity] GPU pointer arrays for K
+            - v_ptrs_dev_per_layer: [granularity] GPU pointer arrays for V
+            - aligned_combined_bytes: Size of each combined block (2MB aligned)
+            - bytes_per_kv: Size of one K or V tensor per layer
+            - kv_handles: [num_blocks] Physical memory handles (shared across layers)
+            - allocation_time_ms: Allocation time in milliseconds
+
+        Raises:
+            RuntimeError: If kv_cache_allocator extension is not available
+        """
+        if not kv_allocator_available:
+            raise RuntimeError("kv_cache_allocator extension not available")
+        
+        if granularity < 1:
+            raise ValueError("granularity must be >= 1")
+        
+        start_time = time.perf_counter()
+        
+        if self.fb_gate is not None:
+            with self.fb_gate.background():
+                results = _cpp_module.allocate_with_cuda_vmm_combined_layers(
+                    num_blocks, block_shape, dtype, device, granularity)
+        else:
+            results = _cpp_module.allocate_with_cuda_vmm_combined_layers(
+                num_blocks, block_shape, dtype, device, granularity)
+        
+        torch.cuda.synchronize(device)
+        alloc_time_ms = (time.perf_counter() - start_time) * 1000
+        logger.info(f"VMM combined layers allocation: alloc_time={alloc_time_ms:.2f}ms, "
+                    f"granularity={granularity}, aligned_combined_bytes={results[4]}, "
+                    f"bytes_per_kv={results[5]}")
+        return results
+
+    def free_vmm_blocks_combined_layers(
+        self,
+        base_k_ptrs: List[int],
+        handles: List[int],
+        aligned_combined_bytes: int,
+        device: torch.device,
+        granularity: int,
+        bytes_per_kv: int
+    ) -> None:
+        """
+        Free VMM combined layers blocks.
+
+        Frees combined KV cache blocks allocated with allocate_with_cuda_vmm_combined_layers.
+        The handles are shared across layers in a group, so this frees the entire group.
+
+        Args:
+            base_k_ptrs: List of K virtual addresses from the first layer (base of combined block)
+            handles: Corresponding physical memory handles (one per block, shared across layers)
+            aligned_combined_bytes: Size of each combined block (from allocation)
+            device: Target CUDA device
+            granularity: Number of layers per VMM block
+            bytes_per_kv: Size of one K or V tensor per layer
+
+        Note:
+            This must be called with handles from a complete layer group.
+            Partial group freeing is not supported.
+        """
+        if not kv_allocator_available:
+            raise RuntimeError("kv_cache_allocator extension not available")
+        
+        device_id = device.index
+        _cpp_module.free_vmm_blocks_combined_layers(
+            base_k_ptrs, handles, aligned_combined_bytes, device_id, granularity, bytes_per_kv)
 
     def prepare_flexi_kv_ptrs(
         self,

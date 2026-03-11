@@ -34,6 +34,11 @@ class SchedulerStats:
 
     gpu_cache_usage: float = 0.0
 
+    # Actual KV memory used by running requests (bytes, across all layers/GPUs)
+    actual_kv_memory_bytes: int = 0
+    # Allocated KV memory capacity (bytes, across all layers/GPUs)
+    allocated_kv_memory_bytes: int = 0
+
     prefix_cache_stats: PrefixCacheStats = field(
         default_factory=PrefixCacheStats)
 
