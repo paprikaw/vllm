@@ -134,6 +134,10 @@ class DynamicGPUWorker(Worker):
 
         # 记录target pp config
         self.target_pp_layer_config: Optional[list[Tuple[int, int]]] = None
+        
+        # Async layer loading tracking
+        self._async_add_layers_threads: list[threading.Thread] = []
+        self._async_add_layers_lock = threading.Lock()
 
 
         # page meta
@@ -718,8 +722,25 @@ class DynamicGPUWorker(Worker):
             self._add_layers(layer_list)
         # 异步调用：与工作的 commit 9ed5ec00f2c94 保持一致
         # 注意：daemon=False 确保线程在进程退出前完成
-        threading.Thread(target=_do_add, daemon=False).start()
+        thread = threading.Thread(target=_do_add, daemon=False)
+        with self._async_add_layers_lock:
+            self._async_add_layers_threads.append(thread)
+        thread.start()
         logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
+
+    def wait_for_async_add_layers(self) -> None:
+        """Wait for all async_add_layers threads to complete."""
+        threads_to_wait = []
+        with self._async_add_layers_lock:
+            threads_to_wait = list(self._async_add_layers_threads)
+        
+        logger.info(f"[async_fast] Waiting for {len(threads_to_wait)} async_add_layers threads to complete")
+        for thread in threads_to_wait:
+            thread.join()
+        
+        with self._async_add_layers_lock:
+            self._async_add_layers_threads.clear()
+        logger.info(f"[async_fast] All async_add_layers threads completed")
 
     def add_layers(self, rank: int, layer_list: list[Tuple[int, int]]) -> None:
         if self.rank != rank:
@@ -2361,6 +2382,82 @@ class DynamicGPUWorker(Worker):
             memory_snapshot(f"rank{self.rank}_after_commit_ptr_tables", self.device)
         
         logger.info(f"finish sync migration in {time.time() - time_start:.2f}")
+        return None
+
+    def start_kv_cache_migration_async_fast(self, pp_layer_config: list[Tuple[int, int]], 
+                                             src_to_sending_layers: dict[int, dict[int, list[Tuple[int, int]]]], 
+                                             rank_to_layer_ids: dict[int, list[Tuple[int, int]]],
+                                             slot_mapping: Optional[list[int]] = None) -> None:
+        """Async-fast KV cache migration - similar to sync but used after async weight loading.
+        
+        This performs a one-shot KV transfer without the continuous patch phase.
+        Weight loading should have already completed before this is called.
+        
+        Args:
+            pp_layer_config: Target layer configuration per rank
+            src_to_sending_layers: Mapping of source rank to {dest_rank: layer_ranges}
+            rank_to_layer_ids: Mapping of destination rank to layer ranges to receive
+            slot_mapping: Optional list of slot indices for flexi mode
+        """
+        time_start = time.time()
+        
+        with self._receive_finished_cv:
+            assert self.receive_in_process == False, "The receiving kv cache should not be in process"
+
+        if self.rank in rank_to_layer_ids:
+            logger.info(f"[async_fast] rank {self.rank} is receiving kv cache")
+            with self._receive_finished_cv:
+                self.receive_in_process = True
+
+        assert isinstance(self.model_runner.model, DynamicModelBase)
+        memory_snapshot(f"rank{self.rank}_async_fast_migration_entry", self.device)
+
+        # Sender Side, Send KV Cache (same as sync)
+        logger.info(f"[async_fast] Enter async_fast migration process")
+        if self.rank in src_to_sending_layers:
+            sending_layers_plans = src_to_sending_layers[self.rank]
+            logger.info(f"[async_fast] Enter Sender Side, sending_layer_plans:{sending_layers_plans}")
+            sending_layers_list: dict[int, list[int]] = {}
+            for rank, layer_ranges in sending_layers_plans.items():
+                for layer_range in layer_ranges:
+                    layer_ids = sending_layers_list.setdefault(rank, [])
+                    layer_ids.extend(list(range(layer_range[0], layer_range[1] + 1)))
+
+            # Convert slot_mapping to tensor if provided
+            slot_mapping_tensor: Optional[torch.Tensor] = None
+            if slot_mapping is not None:
+                slot_mapping_tensor = torch.tensor(slot_mapping, dtype=torch.int64, device=self.device)
+
+            with self.model_runner.forward_lock:
+                self.dynamic_kv_synchronizer.send_kv_tensor_sync(
+                    sending_layers_list, 
+                    self.model_runner.kv_caches, 
+                    self.model_runner.model.model.start_layer,
+                    slot_mapping_tensor)
+            all_layer_ranges = []
+            for _, ranges in sending_layers_plans.items():
+                all_layer_ranges.extend(ranges)
+            caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free = self.atomic_shelve_kv_cache(self.rank, all_layer_ranges)
+            self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free)
+            self.remove_layers(self.rank, all_layer_ranges)
+                
+        start_layer = pp_layer_config[self.rank][0]
+        # Receiver Side, Wait for receive to finish
+        if self.rank not in src_to_sending_layers:
+            # Wait for receive to finish if this rank is a receiver
+            if self.rank in rank_to_layer_ids:
+                with self._receive_finished_cv:
+                    while self.receive_in_process:
+                        logger.info(f"[async_fast]: rank {self.rank} waiting for receive to finish")
+                        self._receive_finished_cv.wait()
+            logger.info(f"[async_fast timeline]: after kv cache migration, time taken: {human_readable_duration(time.time() - time_start)}")
+        is_direct = self.vllm_config.dynamic_config.use_direct_ptr  
+        if is_direct:
+            memory_snapshot(f"rank{self.rank}_async_fast_before_commit_ptr_tables", self.device)
+            self.model_runner.commit_ptr_tables(self.model_runner.k_ptr_tensors, self.model_runner.v_ptr_tensors, target_start_layer=start_layer)
+            memory_snapshot(f"rank{self.rank}_async_fast_after_commit_ptr_tables", self.device)
+        
+        logger.info(f"[async_fast] finish migration in {time.time() - time_start:.2f}")
         return None
 
     # ####################################### #

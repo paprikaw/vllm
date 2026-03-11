@@ -494,6 +494,10 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
     def async_add_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
         # fire-and-forget 异步发起，每个 worker 内部用线程执行
         self.collective_rpc("async_add_layers", args=(rank, layers_list))
+
+    def wait_for_all_async_add_layers(self):
+        """Wait for all async_add_layers to complete on all workers."""
+        self.collective_rpc("wait_for_async_add_layers")
     
     def start_kv_cache_migration_async(self, pp_layer_config: list[Tuple[int, int]], src_to_plan: dict[int, dict[int, list[int]]], slot_mapping: Optional[list[int]]):
         # 调用 worker 侧的同名方法，仅在 source_rank 上发送，其余 rank 不做事
@@ -512,6 +516,18 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                                        slot_mapping: Optional[list[int]] = None):
         # 调用 worker 侧的同名方法，仅在 source_rank 上发送，其余 rank 不做事
         self.collective_rpc("start_kv_cache_migration_sync", args=(pp_layer_config, src_to_plan, dst_to_layer_ids, slot_mapping))
+
+    def start_kv_cache_migration_async_fast(self, pp_layer_config: list[Tuple[int, int]], 
+                                             src_to_plan: dict[int, dict[int, list[Tuple[int, int]]]], 
+                                             dst_to_layer_ids: dict[int, list[Tuple[int, int]]],
+                                             slot_mapping: Optional[list[int]] = None):
+        """Start async_fast KV cache migration.
+        
+        This is similar to sync migration but used after async weight loading.
+        It performs one-shot KV transfer without the continuous patch phase.
+        """
+        self.collective_rpc("start_kv_cache_migration_async_fast", args=(pp_layer_config, src_to_plan, dst_to_layer_ids, slot_mapping))
+
     def get_kv_buffer_status(self) -> list[KVBufferStatus]:
         output = self.collective_rpc("get_kv_buffer_status")
         return output
