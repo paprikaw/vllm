@@ -338,6 +338,10 @@ class DynamicLlamaModel(LlamaModel):
                 # Diagnostic: Track NaN propagation through layers
                 _nan_first_detected_layer = -1
                 
+                # Fine-grained timing counters
+                _layer_times = []
+                _total_layer_time = 0.0
+                
                 for layer_idx, layer in enumerate(
                         self.layers[self.sched_start_layer:
                                     self.sched_end_layer],
@@ -368,11 +372,28 @@ class DynamicLlamaModel(LlamaModel):
                     #                 f"hidden_shape={hidden_states.shape} "
                     #                 f"nan_count={torch.isnan(hidden_states).sum().item()}")
                     
-                    logger.debug(
-                        "Layer %d took %s", layer_idx,
-                        human_readable_duration(time.time() - layer_t0))
-                logger.info("forwarding took long time: %s, calculated token: %d",
-                            human_readable_duration(time.time() - fwd_t0), hidden_states.size(1))
+                    layer_elapsed = time.time() - layer_t0
+                    _layer_times.append(layer_elapsed)
+                    _total_layer_time += layer_elapsed
+                    
+                    if layer_idx % 10 == 0 or layer_elapsed > 0.1:
+                        logger.info(
+                            "[LAYER_TIMING] layer %d took %s (cumulative: %s)",
+                            layer_idx, human_readable_duration(layer_elapsed),
+                            human_readable_duration(_total_layer_time))
+                
+                # Log layer timing summary
+                if _layer_times:
+                    avg_time = sum(_layer_times) / len(_layer_times)
+                    max_time = max(_layer_times)
+                    max_layer = _layer_times.index(max_time) + self.sched_start_layer
+                    logger.info(
+                        "[LAYER_SUMMARY] %d layers: total=%s, avg=%s, max=%s (layer %d)",
+                        len(_layer_times), human_readable_duration(_total_layer_time),
+                        human_readable_duration(avg_time), human_readable_duration(max_time), max_layer)
+                
+                logger.info("after forwarding took %s",
+                            human_readable_duration(time.time() - fwd_t0))
 
                 if not get_pp_group().is_last_rank:
                     return IntermediateTensors({

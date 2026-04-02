@@ -490,6 +490,14 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
     def add_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
         self.collective_rpc("add_layers", args=(rank, layers_list))
+
+    def sync_add_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
+        """Synchronously add layers on the target rank.
+
+        This is an explicit alias of `add_layers()` for call sites that need
+        to distinguish it from `async_add_layers()`.
+        """
+        self.add_layers(rank, layers_list)
     
     def async_add_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
         # fire-and-forget 异步发起，每个 worker 内部用线程执行
@@ -569,3 +577,11 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
     def set_env_var(self, key: str, value: str) -> None:
         """Broadcast an environment variable update to all workers."""
         self.collective_rpc("set_env_var", args=(key, value))
+
+    def set_log_stop_time(self, enabled: bool) -> None:
+        """Enable or disable STOP_TIME logging on all workers.
+        
+        Used to disable logging during set_pp_config to avoid polluting
+        migration metrics with initialization overhead.
+        """
+        self.collective_rpc("set_log_stop_time", args=(enabled,))

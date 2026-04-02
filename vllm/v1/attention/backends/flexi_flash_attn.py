@@ -4,7 +4,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from itertools import accumulate
 import os
-import time
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
@@ -30,7 +29,7 @@ from vllm.attention.utils.fa_utils import (flash_attn_supports_fp8,
 from vllm.logger import init_logger
 from vllm.multimodal import MultiModalPlaceholderMap
 from vllm.utils import async_tensor_h2d, make_tensor_with_pad
-from vllm.v1.utils import human_readable_duration
+from vllm.v1.utils import extract_layer_index
 from vllm.vllm_flash_attn import (flash_attn_varlen_func,
                                   flash_attn_with_kvcache)
 from vllm.v1.attention.backends.flash_attn import (FlashAttentionBackend, FlashAttentionImpl,FlashAttentionMetadata)
@@ -130,6 +129,7 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        layer_name = getattr(layer, 'layer_name', None)
         # Reshape the input keys and values and store them in the cache.
         # NOTE(woosuk): Here, key and value are padded while slot_mapping is
         # not padded. However, we don't need to do key[:num_actual_tokens] and
@@ -222,14 +222,9 @@ class FlexiFlashAttentionImpl(FlashAttentionImpl):
                                v_ptr_tables is not None and 
                                k_ptr_tables.numel() > 0)
 
-            import threading
             try:
                 if use_flexi_direct:
-                    logger.debug(f"[DEBUG ATTN] flexi_direct thread_id={threading.get_ident()}, k_ptr_tables.shape={k_ptr_tables.shape}")
                     # Extract layer index from layer name to get the correct ptr_table
-                    from vllm.v1.utils import extract_layer_index
-                    # layer has layer_name attribute from Attention base class
-                    layer_name = getattr(layer, 'layer_name', None)
                     if layer_name is None:
                         # Fallback to non-direct if layer_name not available
                         use_flexi_direct = False

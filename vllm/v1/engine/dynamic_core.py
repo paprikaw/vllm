@@ -56,7 +56,7 @@ from vllm.v1.core.sched.dynamic_scheduler import MigrationStatus
 from vllm.dynamic_config import PPLayerConfigs
 from vllm.version import __version__ as VLLM_VERSION
 from .utils import get_new_layer_config_with_migration_action
-from vllm.v1.utils import WorkerMemInfo, LayerAddingAssessResult, human_readable_duration
+from vllm.v1.utils import WorkerMemInfo, LayerAddingAssessResult, human_readable_duration, StopTimeMetrics
 from dataclasses import dataclass
 from vllm.dynamic_config import MigrationConfig
 from copy import deepcopy
@@ -68,6 +68,15 @@ POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar('_R')  # Return type for collective_rpc
+
+
+def _safe_queue_size(q: Any) -> int:
+    if q is None:
+        return 0
+    try:
+        return q.qsize()
+    except (AttributeError, NotImplementedError):
+        return 0
 
 class DynamicEngineCore(EngineCore):
 
@@ -657,6 +666,30 @@ class DynamicEngineCore(EngineCore):
 
             return engine_core_outputs
 
+    def _get_weight_loading_mode(self) -> str:
+        mode = self.vllm_config.dynamic_config.weight_loading_mode
+        if mode not in ("async", "sync"):
+            raise ValueError(
+                f"Invalid weight_loading_mode: {mode}. Must be 'async' or 'sync'.")
+        return mode
+
+    def _dispatch_weight_loading(
+        self,
+        adding_per_rank: dict[int, list[Tuple[int, int]]],
+        migration_kind: str,
+    ) -> str:
+        weight_loading_mode = self._get_weight_loading_mode()
+        add_layers_fn = (self.model_executor.async_add_layers
+                         if weight_loading_mode == "async"
+                         else self.model_executor.sync_add_layers)
+        for r, add_list in adding_per_rank.items():
+            total_layers = sum(hi - lo + 1 for lo, hi in add_list)
+            logger.info(
+                f"[{migration_kind}] rank {r}: {weight_loading_mode} adding layers {add_list} "
+                f"(total_layers={total_layers})")
+            add_layers_fn(r, add_list)
+        return weight_loading_mode
+
     def change_model_configuration_by_kv_transfer_async(self, pp_layer_config: list[Tuple[int, int]]):
         """
         Our fancy implementation of model configuration change
@@ -745,7 +778,9 @@ class DynamicEngineCore(EngineCore):
 
             if allow_resize and compacted_length < original_length:
                 self.scheduler.shrink_block_pool(compacted_length)
+            engine_lock_time_ms = (time.time() - time_start) * 1000
             logger.info(f"[timeline]: engine locking time: {human_readable_duration(time.time() - time_start)}")
+            logger.info(f"[STOP_TIME][async]: engine_lock_total={engine_lock_time_ms:.2f}ms")
         # with self.engine_lock:
         if allow_resize and need_compact:
             time_start_compact_kv = time.time()
@@ -778,12 +813,11 @@ class DynamicEngineCore(EngineCore):
             self._migration_done_event.set()
             return
 
-        for r, add_list in adding_per_rank.items():
-            logger.info(f"rank {r}: adding layers {add_list}")
-            self.model_executor.async_add_layers(r, add_list)
+        weight_loading_mode = self._dispatch_weight_loading(
+            adding_per_rank, migration_kind="async")
         time_kv_compact_end = time.time()
 
-        logger.info(f"[timeline]: before start actual kv cache migration, time taken to add weights, compact, resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
+        logger.info(f"[timeline]: before start actual kv cache migration, time taken to dispatch {weight_loading_mode} weight loading, compact, resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
 
         # 在异步传输/扩容前，抓取 KV cache 的快照，记录各请求的已计算 token 与 block 映射
         # 用于后续传输完成后对齐新增 token，实现两 GPU 之间 KV 同步
@@ -935,7 +969,10 @@ class DynamicEngineCore(EngineCore):
         logger.info(f"[timeline]: after check resizing done process, time taken: {human_readable_duration(time.time() - time_start_checking_resizing_done)}")
         logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
 
-    def change_model_configuration_by_kv_transfer_async_fast(self, pp_layer_config: list[Tuple[int, int]]):
+    def change_model_configuration_by_kv_transfer_async_fast(
+        self,
+        pp_layer_config: list[Tuple[int, int]],
+    ) -> list[EngineCoreOutputs]:
         """
         Async-fast migration: combines async weight loading with fast KV transfer.
         
@@ -972,9 +1009,9 @@ class DynamicEngineCore(EngineCore):
         bitmap = bitarray()
         engine_core_outputs = []
         
-        time_start = time.time()
         
         with self.engine_lock:
+            time_start = time.time()
             # Phase 1: Assess memory and prepare layer lists
             for rank, layers in enumerate(pp_layer_config):
                 start_layer, end_layer = tmp_pp_layer_config[rank][0], tmp_pp_layer_config[rank][1]
@@ -1017,6 +1054,7 @@ class DynamicEngineCore(EngineCore):
 
             if allow_resize and compacted_length < original_length:
                 self.scheduler.shrink_block_pool(compacted_length)
+            engine_lock_1_time_ms = (time.time() - time_start) * 1000
             logger.info(f"[async_fast timeline]: engine locking time: {human_readable_duration(time.time() - time_start)}")
         
         # Compact KV cache outside of engine lock
@@ -1034,14 +1072,13 @@ class DynamicEngineCore(EngineCore):
             logger.info("[async_fast] No layers to add - skipping migration (no-op)")
             self.migration_status = MigrationStatus.NOT_MIGRATING
             self._migration_done_event.set()
-            return
+            return engine_core_outputs
 
-        # Phase 2: Start async weight loading (same as async)
-        for r, add_list in adding_per_rank.items():
-            logger.info(f"[async_fast] rank {r}: async adding layers {add_list}")
-            self.model_executor.async_add_layers(r, add_list)
-        
-        logger.info(f"[async_fast timeline]: async weight loading started: {human_readable_duration(time.time() - time_start)}")
+        # Phase 2: Start weight loading with configured mode
+        weight_loading_mode = self._dispatch_weight_loading(
+            adding_per_rank, migration_kind="async_fast")
+
+        logger.info(f"[async_fast timeline]: {weight_loading_mode} weight loading dispatched: {human_readable_duration(time.time() - time_start)}")
 
         # Phase 3: Compute src->dst transfer plan
         original_pp_layer_config = deepcopy(self.cur_pp_layer_config)
@@ -1069,97 +1106,98 @@ class DynamicEngineCore(EngineCore):
         sender_list = list(src_to_plan.keys())
         receiver_list = list(adding_per_rank.keys())
         
-        # Phase 4: Wait for weight loading to complete, then drain running queue and send KV
-        # This is the key difference from async - we drain the queue and do one-shot KV transfer
-        def async_fast_migration_thread():
-            try:
-                torch.cuda.set_device(self.device)
-                time_thread_start = time.time()
-                
-                # Wait for all weight loading to complete
-                logger.info(f"[async_fast] Waiting for weight loading to complete...")
-                self.model_executor.wait_for_all_async_add_layers()
-                logger.info(f"[async_fast timeline]: weight loading completed in {human_readable_duration(time.time() - time_thread_start)}")
-                
-                # Drain running queue (like sync migration)
-                with self.engine_lock:
-                    drain_start = time.time()
-                    outputs = self._drain_out_running_queue()
-                    engine_core_outputs.extend(outputs)
-                    logger.info(f"[async_fast timeline]: drain_running_queue took {human_readable_duration(time.time() - drain_start)}")
-                    
-                    # Get slot mapping for KV transfer
-                    should_increase_version = allow_resize and need_compact
-                    slot_mapping = self.scheduler.start_migration(sender_list, receiver_list, should_increase_version)
-                    
-                    # Update cur_pp_layer_config to intermediate state after async weight loading
-                    self.cur_pp_layer_config = deepcopy(tmp_pp_layer_config)
-                    logger.info(f"[async_fast] updated cur_pp_layer_config to intermediate state {self.cur_pp_layer_config}")
-                    
-                    # Start one-shot KV transfer (uses sync-style send, no patch phase)
-                    logger.info(f"[async_fast] Starting one-shot KV transfer")
-                    self.model_executor.start_kv_cache_migration_async_fast(pp_layer_config, sending_plan_for_ranks, adding_per_rank, slot_mapping)
-                    
-                    logger.info(f"[async_fast timeline]: KV transfer completed in {human_readable_duration(time.time() - drain_start)}")
-                    
-                    # Phase 5: Calculate final resized block num
-                    final_pp_layer_config = deepcopy(tmp_pp_layer_config)
-                    deleting_layer_assesses: list[int] = []
-                    for rank, layers in enumerate(pp_layer_config):
-                        start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
-                        deleting_layer_list = []
-                        if layers[0] > start_layer:
-                            deleting_layer_list.append((start_layer, layers[0] - 1))
-                            final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
-                        if layers[1] < end_layer:
-                            deleting_layer_list.append((layers[1] + 1, end_layer))
-                            final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
-                        deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
-                        assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
-                        deleting_layer_assesses.append(assess.max_blocks_per_layer)
+        # Phase 4: Drain running queue first, then execute one-shot KV migration.
+        # Do NOT wait for async add-layers; weight loading and migration can still overlap.
+        with self.engine_lock:
+            drain_start = time.time()
+            outputs = self._drain_out_running_queue()
+            engine_core_outputs.extend(outputs)
+            logger.info(f"[async_fast timeline]: drain_running_queue took {human_readable_duration(time.time() - drain_start)}")
+            logger.info(f"[async_fast] drained {len(outputs)} outputs during migration")
 
-                    resized_block_num = min(deleting_layer_assesses)
-                    if not allow_resize:
-                        resized_block_num = self.scheduler.kv_cache_manager.num_gpu_blocks
-                        logger.info(f"[async_fast] fixed_num_gpu_blocks={fixed_blocks}, keeping current block count: {resized_block_num}")
+            should_increase_version = allow_resize and need_compact
+            slot_mapping = self.scheduler.start_migration(sender_list, receiver_list, should_increase_version)
+            assert slot_mapping is not None if is_flexi else True
 
-                    # Update scheduler configuration synchronously
-                    self.scheduler.sync_change_configuration(pp_layer_config)
-                    current_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
-                    if allow_resize and resized_block_num != current_blocks:
-                        logger.info(f"[async_fast] resizing KV cache from {current_blocks} to {resized_block_num} blocks")
-                        self.model_executor.resize_kv_cache(resized_block_num)
-                        if resized_block_num > current_blocks:
-                            self.scheduler.extend_block_pool(resized_block_num)
-                        else:
-                            self.scheduler.shrink_block_pool(resized_block_num)
-                    
-                    self.cur_pp_layer_config = pp_layer_config
-                    logger.info(f"[async_fast] Migration complete, cur_pp_layer_config: {self.cur_pp_layer_config}")
-                
-                # Flush drain outputs to output queue
-                for output in engine_core_outputs:
-                    if output is not None:
-                        self.output_queue.put_nowait(output)
-                logger.info(f"[async_fast] Flushed {len(engine_core_outputs)} drain outputs to output_queue")
-                
-                logger.info(f"[async_fast timeline]: total migration time: {human_readable_duration(time.time() - time_thread_start)}")
-            except Exception as e:
-                logger.error(f"[async_fast] Migration thread failed: {e}")
-                import traceback
-                traceback.print_exc()
-            finally:
-                self.migration_status = MigrationStatus.NOT_MIGRATING
-                self._migration_done_event.set()
+            self.cur_pp_layer_config = deepcopy(tmp_pp_layer_config)
+            logger.info(f"[async_fast] updated cur_pp_layer_config to intermediate state {self.cur_pp_layer_config}")
+
+            self.model_executor.start_kv_cache_migration_async_fast(
+                pp_layer_config,
+                sending_plan_for_ranks,
+                adding_per_rank,
+                slot_mapping,
+            )
+            engine_lock_2_time_ms = (time.time() - drain_start) * 1000
+            drain_time_ms = (time.time() - drain_start) * 1000  # Approximately includes drain + kv_transfer
+            logger.info(f"[async_fast timeline]: one-shot KV transfer completed in {human_readable_duration(time.time() - drain_start)}")
+            logger.info(f"[STOP_TIME][async_fast]: engine_lock_total={engine_lock_1_time_ms + engine_lock_2_time_ms:.2f}ms (lock1={engine_lock_1_time_ms:.2f}ms, lock2={engine_lock_2_time_ms:.2f}ms) drain+kv_transfer={drain_time_ms:.2f}ms")
+
+        time_kv_migration_end = time.time()
+        logger.info(f"[async_fast timeline]: migration initiated, time taken: {human_readable_duration(time_kv_migration_end - time_start)}")
+
+        # Phase 5: finalize scheduler/config after one-shot transfer is completed.
+        assert isinstance(self.scheduler, DynamicScheduler)
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        final_pp_layer_config = deepcopy(tmp_pp_layer_config)
+        deleting_layer_assesses: list[int] = []
+        for rank, layers in enumerate(pp_layer_config):
+            start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
+            deleting_layer_list = []
+            if layers[0] > start_layer:
+                deleting_layer_list.append((start_layer, layers[0] - 1))
+                final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
+            if layers[1] < end_layer:
+                deleting_layer_list.append((layers[1] + 1, end_layer))
+                final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
+            deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
+            assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
+            deleting_layer_assesses.append(assess.max_blocks_per_layer)
+
+        for rank, layers in enumerate(final_pp_layer_config):
+            assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
+
+        resized_block_num = min(deleting_layer_assesses)
+        if not allow_resize:
+            resized_block_num = self.scheduler.kv_cache_manager.num_gpu_blocks
+            logger.info(f"[async_fast] fixed_num_gpu_blocks={fixed_blocks}, keeping current block count: {resized_block_num}")
+
+        with self.scheduler.lock:
+            self.scheduler.async_change_configuration(pp_layer_config,
+                                                      resized_block_num)
+
+        self.cur_pp_layer_config = pp_layer_config
+        logger.info(f"[async_fast] config synced to {pp_layer_config}")
+
+        assert resized_block_num != 0
+        if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
+            logger.info(f"[async_fast] no need to resize kv cache, migration setup complete in {human_readable_duration(time.time() - time_start)}")
+            self.migration_status = MigrationStatus.NOT_MIGRATING
+            self._migration_done_event.set()
+            return engine_core_outputs
         
-        # Start the migration in a background thread
-        threading.Thread(target=async_fast_migration_thread, daemon=True).start()
-        logger.info(f"[async_fast] Migration thread started")
+        time_start_checking_resizing_done = time.time()
+        # Check if KV resizing is done
+        while True:
+            time.sleep(0.3)
+            resizing_done = self.model_executor.get_is_kv_resizing_done()
+            logger.info(f"resizing_done status: {resizing_done}")
+            if all(resizing_done):
+                with self.scheduler.lock:
+                    self.scheduler.extend_block_pool(resized_block_num)
+                break
+
+        self.migration_status = MigrationStatus.NOT_MIGRATING
+        self._migration_done_event.set()
+        logger.info(f"[timeline]: check resizing done in {human_readable_duration(time.time() - time_start_checking_resizing_done)}")
+        logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
+        return engine_core_outputs
 
     def change_model_configuration_by_kv_transfer_sync(
         self,
         pp_layer_config: list[Tuple[int, int]],
         target_kv_blocks: Optional[int] = None,
+        log_stop_time: bool = True,
     ) -> list[EngineCoreOutputs]:
         """
         Our fancy implementation of model synchronized configuration change.
@@ -1168,10 +1206,12 @@ class DynamicEngineCore(EngineCore):
             pp_layer_config: Target layer configuration per rank.
             target_kv_blocks: If provided and > 0, the final KV block count
                 after migration.  None means use the calculated maximum.
+            log_stop_time: If True, emit [STOP_TIME] logs. Set to False when
+                called from set_pp_config to avoid polluting migration metrics.
         """
         logger.info(f"Start migrating to new configuration {pp_layer_config}")
         assert isinstance(self.scheduler, DynamicScheduler)
-        time_start = time.time()
+        time_start = None 
         engine_core_outputs = []
         fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
         enable_kv_resize = self.vllm_config.dynamic_config.enable_kv_resize
@@ -1187,6 +1227,7 @@ class DynamicEngineCore(EngineCore):
         # 若任一 rank 需要 compact，则在持有引擎锁时再次校验一次可用显存，
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         with self.engine_lock:
+            time_start =  time.time()
             # 先获取一次内存快照
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
             mem_infos = self.model_executor.get_workers_mem_info()
@@ -1235,6 +1276,7 @@ class DynamicEngineCore(EngineCore):
 
             outputs = self._drain_out_running_queue()
             engine_core_outputs.extend(outputs)
+            drain_time_ms = (time.time() - time_start) * 1000
             logger.info(f"[timeline]: after drain out running queue, time taken: {human_readable_duration(time.time() - time_start)}")
             logger.info(f"[debug]: tmp pp layer config: {tmp_pp_layer_config}")
 
@@ -1280,14 +1322,17 @@ class DynamicEngineCore(EngineCore):
             # Save original config before updating - needed for find_src_rank_for_range
             original_pp_layer_config = deepcopy(self.cur_pp_layer_config)
             
-            for r, add_list in adding_per_rank.items():
-                self.model_executor.add_layers(r, add_list)
+            weight_loading_mode = self._dispatch_weight_loading(
+                adding_per_rank, migration_kind="sync")
+            if weight_loading_mode == "async":
+                logger.info("[sync_migration] waiting for async weight loading to complete before KV migration")
+                self.model_executor.wait_for_all_async_add_layers()
             # Update cur_pp_layer_config immediately after add_layers succeeds
             # This ensures Engine state matches Worker state even if later operations fail
             self.cur_pp_layer_config = deepcopy(tmp_pp_layer_config)
             logger.info(f"[sync_migration]: updated cur_pp_layer_config to intermediate state {self.cur_pp_layer_config} after add_layers")
             time_kv_compact_end = time.time()
-            logger.info(f"[timeline]: before start actual kv cache migration, time taken to add weights, compact, resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
+            logger.info(f"[timeline]: before start actual kv cache migration, time taken to complete {weight_loading_mode} weight loading, compact, resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
 
 
             # 在异步传输/扩容前，抓取 KV cache 的快照，记录各请求的已计算 token 与 block 映射
@@ -1358,7 +1403,11 @@ class DynamicEngineCore(EngineCore):
             elif not allow_resize:
                 logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, skipping end-of-migration resize (would be {resized_block_num} blocks)")
             self.cur_pp_layer_config = pp_layer_config
+            engine_lock_total_ms = (time.time() - time_start) * 1000
             logger.info(f"[sync_migration]: updated cur_pp_layer_config to {self.cur_pp_layer_config}, time taken: {human_readable_duration(time.time() - time_start)}")
+            logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
+            if log_stop_time:
+                logger.info(f"[STOP_TIME][sync]: engine_lock_total={engine_lock_total_ms:.2f}ms drain={drain_time_ms:.2f}ms")
 
             return engine_core_outputs
 
@@ -1368,6 +1417,7 @@ class DynamicEngineCore(EngineCore):
         alternative_configs: Optional[Dict[int, Any]] = None,
         migration_steps: Optional[list[int]] = None,
         migration_mode: Optional[str] = None,
+        weight_loading_mode: Optional[str] = None,
         weight_chunk_size_mb: Optional[float] = None,
         fixed_num_gpu_blocks: Optional[int] = None,
     ) -> list[EngineCoreOutputs]:
@@ -1388,8 +1438,10 @@ class DynamicEngineCore(EngineCore):
                                  Format: {0: [(0,17), (18,63)], 1: [(0,19), (20,63)]}
             migration_steps: Optional new migration steps (request indices at which
                             to trigger migration). If provided, updates the migration_thread.
-            migration_mode: Optional migration mode ('sync' or 'async'). If provided,
+            migration_mode: Optional migration mode ('sync', 'async', or 'async_fast'). If provided,
                            updates self.dynamic_config.migration_mode for subsequent migrations.
+            weight_loading_mode: Optional weight loading mode ('sync' or 'async'). If provided,
+                           updates self.dynamic_config.weight_loading_mode for subsequent migrations.
         
         Returns:
             List of EngineCoreOutputs from processing any pending requests.
@@ -1405,6 +1457,18 @@ class DynamicEngineCore(EngineCore):
         if migration_mode is not None:
             logger.info(f"set_pp_config: Updating migration_mode to '{migration_mode}'")
             self.migration_config.migration_mode = migration_mode
+
+        if weight_loading_mode is not None:
+            if weight_loading_mode not in ("async", "sync"):
+                raise ValueError(
+                    f"Invalid weight_loading_mode: {weight_loading_mode}. Must be 'async' or 'sync'.")
+            old_mode = self.vllm_config.dynamic_config.weight_loading_mode
+            if old_mode != weight_loading_mode:
+                logger.info("set_pp_config: Updating weight_loading_mode from '%s' to '%s'",
+                            old_mode, weight_loading_mode)
+                self.vllm_config.dynamic_config.weight_loading_mode = weight_loading_mode
+            else:
+                logger.info(f"set_pp_config: weight_loading_mode already '{weight_loading_mode}', no change")
         
         # Update weight_chunk_size_mb if provided
         if weight_chunk_size_mb is not None:
@@ -1474,16 +1538,21 @@ class DynamicEngineCore(EngineCore):
             saved_enable_kv_resize = self.vllm_config.dynamic_config.enable_kv_resize
             self.vllm_config.dynamic_config.fixed_num_gpu_blocks = -1
             self.vllm_config.dynamic_config.enable_kv_resize = True
+            # Disable STOP_TIME logging on workers to avoid polluting migration metrics
+            self.model_executor.set_log_stop_time(False)
             try:
                 outputs.extend(self.change_model_configuration_by_kv_transfer_sync(
                     pp_layer_config,
                     target_kv_blocks=target_kv,
+                    log_stop_time=False,  # Don't pollute migration metrics
                 ))
             finally:
                 # Restore to the NEW target value (already set by the
                 # "Update fixed_num_gpu_blocks" block above)
                 self.vllm_config.dynamic_config.fixed_num_gpu_blocks = fixed_blocks
                 self.vllm_config.dynamic_config.enable_kv_resize = saved_enable_kv_resize
+                # Re-enable STOP_TIME logging on workers
+                self.model_executor.set_log_stop_time(True)
         
         # Signal migration_thread to reset request counter for next benchmark run
         logger.info("set_pp_config: Signaling migration_thread to reset request counter")
@@ -1492,6 +1561,34 @@ class DynamicEngineCore(EngineCore):
         self._migration_reset_event.set()
         logger.info(f"set_pp_config completed, now at {self.cur_pp_layer_config}")
         return outputs
+
+    def get_engine_state(self) -> Dict[str, Any]:
+        assert isinstance(self.scheduler, DynamicScheduler)
+
+        batch_queue_size = _safe_queue_size(self.batch_queue)
+        input_queue_size = _safe_queue_size(self.input_queue)
+        unfinished_requests = self.scheduler.get_num_unfinished_requests()
+        running_requests = self.scheduler.running_controller.get_total_length()
+        waiting_requests = self.scheduler.waiting_controller.get_total_length()
+        migration_in_process = (self.migration_in_process
+                                or not self._migration_done_event.is_set())
+
+        is_idle = (unfinished_requests == 0 and batch_queue_size == 0
+                   and input_queue_size == 0 and not self.engines_running
+                   and not migration_in_process)
+
+        return {
+            "is_idle": is_idle,
+            "unfinished_requests": unfinished_requests,
+            "running_requests": running_requests,
+            "waiting_requests": waiting_requests,
+            "tracked_requests": len(self.scheduler.requests),
+            "batch_queue_size": batch_queue_size,
+            "input_queue_size": input_queue_size,
+            "engines_running": bool(self.engines_running),
+            "migration_in_process": migration_in_process,
+            "current_pp_layer_config": self.cur_pp_layer_config,
+        }
 
     def migrate_layer_v1(self, rank_from: int, rank_to: int, num_layers: int) -> list[EngineCoreOutputs]:
         with self.engine_lock:
@@ -1797,7 +1894,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
         waited = False
-        while not self.engines_running and not (self.scheduler.has_requests()):
+        while not self.engines_running and not (self.scheduler.has_requests()) and self.batch_queue.empty():
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
@@ -2058,7 +2155,11 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                         self.change_model_configuration_by_kv_transfer_async(alternative_configs[cur_config])
                     elif migration_mode == "async_fast":
                         logger.info(f"Using async_fast migration mode")
-                        self.change_model_configuration_by_kv_transfer_async_fast(alternative_configs[cur_config])
+                        engine_core_outputs = self.change_model_configuration_by_kv_transfer_async_fast(alternative_configs[cur_config])
+                        for output in engine_core_outputs:
+                            if output is not None:
+                                self.output_queue.put_nowait(output)
+                        logger.info(f"migration_thread: flushed {len(engine_core_outputs)} async_fast drain outputs to output_queue")
                     else:
                         raise ValueError(f"Invalid migration_mode: {migration_mode}. Must be 'sync', 'async', or 'async_fast'.")
 

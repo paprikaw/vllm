@@ -118,6 +118,7 @@ async def get_request(
     input_requests: list[SampleRequest],
     request_rate: float,
     burstiness: float = 1.0,
+    request_intervals: Optional[list[float]] = None,
 ) -> AsyncGenerator[SampleRequest, None]:
     """
     Asynchronously generates requests at a specified rate
@@ -137,7 +138,13 @@ async def get_request(
             in more bursty requests, while a higher burstiness value
             (burstiness > 1) results in a more uniform arrival of requests.
     """
-    input_requests: Iterable[SampleRequest] = iter(input_requests)
+    num_requests = len(input_requests)
+    if request_intervals is not None:
+        expected_intervals = max(num_requests - 1, 0)
+        assert len(request_intervals) == expected_intervals, (
+            "request_intervals length mismatch: "
+            f"expected {expected_intervals}, got {len(request_intervals)}"
+        )
 
     # Calculate scale parameter theta to maintain the desired request_rate.
     assert burstiness > 0, (
@@ -145,18 +152,42 @@ async def get_request(
     )
     theta = 1.0 / (request_rate * burstiness)
 
-    for request in input_requests:
+    for idx, request in enumerate(input_requests):
         yield request
+
+        if idx == num_requests - 1:
+            continue
 
         if request_rate == float("inf"):
             # If the request rate is infinity, then we don't need to wait.
             continue
 
-        # Sample the request interval from the gamma distribution.
-        # If burstiness is 1, it follows exponential distribution.
-        interval = np.random.gamma(shape=burstiness, scale=theta)
+        if request_intervals is not None:
+            interval = request_intervals[idx]
+        else:
+            # Sample the request interval from the gamma distribution.
+            # If burstiness is 1, it follows exponential distribution.
+            interval = np.random.gamma(shape=burstiness, scale=theta)
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
+
+
+def build_request_intervals(
+    num_requests: int,
+    request_rate: float,
+    burstiness: float = 1.0,
+) -> list[float]:
+    if num_requests <= 1 or request_rate == float("inf"):
+        return []
+
+    assert burstiness > 0, (
+        f"A positive burstiness factor is expected, but given {burstiness}."
+    )
+    theta = 1.0 / (request_rate * burstiness)
+    return [
+        float(np.random.gamma(shape=burstiness, scale=theta))
+        for _ in range(num_requests - 1)
+    ]
 
 
 def calculate_metrics(
@@ -342,6 +373,7 @@ async def set_pp_config(
     alternative_configs: Optional[dict] = None,
     migration_steps: Optional[list] = None,
     migration_mode: Optional[str] = None,
+    weight_loading_mode: Optional[str] = None,
     timeout: float = 120.0
 ) -> bool:
     """Set pipeline configuration to a specific target config.
@@ -356,9 +388,11 @@ async def set_pp_config(
         base_url: Base URL of the vLLM server (e.g., http://localhost:8000)
         pp_layer_config: Target configuration as list of [start, end] pairs per rank.
                          Example: [[0, 39], [40, 63]] for 2 ranks.
-        migration_mode: Optional migration mode ('sync' or 'async') to set on the
+        migration_mode: Optional migration mode ('sync', 'async', or 'async_fast') to set on the
                        server for use by migration_thread. Does NOT affect the
                        set_pp_config reset migration itself (always sync).
+        weight_loading_mode: Optional weight loading mode ('sync' or 'async') to
+                   set on the server for subsequent migrations.
         timeout: Request timeout in seconds
     
     Returns:
@@ -366,13 +400,15 @@ async def set_pp_config(
     """
     import aiohttp
     set_url = f"{base_url}/set_pp_config"
-    payload = {"pp_layer_config": pp_layer_config}
+    payload: dict[str, Any] = {"pp_layer_config": pp_layer_config}
     if alternative_configs is not None:
         payload["alternative_configs"] = alternative_configs
     if migration_steps is not None:
         payload["migration_steps"] = migration_steps
     if migration_mode is not None:
         payload["migration_mode"] = migration_mode
+    if weight_loading_mode is not None:
+        payload["weight_loading_mode"] = weight_loading_mode
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(set_url, json=payload, 
@@ -392,6 +428,101 @@ async def set_pp_config(
     except Exception as e:
         print(f"  Warning: Failed to set pp config: {e}")
         return False
+
+
+async def wait_for_server_idle(
+    base_url: str,
+    timeout: float = 60.0,
+    poll_interval: float = 0.5,
+    quiet_time: float = 2.0,
+) -> bool:
+    """Wait until the engine has no running/waiting requests for a quiet window.
+
+    Prefer the live `/engine_state` endpoint. Prometheus `/metrics` only exposes
+    the last logged scheduler snapshot, which can stay stale after the engine
+    stops stepping. `/load` is only the last fallback because it tracks HTTP
+    handlers rather than true engine state.
+    """
+    import aiohttp
+
+    deadline = time.monotonic() + timeout
+    idle_since: Optional[float] = None
+    engine_state_url = f"{base_url}/engine_state"
+    load_url = f"{base_url}/load"
+    metrics_url = f"{base_url}/metrics"
+
+    def _parse_engine_pending(metrics_text: str) -> Optional[float]:
+        running = 0.0
+        waiting = 0.0
+        found = False
+        for line in metrics_text.splitlines():
+            if line.startswith("vllm:num_requests_running"):
+                try:
+                    running += float(line.rsplit(" ", 1)[-1])
+                    found = True
+                except ValueError:
+                    continue
+            elif line.startswith("vllm:num_requests_waiting"):
+                try:
+                    waiting += float(line.rsplit(" ", 1)[-1])
+                    found = True
+                except ValueError:
+                    continue
+        if not found:
+            return None
+        return running + waiting
+
+    async with aiohttp.ClientSession() as session:
+        while time.monotonic() < deadline:
+            try:
+                idle_now: Optional[bool] = None
+                pending_requests: Optional[float] = None
+
+                async with session.get(
+                    engine_state_url,
+                    timeout=aiohttp.ClientTimeout(total=poll_interval + 1.0),
+                ) as response:
+                    if response.status == 200:
+                        payload = await response.json()
+                        idle_now = bool(payload.get("is_idle", False))
+                        pending_requests = float(
+                            payload.get("unfinished_requests", 0))
+
+                if idle_now is None:
+                    async with session.get(
+                        metrics_url,
+                        timeout=aiohttp.ClientTimeout(total=poll_interval + 1.0),
+                    ) as response:
+                        if response.status == 200:
+                            pending_requests = _parse_engine_pending(
+                                await response.text())
+                            if pending_requests is not None:
+                                idle_now = pending_requests == 0
+
+                if idle_now is None:
+                    async with session.get(
+                        load_url,
+                        timeout=aiohttp.ClientTimeout(total=poll_interval + 1.0),
+                    ) as response:
+                        if response.status == 200:
+                            payload = await response.json()
+                            pending_requests = float(
+                                payload.get("server_load", 0))
+                            idle_now = pending_requests == 0
+
+                if idle_now:
+                    if idle_since is None:
+                        idle_since = time.monotonic()
+                    elif time.monotonic() - idle_since >= quiet_time:
+                        return True
+                else:
+                    idle_since = None
+            except Exception:
+                idle_since = None
+
+            await asyncio.sleep(poll_interval)
+
+    return False
 
 
 def _print_repetition_summary(rep: int, metrics: BenchmarkMetrics) -> None:
@@ -534,6 +665,7 @@ async def run_repetition_benchmark(
     alternative_configs: Optional[dict] = None,
     migration_steps: Optional[list] = None,
     migration_mode: Optional[str] = None,
+    weight_loading_mode: Optional[str] = None,
     **kwargs
 ) -> tuple[BenchmarkMetrics, list[int]]:
     """Run benchmark multiple times with pipeline config reset between repetitions.
@@ -546,7 +678,8 @@ async def run_repetition_benchmark(
                           If None, skip the reset (server will handle same-config skip).
         alternative_configs: Optional migration target configs for set_pp_config.
         migration_steps: Optional migration trigger points (request indices).
-        migration_mode: Optional migration mode ('sync' or 'async') for migration_thread.
+        migration_mode: Optional migration mode ('sync', 'async', or 'async_fast') for migration_thread.
+        weight_loading_mode: Optional weight loading mode ('sync' or 'async').
         **kwargs: Arguments to pass to run_single_benchmark_func
     
     Returns:
@@ -563,7 +696,7 @@ async def run_repetition_benchmark(
         print(f"\n{'#' * 70}")
         print(f"###################### REPETITION {rep}/{repetition} ######################")
         print(f"{'#' * 70}")
-        
+
         # Run single benchmark (add base_url and repetition_index to kwargs for run_multi_stage_benchmark)
         kwargs_with_base_url = {**kwargs, 'base_url': base_url, 'repetition_index': rep}
         metrics, output_lens = await run_single_benchmark_func(**kwargs_with_base_url)
@@ -575,6 +708,11 @@ async def run_repetition_benchmark(
         
         # Reset pipeline config if not the last repetition
         if rep < repetition:
+            print("\n  Waiting for server to become idle before reset...")
+            became_idle = await wait_for_server_idle(base_url)
+            if not became_idle:
+                print("  Warning: Timed out waiting for server idle state, continuing with reset...")
+
             if initial_pp_config is not None:
                 print(f"\n  Resetting pipeline configuration to {initial_pp_config} for next repetition...")
                 success = await set_pp_config(
@@ -582,12 +720,17 @@ async def run_repetition_benchmark(
                     initial_pp_config,
                     alternative_configs=alternative_configs,
                     migration_steps=migration_steps,
-                    migration_mode=migration_mode
+                    migration_mode=migration_mode,
+                    weight_loading_mode=weight_loading_mode,
                 )
                 if not success:
                     print(f"  Warning: Pipeline config reset failed, continuing anyway...")
-                # Small delay after reset to ensure server is ready
-                await asyncio.sleep(1.0)
+                print("  Waiting for server to settle after reset...")
+                became_idle_after_reset = await wait_for_server_idle(
+                    base_url, timeout=30.0, quiet_time=1.0)
+                if not became_idle_after_reset:
+                    print("  Warning: Timed out waiting for idle after reset, using fallback sleep...")
+                    await asyncio.sleep(1.0)
             else:
                 print(f"\n  No initial_pp_config provided, skipping pipeline reset...")
     
@@ -674,6 +817,7 @@ async def run_multi_stage_benchmark(
     input_requests: list[SampleRequest],
     request_rate_list: list[float],
     running_num_requests: list[int],
+    stage_request_intervals: Optional[list[list[float]]],
     burstiness: float,
     disable_tqdm: bool,
     max_concurrency: Optional[int],
@@ -734,6 +878,9 @@ async def run_multi_stage_benchmark(
         start_idx = start_indices[stage_idx]
         end_idx = start_idx + num_req
         stage_requests = input_requests[start_idx:end_idx]
+        stage_intervals = None
+        if stage_request_intervals is not None:
+            stage_intervals = stage_request_intervals[stage_idx]
 
         stage_lora_modules = None
         if lora_modules:
@@ -742,7 +889,12 @@ async def run_multi_stage_benchmark(
             )
 
         stage_tasks: list[asyncio.Task] = []
-        async for request in get_request(stage_requests, request_rate, burstiness):
+        async for request in get_request(
+            stage_requests,
+            request_rate,
+            burstiness,
+            request_intervals=stage_intervals,
+        ):
             prompt, prompt_len, output_len, mm_content = (
                 request.prompt,
                 request.prompt_len,
@@ -1077,6 +1229,7 @@ async def benchmark(
     alternative_configs: Optional[dict] = None,
     migration_steps: Optional[list] = None,
     migration_mode: Optional[str] = None,
+    weight_loading_mode: Optional[str] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1145,6 +1298,11 @@ async def benchmark(
         assert len(compact_kv_request_rate_list) == len(running_num_requests), "request_rate_list and num_requests must have the same length"
         for i, (rate, num_req) in enumerate(zip(compact_kv_request_rate_list, running_num_requests)):
             print(f"  Stage {i+1}: {num_req} requests at {rate} req/s")
+
+        stage_request_intervals = [
+            build_request_intervals(num_req, rate, burstiness)
+            for rate, num_req in zip(compact_kv_request_rate_list, running_num_requests)
+        ]
         
         # If repetition > 1, wrap in run_repetition_benchmark
         if repetition > 1:
@@ -1156,10 +1314,12 @@ async def benchmark(
                 alternative_configs=alternative_configs,
                 migration_steps=migration_steps,
                 migration_mode=migration_mode,
+                weight_loading_mode=weight_loading_mode,
                 request_func=request_func,
                 input_requests=input_requests,
                 request_rate_list=compact_kv_request_rate_list,
                 running_num_requests=running_num_requests,
+                stage_request_intervals=stage_request_intervals,
                 burstiness=burstiness,
                 disable_tqdm=disable_tqdm,
                 max_concurrency=max_concurrency,
@@ -1189,6 +1349,7 @@ async def benchmark(
             input_requests=input_requests,
             request_rate_list=compact_kv_request_rate_list,
             running_num_requests=running_num_requests,
+            stage_request_intervals=stage_request_intervals,
             burstiness=burstiness,
             disable_tqdm=disable_tqdm,
             max_concurrency=max_concurrency,
@@ -1729,6 +1890,7 @@ def main(args: argparse.Namespace):
     alternative_configs = getattr(benchmark_config, "alternative_configs", None)
     migration_steps = getattr(benchmark_config, "migration_steps", None)
     migration_mode = getattr(benchmark_config, "migration_mode", None)
+    weight_loading_mode = getattr(benchmark_config, "weight_loading_mode", None)
     
     if getattr(benchmark_config, "warmup", None) is not None and benchmark_config.warmup.enabled:
         warm = benchmark_config.warmup
@@ -1769,6 +1931,7 @@ def main(args: argparse.Namespace):
             alternative_configs=alternative_configs,
             migration_steps=migration_steps,
             migration_mode=migration_mode,
+            weight_loading_mode=weight_loading_mode,
         )
     )
 

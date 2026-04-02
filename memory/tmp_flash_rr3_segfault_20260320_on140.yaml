@@ -1,0 +1,73 @@
+project: "tmp_flash_rr3_segfault_20260320_on140"
+type: "sweep_test"
+
+envs:
+  RAY_DEDUP_LOGS: "0"
+  NCCL_DEBUG: INFO
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+  VLLM_TORCH_PROFILER_DIR: /home/bxb1/data/vllm_workbench/profiler/
+  RAY_CGRAPH_get_timeout: "10000"
+  BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+  DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+  KV_SYNC_USE_CPU: "0"
+  VLLM_USE_CPU_MODEL: "0"
+  CUDA_LAUNCH_BLOCKING: "0"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+  VLLM_USE_RAY_COMPILED_DAG: "1"
+  NCCL_SOCKET_IFNAME: "bond0.3027"
+  GLOO_SOCKET_IFNAME: "bond0.3027"
+  VLLM_SERVER_DEV_MODE: "1"
+
+is_log_cover: true
+static_config:
+  model:
+    path: "/data/gpfs/projects/punim2715/huggingface/Llama-3.3-70B-Instruct-FP8"
+    name: "Llama-3.3-70B-Instruct-FP8"
+  network:
+    rank_to_ip:
+      0: "spartan-gpgpu140"
+      1: "spartan-gpgpu140"
+    rank_to_node:
+      0: "spartan-gpgpu140"
+      1: "spartan-gpgpu140"
+  vllm:
+    head_addr: "localhost"
+    disable_memory_overhead_monitor: true
+    pipeline_parallel_size: 2
+    gpu_memory_utilization: 0.95
+    max_model_len: 8000
+    chunked_prefill: true
+    enable_cuda_graph: false
+    enable_nsight: false
+    weight_chunk_size_mb: 5
+    max_num_batched_tokens: 8128
+    enable_cpu_weight_cache: true
+  benchmark:
+    repetition: 3
+    burstiness: 100.0
+    benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+    profile: false
+    print_outputs: true
+    warmup:
+      enabled: false
+      num_total_requests: 10
+      input_length: 1024
+      output_length: 32
+      request_rate: 10
+sweep_configs:
+  - vllm:
+      attention_kernel: [flash]
+      fixed_num_gpu_blocks: [-1]
+      weight_chunk_size_mb: [5]
+      migration_approach: [async]
+      use_vmm: [true]
+      block_size: [128]
+      enable_cpu_weight_cache: [true]
+    benchmark:
+      num_total_requests: 100
+      pp_layer_configs: ["40, 40"]
+      request_rates: [3]
+      input_lens: [512]
+      output_lens: [16]

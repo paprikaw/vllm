@@ -2,6 +2,7 @@
 
 import itertools
 from abc import abstractmethod
+from datetime import timedelta
 import time
 from typing import Any, Literal, Optional, Union
 
@@ -1655,7 +1656,7 @@ def chunked_copy_inplace(
     # Use environment variable if chunk_size_mb not specified
     if chunk_size_mb is None:
         chunk_size_mb = envs.VLLM_WEIGHT_CHUNK_SIZE_MB
-    logger.info(f"[Weight Loading] chunked_copy_inplace called for {name} with chunk_size_mb={chunk_size_mb} MB, n_copy={n_copy}, non_blocking={non_blocking}")
+    # logger.info(f"[Weight Loading] chunked_copy_inplace called for {name} with chunk_size_mb={chunk_size_mb} MB, n_copy={n_copy}, non_blocking={non_blocking}")
     # 参数验证
     assert dst.shape == src.shape, f"Shape mismatch: dst {dst.shape} vs src {src.shape}"
     

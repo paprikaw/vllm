@@ -1,0 +1,5 @@
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+          22953614 deeplearn  A100.sh     bxb1  R 1-11:37:05      1 spartan-gpgpu140
+          22729426 deeplearn  A100.sh     bxb1  R 3-10:59:33      1 spartan-gpgpu166
+          22911778  gpu-l40s  L40s.sh     bxb1  R 2-16:17:53      1 spartan-gpgpu002
+          22960125  gpu-l40s  L40s.sh     bxb1  R 1-06:26:03      1 spartan-gpgpu001

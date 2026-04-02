@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -70,22 +71,44 @@ class SiluAndMul(CustomOp):
             from vllm._ipex_ops import ipex_ops
             self.op = ipex_ops.silu_and_mul
 
+    def _allocate_output(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d, )
+        required_numel = x.numel() // 2
+
+        workspace_buffers: Optional[dict[str, torch.Tensor]] = None
+        try:
+            workspace_buffers = get_forward_context().workspace_buffers
+        except AssertionError:
+            workspace_buffers = None
+
+        if workspace_buffers is None:
+            return torch.empty(output_shape, dtype=x.dtype, device=x.device)
+
+        workspace_name = "silu_and_mul"
+        output_buffer = workspace_buffers.get(workspace_name)
+        if (output_buffer is None or output_buffer.device != x.device
+                or output_buffer.dtype != x.dtype
+                or output_buffer.numel() < required_numel):
+            output_buffer = torch.empty(required_numel,
+                                        dtype=x.dtype,
+                                        device=x.device)
+            workspace_buffers[workspace_name] = output_buffer
+
+        return output_buffer[:required_numel].view(output_shape)
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        out = self._allocate_output(x)
         self.op(out, x)
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        out = self._allocate_output(x)
         self.op(out, x)
         return out
 

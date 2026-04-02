@@ -17,14 +17,14 @@
 
 **Basic Command:**
 ```bash
-python3 -m vllm_exp.run --config <config_file.yaml> --log-dir <log_directory>
+python3 -m vllm_exp.run sweep-test --config <config_file.yaml> --single-server
 ```
 
 **Example:**
 ```bash
-python3 -m vllm_exp.run \
+python3 -m vllm_exp.run sweep-test \
   --config /home/bxb1/vllm_workbench/vllm/vllm_exp/configs/migration_test_A100.yaml \
-  --log-dir /home/bxb1/vllm_workbench/vllm/logs/
+  --single-server
 ```
 
 
@@ -62,7 +62,7 @@ network:
 
 ### Log Output
 
-Logs are written to `--log-dir` with subdirectories based on:
+Logs are written under the experiment's default output root, with subdirectories based on:
 - Project name: `project-{project_name}/`
 - Variables from `path_policy`: Used to create nested directory structure
 - Server logs: `server-{pp=X,Y}-{flexi=0/1}.log`
@@ -110,8 +110,8 @@ For comparing attention kernels:
 
 2. **Run both experiments**
    ```bash
-   python3 -m vllm_exp.run --config regular.yaml --log-dir logs/
-   python3 -m vllm_exp.run --config flexi.yaml --log-dir logs/
+  python3 -m vllm_exp.run sweep-test --config regular.yaml --single-server
+  python3 -m vllm_exp.run sweep-test --config flexi.yaml --single-server
    ```
 
 3. **Analyze server logs** for timing information

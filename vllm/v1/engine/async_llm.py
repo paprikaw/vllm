@@ -504,6 +504,7 @@ class AsyncLLM(EngineClient):
         alternative_configs: Optional[dict] = None,
         migration_steps: Optional[list[int]] = None,
         migration_mode: Optional[str] = None,
+        weight_loading_mode: Optional[str] = None,
         weight_chunk_size_mb: Optional[float] = None,
         fixed_num_gpu_blocks: Optional[int] = None
     ) -> None:
@@ -516,15 +517,20 @@ class AsyncLLM(EngineClient):
                              Example: [[0, 39], [40, 63]] for 2 ranks.
             alternative_configs: Optional new migration targets.
             migration_steps: Optional new migration trigger points (request indices).
-            migration_mode: Optional migration mode ('sync' or 'async').
+            migration_mode: Optional migration mode ('sync', 'async', or 'async_fast').
+            weight_loading_mode: Optional weight loading mode ('sync' or 'async').
             fixed_num_gpu_blocks: Optional fixed KV cache block count (-1 to disable).
         """
         await self.engine_core.set_pp_config_async(pp_layer_config,
                                                    alternative_configs,
                                                    migration_steps,
                                                    migration_mode,
+                                                   weight_loading_mode,
                                                    weight_chunk_size_mb,
                                                    fixed_num_gpu_blocks)
+
+    async def get_engine_state(self) -> dict[str, Any]:
+        return await self.engine_core.get_engine_state_async()
 
     async def sleep(self, level: int = 1) -> None:
         await self.engine_core.sleep_async(level)

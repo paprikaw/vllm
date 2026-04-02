@@ -4184,6 +4184,12 @@ class DynamicConfig:
     'sync' uses change_model_configuration_by_kv_transfer_sync().
     Default is 'async'."""
 
+    weight_loading_mode: str = "async"
+    """Weight loading mode during migration.
+    - 'async' (default): Launch weight loading asynchronously.
+    - 'sync': Load weights synchronously before continuing.
+    """
+
     rank_to_ip: Optional[dict[str, str]] = None
     """Mapping from pipeline parallel rank to reachable IP address.
     Format: {"0": "192.168.1.1", "1": "192.168.1.2", ...}
@@ -4228,6 +4234,12 @@ class DynamicConfig:
     - False (default): Skip KV memory stats calculation for better performance
     - True: Calculate actual_kv_memory_bytes and allocated_kv_memory_bytes
       in SchedulerStats. May have slight performance impact on schedule().
+    """
+
+    enable_cpu_weight_cache: bool = True
+    """Whether to preload all weights into CPU memory at startup.
+    - True (default): Preload weights to CPU pinned memory for faster GPU loading
+    - False: Load weights from disk on-demand during migration
     """
 
     @property

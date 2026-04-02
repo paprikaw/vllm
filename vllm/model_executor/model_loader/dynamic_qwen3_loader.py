@@ -4,6 +4,7 @@ from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 from vllm.model_executor.models.dynamic_model_base import DynamicModelBase
 from vllm.logger import init_logger
 from typing import cast, Tuple, Generator, Iterable, Optional
+from collections import defaultdict
 from tqdm.auto import tqdm
 
 from .weight_utils import _BAR_FORMAT
@@ -27,9 +28,13 @@ class CustomModelLoader(DefaultModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
+        # CPU weight cache flag - will be set from vllm_config in load_model/load_dynamic_layers
+        self._use_cpu_cache: Optional[bool] = None
         # Dictionary to store preloaded weights: {weight_name: tensor}
         self._preloaded_weights: dict[str, torch.Tensor] = {}
         self._weights_preloaded = False
+        # Store prepared weights info for disk-based loading
+        self._prepared_weights_info: Optional[tuple] = None
 
     def _preload_all_weights(
             self, 
@@ -62,12 +67,13 @@ class CustomModelLoader(DefaultModelLoader):
         ):
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():
-                    # Load tensor into memory
+                    # Load tensor from safetensors mmap first.
+                    # We then materialize a real CPU copy so the cache does not
+                    # keep file-backed mmap tensors that can still fault later
+                    # during model.load_weights().
                     param = f.get_tensor(name)
-                    # Use madvise to prefetch/populate mmap pages
-                    # This avoids page faults during first migration (2ms->700µs/chunk)
+                    # Use madvise to prefetch/populate mmap pages before the copy.
                     import ctypes
-                    import os
                     ptr = param.data_ptr()
                     nbytes = param.numel() * param.element_size()
                     # Align to page boundary
@@ -85,32 +91,47 @@ class CustomModelLoader(DefaultModelLoader):
                         libc.madvise(ctypes.c_void_p(aligned_ptr),
                                      ctypes.c_size_t(aligned_len),
                                      MADV_WILLNEED)
-                    self._preloaded_weights[name] = param
-                    total_size += param.numel() * param.element_size()
+                    materialized_param = torch.empty_like(param, device="cpu")
+                    materialized_param.copy_(param)
+                    self._preloaded_weights[name] = materialized_param
+                    total_size += materialized_param.numel() * materialized_param.element_size()
+                    del param
         
         self._weights_preloaded = True
-        logger.info(f"[timeline]: Preloaded {len(self._preloaded_weights)} weights, "
-                   f"total size: {total_size / (1024**3):.2f} GB, "
-                   f"time taken: {human_readable_duration(time.time() - time_start)}")
+        logger.info(f"[timeline]: Preloaded {len(self._preloaded_weights)} weights into materialized CPU cache, "
+               f"total size: {total_size / (1024**3):.2f} GB, "
+               f"time taken: {human_readable_duration(time.time() - time_start)}")
 
     def _get_layer_weights_iterator(
             self, source: DefaultModelLoader.Source, 
             layers: Tuple[int, int]
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights based on the load format."""
-        #ss Preload all weights on first call
-        assert self._weights_preloaded
-            # self._preload_all_weights(
-            #     source.model_or_path, 
-            #     source.revision, 
-            #     source.fall_back_to_pt,
-            #     source.allow_patterns_overrides
-            # )
-        logger.info(f"using preloaded weights")
-        weights_iterator = safetensors_layer_weights_iterator(
-            self._preloaded_weights,
-            layers
-        )
+        """Get an iterator for the model weights based on the load format.
+        
+        When cpu_cache=False: Only loads specified layers from disk, no caching.
+        When cpu_cache=True: Uses preloaded weights from CPU memory cache.
+        """
+        
+        if self._use_cpu_cache:
+            # Use preloaded weights from CPU cache
+            assert self._weights_preloaded, "Weights must be preloaded when CPU cache is enabled"
+            logger.info(f"[cpu-cache]: Fetching layers {layers} from CPU memory cache")
+            weights_iterator = safetensors_layer_weights_iterator(
+                self._preloaded_weights,
+                layers
+            )
+        else:
+            # Load weights directly from disk - ONLY specified layers, no caching
+            logger.info(f"[disk-mode]: Loading ONLY layers {layers} directly from disk (no caching)")
+            hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+                source.model_or_path, source.revision, source.fall_back_to_pt,
+                source.allow_patterns_overrides)
+            assert use_safetensors and self.load_config.load_format != LoadFormat.FASTSAFETENSORS
+            weights_iterator = safetensors_layer_weights_iterator_from_disk(
+                hf_weights_files,
+                layers,
+                self.load_config.use_tqdm_on_load
+            )
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
@@ -155,7 +176,6 @@ class CustomModelLoader(DefaultModelLoader):
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get all weights for initial model loading (not layer-specific)."""
-        # Preload weights on first call
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
@@ -164,18 +184,23 @@ class CustomModelLoader(DefaultModelLoader):
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
         
-        # Trigger preloading if not already done
-        if not self._weights_preloaded:
-            self._preload_all_weights(
-                primary_weights.model_or_path,
-                primary_weights.revision,
-                primary_weights.fall_back_to_pt,
-                primary_weights.allow_patterns_overrides
-            )
-        
-        # Yield all preloaded weights (not filtered by layer)
-        for name, param in self._preloaded_weights.items():
-            yield primary_weights.prefix + name, param
+        if self._use_cpu_cache:
+            # Trigger preloading if not already done
+            if not self._weights_preloaded:
+                self._preload_all_weights(
+                    primary_weights.model_or_path,
+                    primary_weights.revision,
+                    primary_weights.fall_back_to_pt,
+                    primary_weights.allow_patterns_overrides
+                )
+            
+            # Yield all preloaded weights (not filtered by layer)
+            for name, param in self._preloaded_weights.items():
+                yield primary_weights.prefix + name, param
+        else:
+            # Load directly from disk without CPU cache
+            logger.info("Loading all weights directly from disk (CPU cache disabled)")
+            yield from self._get_weights_iterator(primary_weights)
         
         # Handle secondary weights if any (rare case)
         secondary_weights = cast(
@@ -192,6 +217,10 @@ class CustomModelLoader(DefaultModelLoader):
         """Load the complete model with weight preloading."""
         from vllm.model_executor.model_loader.utils import (
             initialize_model, process_weights_after_loading, set_default_torch_dtype)
+        
+        # Set CPU weight cache flag from dynamic config
+        self._use_cpu_cache = vllm_config.dynamic_config.enable_cpu_weight_cache
+        logger.info(f"CustomModelLoader using CPU weight cache: {self._use_cpu_cache}")
         
         device_config = vllm_config.device_config
         target_device = torch.device(device_config.device)
@@ -232,8 +261,24 @@ class CustomModelLoader(DefaultModelLoader):
                    device: torch.device
                    ) -> None:
         assert isinstance(model, DynamicModelBase), "model must be a DynamicModelBase instance"
+        
+        # Always update CPU weight cache flag from dynamic config
+        # This ensures config changes between sweep experiments take effect
+        new_cpu_cache_setting = vllm_config.dynamic_config.enable_cpu_weight_cache
+        if self._use_cpu_cache != new_cpu_cache_setting:
+            logger.info(f"CustomModelLoader CPU weight cache changed: {self._use_cpu_cache} -> {new_cpu_cache_setting}")
+            self._use_cpu_cache = new_cpu_cache_setting
+        
         time_start = time.time()
         logger.info(f"[timeline]: start to load layers {layers}")
+        logger.info(
+            "[dynamic-load]: begin layers=%s layer_count=%d cpu_cache=%s model_range_before=(%d,%d)",
+            layers,
+            layers[1] - layers[0] + 1,
+            self._use_cpu_cache,
+            model.model.start_layer,
+            model.model.end_layer,
+        )
         # 创建低优先级 stream（priority 值越大优先级越低）
         # 注意：这主要影响 GPU kernel 执行，对 CPU I/O 无效
         with set_default_torch_dtype(model_config.dtype): 
@@ -245,8 +290,20 @@ class CustomModelLoader(DefaultModelLoader):
                 # 再次显式设置当前设备，确保后续操作在正确的设备上
                 logger.info(f"before weight loading, explicitly set device to current device: {torch.cuda.current_device()}")
                 logger.info(f"before weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+                free_before_add, total_gpu_memory = torch.cuda.mem_get_info()
                 # 只收集属于指定层范围的参数名，更易读
+                add_structure_start = time.time()
                 model.add_layers(layers)
+                logger.info(
+                    "[dynamic-load]: add_layers_structure layers=%s took=%s model_range_after=(%d,%d) free_gpu_before=%.2fGB free_gpu_after=%.2fGB total_gpu=%.2fGB",
+                    layers,
+                    human_readable_duration(time.time() - add_structure_start),
+                    model.model.start_layer,
+                    model.model.end_layer,
+                    free_before_add / 1024 ** 3,
+                    torch.cuda.mem_get_info()[0] / 1024 ** 3,
+                    total_gpu_memory / 1024 ** 3,
+                )
                 logger.info(f"[timeline]: after add layers but not weigths, time taken: {human_readable_duration(time.time() - time_start)}")
                 logger.info(f"[debug]: Loading weights for layers {layers}")
                 weights_to_load = {
@@ -254,9 +311,52 @@ class CustomModelLoader(DefaultModelLoader):
                     for name, _ in model.named_parameters()
                     if "layers" in name and extract_layer_index(name) in range(layers[0], layers[1]+1)
                 }
-                logger.info(f"[debug]: Weights to load: {weights_to_load}")
-                loaded_weights = model.load_weights(
-                    self.get_layer_weights(model_config, model, layers)) 
+                sample_weights = sorted(weights_to_load)[:5]
+                logger.info(
+                    "[dynamic-load]: weights_to_load_summary layers=%s count=%d sample=%s",
+                    layers,
+                    len(weights_to_load),
+                    sample_weights,
+                )
+
+                layer_weight_stats: dict[int, dict[str, float]] = defaultdict(
+                    lambda: {"tensor_count": 0, "bytes": 0.0})
+                total_weight_tensors = 0
+                total_weight_bytes = 0.0
+                iterator_start = time.time()
+                first_tensor_latency_s: Optional[float] = None
+
+                def traced_layer_weights() -> Generator[tuple[str, torch.Tensor], None, None]:
+                    nonlocal total_weight_tensors, total_weight_bytes, first_tensor_latency_s
+                    for name, tensor in self.get_layer_weights(model_config, model, layers):
+                        now = time.time()
+                        if first_tensor_latency_s is None:
+                            first_tensor_latency_s = now - iterator_start
+                        tensor_bytes = float(tensor.numel() * tensor.element_size())
+                        total_weight_tensors += 1
+                        total_weight_bytes += tensor_bytes
+                        layer_idx = extract_layer_index(name)
+                        if layer_idx is not None:
+                            layer_weight_stats[layer_idx]["tensor_count"] += 1
+                            layer_weight_stats[layer_idx]["bytes"] += tensor_bytes
+                        yield name, tensor
+
+                load_weights_start = time.time()
+                loaded_weights = model.load_weights(traced_layer_weights()) 
+                per_layer_summary = ", ".join(
+                    f"L{layer_idx}:{int(stats['tensor_count'])}t/{stats['bytes'] / 1024 ** 3:.2f}GB"
+                    for layer_idx, stats in sorted(layer_weight_stats.items())
+                )
+                logger.info(
+                    "[dynamic-load]: load_weights_summary layers=%s source=%s yielded_tensors=%d yielded_bytes=%.2fGB first_tensor_latency=%s load_weights_took=%s per_layer=[%s]",
+                    layers,
+                    "cpu_cache" if self._use_cpu_cache else "disk",
+                    total_weight_tensors,
+                    total_weight_bytes / 1024 ** 3,
+                    human_readable_duration(first_tensor_latency_s) if first_tensor_latency_s is not None else "n/a",
+                    human_readable_duration(time.time() - load_weights_start),
+                    per_layer_summary,
+                )
                 logger.info(f"[debug]: after weight loading, gpu occupied: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
                 if model_config.quantization is None and loaded_weights is not None:
                     weights_not_loaded = weights_to_load - loaded_weights
@@ -264,7 +364,16 @@ class CustomModelLoader(DefaultModelLoader):
                         raise ValueError(
                             "Following weights were not initialized from "
                             f"checkpoint: {weights_not_loaded}")
+                process_after_loading_start = time.time()
                 process_layer_weights_after_loading(model, model_config, device, layers)
+                free_after_process, _ = torch.cuda.mem_get_info()
+                logger.info(
+                    "[dynamic-load]: process_after_loading_summary layers=%s took=%s free_gpu_after=%.2fGB total_dynamic_load=%s",
+                    layers,
+                    human_readable_duration(time.time() - process_after_loading_start),
+                    free_after_process / 1024 ** 3,
+                    human_readable_duration(time.time() - time_start),
+                )
                 logger.info(f"[timeline]: after process layer weights after loading, time taken: {human_readable_duration(time.time() - time_start)}")
         return
 
@@ -291,6 +400,52 @@ def safetensors_layer_weights_iterator(
         logger.debug(f"[debug]: Yielding preloaded weight {name} for layer {layer_idx}")
         yield name, param
 
+
+def safetensors_layer_weights_iterator_from_disk(
+    hf_weights_files: list[str],
+    layer: Tuple[int, int],
+    use_tqdm_on_load: bool,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over safetensors files and yield weights ONLY for specified layer range.
+    
+    This function reads weights directly from disk without any CPU caching.
+    Used when enable_cpu_weight_cache is disabled.
+    
+    IMPORTANT: Only weights for the specified layer range are loaded into memory.
+    Other weights are skipped entirely (no disk I/O for them).
+    """
+    logger.info(f"[disk-loading]: Loading ONLY layers {layer[0]}-{layer[1]} from disk (no caching)")
+    
+    loaded_count = 0
+    skipped_count = 0
+    total_loaded_bytes = 0
+    time_start = time.time()
+    
+    for st_file in tqdm(
+            hf_weights_files,
+            desc="Loading safetensors from disk",
+            disable=not enable_tqdm(use_tqdm_on_load),
+            bar_format=_BAR_FORMAT,
+    ):
+        with safe_open(st_file, framework="pt") as f:
+            for name in f.keys():
+                # Filter weights: only yield weights belonging to the specified layer range
+                if "layers" not in name:
+                    skipped_count += 1
+                    continue
+                
+                layer_idx = extract_layer_index(name)
+                if layer_idx is None or layer_idx not in range(layer[0], layer[1]+1):
+                    skipped_count += 1
+                    continue
+                
+                # Load ONLY this specific tensor from disk
+                param = f.get_tensor(name)
+                total_loaded_bytes += param.numel() * param.element_size()
+                loaded_count += 1
+                logger.debug(f"[disk-loading]: Loaded weight {name} for layer {layer_idx}")
+                yield name, param
+    
 def process_layer_weights_after_loading(model: nn.Module, model_config: ModelConfig,
                                   target_device: torch.device, layers: Tuple[int, int]) -> None:
     from vllm.model_executor.utils import extract_layer_index

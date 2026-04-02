@@ -8,8 +8,7 @@
 - 在容器内运行simple_test：
 
 ```bash
-python3 -m vllm_exp.run --config /root/vllm_workbench/vllm/vllm_exp/configs/migration_test.yaml \
-  --log-dir /root/vllm_workbench/vllm/logs
+python3 -m vllm_exp.run sweep-test --config /root/vllm_workbench/vllm/vllm_exp/configs/migration_test.yaml
 ```
 
 注意：

@@ -145,6 +145,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: dict[str, dict[int, torch.Tensor]] = {}
+        self.workspace_buffers: dict[str, torch.Tensor] = {}
 
         # Set up speculative decoding.
         self.use_spec_decode = False
@@ -1234,7 +1235,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Use persistent buffers for CUDA graphs.
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
-                                 num_tokens=num_input_tokens):
+                                 num_tokens=num_input_tokens,
+                                 workspace_buffers=self.workspace_buffers):
             self.maybe_setup_kv_connector(scheduler_output)
             try:
                 model_forward_start = time.time()
@@ -1494,7 +1496,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def kv_connector_no_forward(
             self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         # KV send/recv even if no work to do.
-        with set_forward_context(None, self.vllm_config):
+        with set_forward_context(None,
+                                 self.vllm_config,
+                                 workspace_buffers=self.workspace_buffers):
             self.maybe_setup_kv_connector(scheduler_output)
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
@@ -1778,7 +1782,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             with set_forward_context(attn_metadata,
                                      self.vllm_config,
-                                     num_tokens=num_tokens):
+                                     num_tokens=num_tokens,
+                                     workspace_buffers=self.workspace_buffers):
                 outputs = model(
                     input_ids=input_ids,
                     positions=positions,

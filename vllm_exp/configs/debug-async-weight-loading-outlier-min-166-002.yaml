@@ -1,15 +1,11 @@
-# Debug Repetition Test Configuration (sweep_test format)
-# Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
-
-project: "kernal_cmp_decode_direct"
+project: "debug-async-weight-loading-outlier-min-166-002"
 type: "sweep_test"
 
 envs:
-  RAY_DEDUP_LOGS: "0"  # Disable Ray log deduplication for debugging
+  RAY_DEDUP_LOGS: "0"
   NCCL_DEBUG: INFO
   NCCL_CUMEM_HOST_ENABLE: "0"
   VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
-  VLLM_TORCH_PROFILER_DIR: /home/bxb1/data/vllm_workbench/profiler/
   RAY_CGRAPH_get_timeout: "10000"
   BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
   DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
@@ -21,9 +17,11 @@ envs:
   VLLM_USE_RAY_COMPILED_DAG: "1"
   NCCL_SOCKET_IFNAME: "bond0.3027"
   GLOO_SOCKET_IFNAME: "bond0.3027"
-  VLLM_SERVER_DEV_MODE: "1"  # Enable /set_pp_config endpoint
+  VLLM_SERVER_DEV_MODE: "1"
+  VLLM_DISABLE_CUTLASS_FP8: "1"
 
 is_log_cover: true
+
 static_config:
   model:
     path: "/data/gpfs/projects/punim2715/huggingface/Llama-3.3-70B-Instruct-FP8"
@@ -31,69 +29,83 @@ static_config:
   network:
     rank_to_ip:
       0: "spartan-gpgpu166"
-      1: "spartan-gpgpu166"
+      1: "spartan-gpgpu002"
     rank_to_node:
       0: "spartan-gpgpu166"
-      1: "spartan-gpgpu166"
-  
+      1: "spartan-gpgpu002"
   vllm:
     head_addr: "localhost"
-    disable_memory_overhead_monitor: true
     pipeline_parallel_size: 2
     gpu_memory_utilization: 0.95
-    max_model_len: 8000
+    max_model_len: 4000
+    max_num_batched_tokens: 8128
     chunked_prefill: true
     enable_cuda_graph: false
     enable_nsight: false
+    log_kv_memory_stats: true
     weight_chunk_size_mb: 5
-    max_num_batched_tokens: 4096 
-  
+    disable_memory_overhead_monitor: false
   benchmark:
     burstiness: 100.0
     benchmark_script_path: "/home/bxb1/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     profile: false
+    num_total_requests: 120
     print_outputs: true
     warmup:
       enabled: false
-      num_total_requests: 25
-      input_length: 10000
-      output_length: 50
-      request_rate: 25
+      num_total_requests: 0
+      input_length: 0
+      output_length: 0
+      request_rate: 0
 
-# No sweep variables - single experiment with benchmark_config inside sweep_config
 sweep_configs:
   - vllm:
       attention_kernel: [direct]
-      fixed_num_gpu_blocks: [-1] 
+      fixed_num_gpu_blocks: [-1]
       weight_chunk_size_mb: [5]
       migration_approach: [async]
+      weight_loading_mode: [sync]
       use_vmm: [true]
-      block_size: [32]
+      enable_kv_resize: [true]
+      enable_cpu_weight_cache: [true]
+      block_size: [128]
     benchmark_config:
-      - num_total_requests: 100  # Small number for quick testing
-        repetition: 3          # 3 repetitions to test the feature
+      - num_total_requests: 120
+        repetition: 2
         pp_layer_config:
-          0: "32, 48"           # Single config = no migration, only reset between reps
+          0: "40, 40"
+          60: "48, 32"
         requests:
           0:
-            request_rate: 4
+            request_rate: 2
+            input_lens: 512
+            output_lens: 16
+          60:
+            request_rate: 2
             input_lens: 128
             output_lens: 512
- # Test repetition with 3 repetitions, no migration
   - vllm:
       attention_kernel: [direct]
-      fixed_num_gpu_blocks: [-1] 
+      fixed_num_gpu_blocks: [-1]
       weight_chunk_size_mb: [5]
       migration_approach: [async]
-      use_vmm: [false]
-      block_size: [32]
+      weight_loading_mode: [sync]
+      use_vmm: [true]
+      enable_kv_resize: [true]
+      enable_cpu_weight_cache: [true]
+      block_size: [128]
     benchmark_config:
-      - num_total_requests: 100  # Small number for quick testing
-        repetition: 3          # 3 repetitions to test the feature
+      - num_total_requests: 120
+        repetition: 2
         pp_layer_config:
-          0: "32, 48"           # Single config = no migration, only reset between reps
+          0: "40, 40"
+          60: "56, 24"
         requests:
           0:
-            request_rate: 4
+            request_rate: 2
+            input_lens: 512
+            output_lens: 16
+          60:
+            request_rate: 2
             input_lens: 128
             output_lens: 512

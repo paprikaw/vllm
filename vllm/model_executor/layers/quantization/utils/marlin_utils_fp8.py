@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 import vllm._custom_ops as ops
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT, marlin_make_workspace_new, marlin_permute_scales,
@@ -47,6 +48,32 @@ def apply_fp8_marlin_linear(
 
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (size_n, )
+    required_numel = reshaped_x.size(0) * size_n
+
+    workspace_buffers: Optional[dict[str, torch.Tensor]] = None
+    try:
+        workspace_buffers = get_forward_context().workspace_buffers
+    except AssertionError:
+        workspace_buffers = None
+
+    output_buffer: Optional[torch.Tensor] = None
+    if workspace_buffers is not None:
+        workspace_name = f"fp8_marlin_linear_{size_n}"
+        output_buffer = workspace_buffers.get(workspace_name)
+        if (output_buffer is None or output_buffer.device != input.device
+                or output_buffer.dtype != input.dtype
+                or output_buffer.numel() < required_numel):
+            output_buffer = torch.empty(required_numel,
+                                        dtype=input.dtype,
+                                        device=input.device)
+            workspace_buffers[workspace_name] = output_buffer
+
+    if output_buffer is None:
+        output_buffer = torch.empty(required_numel,
+                                    dtype=input.dtype,
+                                    device=input.device)
+
+    output = output_buffer[:required_numel].view(reshaped_x.size(0), size_n)
 
     use_atomic_add = should_use_atomic_add_reduce(m=reshaped_x.size(0),
                                                   n=size_n,
@@ -55,7 +82,7 @@ def apply_fp8_marlin_linear(
                                                   dtype=input.dtype)
 
     output = ops.gptq_marlin_gemm(a=reshaped_x,
-                                  c=None,
+                                  c=output,
                                   b_q_weight=weight,
                                   b_scales=weight_scale,
                                   global_scale=None,
