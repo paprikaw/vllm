@@ -1,0 +1,2 @@
+index	config	project	host	port	status	exit_code	log_dir	note
+1	/home/bxb1/vllm_workbench/vllm/vllm_exp/configs/a-e2e-cmp-llama.yaml	e2e-cmp-llama-5	spartan-gpgpu166	8000	failed	130	/home/bxb1/vllm_workbench/vllm/new-logs/sequential-run-20260322-000607/project-e2e-cmp-llama-5	实验返回非零退出码，但未检测到端口残留

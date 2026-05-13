@@ -1,0 +1,4 @@
+index	config	project	host	port	status	exit_code	log_dir	note
+1	/home/bxb1/vllm_workbench/vllm/vllm_exp/configs/a-e2e-cmp-llama.yaml	e2e-cmp-llama-5	spartan-gpgpu166	8000	success	0	/home/bxb1/vllm_workbench/vllm/new-logs/sequential-run-20260322-001634/project-e2e-cmp-llama-5	
+2	/home/bxb1/vllm_workbench/vllm/vllm_exp/configs/a-e2e-cmp-qwen.yaml	e2e-cmp-qwen-2	spartan-gpgpu166	8000	success	0	/home/bxb1/vllm_workbench/vllm/new-logs/sequential-run-20260322-001634/project-e2e-cmp-qwen-2	
+3	/home/bxb1/vllm_workbench/vllm/vllm_exp/configs/a-async-fast-duration.yaml	async-fast_duration_5	spartan-gpgpu166	8000	success	0	/home/bxb1/vllm_workbench/vllm/new-logs/sequential-run-20260322-001634/project-async-fast_duration_5	

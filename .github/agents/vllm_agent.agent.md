@@ -14,17 +14,10 @@ This repository is an **extended version of vLLM** that addresses limitations in
 
 ## Basic Rules
 1. You should always follows the user defines basic setup above. 
-2. If you have come to a conclusion for a problem, please generate a reports under ./reports directory
 3. In the process of solving a problem, you will find youself generating all sorts of tools to analyse log, trying to use the exisiting tools provided in the **./vllm_exp/tools**, if you need a new tools, please think of maybe adding feature to exising one. Try to make it easy to maintain, you should think these set of tools as a framework of log analysing. If the things you want to do can only be done by temporary scripts and not be easily integrated to existing tools, you should place it in /tmp directory.
 4. If you are going to test a vllm inferencing process without migration, simply set the migration_step higher than the total number of requests, so that no migration will happen.
 5. Keeps the repository clean and prevents accidental commits of temporary code.
-6. When investigating whether a log file has error, rather than print the tail of the log, you should search whether there is errors happening in the log.
-7. When investigating a benchmark file, you should **only** consider it as normal when all the output has <think> as begining and produce full sentence with requred num of tokens.
 9. When answering me or when generating a report, use *Chinese*
-10: Whenever you want to run a command, please figure out which node you are going to run, use squeue --me to check the status of the reserved node and its related GPU type.
-10. Every time you checkout a log file, you should not only tell what configuration this log is represent merely by its name, but also explicitly check the benchmark_config.json and constants.json
-11. 使用 bash /home/bxb1/vllm_workbench/scripts/running_compile_vllm.sh 来编译 vllm，确保使用正确的环境和编译选项。
-12. 在当前的spartan环境下，文件系统都是共享的，所以你修改了一个地方的文件，比如编译了vllm，不需要在两个节点上都编译。只需要在一个节点上编译就好了。
 
 
 ## 命令执行规则
@@ -59,7 +52,7 @@ Python Environment: /data/gpfs/projects/punim2715/vllm_workbench/.venv/bin/pytho
 1. Checking out current gpu cluster status: ```ray status```
 2. running a experiment:
 ```bash
-python -m vllm_exp.run sweep-test     --config path/to/configfile  --log-dir new-logs/     --single-server
+python -m vllm_exp.run sweep-test --config path/to/configfile --single-server
 ```
 3. using log analysis tools:
 ```bash

@@ -1,0 +1,5 @@
+index	config	project	host	port	status	exit_code	log_dir	note
+1	/home/bxb1/vllm_workbench/vllm/vllm_exp/configs/a-kernal_cmp.yaml	kernal_cmp_6	spartan-gpgpu166	8000	success	0	/home/bxb1/vllm_workbench/vllm/new-logs/sequential-run-20260320-000505/project-kernal_cmp_6	
+2	/home/bxb1/vllm_workbench/vllm/vllm_exp/configs/a-migration_cmp.yaml	config-cmp-with-mig-2	spartan-gpgpu166	8000	success	0	/home/bxb1/vllm_workbench/vllm/new-logs/sequential-run-20260320-000505/project-config-cmp-with-mig-2	
+3	/home/bxb1/vllm_workbench/vllm/vllm_exp/configs/qwen_config_finder.yaml	config_finder_qwen-1	spartan-gpgpu166	8000	success	0	/home/bxb1/vllm_workbench/vllm/new-logs/sequential-run-20260320-000505/project-config_finder_qwen-1	
+4	/home/bxb1/vllm_workbench/vllm/vllm_exp/configs/a-async-fast-duration.yaml	async-fast_duration_3	spartan-gpgpu166	8000	success	0	/home/bxb1/vllm_workbench/vllm/new-logs/sequential-run-20260320-000505/project-async-fast_duration_3	

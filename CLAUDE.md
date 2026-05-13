@@ -1,3 +1,4 @@
+
 # vLLM Extended Agent
 ## Overview
 This agent is specialized for working with an extended version of vLLM that enables dynamic pipeline parallelism configuration switching and KV cache migration capabilities. The agent has deep knowledge of the codebase architecture, experimental setup, and best practices for development and testing.
@@ -8,18 +9,20 @@ This repository is an **extended version of vLLM** that addresses limitations in
 - **Additional Features**: Includes experimental environment code for testing and validation
 
 ## Basic Rules
-1. You should always follows the user defines basic setup above. 
-2. If you have come to a conclusion for a problem, please generate a reports under ./reports directory
-3. In the process of solving a problem, you will find youself generating all sorts of tools to analyse log, trying to use the exisiting tools provided in the **./vllm_exp/tools**, if you need a new tools, please think of maybe adding feature to exising one. Try to make it easy to maintain, you should think these set of tools as a framework of log analysing. If the things you want to do can only be done by temporary scripts and not be easily integrated to existing tools, you should place it in /tmp directory.
-4. If you are going to test a vllm inferencing process without migration, simply set the migration_step higher than the total number of requests, so that no migration will happen.
-5. Keeps the repository clean and prevents accidental commits of temporary code.
-6. When investigating whether a log file has error, rather than print the tail of the log, you should search whether there is errors happening in the log.
-7. When investigating a benchmark file, you should **only** consider it as normal when all the output has <think> as begining and produce full sentence with requred num of tokens.
-9. When answering me or when generating a report, use *Chinese*
-10: Whenever you want to run a command, please figure out which node you are going to run, use squeue --me to check the status of the reserved node and its related GPU type.
-10. Every time you checkout a log file, you should not only tell what configuration this log is represent merely by its name, but also explicitly check the benchmark_config.json and constants.json
-11. 使用 bash /home/bxb1/vllm_workbench/scripts/running_compile_vllm.sh 来编译 vllm，确保使用正确的环境和编译选项。
-12. 在当前的spartan环境下，文件系统都是共享的，所以你修改了一个地方的文件，比如编译了vllm，不需要在两个节点上都编译。只需要在一个节点上编译就好了。
+1. In the process of solving a problem, you will find youself generating all sorts of tools to analyse log, trying to use the exisiting tools provided in the **./vllm_exp/tools**, if you need a new tools, please think of maybe adding feature to exising one. Try to make it easy to maintain, you should think these set of tools as a framework of log analysing. If the things you want to do can only be done by temporary scripts and not be easily integrated to existing tools, you should place it in /tmp directory.
+2. Keeps the repository clean and prevents accidental commits of temporary code.
+3. When investigating whether a log file has error, rather than print the tail of the log, you should search whether there is errors happening in the log.
+4. When answering me or when generating a report, use *Chinese*
+5. 在当前的spartan环境下，文件系统都是共享的，所以你修改了一个地方的文件，不需要在所有节点上修改。
+6. Whenever you think the seesion you are running have valuable informations, keep it as a .md file in the ./memory directory. Don't overdo it.
+7. When drawing, output should be put into the sosp paper's draw directory.
+
+## Delegating Subagents
+Whenever you think is appropriate, you can delegate tasks to subagents to save your context window. Here are some example scenarios:
+   Research before implementation
+   Parallel code analysis
+   Explore multiple solutions
+   Code review with specialized focus
 
 
 ## 命令执行规则
@@ -28,10 +31,7 @@ This repository is an **extended version of vLLM** that addresses limitations in
 2. **禁止擅自后台运行**: 如果认为必须使用 `isBackground: true` 或不追踪命令，**必须先询问用户**
 3. 不要使用&来后台运行任务
 4. 永远不要重启ray cluster，当你觉得需要重启的时候，请你pass给我让我手动进行这个操作。
-5. If you want to compile the vllm, please use the script: /home/bxb1/vllm_workbench/scripts/running_compile_vllm.sh
-6. Anytime you run any experiments or recompile anything, you need to activate /home/bxb1/vllm_workbench/.venv 
-7. Don't recompile anything if you are not changing the C++ code.
-8. If the rank 0 in the config is on remote log, you should ssh to the remote server and run the commands.
+5. If the rank 0 in the config is on remote log, you should ssh to the remote server and run the commands.
 
 ## Development
 ### Code Modification Guidelines
@@ -43,35 +43,8 @@ This repository is an **extended version of vLLM** that addresses limitations in
 4. Testing: Always test changes using the experimental environment
 5. When adding new variables to vllm, making sure to also add them to the experiment framework exp_vllm to make sure user can directly configure them via the experiment configuration files. Making sure not using environment variables, add them to the data.py and pass them through vllm's args.
 6. You should always write most succint, clear and elegent code. Don't over engineer stuff.
-### Environment Setup
-Python Environment: /data/gpfs/projects/punim2715/vllm_workbench/.venv/bin/python
-### Important Paths
-- **Logs**: `/home/bxb1/data/vllm_workbench/vllm/logs`
-- **Experimental Code**: `vllm_exp/`
-- **Dynamic Extensions**: `vllm/v1/worker/dynamic_*.py`
-- **Flexible Kernels**: `../flash-attention/`
-### Basic Commands
-1. Checking out current gpu cluster status: ```ray status```
-2. running a experiment:
-```bash
-python -m vllm_exp.run sweep-test     --config path/to/configfile  --log-dir new-logs/     --single-server
-```
-3. using log analysis tools:
-```bash
-python /home/bxb1/vllm_workbench/vllm/logs/analyze_log_metrics.py "/home/bxb1/vllm_workbench/vllm/logs/project-migration_test_async_with_migration/server-{pp=32,32}-{flexi=0}.log" --top 50 > /home/bxb1/vllm_workbench/vllm/logs/agents/analyse_regular.txt
-```
+7. When writing code, you should follow the *fail quick* principle, we are not developing production application, we want the problem to be opposed early.
 
-### Code Architecture
-#### Dynamic Extensions (`dynamic_*` prefix)
-The codebase uses **inheritance-based extension pattern** to augment vLLM's original functionality without modifying core code:
-- **`dynamic_gpu_worker.py`**: Extended GPU worker with dynamic pipeline stage management
-- **`dynamic_gpu_model_runner.py`**: Model runner supporting runtime reconfiguration
-- **`dynamic_kv_synchronizer.py`**: KV cache synchronization across pipeline stages
-- **Other dynamic modules**: Various components enabling dynamic behavior
-**Key Design Principle**: All dynamic code inherits from original vLLM classes, allowing seamless integration and easy maintenance.
-#### Flexible KV Cache (`flexi_*` prefix)
-Files with `flexi` prefix implement **flexible KV cache expansion** with custom Flash Attention kernels:
-- **`flexi_attention_kernels.cu`**: Custom CUDA kernels for variable-size KV cache
-- **`flexi_bind_kv_cache.py`**: Dynamic binding utilities for flexible cache management
-- **Purpose**: Enable efficient memory usage and support for dynamic sequence length handling
-The real implementation of flexi kernal is under the **../flash-attention/** directory.
+
+# Subagent Instructions(important)
+You are not having a large context window(100k ~ 200k), You should delegate subagents to do its tasks whenever it is possible to save context window.
