@@ -210,5 +210,6 @@ logs/**
 reports/**
 
 new-logs/**
+new-logs-1/**
 
 draws/*.png

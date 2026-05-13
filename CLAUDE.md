@@ -47,4 +47,4 @@ Whenever you think is appropriate, you can delegate tasks to subagents to save y
 
 
 # Subagent Instructions(important)
-You are not having a large context window(100k ~ 200k), You should delegate subagents to do its tasks whenever it is possible to save context window.
+You are not having a large context window(100k ~ 200k), You should delegate subagents to do its tasks whenever it is possible to save context window
