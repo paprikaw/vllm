@@ -77,6 +77,25 @@ network:
 
 框架会将其注入到运行环境变量，供双向通道初始化使用。
 
+在 `sweep_test` 的 `static_config.network` 中也可以使用更高层的
+`placements` 来同时声明 PP stage、Ray rank、节点和 KV 通道地址：
+
+```yaml
+static_config:
+  network:
+    placements:
+      - {pp_stage: 0, node: "node-a", ip: "node-a"}
+      - {pp_stage: 1, node: "node-a", ip: "node-a"}
+      - {pp_stage: 2, node: "node-b", ip: "node-b"}
+      - {pp_stage: 3, node: "node-b", ip: "node-b"}
+  vllm:
+    pipeline_parallel_size: 4
+```
+
+`placements` 会自动展开成 `rank_to_node`、`rank_to_ip` 和
+`pipeline_stage_to_rank`。在 TP=1 的 VMXpert 实验里，不写 `rank` 时
+默认 `rank == pp_stage`；需要非默认顺序时可显式写 `rank`。
+
 ### 不同测试类型的必填项
 
 下表给出三种测试类型在 `projects[].type` 不同取值下需要的字段。
@@ -230,5 +249,4 @@ is_log_cover: true
 
 - 所有日志与指标写入 `--log-dir` 下按 `path_policy.variables` 组成的层级目录。
 - 框架会在 `constants.json` 中写入“常量参数指纹”，便于区分不同实验。
-
 

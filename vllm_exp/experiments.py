@@ -734,10 +734,13 @@ def get_path_policy_from_var_keys(var_keys: list[str]) -> PathPolicy:
 ## Functions to start vllm and benchmark ##
 def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Optional[dict[str, Any]] = None) -> subprocess.Popen:
     env = os.environ.copy()
+    rank_to_ip, rank_to_node, pipeline_stage_to_rank = cfg.network.resolve_worker_placement(
+        cfg.vllm.pipeline_parallel_size
+    )
     # 传递 LayerKV 双向通道所需的 rank->ip 映射（JSON 字符串）
-    if cfg.network.rank_to_ip:
+    if rank_to_ip:
         import json as _json
-        env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(cfg.network.rank_to_ip)
+        env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(rank_to_ip)
 
     # 启动服务
     serve_args = [
@@ -779,9 +782,12 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
     if cfg.vllm.enable_nsight:
         serve_args.append("--ray-workers-use-nsight")
     # 传递 Ray worker 节点部署映射（用于跨节点 pipeline parallelism）
-    if cfg.network.rank_to_node:
+    if rank_to_node:
         import json as _json
-        serve_args.extend(["--ray-rank-to-node", _json.dumps(cfg.network.rank_to_node)])
+        serve_args.extend(["--ray-rank-to-node", _json.dumps(rank_to_node)])
+    if pipeline_stage_to_rank:
+        import json as _json
+        serve_args.extend(["--pipeline-stage-to-rank", _json.dumps(pipeline_stage_to_rank)])
 
     metrics_path = logm.get_path_with_log_type("timestamp_metrics", "csv", vars)
     if metrics_path.exists():
@@ -811,9 +817,12 @@ def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManag
     Returns (proc, capture, timestamp_metrics_raw_path).
     """
     env = os.environ.copy()
-    if cfg.network.rank_to_ip:
+    rank_to_ip, rank_to_node, pipeline_stage_to_rank = cfg.network.resolve_worker_placement(
+        cfg.vllm.pipeline_parallel_size
+    )
+    if rank_to_ip:
         import json as _json
-        env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(cfg.network.rank_to_ip)
+        env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(rank_to_ip)
 
     serve_args = [
         "vllm", "serve", cfg.model.path,
@@ -854,9 +863,12 @@ def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManag
     if cfg.vllm.enable_nsight:
         serve_args.append("--ray-workers-use-nsight")
     # 传递 Ray worker 节点部署映射（用于跨节点 pipeline parallelism）
-    if cfg.network.rank_to_node:
+    if rank_to_node:
         import json as _json
-        serve_args.extend(["--ray-rank-to-node", _json.dumps(cfg.network.rank_to_node)])
+        serve_args.extend(["--ray-rank-to-node", _json.dumps(rank_to_node)])
+    if pipeline_stage_to_rank:
+        import json as _json
+        serve_args.extend(["--pipeline-stage-to-rank", _json.dumps(pipeline_stage_to_rank)])
 
     # Timestamp metrics: write a raw CSV, then split into warmup/main later.
     metrics_raw_path = logm.get_path_with_log_type("timestamp_metrics_raw", "csv", vars)
@@ -1312,6 +1324,7 @@ def generate_experiment_specs(
             migration_steps=exp_cfg.vllm.get_migration_steps(),
             rank_to_ip=exp_cfg.network.rank_to_ip,
             rank_to_node=exp_cfg.network.rank_to_node,
+            pipeline_stage_to_rank=exp_cfg.network.pipeline_stage_to_rank,
             pattern_batch_size=exp_cfg.benchmark.pattern_batch_size,
             metrics_csv_path=metrics_csv_path,
             server_raw_log_path=server_raw_log_path,
@@ -1416,6 +1429,11 @@ def start_vllm_for_sweep(
         serve_args.append("--ray-workers-use-nsight")
     if spec.rank_to_node:
         serve_args.extend(["--ray-rank-to-node", json.dumps(spec.rank_to_node)])
+    if spec.pipeline_stage_to_rank:
+        serve_args.extend([
+            "--pipeline-stage-to-rank",
+            json.dumps(spec.pipeline_stage_to_rank),
+        ])
     # Generate dynamic config from spec (includes all settings like rank_to_ip, metrics_csv_path, etc.)
     dynamic_cfg = json.dumps(spec.to_dynamic_cfg())
     serve_args.extend(["-D", dynamic_cfg])
@@ -1497,8 +1515,8 @@ def start_benchmark_for_sweep(
     if dataset_name == "sharegpt" and sharegpt_output_len is not None:
         bench_args.extend(["--sharegpt-output-len", str(sharegpt_output_len)])
     
-    # Intentionally keep benchmark logs free of per-request generated text.
-    # Even if config asks for print_outputs, do not forward it to the benchmark CLI.
+    if spec.print_outputs:
+        bench_args.append("--print-outputs")
     if spec.profile:
         bench_args.append("--profile")
     
@@ -2303,6 +2321,11 @@ def start_vllm_single_instance(
         serve_args.append("--ray-workers-use-nsight")
     if spec.rank_to_node:
         serve_args.extend(["--ray-rank-to-node", json.dumps(spec.rank_to_node)])
+    if spec.pipeline_stage_to_rank:
+        serve_args.extend([
+            "--pipeline-stage-to-rank",
+            json.dumps(spec.pipeline_stage_to_rank),
+        ])
     
     # Generate dynamic config from spec
     dynamic_cfg = json.dumps(spec.to_dynamic_cfg())

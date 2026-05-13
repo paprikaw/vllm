@@ -73,6 +73,7 @@ class VllmCfg(BaseModel):
     port: int = 8000
     ray_port: int = 6379
     start_pp_layer_partitions: list[str] = ["8,56"]
+    disable_memory_overhead_monitor: bool = False
 
 class MigrationCfg(BaseModel):
     is_migration: bool = False 
@@ -202,6 +203,27 @@ class BenchCfg(BaseModel):
         return v
 
 
+class PipelineStagePlacement(BaseModel):
+    """Placement for one logical PP stage or global worker rank.
+
+    For the current VMXpert experiments tensor_parallel_size is 1, so
+    pp_stage and rank are usually the same value. Keeping both fields lets a
+    config describe non-identity stage-to-rank mappings when vLLM is launched
+    with a matching pipeline_stage_to_rank map.
+    """
+
+    pp_stage: Optional[int] = None
+    rank: Optional[int] = None
+    node: str
+    ip: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_stage_or_rank(self) -> "PipelineStagePlacement":
+        if self.pp_stage is None and self.rank is None:
+            raise ValueError("network.placements entries must define pp_stage or rank")
+        return self
+
+
 class NetworkCfg(BaseModel):
     delays: List[float] = [0]
     # 可选：pipeline 并行各 rank 的可达 IP，供 KV synchronizer 双向通道使用
@@ -209,6 +231,69 @@ class NetworkCfg(BaseModel):
     # 可选：指定每个 rank 对应的 Ray 节点（hostname 或 IP），用于跨节点 worker 部署
     # 示例：{0: "node1", 1: "node2"} 表示 rank 0 部署在 node1，rank 1 部署在 node2
     rank_to_node: Dict[int, str] = {}
+    # 可选：指定逻辑 PP stage 对应的 global rank。TP=1 时 rank 就是 GPU worker rank。
+    # 示例：{0: 0, 1: 1, 2: 2, 3: 3}
+    pipeline_stage_to_rank: Dict[int, int] = {}
+    # 可选：更可读的 placement 写法，会自动展开为 rank_to_node/rank_to_ip。
+    # 示例：
+    # placements:
+    #   - {pp_stage: 0, node: node-a, ip: node-a}
+    #   - {pp_stage: 1, node: node-a, ip: node-a}
+    #   - {pp_stage: 2, node: node-b, ip: node-b}
+    #   - {pp_stage: 3, node: node-b, ip: node-b}
+    placements: List[PipelineStagePlacement] = []
+
+    def resolve_worker_placement(
+        self,
+        pipeline_parallel_size: int,
+        tensor_parallel_size: int = 1,
+    ) -> tuple[Dict[int, str], Dict[int, str], Dict[int, int]]:
+        """Resolve high-level placement into rank_to_ip/node and stage_to_rank."""
+        rank_to_ip = dict(self.rank_to_ip)
+        rank_to_node = dict(self.rank_to_node)
+        stage_to_rank = dict(self.pipeline_stage_to_rank)
+
+        for placement in self.placements:
+            rank = placement.rank
+            if placement.pp_stage is not None:
+                default_rank = placement.pp_stage * tensor_parallel_size
+                if rank is None:
+                    rank = default_rank
+                stage_to_rank.setdefault(placement.pp_stage, rank)
+            assert rank is not None
+            rank_to_node[rank] = placement.node
+            if placement.ip is not None:
+                rank_to_ip[rank] = placement.ip
+
+        if stage_to_rank:
+            expected_stages = set(range(pipeline_parallel_size))
+            actual_stages = set(stage_to_rank)
+            if actual_stages != expected_stages:
+                raise ValueError(
+                    "network.pipeline_stage_to_rank/placements must cover every "
+                    f"PP stage 0..{pipeline_parallel_size - 1}; got {sorted(actual_stages)}"
+                )
+            ranks = list(stage_to_rank.values())
+            if len(set(ranks)) != len(ranks):
+                raise ValueError(f"Duplicate ranks in pipeline_stage_to_rank: {stage_to_rank}")
+            world_size = pipeline_parallel_size * tensor_parallel_size
+            invalid_ranks = [rank for rank in ranks if rank < 0 or rank >= world_size]
+            if invalid_ranks:
+                raise ValueError(
+                    f"pipeline_stage_to_rank contains ranks outside world size {world_size}: "
+                    f"{invalid_ranks}"
+                )
+            if tensor_parallel_size > 1:
+                invalid_bases = [
+                    rank for rank in ranks if rank % tensor_parallel_size != 0
+                ]
+                if invalid_bases:
+                    raise ValueError(
+                        "With tensor_parallel_size > 1, pipeline_stage_to_rank values "
+                        f"must be TP-group base ranks; got {invalid_bases}"
+                    )
+
+        return rank_to_ip, rank_to_node, stage_to_rank
 
 class PathPolicy(BaseModel):
     variables: List[str] = []                   # 本轮作为“变量”的键
@@ -683,6 +768,8 @@ class StaticVllmCfg(BaseModel):
     """Whether to preload all weights into CPU memory at startup. Default True.
     When True, weights are preloaded to CPU pinned memory for faster GPU loading.
     When False, weights are loaded from disk on-demand during migration."""
+    disable_memory_overhead_monitor: bool = False
+    """Disable VMXpert memory overhead monitoring during migration."""
 
 
 class StaticBenchCfg(BaseModel):
@@ -914,6 +1001,7 @@ class ExpNetworkConfig:
     """Network configuration for a single experiment."""
     rank_to_ip: Dict[int, str] = field(default_factory=dict)
     rank_to_node: Dict[int, str] = field(default_factory=dict)
+    pipeline_stage_to_rank: Dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -1268,9 +1356,16 @@ class ExperimentConfig:
             name=static_cfg.model.name,
         )
         
+        rank_to_ip, rank_to_node, pipeline_stage_to_rank = (
+            static_cfg.network.resolve_worker_placement(
+                static_cfg.vllm.pipeline_parallel_size
+            )
+        )
+
         network_cfg = ExpNetworkConfig(
-            rank_to_ip=static_cfg.network.rank_to_ip,
-            rank_to_node=static_cfg.network.rank_to_node,
+            rank_to_ip=rank_to_ip,
+            rank_to_node=rank_to_node,
+            pipeline_stage_to_rank=pipeline_stage_to_rank,
         )
         
         vllm_cfg = ExpVllmConfig(
@@ -1293,6 +1388,7 @@ class ExperimentConfig:
             enable_kv_resize=kv_resize,
             enable_cpu_weight_cache=cpu_cache,
             log_kv_memory_stats=static_cfg.vllm.log_kv_memory_stats,
+            disable_memory_overhead_monitor=static_cfg.vllm.disable_memory_overhead_monitor,
             pp_layer_partition=initial_pp,
             pp_layer_config={k: v.replace(" ", "") for k, v in bench_cfg.pp_layer_config.items()},
         )
@@ -1418,6 +1514,7 @@ class VllmServerSpec:
     # Network
     rank_to_ip: Dict[int, str] = field(default_factory=dict)
     rank_to_node: Dict[int, str] = field(default_factory=dict)
+    pipeline_stage_to_rank: Dict[int, int] = field(default_factory=dict)
     
     # Benchmark-related (for dynamic config)
     pattern_batch_size: int = 150
@@ -1446,6 +1543,10 @@ class VllmServerSpec:
         # Only include rank_to_ip if non-empty
         if self.rank_to_ip:
             cfg["rank_to_ip"] = {str(k): v for k, v in self.rank_to_ip.items()}
+        if self.pipeline_stage_to_rank:
+            cfg["pipeline_stage_to_rank"] = {
+                str(k): v for k, v in self.pipeline_stage_to_rank.items()
+            }
         return cfg
 
 

@@ -1,7 +1,7 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "config_finder_qwen-1"
+project: "config_finder_qwen_new_mission_mode_2"
 type: "sweep_test"
 
 envs:
@@ -30,15 +30,22 @@ static_config:
     path: "/home/bxb1/data/huggingface/Qwen3-32B-FP8"
     name: "Qwen3-32B-FP8"
   network:
-    rank_to_ip:
-      0: "spartan-gpgpu166"
-      1: "spartan-gpgpu002"
-    rank_to_node:
-      0: "spartan-gpgpu166"
-      1: "spartan-gpgpu002"
+    placements:
+      - pp_stage: 0
+        node: "spartan-gpgpu066"
+        ip: "spartan-gpgpu066"
+      - pp_stage: 1
+        node: "spartan-gpgpu066"
+        ip: "spartan-gpgpu066"
+      - pp_stage: 2
+        node: "spartan-gpgpu007"
+        ip: "spartan-gpgpu007"
+      - pp_stage: 3
+        node: "spartan-gpgpu007"
+        ip: "spartan-gpgpu007"
   vllm:
     head_addr: "localhost"
-    pipeline_parallel_size: 2
+    pipeline_parallel_size: 4
     gpu_memory_utilization: 0.95
     max_model_len: 8000
     chunked_prefill: true
@@ -53,7 +60,7 @@ static_config:
     profile: false
     print_outputs: true
     num_total_requests: 100  # Shared across all sweep combinations
-    repetition: 2  # Shared across all sweep combinations
+    repetition: 10  # Shared across all sweep combinations
     warmup:
       enabled: false
       num_total_requests: 25
@@ -84,11 +91,11 @@ sweep_configs:
       use_vmm: [true]
       block_size: [128]
     benchmark:
-      repetition: 2          # 3 repetitions to test the feature
-      pp_layer_configs: ["44, 20", "48, 16", "52, 12", "56,8", "60,4"]  # pp_layer_partition strings
-      request_rates: [1,2,3,4,5]  # float values
-      input_lens: [128]  # int values
-      output_lens: [512]  # int value
+      repetition: 10          # 3 repetitions to test the feature
+      pp_layer_configs: ["16,16,16,16", "20,16,16,12", "24,16,16,8", "28,12,12,12", "32,12,12,8"]  # pp_layer_partition strings
+      request_rates: [0.5,1,2,3,4,5,6,7,8,9,10]  # float values
+      input_lens: [128, 512]  # int values
+      output_lens: [512, 128]  # int value
   - vllm:
       attention_kernel: [direct]
       fixed_num_gpu_blocks: [-1]
@@ -98,7 +105,7 @@ sweep_configs:
       block_size: [128]
     benchmark:
       repetition: 2          # 3 repetitions to test the feature
-      pp_layer_configs: ["44, 20", "48, 16", "52, 12", "56,8", "60,4"]  # pp_layer_partition strings
+      pp_layer_configs: ["16,16,16,16", "20,16,16,12", "24,16,16,8", "28,12,12,12", "32,12,12,8"]  # pp_layer_partition strings
       request_rates: [1,2,3,4,5]  # float values
       input_lens: [512]  # int values60
       output_lens: [16]  # int value
