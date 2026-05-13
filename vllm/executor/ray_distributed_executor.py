@@ -422,8 +422,8 @@ class RayDistributedExecutor(DistributedExecutorBase):
                         self.parallel_config.tensor_parallel_size):
                     # PP=2, TP=4
                     # pp_tp_workers = [[0, 1, 2, 3], [4, 5, 6, 7]]
-                    rank = (pp_rank * self.parallel_config.tensor_parallel_size
-                            ) + tp_rank
+                    rank = self.parallel_config.get_rank_for_pipeline_stage(
+                        pp_rank, tp_rank)
                     assert len(self.pp_tp_workers[pp_rank]) == tp_rank
                     assert pp_rank < len(self.pp_tp_workers)
                     self.pp_tp_workers[pp_rank].append(self.workers[rank])

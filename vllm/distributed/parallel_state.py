@@ -1014,6 +1014,23 @@ def initialize_model_parallel(
     all_ranks = torch.arange(world_size).reshape(
         -1, data_parallel_size, pipeline_model_parallel_size,
         tensor_model_parallel_size)  # noqa
+    stage_to_rank = getattr(config.parallel_config, "pipeline_stage_to_rank",
+                            None) if config is not None else None
+    if stage_to_rank:
+        if data_parallel_size != 1:
+            raise ValueError(
+                "pipeline_stage_to_rank is not supported with "
+                f"data_parallel_size={data_parallel_size}")
+        stage_order = []
+        for pp_rank in range(pipeline_model_parallel_size):
+            base_rank = int(stage_to_rank[pp_rank])
+            stage_order.append([
+                base_rank + tp_rank
+                for tp_rank in range(tensor_model_parallel_size)
+            ])
+        all_ranks = torch.tensor(stage_order, dtype=torch.int64).reshape(
+            -1, data_parallel_size, pipeline_model_parallel_size,
+            tensor_model_parallel_size)
 
     # Build the tensor model-parallel groups.
     global _TP

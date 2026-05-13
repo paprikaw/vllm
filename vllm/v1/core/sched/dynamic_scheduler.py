@@ -188,6 +188,7 @@ class DynamicScheduler(Scheduler):
         self.round_robin_index = 0
         self.running_controller = RunningQueueMigrationController()
         self.waiting_controller = WaitingQueueMigrationController()
+        self._sync_drain_pending_waiting: Optional[deque[Request]] = None
         # self.cur_running = []
         # self.cur_waiting = deque()
         # self.next_running = []
@@ -514,6 +515,13 @@ class DynamicScheduler(Scheduler):
             return scheduler_output
 
     def add_request(self, request: Request) -> None:
+        if self._sync_drain_pending_waiting is not None:
+            self._sync_drain_pending_waiting.append(request)
+            self.requests[request.request_id] = request
+            if self.log_stats:
+                request.record_event(EngineCoreEventType.QUEUED)
+            return
+
         if self.migration_status == MigrationStatus.MIGRATING:
             self.waiting = self.waiting_controller.get_next()
             super().add_request(request)
@@ -522,6 +530,26 @@ class DynamicScheduler(Scheduler):
             self.waiting = self.waiting_controller.get_cur()
             super().add_request(request)
             self.waiting_controller.cur = self.waiting
+
+    def begin_sync_drain(self) -> None:
+        assert self._sync_drain_pending_waiting is None, (
+            "sync drain is already active")
+        self._sync_drain_pending_waiting = deque()
+
+    def finish_sync_drain(self) -> None:
+        if self._sync_drain_pending_waiting is None:
+            return
+
+        _, cur_running = self.running_controller.get_cur()
+        cur_waiting = self.waiting_controller.get_cur()
+        assert len(cur_running) == 0, (
+            f"sync drain finished with running requests: {cur_running}")
+        assert len(cur_waiting) == 0, (
+            f"sync drain finished with waiting requests: {cur_waiting}")
+
+        self.waiting_controller.cur = self._sync_drain_pending_waiting
+        self.waiting = self.waiting_controller.cur
+        self._sync_drain_pending_waiting = None
 
     def finish_requests(
         self,

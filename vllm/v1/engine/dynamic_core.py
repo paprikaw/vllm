@@ -481,7 +481,10 @@ class DynamicEngineCore(EngineCore):
                      "warmup model) took %.2f seconds"), elapsed)
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
-    def _drain_out_running_queue(self) -> list[EngineCoreOutputs]:
+    def _drain_out_running_queue(
+        self,
+        finish_waiting: bool = False,
+    ) -> list[EngineCoreOutputs]:
         assert isinstance(self.scheduler, DynamicScheduler)
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
 
@@ -489,13 +492,49 @@ class DynamicEngineCore(EngineCore):
         if self.batch_queue is None:
             # PP=1: no batch queue, nothing to drain
             return engine_core_outputs
-        while not self.batch_queue.empty():
-            future, scheduler_output = self.batch_queue.get_nowait()
-            # Blocking until the first result is available.
-            model_output = future.result()
-            self.batch_queue.task_done()
-            engine_core_outputs.append(self.scheduler.update_from_output(
-                scheduler_output, model_output))
+
+        is_ray_use_cpu = os.getenv("VLLM_USE_CPU_MODEL", "0") == "1"
+        execute_func = (self.model_executor.execute_cpu_model
+                        if is_ray_use_cpu
+                        else self.model_executor.execute_model)
+
+        if finish_waiting:
+            self.scheduler.begin_sync_drain()
+
+        try:
+            while True:
+                if not self.batch_queue.empty():
+                    future, scheduler_output = self.batch_queue.get_nowait()
+                    # Blocking until the first result is available.
+                    model_output = future.result()
+                    self.batch_queue.task_done()
+                    engine_core_outputs.append(self.scheduler.update_from_output(
+                        scheduler_output, model_output))
+                    continue
+
+                if not finish_waiting:
+                    break
+
+                _, cur_running = self.scheduler.running_controller.get_cur()
+                cur_waiting = self.scheduler.waiting_controller.get_cur()
+                if not cur_running and not cur_waiting:
+                    break
+
+                scheduler_output = self.scheduler.dynamic_schedule()
+                if scheduler_output.total_num_scheduled_tokens == 0:
+                    logger.warning(
+                        "sync drain could not schedule remaining work: "
+                        "running=%d waiting=%d",
+                        len(cur_running), len(cur_waiting))
+                    break
+
+                future = execute_func(scheduler_output)
+                model_output = future.result()
+                engine_core_outputs.append(self.scheduler.update_from_output(
+                    scheduler_output, model_output))
+        finally:
+            if finish_waiting:
+                self.scheduler.finish_sync_drain()
         return engine_core_outputs
 
     def step_with_batch_queue(self) -> Optional[EngineCoreOutputs]:
@@ -888,15 +927,33 @@ class DynamicEngineCore(EngineCore):
             logger.info(f"applied_token_list: {applied_token_list}")
             logger.info(f"num of tokens for migration: {self.scheduler.num_tokens_for_migration}")
             
-            # Filter out None values
-            valid_applied_tokens = [applied_tokens for applied_tokens in applied_token_list if applied_tokens is not None]
-            if not valid_applied_tokens:
-                logger.info("No valid applied tokens yet, waiting...")
-                return False
-            
-            min_applied_token = min([min(applied_tokens) for applied_tokens in valid_applied_tokens])
+            relevant_applied_tokens: list[int] = []
+            world_size = self.vllm_config.parallel_config.pipeline_parallel_size
+            for src_rank, rank_to_layers_ids in src_to_plan.items():
+                for dst_rank in rank_to_layers_ids:
+                    applied_tokens = applied_token_list[dst_rank]
+                    if applied_tokens is None:
+                        logger.info(
+                            "Receiver rank %s did not report applied tokens yet",
+                            dst_rank)
+                        return False
+                    peer_ranks = [
+                        rank for rank in range(world_size)
+                        if rank != dst_rank
+                    ]
+                    src_index = peer_ranks.index(src_rank)
+                    relevant_applied_tokens.append(applied_tokens[src_index])
 
-            lag = [self.scheduler.num_tokens_for_migration - min(applied_tokens) for applied_tokens in valid_applied_tokens]
+            if not relevant_applied_tokens:
+                logger.info("No relevant applied tokens yet, waiting...")
+                return False
+
+            min_applied_token = min(relevant_applied_tokens)
+
+            lag = [
+                self.scheduler.num_tokens_for_migration - applied
+                for applied in relevant_applied_tokens
+            ]
             logger.info(f"lag between sent and applied tokens: {lag}")
             return min_applied_token > 0 and max(lag) < token_to_send_threshold
 
@@ -1110,7 +1167,7 @@ class DynamicEngineCore(EngineCore):
         # Do NOT wait for async add-layers; weight loading and migration can still overlap.
         with self.engine_lock:
             drain_start = time.time()
-            outputs = self._drain_out_running_queue()
+            outputs = self._drain_out_running_queue(finish_waiting=True)
             engine_core_outputs.extend(outputs)
             logger.info(f"[async_fast timeline]: drain_running_queue took {human_readable_duration(time.time() - drain_start)}")
             logger.info(f"[async_fast] drained {len(outputs)} outputs during migration")
@@ -1274,7 +1331,7 @@ class DynamicEngineCore(EngineCore):
             # For sync migration, running queue should be empty after drain
             # No slot_mapping is needed - receiver will create fresh empty KV caches
 
-            outputs = self._drain_out_running_queue()
+            outputs = self._drain_out_running_queue(finish_waiting=True)
             engine_core_outputs.extend(outputs)
             drain_time_ms = (time.time() - time_start) * 1000
             logger.info(f"[timeline]: after drain out running queue, time taken: {human_readable_duration(time.time() - time_start)}")

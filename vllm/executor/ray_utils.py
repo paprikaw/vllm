@@ -409,11 +409,14 @@ def initialize_ray_cluster(
         if not rank_to_node:
             placement_group_specs[0][f"node:{current_ip}"] = 0.001
 
-        # Use STRICT_SPREAD when rank_to_node is specified to ensure cross-node deployment
-        # Otherwise use SPREAD for best-effort distribution
-        if rank_to_node and len(set(rank_to_node.values())) > 1:
-            strategy = "STRICT_SPREAD"
-            logger.info("Using STRICT_SPREAD strategy for cross-node deployment")
+        # Explicit node constraints already pin each bundle. STRICT_SPREAD is
+        # invalid for mappings like {0: A, 1: A, 2: B, 3: B}, where multiple
+        # ranks intentionally share a node, so use PACK and let the node
+        # resources drive placement.
+        if rank_to_node:
+            strategy = "PACK"
+            logger.info(
+                "Using PACK strategy with explicit rank-to-node constraints")
         else:
             strategy = "SPREAD"
             logger.info("Using SPREAD strategy for worker placement")

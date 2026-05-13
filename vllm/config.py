@@ -1201,9 +1201,9 @@ class ModelConfig:
         else:
             total_num_hidden_layers = getattr(self.hf_text_config,
                                               "num_hidden_layers", 0)
-        # the layout order is: DP x PP x TP
-        pp_rank = (parallel_config.rank // parallel_config.tensor_parallel_size
-                   ) % parallel_config.pipeline_parallel_size
+        # the layout order is: DP x PP x TP. A custom PP-stage-to-rank map
+        # can override the default contiguous rank order.
+        pp_rank = parallel_config.get_pipeline_stage_for_rank()
         pp_size = parallel_config.pipeline_parallel_size
         start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
         return start, end
@@ -1728,6 +1728,11 @@ class ParallelConfig:
     Example: {0: "192.168.1.1", 1: "192.168.1.2"} places rank 0 on first node
     and rank 1 on second node. Used for cross-node pipeline parallelism."""
 
+    pipeline_stage_to_rank: Optional[Dict[int, int]] = None
+    """Mapping from logical PP stage to the base global rank for that stage.
+    With tensor_parallel_size=1 this directly maps PP stage to GPU worker rank.
+    With tensor_parallel_size>1 values must be the first rank of each TP group."""
+
     distributed_executor_backend: Optional[Union[DistributedExecutorBackend,
                                                  type["ExecutorBase"]]] = None
     """Backend to use for distributed model
@@ -1815,11 +1820,48 @@ class ParallelConfig:
         factors.append(self.pipeline_parallel_size)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_expert_parallel)
+        if self.pipeline_stage_to_rank:
+            factors.append(tuple(sorted(self.pipeline_stage_to_rank.items())))
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
     def __post_init__(self) -> None:
         self.world_size = self.pipeline_parallel_size * \
             self.tensor_parallel_size
+
+        if self.pipeline_stage_to_rank:
+            self.pipeline_stage_to_rank = {
+                int(stage): int(rank)
+                for stage, rank in self.pipeline_stage_to_rank.items()
+            }
+            expected_stages = set(range(self.pipeline_parallel_size))
+            actual_stages = set(self.pipeline_stage_to_rank)
+            if actual_stages != expected_stages:
+                raise ValueError(
+                    "pipeline_stage_to_rank must cover every pipeline stage "
+                    f"0..{self.pipeline_parallel_size - 1}; got "
+                    f"{sorted(actual_stages)}")
+            base_ranks = list(self.pipeline_stage_to_rank.values())
+            if len(set(base_ranks)) != len(base_ranks):
+                raise ValueError(
+                    f"pipeline_stage_to_rank contains duplicate ranks: "
+                    f"{self.pipeline_stage_to_rank}")
+            invalid_ranks = [
+                rank for rank in base_ranks
+                if rank < 0 or rank >= self.world_size
+            ]
+            if invalid_ranks:
+                raise ValueError(
+                    "pipeline_stage_to_rank contains ranks outside world "
+                    f"size {self.world_size}: {invalid_ranks}")
+            invalid_bases = [
+                rank for rank in base_ranks
+                if rank % self.tensor_parallel_size != 0
+            ]
+            if invalid_bases:
+                raise ValueError(
+                    "pipeline_stage_to_rank values must be TP-group base "
+                    f"ranks when tensor_parallel_size={self.tensor_parallel_size}; "
+                    f"got {invalid_bases}")
 
         if self.data_parallel_size_local > self.data_parallel_size:
             raise ValueError(
@@ -1888,6 +1930,24 @@ class ParallelConfig:
             self.distributed_executor_backend = "uni"
 
         self._verify_args()
+
+    def get_rank_for_pipeline_stage(self,
+                                    pp_stage: int,
+                                    tp_rank: int = 0) -> int:
+        if self.pipeline_stage_to_rank:
+            return self.pipeline_stage_to_rank[pp_stage] + tp_rank
+        return pp_stage * self.tensor_parallel_size + tp_rank
+
+    def get_pipeline_stage_for_rank(self, rank: Optional[int] = None) -> int:
+        rank = self.rank if rank is None else rank
+        base_rank = rank - (rank % self.tensor_parallel_size)
+        if self.pipeline_stage_to_rank:
+            rank_to_stage = {
+                stage_base_rank: stage
+                for stage, stage_base_rank in self.pipeline_stage_to_rank.items()
+            }
+            return rank_to_stage[base_rank]
+        return (rank // self.tensor_parallel_size) % self.pipeline_parallel_size
 
     @property
     def use_ray(self) -> bool:
@@ -4195,6 +4255,10 @@ class DynamicConfig:
     Format: {"0": "192.168.1.1", "1": "192.168.1.2", ...}
     Used by DynamicLayerKVConnector for bidirectional control channels.
     This takes precedence over the VLLM_LAYERKV_RANK_TO_IP environment variable."""
+
+    pipeline_stage_to_rank: Optional[dict[str, int]] = None
+    """Mapping from logical PP stage to global rank for VMXpert placement
+    metadata. The executable placement is controlled by ParallelConfig."""
 
     fixed_num_gpu_blocks: int = -1
     """Fixed number of GPU KV cache blocks per layer. Default -1 (auto).

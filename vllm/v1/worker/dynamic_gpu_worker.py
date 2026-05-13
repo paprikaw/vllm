@@ -2382,12 +2382,18 @@ class DynamicGPUWorker(Worker):
         assert all(transfer_in_process == False for transfer_in_process in self.dynamic_kv_synchronizer.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
         assert all(patch_id == 0 for patch_id in self.dynamic_kv_synchronizer.last_patch_ids.values()), "The patch id of the rank should be 0."
         slot_mapping_dev = torch.tensor(slot_mapping, device=self.device) if slot_mapping is not None else None
-        start_layer_id = self.model_runner.model.model.start_layer        # Firstly send the kv tensor to remote rank
         assert self.migration_stream is not None
         with self.migration_stream:
             for layer_id in layer_ids:
                 time_start = time.time()
-                kv_tensor_meta, kv_tensor_data = self.dynamic_kv_synchronizer.get_kv_tensor_from_cache(layer_ids, layer_id, start_layer_id, self.model_runner.page_meta,  slot_mapping_dev)
+                # A PP stage can be both a sender and a receiver during PP>2
+                # async reconfiguration.  In that case _add_layers may update
+                # model.start_layer before it pads the KV pointer lists.  Guard
+                # the read so the sender only observes a consistent layer base
+                # and pointer layout.
+                with self._layer_loaded_cv:
+                    start_layer_id = self.model_runner.model.model.start_layer
+                    kv_tensor_meta, kv_tensor_data = self.dynamic_kv_synchronizer.get_kv_tensor_from_cache(layer_ids, layer_id, start_layer_id, self.model_runner.page_meta,  slot_mapping_dev)
                 logger.info(f"start to send kv tensor for layer {layer_id} to rank {rank}, kv_tensor_meta: {kv_tensor_meta}, kv_tensor_data shape: {kv_tensor_data.shape}, time taken to get kv tensor: {human_readable_duration(time.time() - time_start)} seconds")
                 with self.model_runner.fbgate.background():
                     self.dynamic_kv_synchronizer.send_kv_tensor_to_rank(rank, kv_tensor_meta, kv_tensor_data, slot_mapping_dev)
@@ -2414,6 +2420,8 @@ class DynamicGPUWorker(Worker):
             logger.info(f"[timeline]: wait for kv patch")
             self.dynamic_kv_synchronizer.wait_for_kv_patch(rank)
             logger.info(f"[timeline]: wait for kv patch preparation take {human_readable_duration(time.time() - time_start_to_wait)}")
+            with self._layer_loaded_cv:
+                start_layer_id = self.model_runner.model.model.start_layer
             for kv_patch in self.dynamic_kv_synchronizer.get_kv_patch(rank, start_layer_id, layer_ids, self.model_runner.page_meta):
                 time_start = time.time()
                 patch_payload_size = kv_patch.kv_payload.numel() * kv_patch.kv_payload.element_size()
@@ -2492,15 +2500,20 @@ class DynamicGPUWorker(Worker):
             # memory_snapshot(f"rank{self.rank}_after_remove_layers", self.device)
                 
         start_layer = pp_layer_config[self.rank][0]
-        # Receiver Side, Wait for receive to finish
-        if self.rank not in src_to_sending_layers:
-            # Wait for receive to finish if this rank is a receiver
-            if self.rank in rank_to_layer_ids:
-                with self._receive_finished_cv:
-                    while self.receive_in_process:
-                        logger.info(f"[sync migration]: rank {self.rank} waiting for receive to finish")
-                        self._receive_finished_cv.wait()
-            logger.info(f"[timeline]: after start kv cache migration sync, time taken: {human_readable_duration(time.time() - time_start)}")
+        # Receiver Side, Wait for receive to finish.
+        #
+        # For PP>2 a middle rank can be both a sender and a receiver in the
+        # same reconfiguration, e.g. 16,16,16,16 -> 8,8,24,24 makes rank 1
+        # send layers 16-31 while receiving layers 8-15. The old PP=2-oriented
+        # branch skipped the receive wait for sender ranks, so direct pointer
+        # tables could be committed before all newly received layer KV pointers
+        # were bound.
+        if self.rank in rank_to_layer_ids:
+            with self._receive_finished_cv:
+                while self.receive_in_process:
+                    logger.info(f"[sync migration]: rank {self.rank} waiting for receive to finish")
+                    self._receive_finished_cv.wait()
+        logger.info(f"[timeline]: after start kv cache migration sync, time taken: {human_readable_duration(time.time() - time_start)}")
         is_direct = self.vllm_config.dynamic_config.use_direct_ptr  
         if is_direct:
             memory_snapshot(f"rank{self.rank}_before_commit_ptr_tables", self.device)
