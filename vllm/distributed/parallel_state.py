@@ -195,6 +195,7 @@ class GroupCoordinator:
     #   3     |   1  |  3   |     1      |       3
     local_rank: int  # local rank used to assign devices
     rank_in_group: int  # rank inside the group
+    active_ranks: Optional[list[int]]
     cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
     use_device_communicator: bool  # whether to use device communicator
@@ -218,6 +219,7 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        self.active_ranks = None
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
@@ -270,14 +272,37 @@ class GroupCoordinator:
                                    or current_platform.is_tpu())
 
     @property
+    def routing_ranks(self):
+        """Ranks currently participating in point-to-point PP routing.
+
+        Pipeline autoscaling keeps the underlying process group fixed at the
+        candidate-rank superset, while only a subset of ranks is active for the
+        current PP placement. Non-PP groups leave active_ranks unset.
+        """
+        return self.active_ranks or self.ranks
+
+    def set_active_ranks(self, active_ranks: Optional[list[int]]) -> None:
+        if active_ranks is None:
+            self.active_ranks = None
+            return
+        invalid_ranks = [rank for rank in active_ranks if rank not in self.ranks]
+        if invalid_ranks:
+            raise ValueError(
+                f"active_ranks contains ranks outside group {self.ranks}: "
+                f"{invalid_ranks}")
+        if len(set(active_ranks)) != len(active_ranks):
+            raise ValueError(f"active_ranks contains duplicates: {active_ranks}")
+        self.active_ranks = list(active_ranks)
+
+    @property
     def first_rank(self):
         """Return the global rank of the first process in the group"""
-        return self.ranks[0]
+        return self.routing_ranks[0]
 
     @property
     def last_rank(self):
         """Return the global rank of the last process in the group"""
-        return self.ranks[-1]
+        return self.routing_ranks[-1]
 
     @property
     def is_first_rank(self):
@@ -292,16 +317,22 @@ class GroupCoordinator:
     @property
     def next_rank(self):
         """Return the global rank of the process that follows the caller"""
-        rank_in_group = self.rank_in_group
-        world_size = self.world_size
-        return self.ranks[(rank_in_group + 1) % world_size]
+        ranks = self.routing_ranks
+        if self.rank not in ranks:
+            return self.rank
+        rank_in_group = ranks.index(self.rank)
+        world_size = len(ranks)
+        return ranks[(rank_in_group + 1) % world_size]
 
     @property
     def prev_rank(self):
         """Return the global rank of the process that precedes the caller"""
-        rank_in_group = self.rank_in_group
-        world_size = self.world_size
-        return self.ranks[(rank_in_group - 1) % world_size]
+        ranks = self.routing_ranks
+        if self.rank not in ranks:
+            return self.rank
+        rank_in_group = ranks.index(self.rank)
+        world_size = len(ranks)
+        return ranks[(rank_in_group - 1) % world_size]
 
     @contextmanager
     def graph_capture(
@@ -870,6 +901,13 @@ def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, (
         "pipeline model parallel group is not initialized")
     return _PP
+
+
+def set_pp_group_active_ranks(active_ranks: Optional[list[int]]) -> None:
+    """Set the active PP routing subset for pipeline autoscaling."""
+    assert _PP is not None, (
+        "pipeline model parallel group is not initialized")
+    _PP.set_active_ranks(active_ranks)
 
 
 # kept for backward compatibility

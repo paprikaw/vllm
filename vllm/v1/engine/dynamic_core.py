@@ -112,15 +112,27 @@ class DynamicEngineCore(EngineCore):
         if partition_list_str is None:
             raise ValueError("dynamic_config.pp_layer_partition must be set")
         partitions = [int(layer) for layer in partition_list_str.split(",")]
+        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        if len(partitions) > pp_size:
+            raise ValueError(
+                f"pp_layer_partition has {len(partitions)} entries, larger "
+                f"than pipeline_parallel_size={pp_size}")
+        partitions.extend([0] * (pp_size - len(partitions)))
         initial_layer_configs = []
         start_layer = 0
         for num_layers in partitions:
+            if num_layers <= 0:
+                initial_layer_configs.append((start_layer, start_layer - 1))
+                continue
             end_layer = start_layer + num_layers - 1
             initial_layer_configs.append((start_layer, end_layer))
             start_layer = end_layer + 1
         self.cur_pp_layer_config = initial_layer_configs
         # Store initial config for reference
         self.initial_pp_layer_config = list(initial_layer_configs)
+        self._placement_generation = 0
+        self.cur_active_pp_ranks = self._active_ranks_for_config(
+            self.cur_pp_layer_config)
         self.migration_in_process = False
         
         # Event to signal migration_thread to reset its request counter
@@ -134,15 +146,53 @@ class DynamicEngineCore(EngineCore):
         self._migration_config_lock = threading.Lock()
         
         # Initialize from dynamic_config if available
-        if vllm_config.dynamic_config and vllm_config.dynamic_config.is_migration:
+        if (vllm_config.dynamic_config and
+                (vllm_config.dynamic_config.is_migration
+                 or vllm_config.dynamic_config.autoscaling_sequence)):
+            if vllm_config.dynamic_config.autoscaling_sequence:
+                sequence_configs: dict[int, list[Tuple[int, int]]] = {}
+                sequence_steps: list[int] = []
+                for idx, step_cfg in enumerate(
+                        vllm_config.dynamic_config.autoscaling_sequence):
+                    if "step" not in step_cfg:
+                        raise ValueError(
+                            "autoscaling_sequence entries must include step")
+                    pp_config = step_cfg.get("pp_layer_config")
+                    if pp_config is None:
+                        pp_partition = step_cfg.get("pp_layer_partition")
+                        if pp_partition is None:
+                            raise ValueError(
+                                "autoscaling_sequence entries must include "
+                                "pp_layer_config or pp_layer_partition")
+                        pp_config = self._parse_pp_layer_partition(pp_partition)
+                    sequence_steps.append(int(step_cfg["step"]))
+                    sequence_configs[idx] = self._normalize_pp_layer_config(
+                        pp_config)
+                self._migration_alternative_configs = sequence_configs
+                self._migration_steps = set(sequence_steps)
             if vllm_config.dynamic_config.alternative_configs:
                 # alternative_configs is a dict like {"pp_layer_configs": {"0": [[0,31],[32,63]], ...}}
                 pp_layer_configs = vllm_config.dynamic_config.alternative_configs.get("pp_layer_configs", {})
                 self._migration_alternative_configs = {
-                    int(k): v for k, v in pp_layer_configs.items()
+                    int(k): self._normalize_pp_layer_config(v)
+                    for k, v in pp_layer_configs.items()
                 }
             if vllm_config.dynamic_config.migration_steps:
                 self._migration_steps = set(vllm_config.dynamic_config.migration_steps)
+            if vllm_config.dynamic_config.autoscaling_sequence:
+                sequence_configs = {}
+                sequence_steps = []
+                for idx, step_cfg in enumerate(
+                        vllm_config.dynamic_config.autoscaling_sequence):
+                    pp_config = step_cfg.get("pp_layer_config")
+                    if pp_config is None:
+                        pp_config = self._parse_pp_layer_partition(
+                            step_cfg["pp_layer_partition"])
+                    sequence_steps.append(int(step_cfg["step"]))
+                    sequence_configs[idx] = self._normalize_pp_layer_config(
+                        pp_config)
+                self._migration_alternative_configs = sequence_configs
+                self._migration_steps = set(sequence_steps)
 
         # Setup KV Caches and update CacheConfig after profiling.
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
@@ -179,6 +229,7 @@ class DynamicEngineCore(EngineCore):
             > 1,
             log_stats=self.log_stats,
         )
+        self._apply_active_pp_ranks_for_config(self.cur_pp_layer_config)
 
         # Setup MM Input Mapper.
         self.mm_input_cache_server = MirroredProcessingCache(
@@ -207,6 +258,54 @@ class DynamicEngineCore(EngineCore):
         self._migration_done_event.set()  # initially no migration in progress
 
         self.scheduler_kv_cache_config: Optional[KVCacheConfig]
+
+    def _normalize_pp_layer_config(
+        self,
+        pp_layer_config: list[Tuple[int, int]],
+    ) -> list[Tuple[int, int]]:
+        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        normalized = [(int(lo), int(hi)) for lo, hi in pp_layer_config]
+        if len(normalized) > pp_size:
+            raise ValueError(
+                f"pp_layer_config has {len(normalized)} stages, larger than "
+                f"pipeline_parallel_size={pp_size}")
+        next_layer = normalized[-1][1] + 1 if normalized else 0
+        normalized.extend([(next_layer, next_layer - 1)] *
+                          (pp_size - len(normalized)))
+        return normalized
+
+    def _parse_pp_layer_partition(self, pp_layer_partition: str) -> list[Tuple[int, int]]:
+        parts = [int(x.strip()) for x in pp_layer_partition.split(",")]
+        ranges: list[Tuple[int, int]] = []
+        start = 0
+        for num_layers in parts:
+            if num_layers <= 0:
+                ranges.append((start, start - 1))
+                continue
+            end = start + num_layers - 1
+            ranges.append((start, end))
+            start = end + 1
+        return ranges
+
+    def _active_ranks_for_config(
+        self,
+        pp_layer_config: list[Tuple[int, int]],
+    ) -> list[int]:
+        return [rank for rank, (lo, hi) in enumerate(pp_layer_config)
+                if hi >= lo]
+
+    def _apply_active_pp_ranks_for_config(
+        self,
+        pp_layer_config: list[Tuple[int, int]],
+    ) -> None:
+        active_ranks = self._active_ranks_for_config(pp_layer_config)
+        self.cur_active_pp_ranks = active_ranks
+        self._placement_generation += 1
+        if isinstance(self.model_executor, DynamicRayDistributedExecutor):
+            self.model_executor.set_active_pp_ranks(active_ranks)
+        logger.info(
+            "Applied pipeline autoscaling placement generation=%s active_ranks=%s",
+            self._placement_generation, active_ranks)
 
 
         
@@ -237,8 +336,12 @@ class DynamicEngineCore(EngineCore):
         assert self.scheduler_kv_cache_config is not None
 
         num_layers_on_rank = current_pp_layer_config[rank][1] - current_pp_layer_config[rank][0] + 1
+        if num_layers_on_rank <= 0 and num_changed_layers <= 0:
+            return LayerAddingAssessResult(True, True, sys.maxsize)
         # 计算在加入当前layer之后，kv cache的最大block数量
         total_layer_num = num_changed_layers + num_layers_on_rank
+        if total_layer_num <= 0:
+            return LayerAddingAssessResult(True, True, sys.maxsize)
         block_size = self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
         max_blocks_per_layer = self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, block_size, total_layer_num, mem_info.runtime_overhead_bytes)
 
@@ -642,6 +745,7 @@ class DynamicEngineCore(EngineCore):
         Change the model configuration by reinitializing the kv cache
         In this implementation, we drain out the running queue, preempt all requests, release the kv cache, add the layers, remove the layers, and reinitialize the kv cache
         """
+        pp_layer_config = self._normalize_pp_layer_config(pp_layer_config)
         with self.engine_lock:
             logger.info(f"Change configuration from {self.cur_pp_layer_config} to {pp_layer_config}")
             start_time = time.time()
@@ -691,6 +795,7 @@ class DynamicEngineCore(EngineCore):
             end_time = time.time()
 
             self.cur_pp_layer_config = pp_layer_config
+            self._apply_active_pp_ranks_for_config(pp_layer_config)
             from datetime import timedelta
 
             def format_duration(seconds):
@@ -733,6 +838,7 @@ class DynamicEngineCore(EngineCore):
         """
         Our fancy implementation of model configuration change
         """
+        pp_layer_config = self._normalize_pp_layer_config(pp_layer_config)
         logger.info(f"Start migrating to new configuration {pp_layer_config}")
         self.migration_status = MigrationStatus.MIGRATING
         self._migration_done_event.clear()  # signal that migration is in progress
@@ -1000,6 +1106,7 @@ class DynamicEngineCore(EngineCore):
 
                 self.scheduler.async_change_configuration(pp_layer_config, resized_block_num)
                 self.cur_pp_layer_config = pp_layer_config
+                self._apply_active_pp_ranks_for_config(pp_layer_config)
                 break
 
         assert resized_block_num != 0
@@ -1042,6 +1149,7 @@ class DynamicEngineCore(EngineCore):
         This is faster than async because it avoids the continuous kv_patch sending phase,
         but requires draining the running queue similar to sync migration.
         """
+        pp_layer_config = self._normalize_pp_layer_config(pp_layer_config)
         logger.info(f"[async_fast] Start migrating to new configuration {pp_layer_config}")
         self.migration_status = MigrationStatus.MIGRATING
         self._migration_done_event.clear()
@@ -1224,6 +1332,7 @@ class DynamicEngineCore(EngineCore):
                                                       resized_block_num)
 
         self.cur_pp_layer_config = pp_layer_config
+        self._apply_active_pp_ranks_for_config(pp_layer_config)
         logger.info(f"[async_fast] config synced to {pp_layer_config}")
 
         assert resized_block_num != 0
@@ -1266,6 +1375,7 @@ class DynamicEngineCore(EngineCore):
             log_stop_time: If True, emit [STOP_TIME] logs. Set to False when
                 called from set_pp_config to avoid polluting migration metrics.
         """
+        pp_layer_config = self._normalize_pp_layer_config(pp_layer_config)
         logger.info(f"Start migrating to new configuration {pp_layer_config}")
         assert isinstance(self.scheduler, DynamicScheduler)
         time_start = None 
@@ -1460,6 +1570,7 @@ class DynamicEngineCore(EngineCore):
             elif not allow_resize:
                 logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, skipping end-of-migration resize (would be {resized_block_num} blocks)")
             self.cur_pp_layer_config = pp_layer_config
+            self._apply_active_pp_ranks_for_config(pp_layer_config)
             engine_lock_total_ms = (time.time() - time_start) * 1000
             logger.info(f"[sync_migration]: updated cur_pp_layer_config to {self.cur_pp_layer_config}, time taken: {human_readable_duration(time.time() - time_start)}")
             logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
@@ -1504,6 +1615,7 @@ class DynamicEngineCore(EngineCore):
             List of EngineCoreOutputs from processing any pending requests.
         """
         outputs = []
+        pp_layer_config = self._normalize_pp_layer_config(pp_layer_config)
         
         # Wait for any ongoing async migration to fully complete
         # (including worker-side do_resize / finish_migration) before resetting state
@@ -1550,12 +1662,14 @@ class DynamicEngineCore(EngineCore):
                 if "pp_layer_configs" in alternative_configs:
                     pp_layer_configs = alternative_configs.get("pp_layer_configs", {})
                     self._migration_alternative_configs = {
-                        int(k): v for k, v in pp_layer_configs.items()
+                        int(k): self._normalize_pp_layer_config(v)
+                        for k, v in pp_layer_configs.items()
                     }
                 else:
                     # Already in {int: config} format
                     self._migration_alternative_configs = {
-                        int(k) if isinstance(k, str) else k: v 
+                        int(k) if isinstance(k, str) else k:
+                        self._normalize_pp_layer_config(v)
                         for k, v in alternative_configs.items()
                     }
                 logger.info(f"set_pp_config: Updated alternative_configs to {self._migration_alternative_configs}")

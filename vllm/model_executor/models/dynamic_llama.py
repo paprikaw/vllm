@@ -22,6 +22,7 @@ from vllm.distributed import get_pp_group
 from vllm.kv_allocator import ForegroundBackgroundGate
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead)
 from vllm.model_executor.utils import extract_layer_index
@@ -68,7 +69,8 @@ class DynamicLlamaForCausalLM(LlamaForCausalLM, DynamicModelBase):
         self.model = DynamicLlamaModel(vllm_config=vllm_config,
                                        prefix=maybe_prefix(prefix, "model"))
 
-        if get_pp_group().is_last_rank:
+        is_autoscaling = vllm_config.dynamic_config.pipeline_autoscaling_enabled
+        if get_pp_group().is_last_rank or is_autoscaling:
             self.unpadded_vocab_size = config.vocab_size
             if lora_config:
                 self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
@@ -184,6 +186,10 @@ class DynamicLlamaModel(LlamaModel):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        if (vllm_config.dynamic_config.pipeline_autoscaling_enabled
+                and isinstance(self.norm, PPMissingLayer)):
+            self.norm = RMSNorm(self.config.hidden_size,
+                                eps=self.config.rms_norm_eps)
         # LlamaModel doesn't store prefix / cache_config – add them
         self.prefix = prefix
         self.cache_config = vllm_config.cache_config

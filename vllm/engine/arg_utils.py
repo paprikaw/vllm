@@ -362,6 +362,11 @@ class EngineArgs:
     ray_rank_to_node: Optional[Dict[int, str]] = ParallelConfig.ray_rank_to_node
     pipeline_stage_to_rank: Optional[Dict[int, int]] = \
         ParallelConfig.pipeline_stage_to_rank
+    pipeline_autoscaling_enabled: bool = DynamicConfig.pipeline_autoscaling_enabled
+    autoscaling_candidate_ranks: Optional[list[int]] = \
+        DynamicConfig.autoscaling_candidate_ranks
+    autoscaling_sequence: Optional[list[dict[str, Any]]] = \
+        DynamicConfig.autoscaling_sequence
     num_gpu_blocks_override: Optional[
         int] = CacheConfig.num_gpu_blocks_override
     num_lookahead_slots: int = SchedulerConfig.num_lookahead_slots
@@ -435,6 +440,15 @@ class EngineArgs:
         # support `EngineArgs(dynamic_config={...})`
         if isinstance(self.dynamic_config, dict):
             self.dynamic_config = DynamicConfig(**self.dynamic_config)
+        if self.dynamic_config is None:
+            self.dynamic_config = DynamicConfig()
+        if self.pipeline_autoscaling_enabled:
+            self.dynamic_config.pipeline_autoscaling_enabled = True
+        if self.autoscaling_candidate_ranks is not None:
+            self.dynamic_config.autoscaling_candidate_ranks = (
+                self.autoscaling_candidate_ranks)
+        if self.autoscaling_sequence is not None:
+            self.dynamic_config.autoscaling_sequence = self.autoscaling_sequence
         if self.qlora_adapter_name_or_path is not None:
             warnings.warn(
                 "The `qlora_adapter_name_or_path` is deprecated "
@@ -649,6 +663,20 @@ class EngineArgs:
             help='JSON string mapping logical PP stage to global rank. '
                  'Example: \'{"0": 0, "1": 1, "2": 2, "3": 3}\'. '
                  'With TP>1 values must be TP-group base ranks.')
+        parallel_group.add_argument(
+            "--pipeline-autoscaling-enabled",
+            action="store_true",
+            help="Enable experimental TP=1/DP=1 pipeline autoscaling.")
+        parallel_group.add_argument(
+            "--autoscaling-candidate-ranks",
+            type=json.loads,
+            default=None,
+            help="JSON list of candidate global ranks for pipeline autoscaling.")
+        parallel_group.add_argument(
+            "--autoscaling-sequence",
+            type=json.loads,
+            default=None,
+            help="JSON autoscaling sequence used by dynamic PP experiments.")
         parallel_group.add_argument(
             "--disable-custom-all-reduce",
             **parallel_kwargs["disable_custom_all_reduce"])

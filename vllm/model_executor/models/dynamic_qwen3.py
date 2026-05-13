@@ -25,6 +25,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.config import VllmConfig
 from .utils import AutoWeightsLoader, PPMissingLayer, maybe_prefix
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
@@ -58,7 +59,8 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM, DynamicModelBase):
         self.model = DynamicQwen3Model(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
 
-        if get_pp_group().is_last_rank:
+        is_autoscaling = vllm_config.dynamic_config.pipeline_autoscaling_enabled
+        if get_pp_group().is_last_rank or is_autoscaling:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
@@ -155,6 +157,10 @@ class DynamicQwen3Model(Qwen3Model):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix)
+        if (vllm_config.dynamic_config.pipeline_autoscaling_enabled
+                and isinstance(self.norm, PPMissingLayer)):
+            self.norm = RMSNorm(self.config.hidden_size,
+                                eps=self.config.rms_norm_eps)
         self.sched_start_layer = self.start_layer
         self.sched_end_layer = self.end_layer
         self.model_lock = Lock()

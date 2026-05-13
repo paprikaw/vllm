@@ -4260,6 +4260,25 @@ class DynamicConfig:
     """Mapping from logical PP stage to global rank for VMXpert placement
     metadata. The executable placement is controlled by ParallelConfig."""
 
+    pipeline_autoscaling_enabled: bool = False
+    """Enable experimental pipeline autoscaling.
+
+    TP=1/DP=1 only. The underlying distributed world is a superset of all
+    candidate PP ranks, while each PP config may activate only the ranks whose
+    layer ranges are non-empty.
+    """
+
+    autoscaling_candidate_ranks: Optional[list[int]] = None
+    """Global ranks that may become active PP stages during autoscaling."""
+
+    autoscaling_sequence: Optional[list[dict[str, Any]]] = None
+    """Optional multi-step autoscaling sequence for experiments.
+
+    Each entry may contain step, active_ranks, pp_layer_config or
+    pp_layer_partition. Runtime converts this into migration_steps and
+    alternative_configs.
+    """
+
     fixed_num_gpu_blocks: int = -1
     """Fixed number of GPU KV cache blocks per layer. Default -1 (auto).
     When set to a positive value, initializes the KV cache with exactly this
@@ -4309,7 +4328,7 @@ class DynamicConfig:
     @property
     def is_migration(self) -> bool:
         """Whether migration is enabled (derived from migration_steps)."""
-        return bool(self.migration_steps)
+        return bool(self.migration_steps or self.autoscaling_sequence)
 
     @property
     def use_flexi_kv(self) -> bool:

@@ -30,6 +30,13 @@ logger = init_logger(__name__)
 
 class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
+    @property
+    def max_concurrent_batches(self) -> int:
+        active_ranks = getattr(self, "active_pp_ranks", None)
+        if active_ranks:
+            return len(active_ranks)
+        return self.parallel_config.pipeline_parallel_size
+
 
     def _init_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
@@ -48,6 +55,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         # and then TP rank. In other words, the inner list is
         # the TP group of workers for a PP rank.
         self.pp_tp_workers: List[List[DynamicRayWorkerWrapper]] = []
+        self.active_pp_ranks: Optional[list[int]] = None
 
         if self.parallel_config.ray_workers_use_nsight:
             ray_remote_kwargs = self._configure_ray_workers_use_nsight(
@@ -334,6 +342,11 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         self._run_workers("init_worker", all_kwargs)
 
         self._run_workers("init_device")
+        dynamic_config = self.vllm_config.dynamic_config
+        if getattr(dynamic_config, "pipeline_autoscaling_enabled", False):
+            active_ranks = self._active_ranks_from_partition(
+                dynamic_config.pp_layer_partition)
+            self._run_workers("set_active_pp_ranks", active_ranks)
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)
@@ -350,6 +363,8 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                     assert len(self.pp_tp_workers[pp_rank]) == tp_rank
                     assert pp_rank < len(self.pp_tp_workers)
                     self.pp_tp_workers[pp_rank].append(self.workers[rank])
+            if getattr(dynamic_config, "pipeline_autoscaling_enabled", False):
+                self._set_active_pp_ranks_local(active_ranks)
 
         # This is the list of workers that are rank 0 of each TP group EXCEPT
         # global rank 0. These are the workers that will broadcast to the
@@ -368,6 +383,32 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                 self.tp_driver_workers.append(worker)
             else:
                 self.non_driver_workers.append(worker)
+
+    def _active_ranks_from_partition(
+        self,
+        pp_layer_partition: Optional[str],
+    ) -> list[int]:
+        if pp_layer_partition is None:
+            return list(range(self.parallel_config.pipeline_parallel_size))
+        parts = [int(x.strip()) for x in pp_layer_partition.split(",")]
+        if len(parts) > self.parallel_config.pipeline_parallel_size:
+            raise ValueError(
+                "pp_layer_partition has more entries than "
+                f"pipeline_parallel_size: {pp_layer_partition}")
+        return [rank for rank, num_layers in enumerate(parts)
+                if num_layers > 0]
+
+    def _set_active_pp_ranks_local(self, active_ranks: Optional[list[int]]) -> None:
+        self.active_pp_ranks = list(active_ranks) if active_ranks else None
+        if not self.use_ray_spmd_worker or not active_ranks:
+            return
+        if self.parallel_config.tensor_parallel_size != 1:
+            raise NotImplementedError(
+                "pipeline autoscaling currently supports TP=1 only")
+        self.pp_tp_workers = [[self.workers[rank]] for rank in active_ranks]
+        self.forward_dag = None
+        self.cpu_forward_dag = None
+        logger.info("Updated active PP worker chain to ranks %s", active_ranks)
 
 
     def _compiled_cpu_ray_dag(self, enable_asyncio: bool):
@@ -585,3 +626,8 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         migration metrics with initialization overhead.
         """
         self.collective_rpc("set_log_stop_time", args=(enabled,))
+
+    def set_active_pp_ranks(self, active_ranks: Optional[list[int]]) -> None:
+        """Set the active PP routing subset on all workers."""
+        self._set_active_pp_ranks_local(active_ranks)
+        self.collective_rpc("set_active_pp_ranks", args=(active_ranks,))

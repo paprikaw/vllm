@@ -47,7 +47,8 @@ from vllm.v1.engine.memory_stress_tester import initialize_stress_tester, get_gl
 
 from .utils import KVBufferStatus
 from vllm.sequence import IntermediateTensors
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import (get_pp_group, get_tp_group,
+                                             set_pp_group_active_ranks)
 from vllm.distributed.kv_transfer.kv_connector.dynamic_kv_synchronizer import KVPatchMeta, KVTensorMeta
 from bitarray import bitarray
 import time
@@ -657,6 +658,16 @@ class DynamicGPUWorker(Worker):
         migration metrics with initialization overhead.
         """
         self.log_stop_time = enabled
+
+    def set_active_pp_ranks(self, active_ranks: Optional[list[int]]) -> None:
+        """Update the active PP routing subset for pipeline autoscaling.
+
+        The underlying distributed PP group remains the candidate-rank
+        superset. This only changes first/last/next/prev PP routing semantics
+        used by model forward and pipeline output handling.
+        """
+        set_pp_group_active_ranks(active_ranks)
+        logger.info("Updated active PP ranks to %s", active_ranks)
         logger.debug(f"Worker {self.rank}: set log_stop_time={enabled}")
 
     @torch.inference_mode()
