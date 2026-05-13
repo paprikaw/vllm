@@ -101,6 +101,7 @@ class EngineCoreClient(ABC):
         alternative_configs: Optional[dict] = None,
         migration_steps: Optional[list[int]] = None,
         migration_mode: Optional[str] = None,
+        weight_loading_mode: Optional[str] = None,
         weight_chunk_size_mb: Optional[float] = None,
         fixed_num_gpu_blocks: Optional[int] = None
     ) -> None:
@@ -170,6 +171,7 @@ class EngineCoreClient(ABC):
         alternative_configs: Optional[dict] = None,
         migration_steps: Optional[list[int]] = None,
         migration_mode: Optional[str] = None,
+        weight_loading_mode: Optional[str] = None,
         weight_chunk_size_mb: Optional[float] = None,
         fixed_num_gpu_blocks: Optional[int] = None
     ) -> None:
@@ -255,10 +257,11 @@ class InprocClient(EngineCoreClient):
         alternative_configs: Optional[dict] = None,
         migration_steps: Optional[list[int]] = None,
         migration_mode: Optional[str] = None,
+        weight_loading_mode: Optional[str] = None,
         weight_chunk_size_mb: Optional[float] = None,
         fixed_num_gpu_blocks: Optional[int] = None
     ) -> None:
-        self.engine_core.set_pp_config(pp_layer_config, alternative_configs, migration_steps, migration_mode, weight_chunk_size_mb, fixed_num_gpu_blocks)
+        self.engine_core.set_pp_config(pp_layer_config, alternative_configs, migration_steps, migration_mode, weight_loading_mode, weight_chunk_size_mb, fixed_num_gpu_blocks)
 
     def sleep(self, level: int = 1) -> None:
         self.engine_core.sleep(level)
@@ -724,11 +727,16 @@ class SyncMPClient(MPClient):
                        alternative_configs: Optional[dict] = None,
                        migration_steps: Optional[list[int]] = None,
                        migration_mode: Optional[str] = None,
+                              weight_loading_mode: Optional[str] = None,
                        weight_chunk_size_mb: Optional[float] = None,
                        fixed_num_gpu_blocks: Optional[int] = None) -> None:
         self.call_utility("set_pp_config", pp_layer_config,
-                          alternative_configs, migration_steps, migration_mode,
+                                  alternative_configs, migration_steps, migration_mode,
+                                  weight_loading_mode,
                           weight_chunk_size_mb, fixed_num_gpu_blocks)
+
+    def get_engine_state(self) -> dict[str, Any]:
+        return self.call_utility("get_engine_state")
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
@@ -922,13 +930,18 @@ class AsyncMPClient(MPClient):
                                    alternative_configs: Optional[dict] = None,
                                    migration_steps: Optional[list[int]] = None,
                                    migration_mode: Optional[str] = None,
+                                              weight_loading_mode: Optional[str] = None,
                                    weight_chunk_size_mb: Optional[float] = None,
                                    fixed_num_gpu_blocks: Optional[int] = None) -> None:
         await self.call_utility_async("set_pp_config", pp_layer_config,
                                       alternative_configs, migration_steps,
                                       migration_mode,
+                                                  weight_loading_mode,
                                       weight_chunk_size_mb,
                                       fixed_num_gpu_blocks)
+
+    async def get_engine_state_async(self) -> dict[str, Any]:
+        return await self.call_utility_async("get_engine_state")
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)

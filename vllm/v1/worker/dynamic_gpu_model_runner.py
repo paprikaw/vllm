@@ -261,7 +261,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
         k_ptr_tables_tensor = None
         v_ptr_tables_tensor = None
         if self.vllm_config.dynamic_config.use_direct_ptr:
-            time_start = time.time()
             num_reqs = self.input_batch.num_reqs
             
             # PtrTable should already be initialized via commit_ptr_tables()
@@ -281,12 +280,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # Get the block_table from input_batch (it's already on GPU after commit)
             block_table = self.input_batch.block_table[0].get_device_tensor()
             
-            time_start = time.time()
             # Update ptr_tables using efficient GPU operations
             k_ptr_tables_tensor = self.k_ptr_table.update_from_block_table_and_ptr_tensors(
                 block_table, self.k_ptr_tensors, num_reqs)
             v_ptr_tables_tensor = self.v_ptr_table.update_from_block_table_and_ptr_tensors(block_table, self.v_ptr_tensors, num_reqs)
-            logger.info(f"kv ptr_tables update took {human_readable_duration(time.time() - time_start)}")
         # Get the number of scheduled tokens for each request.
         req_ids = self.input_batch.req_ids
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
@@ -396,7 +393,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # Fill unused with -1. Needed for reshape_and_cache
         self.seq_lens[num_reqs:].fill_(0)
         self.query_start_loc[num_reqs + 1:].fill_(-1)
-
         query_start_loc = self.query_start_loc[:num_reqs + 1]
         seq_lens = self.seq_lens[:num_reqs]
 
@@ -466,7 +462,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
-
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
@@ -474,7 +469,6 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
             return self.kv_connector_no_forward(scheduler_output)
-        time_start_prepare = time.time()
         # Prepare the decoder inputs.
         attn_metadata, logits_indices, spec_decode_metadata, k_ptr_tables_tensor, v_ptr_tables_tensor = (
             self._dynamic_prepare_inputs(scheduler_output))
@@ -582,7 +576,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
                                  num_tokens=num_input_tokens,
                                  k_ptr_tables=k_ptr_tables_tensor,
                                  v_ptr_tables=v_ptr_tables_tensor,
-                                 start_layer=start_layer):
+                                 start_layer=start_layer,
+                                 workspace_buffers=self.workspace_buffers):
             self.maybe_setup_kv_connector(scheduler_output)
             try:
                 model_output = self.model(
@@ -1299,30 +1294,29 @@ class DynamicGPUModelRunner(GPUModelRunner):
         if not use_vmm_config:
             layer_group_granularity = 1
         else:
-            # Validate: VMM mode requires combined_layers (granularity > 1)
-            # If block_token_num >= VMM_MIN_TOKENS_PER_BLOCK, a single layer can fill 2MB,
-            # which means we don't need layer grouping. This configuration is invalid for VMM.
-            if block_token_num >= VMM_MIN_TOKENS_PER_BLOCK:
-                raise ValueError(
-                    f"Invalid configuration: use_vmm=True with block_token_num={block_token_num} >= "
-                    f"VMM_MIN_TOKENS_PER_BLOCK={VMM_MIN_TOKENS_PER_BLOCK}. "
-                    f"When block_token_num is large enough to fill a 2MB VMM block alone, "
-                    f"VMM mode is not needed. Please set use_vmm=False or reduce block_token_num."
-                )
-            
             # Calculate required granularity based on block_token_num
-            # granularity = ceil(VMM_MIN_TOKENS_PER_BLOCK / block_token_num)
-            layer_group_granularity = (VMM_MIN_TOKENS_PER_BLOCK + block_token_num - 1) // block_token_num
-            
-            # Validate: num_layers must be divisible by granularity
-            if num_layers % layer_group_granularity != 0:
-                raise ValueError(
-                    f"Invalid configuration for VMM mode: num_layers ({num_layers}) is not divisible by "
-                    f"required layer_group_granularity ({layer_group_granularity}). "
-                    f"block_token_num={block_token_num}, VMM_MIN_TOKENS_PER_BLOCK={VMM_MIN_TOKENS_PER_BLOCK}. "
-                    f"Please adjust block_token_num so that the resulting granularity divides num_layers, "
-                    f"or set use_vmm=False."
+            # If block_token_num >= VMM_MIN_TOKENS_PER_BLOCK, a single layer can fill 2MB,
+            # so granularity = 1 (each layer gets its own VMM allocation)
+            if block_token_num >= VMM_MIN_TOKENS_PER_BLOCK:
+                # Allow VMM with granularity=1 for large block sizes (e.g., block_size=512)
+                layer_group_granularity = 1
+                logger.info(
+                    f"[KV Alloc] block_token_num={block_token_num} >= VMM_MIN_TOKENS_PER_BLOCK={VMM_MIN_TOKENS_PER_BLOCK}. "
+                    f"Using VMM with granularity=1 (each layer gets its own VMM allocation)."
                 )
+            else:
+                # granularity = ceil(VMM_MIN_TOKENS_PER_BLOCK / block_token_num)
+                layer_group_granularity = (VMM_MIN_TOKENS_PER_BLOCK + block_token_num - 1) // block_token_num
+                
+                # Validate: num_layers must be divisible by granularity
+                if num_layers % layer_group_granularity != 0:
+                    raise ValueError(
+                        f"Invalid configuration for VMM mode: num_layers ({num_layers}) is not divisible by "
+                        f"required layer_group_granularity ({layer_group_granularity}). "
+                        f"block_token_num={block_token_num}, VMM_MIN_TOKENS_PER_BLOCK={VMM_MIN_TOKENS_PER_BLOCK}. "
+                        f"Please adjust block_token_num so that the resulting granularity divides num_layers, "
+                        f"or set use_vmm=False."
+                    )
                 
             logger.info(f"[KV Alloc] layer_group_granularity={layer_group_granularity} "
                         f"(block_token_num={block_token_num}, num_layers={num_layers}, "
@@ -1331,11 +1325,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
         
         # Calculate effective block size (total tokens per VMM block = block_token_num * granularity)
         effective_block_token_num = block_token_num * layer_group_granularity
-        # use_vmm_combined is True only if: use_vmm config is True AND we have layer grouping
-        # (Since we validated above, if use_vmm_config is True, granularity > 1 is guaranteed)
-        use_vmm_combined = use_vmm_config and layer_group_granularity > 1
+        # use_vmm_combined is True if: use_vmm config is True (regardless of granularity)
+        # For granularity=1, each layer gets its own VMM allocation (no layer grouping)
+        # For granularity>1, multiple layers share VMM blocks
+        use_vmm_combined = use_vmm_config
         
-        # Validate granularity (num_layers must be divisible)
+        # Validate granularity (num_layers must be divisible) - only for granularity > 1
         if layer_group_granularity > 1:
             if num_layers % layer_group_granularity != 0:
                 raise ValueError(
@@ -1359,7 +1354,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self.vmm_bytes_per_kv = 0
         
         if use_vmm_combined:
-            # VMM combined layers mode: multiple layers share VMM blocks (guaranteed granularity > 1)
+            # VMM combined layers mode: uses VMM allocator
+            # - For granularity > 1: multiple layers share VMM blocks
+            # - For granularity = 1: each layer gets its own VMM allocation (no grouping)
             num_groups = num_layers // layer_group_granularity
             
             for group_idx in range(num_groups):
@@ -2092,11 +2089,27 @@ class DynamicGPUModelRunner(GPUModelRunner):
                         True  # vmm_combined
                     )
             
-            # Append new grouped handles to runner's grouped_handles list
-            # This is critical for proper memory release during future layer removal
+            # Update grouped_handles at the correct positions (not append!)
+            # The positions are determined by layer_ids relative to start_layer
+            # This ensures alignment with key_caches which was padded in _add_layers
             if hasattr(self, 'grouped_handles'):
-                self.grouped_handles.extend(new_grouped_handles)
-                logger.info(f"[Migration] Updated grouped_handles: added {len(new_grouped_handles)} groups, "
+                start_layer = self.model.model.start_layer
+                local_start = layer_ids[0] - start_layer
+                start_group = local_start // granularity
+                
+                # Check if we need to grow grouped_handles (in case it wasn't pre-padded)
+                needed_size = start_group + len(new_grouped_handles)
+                if len(self.grouped_handles) < needed_size:
+                    # Extend with empty groups to make room
+                    self.grouped_handles.extend([[] for _ in range(needed_size - len(self.grouped_handles))])
+                
+                # Assign new groups at the correct positions
+                for i, new_group in enumerate(new_grouped_handles):
+                    target_idx = start_group + i
+                    self.grouped_handles[target_idx] = new_group
+                
+                logger.info(f"[Migration] Updated grouped_handles: assigned {len(new_grouped_handles)} groups at positions "
+                            f"{start_group} to {start_group + len(new_grouped_handles) - 1}, "
                             f"total groups now: {len(self.grouped_handles)}")
             else:
                 self.grouped_handles = new_grouped_handles
@@ -2144,6 +2157,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         assert isinstance(model, DynamicModelBase)
         layer_module = model.model.layers[layer]
         
+        time_start = time.time()
         with torch.cuda.stream(stream):
             # Only call the kernel if there are tokens to process
             if slot_mapping.numel() > 0:
@@ -2159,6 +2173,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     layer_module.self_attn.attn._k_scale, 
                     layer_module.self_attn.attn._v_scale
                 )
+        logger.info(
+            f"[timeline]: apply_kv_tensor_to_allocated_cache layer={layer}, "
+            f"tokens={slot_mapping.numel()}, stream={stream}, took "
+            f"{human_readable_duration(time.time() - time_start)}")
 
     def get_flexi_kv_cache_from_gathered_kv_tensor(self, slot_mapping: torch.Tensor, layer: int,
                                  gathered_kv_tensor: torch.Tensor,

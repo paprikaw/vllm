@@ -279,9 +279,15 @@ class PtrTable:
         Returns:
             ptr_table: (num_layers, num_reqs, max_num_blocks_per_req), uint64
         """
+        import time
+        from vllm.logger import init_logger
+        _ptr_logger = init_logger(__name__)
+        
+        t0 = time.time()
         batch_size = min(num_reqs, block_table.shape[0])
         max_num_blocks = block_table.shape[1]
         num_layers = min(self.num_layers, len(ptr_tensors))
+        t_prep = time.time() - t0
         
         if num_layers == 0 or batch_size == 0:
             raise ValueError(f"No valid layers or requests to update PtrTable., num_reqs: {num_reqs}, num_layers: {num_layers}, block_table shape: {block_table.shape}, ptr_tensors length: {len(ptr_tensors)}")
@@ -290,9 +296,12 @@ class PtrTable:
         # Use cached stacked tensors if available
         # Note: commit_stacked_tensors() should be called explicitly after migration
         # to update the cache. This check is just a fallback for initial setup.
+        t1 = time.time()
         stacked_ptr_tensors = self._cached_stacked_ptr_tensors
         assert stacked_ptr_tensors is not None
+        t_cache = time.time() - t1
         
+        t2 = time.time()
         if use_fused_kernel:
             # Use fused CUDA kernel for maximum performance
             from vllm._custom_ops import update_ptr_table_from_block_table
@@ -325,6 +334,17 @@ class PtrTable:
             
             # Reshape and store: (num_layers, batch_size, max_num_blocks)
             self.ptr_table[:num_layers, :batch_size] = gathered.view(num_layers, batch_size, max_num_blocks)
+        
+        t_kernel = time.time() - t2
+        
+        # Log detailed timing (only for slow updates or periodically)
+        total_time = t_prep + t_cache + t_kernel
+        if total_time > 0.001:  # Log if > 1ms
+            _ptr_logger.info(
+                "[PTR_TABLE_TIMING] update: prep=%.3fms, cache=%.3fms, kernel=%.3fms, total=%.3fms "
+                "(layers=%d, batch=%d, blocks=%d)",
+                t_prep * 1000, t_cache * 1000, t_kernel * 1000, total_time * 1000,
+                num_layers, batch_size, max_num_blocks)
         
         return self.ptr_table[:num_layers, :batch_size].view(torch.uint64)
 

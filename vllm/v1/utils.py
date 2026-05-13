@@ -172,6 +172,38 @@ class LayerDeletionAssessResult:
     max_blocks_per_layer: int
 
 
+@dataclass
+class StopTimeMetrics:
+    """记录单次migration的stop time分解
+    
+    Stop Time = 模型需要完全停止inference进行某些操作的累计时间
+    主要包括：engine_lock持有时间（调度器无法调度）和forward_lock持有时间（模型无法前向）
+    """
+    mode: str = ""                          # migration模式: sync, async_fast, async
+    engine_lock_hold_time_1: float = 0.0    # 第一段engine_lock持有时间 (评估阶段)
+    engine_lock_hold_time_2: float = 0.0    # 第二段engine_lock持有时间 (drain+KV传输, 仅async_fast)
+    drain_time: float = 0.0                 # drain running queue时间
+    weight_loading_sync_time: float = 0.0   # 同步权重加载时间 (仅sync模式)
+    kv_transfer_time: float = 0.0           # KV传输时间
+    
+    @property
+    def total_engine_lock_time(self) -> float:
+        return self.engine_lock_hold_time_1 + self.engine_lock_hold_time_2
+    
+    def to_log_string(self) -> str:
+        parts = [f"[STOP_TIME][{self.mode}]:"]
+        parts.append(f"engine_lock_total={self.total_engine_lock_time*1000:.2f}ms")
+        if self.engine_lock_hold_time_2 > 0:
+            parts.append(f"(lock1={self.engine_lock_hold_time_1*1000:.2f}ms, lock2={self.engine_lock_hold_time_2*1000:.2f}ms)")
+        if self.drain_time > 0:
+            parts.append(f"drain={self.drain_time*1000:.2f}ms")
+        if self.weight_loading_sync_time > 0:
+            parts.append(f"weight_sync={self.weight_loading_sync_time*1000:.2f}ms")
+        if self.kv_transfer_time > 0:
+            parts.append(f"kv_transfer={self.kv_transfer_time*1000:.2f}ms")
+        return " ".join(parts)
+
+
 class ConstantList(Generic[T], Sequence):
 
     def __init__(self, x: list[T]) -> None:
@@ -642,26 +674,39 @@ def dynamic_flexi_bind_single_kv_tensor(
     线程安全：内部获取 forward_lock。
     """
     with device:
+        time_start_total = time.time()
         torch.cuda.set_device(device)
         # Determine local index in runner kv cache list
         assert layer_index >= start_layer and layer_index < end_layer, f"Layer {layer_index} outside of current model range [{start_layer}, {end_layer}]"
         local_index = layer_index - start_layer
         assert local_index < len(runner.key_caches), f"Local index {local_index} is out of range, key_cache length: {len(runner.key_caches)}"
+        logger.info(
+            f"[timeline]: bind layer {layer_index} start, local_index={local_index}, "
+            f"slot_mapping_tokens={slot_mapping.numel()}, kv_tensor_shape={tuple(kv_tensor.shape)}, "
+            f"stream={stream}, preallocated={preallocated is not None}")
         
         if preallocated is not None:
             # Use pre-allocated memory
             key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, vmm_combined = preallocated
             # Apply KV tensor data to pre-allocated cache
+            time_start_apply = time.time()
             runner.apply_kv_tensor_to_allocated_cache(
                 slot_mapping, layer_index, kv_tensor, key_cache_ptr, value_cache_ptr, stream
             )
+            logger.info(
+                f"[timeline]: bind layer {layer_index} apply kv tensor to preallocated cache took "
+                f"{human_readable_duration(time.time() - time_start_apply)}")
             logger.info(f"bind single kv tensor for {layer_index} using preallocated memory, "
                        f"key_cache_ptr:{key_cache_ptr}, value_cache_ptr:{value_cache_ptr}, "
                        f"vmm_combined:{vmm_combined}, handles_count:{len(handles)}")
         else:
             # Allocate and apply in one call (legacy path)
+            time_start_allocate_and_apply = time.time()
             key_cache_list, value_cache_list, key_cache_ptr, value_cache_ptr, handles, vmm_combined = \
                 runner.get_flexi_kv_cache_from_gathered_kv_tensor(slot_mapping, layer_index, kv_tensor, block_num, stream)
+            logger.info(
+                f"[timeline]: bind layer {layer_index} allocate+apply took "
+                f"{human_readable_duration(time.time() - time_start_allocate_and_apply)}")
             logger.info(f"bind single kv tensor for {layer_index}, slot_mapping:{slot_mapping}, "
                        f"key_cache_ptr:{key_cache_ptr}, value_cache_ptr:{value_cache_ptr}, "
                        f"vmm_combined:{vmm_combined}, handles_count:{len(handles)}")
@@ -669,10 +714,18 @@ def dynamic_flexi_bind_single_kv_tensor(
         # PtrTensors only needed by direct kernel
         use_direct_ptr = runner.vllm_config.dynamic_config.use_direct_ptr
         if use_direct_ptr:
+            time_start_ptr_tensor = time.time()
             k_ptr_tensor = create_ptr_tensor_from_list(key_cache_list, device)
             v_ptr_tensor = create_ptr_tensor_from_list(value_cache_list, device)
+            logger.info(
+                f"[timeline]: bind layer {layer_index} create ptr tensors took "
+                f"{human_readable_duration(time.time() - time_start_ptr_tensor)}")
 
+        time_start_forward_lock = time.time()
         with runner.forward_lock:        
+            logger.info(
+                f"[timeline]: bind layer {layer_index} waited for forward_lock "
+                f"{human_readable_duration(time.time() - time_start_forward_lock)}")
             runner.key_caches[local_index] = key_cache_list
             runner.value_caches[local_index] = value_cache_list
             runner.key_cache_ptrs[local_index] = key_cache_ptr
@@ -720,6 +773,9 @@ def dynamic_flexi_bind_single_kv_tensor(
                         insert_idx = i
                         break
                 group.layer_names.insert(insert_idx, layer_name)
+        logger.info(
+            f"[timeline]: bind layer {layer_index} finished in "
+            f"{human_readable_duration(time.time() - time_start_total)}")
 
 def dynamic_flexi_bind_single_kv_cache(
     start_layer: int,

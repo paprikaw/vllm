@@ -54,6 +54,8 @@ class ForwardContext:
     # Start layer index for dynamic model (used to compute local layer index)
     # k_ptr_tables[i] corresponds to global layer index (start_layer + i)
     start_layer: int = 0
+    # Runner-level shared workspaces for transient tensors.
+    workspace_buffers: Optional[dict[str, torch.Tensor]] = None
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -74,7 +76,9 @@ def set_forward_context(attn_metadata: Any,
                         num_tokens: int = 0,
                         k_ptr_tables: Optional["torch.Tensor"] = None,
                         v_ptr_tables: Optional["torch.Tensor"] = None,
-                        start_layer: int = 0):
+                        start_layer: int = 0,
+                        workspace_buffers: Optional[dict[str,
+                                                         torch.Tensor]] = None):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     Here we can inject common logic for every model forward pass.
@@ -117,7 +121,8 @@ def set_forward_context(attn_metadata: Any,
         dp_metadata=dp_metadata,
         k_ptr_tables=k_ptr_tables,
         v_ptr_tables=v_ptr_tables,
-        start_layer=start_layer)
+        start_layer=start_layer,
+        workspace_buffers=workspace_buffers)
 
     try:
         yield

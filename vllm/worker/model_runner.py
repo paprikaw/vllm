@@ -1100,6 +1100,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.has_inner_state = model_config.has_inner_state
 
         self.in_profile_run = False
+        self.workspace_buffers: Dict[str, torch.Tensor] = {}
 
         # When using CUDA graph, the input block tables must be padded to
         # max_seq_len_to_capture. However, creating the block table in
@@ -1652,8 +1653,11 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                         self._update_inputs_to_capture_for_enc_dec_model(
                             capture_inputs)
 
-                    with set_forward_context(attn_metadata, self.vllm_config,
-                                             virtual_engine):
+                    with set_forward_context(
+                            attn_metadata,
+                            self.vllm_config,
+                            virtual_engine,
+                            workspace_buffers=self.workspace_buffers):
                         graph_runner.capture(**capture_inputs)
                     self.graph_memory_pool = graph_runner.graph.pool()
                     self.graph_runners[virtual_engine][(
@@ -1838,8 +1842,11 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         if not bypass_model_exec:
-            with set_forward_context(model_input.attn_metadata,
-                                     self.vllm_config, virtual_engine):
+            with set_forward_context(
+                    model_input.attn_metadata,
+                    self.vllm_config,
+                    virtual_engine,
+                    workspace_buffers=self.workspace_buffers):
                 hidden_or_intermediate_states = model_executable(
                     input_ids=model_input.input_tokens,
                     inputs_embeds=model_input.inputs_embeds,

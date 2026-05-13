@@ -641,9 +641,11 @@ class DynamicKVSynchronizer():
                                      start_layer_id: int, slot_mapping: Optional[torch.Tensor]) -> None:
         """Send KV tensors using flexi format with pointer-based storage.
         
-        For sync migration (e.g., set_pp_config), slot_mapping is empty because
-        there are no running requests. We send empty KV tensors and the receiver
-        will create fresh, empty KV caches for the new layers.
+        For async_fast migration, slot_mapping contains the token indices whose KV cache
+        needs to be transferred. We gather KV data using flexi_gather_pages and send it.
+        
+        For sync migration without running requests, slot_mapping may be empty/None,
+        in which case we send empty KV tensors.
         """
         # Get page metadata for gathering KV data
         assert len(self.key_cache_ptrs) > 0, "key_cache_ptrs not initialized for flexi mode"
@@ -652,22 +654,42 @@ class DynamicKVSynchronizer():
         # Get dimensions from config
         num_heads = self.num_heads
         head_dim = self.head_size
+        block_size = self.vllm_config.cache_config.block_size
         
-        # For sync migration, slot_mapping should be empty (no running requests)
-        # We send empty tensors and receiver will create fresh KV caches
-        slot_mapping_tensor = torch.empty(0, dtype=torch.int64, device='cuda')
+        # Convert slot_mapping to tensor if provided
+        if slot_mapping is not None and len(slot_mapping) > 0:
+            if isinstance(slot_mapping, torch.Tensor):
+                slot_mapping_tensor = slot_mapping.to(device='cuda', dtype=torch.int64)
+            else:
+                slot_mapping_tensor = torch.tensor(slot_mapping, dtype=torch.int64, device='cuda')
+            num_tokens = slot_mapping_tensor.size(0)
+        else:
+            slot_mapping_tensor = torch.empty(0, dtype=torch.int64, device='cuda')
+            num_tokens = 0
         
-        logger.info(f"[flexi sync]: rank {self.rank} sending to rank {rank}, layers={layer_ids}, num_tokens=0 (empty KV for sync)")
+        logger.info(f"[flexi sync]: rank {self.rank} sending to rank {rank}, layers={layer_ids}, num_tokens={num_tokens}")
         
         for layer_id in layer_ids:
-            # Create empty KV tensor - receiver will create fresh KV cache
-            kv_out = torch.empty(2, 0, num_heads, head_dim, dtype=torch.float16, device='cuda')
+            local_layer_id = layer_id - start_layer_id
+            
+            if num_tokens > 0:
+                # Allocate KV output tensor: [2, num_tokens, num_heads, head_dim]
+                # dim 0 = K/V, dim 1 = tokens
+                kv_out = torch.empty(2, num_tokens, num_heads, head_dim, dtype=torch.float16, device='cuda')
+                
+                # Gather KV data from pointer-based storage
+                key_cache_ptr = self.key_cache_ptrs[local_layer_id]
+                value_cache_ptr = self.value_cache_ptrs[local_layer_id]
+                ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_tensor, kv_out[0], kv_out[1], block_size)
+            else:
+                # No tokens to transfer - send empty KV tensor
+                kv_out = torch.empty(2, 0, num_heads, head_dim, dtype=torch.float16, device='cuda')
             
             kv_tensor_meta = FlexiKVTensorMeta(
                 type='kv_tensor',
                 layer_to_be_received=set(layer_ids),
                 layer_id=int(layer_id),
-                num_tokens=0,
+                num_tokens=num_tokens,
                 slot_mapping_dtype=slot_mapping_tensor.dtype,
                 slot_mapping_shape=slot_mapping_tensor.shape,
                 kv_payload_dtype=kv_out.dtype,

@@ -181,6 +181,7 @@ async def build_async_engine_client_from_engine_args(
             alternative_configs=dc.alternative_configs,
             migration_steps=dc.migration_steps,
             migration_mode=dc.migration_mode,
+            weight_loading_mode=dc.weight_loading_mode,
         )
     else:
         # Fallback: load from deployment_config_path file
@@ -454,6 +455,18 @@ async def get_server_load_metrics(request: Request):
     # - /v2/rerank
     return JSONResponse(
         content={'server_load': request.app.state.server_load_metrics})
+
+
+@router.get("/engine_state")
+async def get_engine_state(raw_request: Request):
+    client = engine_client(raw_request)
+    if not hasattr(client, "get_engine_state"):
+        return JSONResponse(
+            status_code=501,
+            content={"error": "engine state endpoint is not supported by this engine client"},
+        )
+    state = await client.get_engine_state()
+    return JSONResponse(content=state)
 
 
 @router.get("/ping", response_class=Response)
@@ -966,6 +979,7 @@ if envs.VLLM_SERVER_DEV_MODE:
             alternative_configs = body.get("alternative_configs")
             migration_steps = body.get("migration_steps")
             migration_mode = body.get("migration_mode")
+            weight_loading_mode = body.get("weight_loading_mode")
             weight_chunk_size_mb = body.get("weight_chunk_size_mb")
             fixed_num_gpu_blocks = body.get("fixed_num_gpu_blocks")
             
@@ -984,13 +998,14 @@ if envs.VLLM_SERVER_DEV_MODE:
                     for k, v in inner_configs.items()
                 }
             
-            logger.info("Setting pp_layer_config to: %s, alternative_configs: %s, migration_steps: %s, migration_mode: %s, weight_chunk_size_mb: %s, fixed_num_gpu_blocks: %s",
-                       pp_layer_config, alternative_configs, migration_steps, migration_mode, weight_chunk_size_mb, fixed_num_gpu_blocks)
+            logger.info("Setting pp_layer_config to: %s, alternative_configs: %s, migration_steps: %s, migration_mode: %s, weight_loading_mode: %s, weight_chunk_size_mb: %s, fixed_num_gpu_blocks: %s",
+                       pp_layer_config, alternative_configs, migration_steps, migration_mode, weight_loading_mode, weight_chunk_size_mb, fixed_num_gpu_blocks)
             await engine_client(raw_request).set_pp_config(
                 pp_layer_config,
                 alternative_configs,
                 migration_steps,
                 migration_mode,
+                weight_loading_mode,
                 weight_chunk_size_mb,
                 fixed_num_gpu_blocks
             )
