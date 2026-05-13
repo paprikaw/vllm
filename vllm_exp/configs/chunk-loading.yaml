@@ -1,7 +1,7 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "chunk-weight-loading-test-debug"
+project: "chunk-weight-loading-test-final-5"
 type: "sweep_test"
 
 envs:
@@ -15,7 +15,7 @@ envs:
   DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
   KV_SYNC_USE_CPU: "0"
   VLLM_USE_CPU_MODEL: "0"
-  CUDA_LAUNCH_BLOCKING: "1"
+  CUDA_LAUNCH_BLOCKING: "0"
   PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
   VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
   VLLM_USE_RAY_COMPILED_DAG: "16.80"
@@ -31,10 +31,10 @@ static_config:
   network:
     rank_to_ip:
       0: "spartan-gpgpu168"
-      1: "spartan-gpgpu001"
+      1: "spartan-gpgpu009"
     rank_to_node:
       0: "spartan-gpgpu168"
-      1: "spartan-gpgpu001"
+      1: "spartan-gpgpu009"
   vllm:
     head_addr: "localhost"
     pipeline_parallel_size: 2
@@ -45,7 +45,7 @@ static_config:
     enable_nsight: false
     log_kv_memory_stats: true
     weight_chunk_size_mb: 5
-    disable_memory_overhead_monitor: true
+    disable_memory_overhead_monitor: false
     max_num_batched_tokens: 8128
   benchmark:
     burstiness: 100.0
@@ -63,15 +63,16 @@ sweep_configs:
   # - vllm:
   #     attention_kernel: [direct]
   #     fixed_num_gpu_blocks: [-1] 
+  #     enable_cpu_weight_cache: [false, true]
   #     weight_chunk_size_mb: [5, 10, 20, 40, 80, 160]
   #     migration_approach: [async]
   #     use_vmm: [true]
   #     block_size: [128] # Granularity equals to 2
   #   benchmark_config:
   #     - num_total_requests: 200  # Small number for quick testing
-  #       repetition: 2         # 3 repetitions to test the feature
+  #       repetition: 1         # 3 repetitions to test the feature
   #       pp_layer_config:
-  #         0: "36, 44"           # Single config = no migration, only reset between reps
+  #         0: "40, 40"           # Single config = no migration, only reset between reps
   #         100: "52, 28"           # Single config = no migration, only reset between reps
   #       requests:
   #         0:
@@ -85,22 +86,23 @@ sweep_configs:
   - vllm:
       attention_kernel: [direct]
       fixed_num_gpu_blocks: [-1] 
-      weight_chunk_size_mb: [5, 10, 20, 40, 80, 160]
+      weight_chunk_size_mb: [1, 5, 20, 40, 80, 160]
+      enable_cpu_weight_cache: [true]
       migration_approach: [async]
-      use_vmm: [true]
-      block_size: [128] # Granularity equals to 2
+      use_vmm: [false]
+      block_size: [512] # Granularity equals to 2
     benchmark_config:
-      - num_total_requests: 200  # Small number for quick testing
-        repetition: 2         # 3 repetitions to test the feature
+      - num_total_requests: 100  # Small number for quick testing
+        repetition: 3         # 3 repetitions to test the feature
         pp_layer_config:
-          0: "36, 44"           # Single config = no migration, only reset between reps
-          100: "52, 28"           # Single config = no migration, only reset between reps
+          0: "40, 40"           # Single config = no migration, only reset between reps
+          50: "52, 28"           # Single config = no migration, only reset between reps
         requests:
           0:
-            request_rate: 3.0
+            request_rate: 2.0 
             input_lens: 512
             output_lens: 16
-          100:
-            request_rate: 2.5 
+          50:
+            request_rate: 2.0
             input_lens: 128
             output_lens: 512

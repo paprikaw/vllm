@@ -159,6 +159,156 @@ METRIC_CONFIGS = [
         category=MetricCategory.STOP_TIME,
         description="Time spent compacting KV cache within lock"
     ),
+    # =========================================================================
+    # STOP TIME METRICS - Detailed Migration Stop Time Breakdown
+    # =========================================================================
+    # Engine-level stop time metrics (from StopTimeMetrics class)
+    MetricConfig(
+        name="stop_time_sync",
+        display_name="[STOP_TIME] Sync Mode - Full Breakdown",
+        log_pattern=r'\[STOP_TIME\]\[sync\]: (.+)',
+        metric_type=MetricType.SPECIAL,
+        category=MetricCategory.STOP_TIME,
+        description="Full stop time breakdown for sync migration mode"
+    ),
+    MetricConfig(
+        name="stop_time_async_fast",
+        display_name="[STOP_TIME] Async-Fast Mode - Full Breakdown",
+        log_pattern=r'\[STOP_TIME\]\[async_fast\]: (.+)',
+        metric_type=MetricType.SPECIAL,
+        category=MetricCategory.STOP_TIME,
+        description="Full stop time breakdown for async_fast migration mode"
+    ),
+    MetricConfig(
+        name="stop_time_async",
+        display_name="[STOP_TIME] Async Mode - Full Breakdown",
+        log_pattern=r'\[STOP_TIME\]\[async\]: (.+)',
+        metric_type=MetricType.SPECIAL,
+        category=MetricCategory.STOP_TIME,
+        description="Full stop time breakdown for async migration mode"
+    ),
+    # Engine lock total time (extracted from the breakdown)
+    MetricConfig(
+        name="stop_time_engine_lock_total",
+        display_name="[STOP_TIME] Engine Lock Total Time",
+        log_pattern=r'\[STOP_TIME\]\[\w+\]: engine_lock_total=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="Total engine_lock hold time during migration"
+    ),
+    MetricConfig(
+        name="stop_time_drain",
+        display_name="[STOP_TIME] Drain Time",
+        log_pattern=r'\[STOP_TIME\]\[\w+\]:.+drain=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="Time to drain running queue during migration"
+    ),
+    MetricConfig(
+        name="stop_time_weight_sync",
+        display_name="[STOP_TIME] Weight Sync Time (Sync Mode Only)",
+        log_pattern=r'\[STOP_TIME\]\[sync\]:.+weight_sync=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="Synchronous weight loading time (sync mode only)"
+    ),
+    MetricConfig(
+        name="stop_time_kv_transfer",
+        display_name="[STOP_TIME] KV Transfer Time",
+        log_pattern=r'\[STOP_TIME\]\[\w+\]:.+kv_transfer=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="KV cache transfer time during migration"
+    ),
+    # Async-fast specific: lock1 and lock2 breakdown
+    MetricConfig(
+        name="stop_time_async_fast_lock1",
+        display_name="[STOP_TIME] Async-Fast Lock1 Time (Assessment)",
+        log_pattern=r'\[STOP_TIME\]\[async_fast\]:.+lock1=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="First engine_lock hold time (memory assessment) in async_fast mode"
+    ),
+    MetricConfig(
+        name="stop_time_async_fast_lock2",
+        display_name="[STOP_TIME] Async-Fast Lock2 Time (Drain+KV)",
+        log_pattern=r'\[STOP_TIME\]\[async_fast\]:.+lock2=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="Second engine_lock hold time (drain + KV transfer) in async_fast mode"
+    ),
+    # -------------------------------------------------------------------------
+    # Worker-level forward_lock metrics
+    # -------------------------------------------------------------------------
+    # NOTE: For sync and async_fast modes, forward_lock is held WITHIN engine_lock,
+    # so the forward_lock time is ALREADY INCLUDED in engine_lock_total.
+    # We ONLY track forward_lock separately for ASYNC mode where it happens
+    # outside engine_lock.
+    #
+    # REMOVED: sync and async_fast worker forward_lock metrics (duplicates engine_lock)
+    # - stop_time_worker_forward_lock_wait_sync
+    # - stop_time_worker_forward_lock_hold_sync  
+    # - stop_time_worker_forward_lock_wait_async_fast
+    # - stop_time_worker_forward_lock_hold_async_fast
+    # -------------------------------------------------------------------------
+    # Async mode: forward_lock happens OUTSIDE engine_lock, so track it
+    MetricConfig(
+        name="stop_time_worker_forward_lock_wait_async",
+        display_name="[STOP_TIME][Worker] Async Forward Lock Wait",
+        log_pattern=r'\[STOP_TIME\]\[worker\]\[async\]\[forward_lock\]:.+wait=([0-9.]+s)',
+        category=MetricCategory.STOP_TIME,
+        description="Time waiting to acquire forward_lock (async mode)"
+    ),
+    MetricConfig(
+        name="stop_time_worker_forward_lock_hold_async",
+        display_name="[STOP_TIME][Worker] Async Forward Lock Total Hold",
+        log_pattern=r'\[STOP_TIME\]\[worker\]\[async\]\[forward_lock\]:.+total_hold=([0-9.]+s)',
+        category=MetricCategory.STOP_TIME,
+        description="Total forward_lock hold time (async mode)"
+    ),
+    # -------------------------------------------------------------------------
+    # Worker forward_lock for add_layers/compact/resize operations (ASYNC MODE ONLY)
+    # -------------------------------------------------------------------------
+    # NOTE: These metrics are only meaningful for ASYNC mode where operations
+    # happen outside engine_lock. For sync/async_fast modes, these times are
+    # ALREADY INCLUDED in engine_lock_total and should NOT be counted separately.
+    # -------------------------------------------------------------------------
+    MetricConfig(
+        name="stop_time_worker_add_layers_forward_lock",
+        display_name="[STOP_TIME][Worker] Add Layers Forward Lock Hold (ASYNC ONLY)",
+        log_pattern=r'\[STOP_TIME\]\[worker\]\[add_layers\]\[forward_lock\]: hold=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="Forward lock hold during add_layers (async mode: add to total; sync/async_fast: included in engine_lock)"
+    ),
+    MetricConfig(
+        name="stop_time_worker_compact_flexi_forward_lock",
+        display_name="[STOP_TIME][Worker] Compact Flexi Forward Lock Hold (ASYNC ONLY)",
+        log_pattern=r'\[STOP_TIME\]\[worker\]\[compact_flexi\]\[forward_lock\]: hold=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="Forward lock hold during flexi compact (async mode: add to total; sync/async_fast: included in engine_lock)"
+    ),
+    MetricConfig(
+        name="stop_time_worker_compact_nonflexi_forward_lock",
+        display_name="[STOP_TIME][Worker] Compact Non-Flexi Forward Lock Hold (ASYNC ONLY)",
+        log_pattern=r'\[STOP_TIME\]\[worker\]\[compact_nonflexi\]\[forward_lock\]: hold=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="Forward lock hold during non-flexi compact (async mode: add to total; sync/async_fast: included in engine_lock)"
+    ),
+    MetricConfig(
+        name="stop_time_worker_resize_shrink_forward_lock",
+        display_name="[STOP_TIME][Worker] Resize Shrink Forward Lock Hold (ASYNC ONLY)",
+        log_pattern=r'\[STOP_TIME\]\[worker\]\[resize_shrink\]\[forward_lock\]: hold=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="Forward lock hold during KV shrink (async mode: add to total; sync/async_fast: included in engine_lock)"
+    ),
+    MetricConfig(
+        name="stop_time_worker_resize_grow_forward_lock",
+        display_name="[STOP_TIME][Worker] Resize Grow Forward Lock Hold (ASYNC ONLY)",
+        log_pattern=r'\[STOP_TIME\]\[worker\]\[resize_grow\]\[forward_lock\]: hold=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="Forward lock hold during KV grow (async mode: add to total; sync/async_fast: included in engine_lock)"
+    ),
+    MetricConfig(
+        name="stop_time_worker_resize_nonflexi_forward_lock",
+        display_name="[STOP_TIME][Worker] Resize Non-Flexi Forward Lock Hold",
+        log_pattern=r'\[STOP_TIME\]\[worker\]\[resize_nonflexi\]\[forward_lock\]: hold=([0-9.]+ms)',
+        category=MetricCategory.STOP_TIME,
+        description="Forward lock hold time during non-flexi resize"
+    ),
     MetricConfig(
         name="timeline_before_kv_migration",
         display_name="[Timeline] Before KV Migration (Add Weights, Compact, Resize)",
@@ -191,6 +341,7 @@ METRIC_CONFIGS = [
         display_name="After Forwarding Took",
         log_pattern=r'after forwarding took ([0-9.eE+-]+\s*[a-zµ]+)',
         category=MetricCategory.FORWARDING,
+        description="Total time for model forwarding pass"
     ),
     MetricConfig(
         name="attn_forward",

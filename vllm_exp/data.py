@@ -83,6 +83,8 @@ class MigrationCfg(BaseModel):
     tester_start_step: Optional[int] = None
     memory_stress_tester: Optional[Dict[str, Any]] = None
     migration_mode: str = "async"  # "async" or "sync" - determines which migration method to use
+    weight_loading_mode: str = "async"
+    """Weight loading mode for migration: 'async' or 'sync'."""
 
 class WarmupBenchCfg(BaseModel):
     """Optional warmup stage config for vllm_exp.
@@ -153,6 +155,9 @@ class BenchCfg(BaseModel):
     # Number of times to repeat the benchmark (default 1 = single run)
     # After each repetition, set_pp_config is called to restore initial config
     repetition: int = 1
+    restart_server_between_repetitions: bool = False
+    """Whether to restart the vLLM server between benchmark repetitions.
+    When False, repetitions run on the same server process and reset PP config via API."""
     
     # Pipeline config for repetition reset (used when repetition > 1)
     initial_pp_config: Optional[List[List[int]]] = None
@@ -165,7 +170,9 @@ class BenchCfg(BaseModel):
     """Request indices at which migration is triggered.
     Passed to set_pp_config when resetting between repetitions."""
     migration_mode: Optional[str] = None
-    """Migration mode: "async" or "sync". Determines which migration method to use."""
+    """Migration mode: "async", "async_fast", or "sync"."""
+    weight_loading_mode: Optional[str] = None
+    """Weight loading mode for migration reset: "async" or "sync"."""
 
     # Optional warmup stage (separate logs + metrics)
     warmup: Optional[WarmupBenchCfg] = None
@@ -333,22 +340,47 @@ class SweepBenchmarkConfig(BaseModel):
 class SweepBenchmarkParams(BaseModel):
     """Individual benchmark parameters for parameter-sweep mode.
     
-    All parameters here are lists for sweeping. Shared parameters like
-    num_total_requests and repetition should be defined in static_config.benchmark.
+    Supports two benchmark sweep styles:
+    1. Flat parameter sweep: use request_rates/input_lens/output_lens lists
+    2. Segmented request sweep: use requests with staged request definitions
+
+    Shared parameters like num_total_requests and repetition usually come from
+    static_config.benchmark, but can also be overridden per sweep block.
     
-    Example:
-        sweep_config:
-          benchmark:
-            pp_layer_configs: ["32, 32", "20, 44"]
-            request_rates: [1.0, 2.0]
-            input_lens: [500, 800]
-            output_lens: [100, 200]
+        Example:
+                sweep_config:
+                    benchmark:
+                        pp_layer_configs: ["32, 32", "20, 44"]
+                        request_rates: [1.0, 2.0]
+                        input_lens: [500, 800]
+                        output_lens: [100, 200]
+
+        Example with segmented requests:
+                sweep_config:
+                    benchmark:
+                        pp_layer_configs: ["32, 32", "20, 44"]
+                        requests:
+                            0:
+                                request_rate: 1.8
+                                input_lens: 800
+                                output_lens: 64
+                            100:
+                                request_rate: 1.5
+                                input_lens: 1024
+                                output_lens: 128
         
         static_config:
           benchmark:
             num_total_requests: 100
             repetition: 2
     """
+
+    num_total_requests: Optional[int] = None
+    """Optional override for total requests in this benchmark sweep block."""
+
+    repetition: Optional[int] = None
+    """Optional override for repetition in this benchmark sweep block."""
+
     pp_layer_configs: Optional[List[str]] = None
     """List of pp_layer_partition strings. Each becomes a separate experiment."""
     
@@ -361,6 +393,41 @@ class SweepBenchmarkParams(BaseModel):
     output_lens: Optional[List[int]] = None
     """List of output lengths to sweep."""
 
+    requests: Optional[Dict[int, RequestStageConfig] | List[Dict[int, RequestStageConfig]]] = None
+    """Segmented request schedule(s) for sweeping pp_layer_configs.
+
+    Can be either:
+    - A single staged request dict: {0: {...}, 100: {...}}
+    - A list of staged request dicts, each becoming an additional sweep axis item
+    """
+
+    @model_validator(mode='after')
+    def validate_request_sweep_mode(self) -> 'SweepBenchmarkParams':
+        """Validate flat-vs-segmented benchmark sweep mode usage."""
+        has_segmented_requests = self.requests is not None
+        has_flat_request_sweep = any(
+            value is not None
+            for value in (self.request_rates, self.input_lens, self.output_lens)
+        )
+
+        if has_segmented_requests and has_flat_request_sweep:
+            raise ValueError(
+                "sweep_config.benchmark 不能同时定义 'requests' 和 "
+                "'request_rates'/'input_lens'/'output_lens'。"
+            )
+
+        if not has_segmented_requests and not all(
+            value is not None
+            for value in (self.request_rates, self.input_lens, self.output_lens)
+        ):
+            raise ValueError(
+                "sweep_config.benchmark 必须提供以下两种配置方式之一：\n"
+                "1. request_rates + input_lens + output_lens\n"
+                "2. requests（分段请求配置）"
+            )
+
+        return self
+
 
 class SweepVllmParams(BaseModel):
     """Individual vLLM parameters for parameter-sweep mode."""
@@ -369,7 +436,9 @@ class SweepVllmParams(BaseModel):
     weight_chunk_size_mb: Optional[List[float]] = None
     """List of weight chunk sizes (MB) for sweep. Affects weight loading during migration."""
     migration_approach: Optional[List[str]] = None
-    """List of migration approaches to sweep: 'sync' or 'async'. Determines which migration method to use."""
+    """List of migration approaches to sweep: 'sync', 'async', or 'async_fast'."""
+    weight_loading_mode: Optional[List[str]] = None
+    """List of weight loading modes to sweep: 'sync' or 'async'."""
     fixed_num_gpu_blocks: Optional[List[int]] = None
     """List of fixed KV cache block counts to sweep. -1 means auto. Positive value fixes the block count."""
     block_size: Optional[List[int]] = None
@@ -378,6 +447,8 @@ class SweepVllmParams(BaseModel):
     """List of use_vmm values to sweep. True=VMM, False=cudaMallocAsync (has memory leak, for testing)."""
     enable_kv_resize: Optional[List[bool]] = None
     """List of enable_kv_resize values to sweep. True=allow resize during migration, False=disable."""
+    enable_cpu_weight_cache: Optional[List[bool]] = None
+    """List of enable_cpu_weight_cache values to sweep. True=preload weights to CPU, False=load from disk on demand."""
 
 
 class SweepConfig(BaseModel):
@@ -411,6 +482,7 @@ class SweepConfig(BaseModel):
         "attention_kernel": "kernel",
         "block_size": "blk",
         "use_vmm": "vmm",
+        "weight_loading_mode": "wl",
     }
     
     # Mode 1: Complete benchmark_config list
@@ -422,7 +494,8 @@ class SweepConfig(BaseModel):
     
     # Note: gpu_memory_utilization and block_size are NOT sweep parameters.
     # They should only be defined in static_config.vllm.
-    # Only attention_kernel and weight_chunk_size_mb can be swept via sweep_config.vllm.
+    # Commonly swept vLLM parameters include attention_kernel,
+    # weight_chunk_size_mb, and weight_loading_mode.
     
     def get_sweep_axes(
         self,
@@ -450,6 +523,8 @@ class SweepConfig(BaseModel):
                 axes['weight_chunk_size_mb'] = self.vllm.weight_chunk_size_mb
             if self.vllm.migration_approach is not None:
                 axes['migration_approach'] = self.vllm.migration_approach
+            if self.vllm.weight_loading_mode is not None:
+                axes['weight_loading_mode'] = self.vllm.weight_loading_mode
             if self.vllm.fixed_num_gpu_blocks is not None:
                 axes['fixed_num_gpu_blocks'] = self.vllm.fixed_num_gpu_blocks
             if self.vllm.block_size is not None:
@@ -458,6 +533,8 @@ class SweepConfig(BaseModel):
                 axes['use_vmm'] = self.vllm.use_vmm
             if self.vllm.enable_kv_resize is not None:
                 axes['enable_kv_resize'] = self.vllm.enable_kv_resize
+            if self.vllm.enable_cpu_weight_cache is not None:
+                axes['enable_cpu_weight_cache'] = self.vllm.enable_cpu_weight_cache
         
         # Mode 1: benchmark_config provided directly in sweep_config
         if self.benchmark_config is not None:
@@ -485,8 +562,11 @@ class SweepConfig(BaseModel):
     ) -> List[SweepBenchmarkConfig]:
         """Generate SweepBenchmarkConfig list from individual benchmark parameters.
         
-        Creates Cartesian product of pp_layer_configs, request_rates, input_lens, output_lens.
-        num_total_requests and repetition are passed from static_config.benchmark.
+        Creates benchmark configs from either:
+        1. Cartesian product of pp_layer_configs, request_rates, input_lens, output_lens
+        2. Cartesian product of pp_layer_configs and staged requests definitions
+        num_total_requests and repetition default to static_config.benchmark, but can be
+        overridden in sweep_config.benchmark.
         
         Args:
             num_total_requests: Shared across all combinations (from static_config.benchmark)
@@ -498,31 +578,42 @@ class SweepConfig(BaseModel):
             return []
         
         params = self.benchmark
+        num_total_requests = params.num_total_requests or num_total_requests
+        repetition = params.repetition or repetition
         
         # Validate required parameters - all must be explicitly provided
         missing_params = []
         if not params.pp_layer_configs:
             missing_params.append("pp_layer_configs")
-        if not params.request_rates:
-            missing_params.append("request_rates")
-        if not params.input_lens:
-            missing_params.append("input_lens")
-        if not params.output_lens:
-            missing_params.append("output_lens")
         
         if missing_params:
             raise ValueError(
                 f"Missing required sweep_config.benchmark parameters: {missing_params}. "
-                "All parameters must be explicitly provided as lists."
+                "pp_layer_configs must be explicitly provided."
             )
         
-        # At this point all params are guaranteed to be non-None
         pp_configs: List[str] = params.pp_layer_configs  # type: ignore[assignment]
+        configs = []
+
+        if params.requests is not None:
+            request_variants = self._normalize_segmented_request_variants(params.requests)
+
+            for pp_config, request_cfg in itertools.product(pp_configs, request_variants):
+                configs.append(
+                    SweepBenchmarkConfig(
+                        num_total_requests=num_total_requests,
+                        repetition=repetition,
+                        pp_layer_config={0: pp_config.replace(" ", "")},
+                        requests=request_cfg,
+                    )
+                )
+
+            return configs
+
+        # At this point flat sweep params are guaranteed to be non-None by validator
         request_rates: List[float] = params.request_rates  # type: ignore[assignment]
         input_lens: List[int] = params.input_lens  # type: ignore[assignment]
         output_lens: List[int] = params.output_lens  # type: ignore[assignment]
-        
-        configs = []
         
         # Generate Cartesian product
         for pp_config, rr, in_len, out_len in itertools.product(
@@ -545,6 +636,15 @@ class SweepConfig(BaseModel):
         
         return configs
 
+    @staticmethod
+    def _normalize_segmented_request_variants(
+        requests: Dict[int, RequestStageConfig] | List[Dict[int, RequestStageConfig]]
+    ) -> List[Dict[int, RequestStageConfig]]:
+        """Normalize segmented request definitions into a list of variants."""
+        if isinstance(requests, dict):
+            return [dict(sorted(requests.items()))]
+        return [dict(sorted(request_cfg.items())) for request_cfg in requests]
+
 
 class StaticVllmCfg(BaseModel):
     """Static vLLM configuration (non-sweep parameters)."""
@@ -562,7 +662,9 @@ class StaticVllmCfg(BaseModel):
     weight_chunk_size_mb: float = 10.0
     """Weight chunk size in MB for chunked weight loading during migration. Default 10 MB."""
     migration_approach: str = "async"
-    """Migration approach: 'sync' or 'async'. Determines which migration method to use. Default 'async'."""
+    """Migration approach: 'sync', 'async', or 'async_fast'. Default 'async'."""
+    weight_loading_mode: str = "async"
+    """Weight loading mode during migration: 'sync' or 'async'. Default 'async'."""
     fixed_num_gpu_blocks: int = -1
     """Fixed number of GPU KV cache blocks per layer. Default -1 (auto).
     When positive, uses this exact block count and prevents changes during migration."""
@@ -577,6 +679,10 @@ class StaticVllmCfg(BaseModel):
     """Whether to log detailed KV cache memory statistics. Default False.
     When True, calculates actual_kv_memory_bytes and allocated_kv_memory_bytes.
     May have slight performance impact on schedule()."""
+    enable_cpu_weight_cache: bool = True
+    """Whether to preload all weights into CPU memory at startup. Default True.
+    When True, weights are preloaded to CPU pinned memory for faster GPU loading.
+    When False, weights are loaded from disk on-demand during migration."""
 
 
 class StaticBenchCfg(BaseModel):
@@ -630,6 +736,9 @@ class StaticBenchCfg(BaseModel):
     
     repetition: int = 1
     """Number of repetitions per experiment (shared across all sweep combinations)."""
+    restart_server_between_repetitions: bool = False
+    """Whether to restart the vLLM server between repetitions of the same experiment.
+    When False, repetitions reuse the same server process and rely on set_pp_config reset."""
     
     # Optional: Fixed benchmark configuration (for fixed-benchmark mode)
     pp_layer_config: Optional[Dict[int, str]] = None
@@ -731,7 +840,7 @@ class SweepTestConfig(BaseModel):
                         f"Configuration conflict in {prefix}: 'static_config.benchmark' has "
                         "pp_layer_config and requests defined, which enables fixed-benchmark mode. "
                         "'benchmark' should not be used in this mode. "
-                        "Only sweep vLLM parameters like attention_kernel or weight_chunk_size_mb."
+                        "Only sweep vLLM parameters like attention_kernel, weight_chunk_size_mb, or weight_loading_mode."
                     )
                 if sc.benchmark_config is not None:
                     errors.append(
@@ -832,7 +941,9 @@ class ExpVllmConfig:
     weight_chunk_size_mb: float = 10.0
     """Weight chunk size in MB for chunked weight loading during migration."""
     migration_approach: str = "async"
-    """Migration approach: 'sync' or 'async'. Determines which migration method to use."""
+    """Migration approach: 'sync', 'async', or 'async_fast'."""
+    weight_loading_mode: str = "async"
+    """Weight loading mode during migration: 'sync' or 'async'."""
     fixed_num_gpu_blocks: int = -1
     """Fixed number of GPU KV cache blocks per layer. Default -1 (auto)."""
     use_vmm: bool = True
@@ -847,12 +958,28 @@ class ExpVllmConfig:
     disable_memory_overhead_monitor: bool = False
     """Disable memory overhead monitoring during migration. Default False.
     Set to True to avoid performance impact from GC and memory measurements."""
+    enable_cpu_weight_cache: bool = True
+    """Whether to preload all weights into CPU memory at startup. Default True.
+    When True, weights are preloaded to CPU pinned memory for faster GPU loading.
+    When False, weights are loaded from disk on-demand during migration."""
     pp_layer_config: Dict[int, str] = field(default_factory=dict)  # {0: "32,32", 100: "20,44"}
     
     @property
     def has_migration(self) -> bool:
         """Returns True if there are multiple pp_layer_config entries."""
         return len(self.pp_layer_config) > 1
+    
+    @property
+    def target_pp_partition(self) -> Optional[str]:
+        """Returns the target pp_layer_partition for migration (last non-initial config).
+        
+        Returns None if there's no migration (only initial config exists).
+        """
+        if not self.has_migration:
+            return None
+        sorted_keys = sorted(self.pp_layer_config.keys())
+        # Return the last config (final target), skip the initial (index 0)
+        return self.pp_layer_config[sorted_keys[-1]].replace(" ", "")
     
     @property
     def base_url(self) -> str:
@@ -922,6 +1049,7 @@ class ExpBenchmarkConfig:
     # From static_config.benchmark
     pattern_batch_size: int = 150
     burstiness: float = 100.0
+    restart_server_between_repetitions: bool = False
     print_outputs: bool = False
     profile: bool = False
     benchmark_script_path: str = ""
@@ -961,7 +1089,9 @@ class ExperimentConfig:
         "repetition": "rep",
         "weight_chunk_size_mb": "chunk",
         "migration_approach": "mig_mode",
+        "weight_loading_mode": "wl",
         "block_size": "blk",
+        "enable_cpu_weight_cache": "cpu_cache",
     }
     
     model: ExpModelConfig
@@ -983,6 +1113,7 @@ class ExperimentConfig:
         }
         vars_dict["chunk"] = self.vllm.weight_chunk_size_mb
         vars_dict["mig_mode"] = self.vllm.migration_approach
+        vars_dict["wl"] = self.vllm.weight_loading_mode
         if self.vllm.block_size is not None:
             vars_dict["blk"] = self.vllm.block_size
         if self.vllm.fixed_num_gpu_blocks != -1:
@@ -991,6 +1122,11 @@ class ExperimentConfig:
         vars_dict["vmm"] = self.vllm.use_vmm
         # Add kv_resize to naming to distinguish experiments with/without resize
         vars_dict["kv_resize"] = self.vllm.enable_kv_resize
+        # Add cpu_cache to naming to distinguish experiments with/without CPU weight preloading
+        vars_dict["cpu_cache"] = self.vllm.enable_cpu_weight_cache
+        # Add target_pp to naming when migration exists - distinguishes different migration targets
+        if self.vllm.target_pp_partition is not None:
+            vars_dict["tgt_pp"] = self.vllm.target_pp_partition
         return vars_dict
     
     @classmethod
@@ -1065,14 +1201,16 @@ class ExperimentConfig:
                 attn_kernel: Optional[str] = combo_dict.get('attention_kernel')
                 weight_chunk_size: Optional[float] = combo_dict.get('weight_chunk_size_mb')
                 mig_approach: Optional[str] = combo_dict.get('migration_approach')
+                weight_loading_mode: Optional[str] = combo_dict.get('weight_loading_mode')
                 fixed_blocks: Optional[int] = combo_dict.get('fixed_num_gpu_blocks')
                 block_sz: Optional[int] = combo_dict.get('block_size')
                 vmm_flag: Optional[bool] = combo_dict.get('use_vmm')
                 kv_resize_flag: Optional[bool] = combo_dict.get('enable_kv_resize')
+                cpu_cache_flag: Optional[bool] = combo_dict.get('enable_cpu_weight_cache')
                 
                 # Create ExperimentConfig from this combination
                 # Yield (sweep_config_index, experiment_config) tuple for server restart isolation
-                yield (sweep_config_index, cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, fixed_blocks, block_sz, vmm_flag, kv_resize_flag))
+                yield (sweep_config_index, cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, weight_loading_mode, fixed_blocks, block_sz, vmm_flag, kv_resize_flag, cpu_cache_flag))
     
     @classmethod
     def _create_from_combo(
@@ -1082,10 +1220,12 @@ class ExperimentConfig:
         attention_kernel: Optional[str] = None,
         weight_chunk_size_mb: Optional[float] = None,
         migration_approach: Optional[str] = None,
+        weight_loading_mode: Optional[str] = None,
         fixed_num_gpu_blocks: Optional[int] = None,
         block_size: Optional[int] = None,
         use_vmm: Optional[bool] = None,
         enable_kv_resize: Optional[bool] = None,
+        enable_cpu_weight_cache: Optional[bool] = None,
     ) -> 'ExperimentConfig':
         """Create a single ExperimentConfig from static config and one sweep combination.
         
@@ -1097,19 +1237,23 @@ class ExperimentConfig:
             attention_kernel: Override from sweep axis (if sweeping), otherwise use static
             weight_chunk_size_mb: Override from sweep axis (if sweeping), otherwise use static
             migration_approach: Override from sweep axis (if sweeping), otherwise use static
+            weight_loading_mode: Override from sweep axis (if sweeping), otherwise use static
             fixed_num_gpu_blocks: Override from sweep axis (if sweeping), otherwise use static
             block_size: Override from sweep axis (if sweeping), otherwise use static
             use_vmm: Override from sweep axis (if sweeping), otherwise use static
             enable_kv_resize: Override from sweep axis (if sweeping), otherwise use static
+            enable_cpu_weight_cache: Override from sweep axis (if sweeping), otherwise use static
         """
         # Resolve sweep overrides: sweep values override static values
         kernel = attention_kernel if attention_kernel is not None else static_cfg.vllm.attention_kernel
         chunk_size = weight_chunk_size_mb if weight_chunk_size_mb is not None else static_cfg.vllm.weight_chunk_size_mb
         mig_approach = migration_approach if migration_approach is not None else static_cfg.vllm.migration_approach
+        weight_loading = weight_loading_mode if weight_loading_mode is not None else static_cfg.vllm.weight_loading_mode
         fixed_blocks = fixed_num_gpu_blocks if fixed_num_gpu_blocks is not None else static_cfg.vllm.fixed_num_gpu_blocks
         blk_size = block_size if block_size is not None else static_cfg.vllm.block_size
         vmm = use_vmm if use_vmm is not None else static_cfg.vllm.use_vmm
         kv_resize = enable_kv_resize if enable_kv_resize is not None else static_cfg.vllm.enable_kv_resize
+        cpu_cache = enable_cpu_weight_cache if enable_cpu_weight_cache is not None else static_cfg.vllm.enable_cpu_weight_cache
         
         # Get initial values from bench_cfg
         sorted_pp_keys = sorted(bench_cfg.pp_layer_config.keys())
@@ -1143,9 +1287,11 @@ class ExperimentConfig:
             enable_nsight=static_cfg.vllm.enable_nsight,
             weight_chunk_size_mb=chunk_size,
             migration_approach=mig_approach,
+            weight_loading_mode=weight_loading,
             fixed_num_gpu_blocks=fixed_blocks,
             use_vmm=vmm,
             enable_kv_resize=kv_resize,
+            enable_cpu_weight_cache=cpu_cache,
             log_kv_memory_stats=static_cfg.vllm.log_kv_memory_stats,
             pp_layer_partition=initial_pp,
             pp_layer_config={k: v.replace(" ", "") for k, v in bench_cfg.pp_layer_config.items()},
@@ -1161,6 +1307,7 @@ class ExperimentConfig:
             input_output_lens=bench_cfg.get_input_output_lens(),
             pattern_batch_size=static_cfg.benchmark.pattern_batch_size,
             burstiness=static_cfg.benchmark.burstiness,
+            restart_server_between_repetitions=static_cfg.benchmark.restart_server_between_repetitions,
             print_outputs=static_cfg.benchmark.print_outputs,
             profile=static_cfg.benchmark.profile,
             benchmark_script_path=static_cfg.benchmark.benchmark_script_path,
@@ -1239,7 +1386,9 @@ class VllmServerSpec:
     weight_chunk_size_mb: float = 10.0
     """Weight chunk size in MB for chunked weight loading during migration."""
     migration_approach: str = "async"
-    """Migration approach: 'sync' or 'async'. Determines which migration method to use."""
+    """Migration approach: 'sync', 'async', or 'async_fast'."""
+    weight_loading_mode: str = "async"
+    """Weight loading mode during migration: 'sync' or 'async'."""
     fixed_num_gpu_blocks: int = -1
     """Fixed number of GPU KV cache blocks per layer. Default -1 (auto)."""
     use_vmm: bool = True
@@ -1251,6 +1400,10 @@ class VllmServerSpec:
     log_kv_memory_stats: bool = False
     """Whether to log detailed KV cache memory statistics. Default False.
     When True, calculates actual_kv_memory_bytes and allocated_kv_memory_bytes."""
+    enable_cpu_weight_cache: bool = True
+    """Whether to preload all weights into CPU memory at startup. Default True.
+    When True, weights are preloaded to CPU pinned memory for faster GPU loading.
+    When False, weights are loaded from disk on-demand during migration."""
     
     # Migration/Partition
     pp_layer_partition: str = ""
@@ -1283,10 +1436,12 @@ class VllmServerSpec:
             "alternative_configs": self.alternative_configs,
             "migration_steps": self.migration_steps,
             "migration_mode": self.migration_approach,
+            "weight_loading_mode": self.weight_loading_mode,
             "fixed_num_gpu_blocks": self.fixed_num_gpu_blocks,
             "use_vmm": self.use_vmm,
             "enable_kv_resize": self.enable_kv_resize,
             "log_kv_memory_stats": self.log_kv_memory_stats,
+            "enable_cpu_weight_cache": self.enable_cpu_weight_cache,
         }
         # Only include rank_to_ip if non-empty
         if self.rank_to_ip:
@@ -1322,6 +1477,8 @@ class BenchmarkSpec:
     repetition: int = 1
     """Number of times to repeat the benchmark. After each repetition,
     set_pp_config is called to return to the initial pp configuration."""
+    restart_server_between_repetitions: bool = False
+    """Whether to restart the vLLM server between repetitions instead of reusing one server."""
     
     # Pipeline config for repetition reset
     initial_pp_config: Optional[List[List[int]]] = None
@@ -1332,7 +1489,9 @@ class BenchmarkSpec:
     migration_steps: Optional[List[int]] = None
     """Request indices at which migration is triggered."""
     migration_mode: Optional[str] = None
-    """Migration mode: 'sync' or 'async'. Passed to set_pp_config between repetitions."""
+    """Migration mode: 'sync', 'async', or 'async_fast'. Passed to set_pp_config between repetitions."""
+    weight_loading_mode: Optional[str] = None
+    """Weight loading mode: 'sync' or 'async'. Passed to set_pp_config between repetitions."""
     
     # Features
     print_outputs: bool = False
@@ -1349,8 +1508,18 @@ class BenchmarkSpec:
     sharegpt_output_len: Optional[int] = None
     """Output length for ShareGPT dataset. If None, uses actual completion length."""
 
-    def build_benchmark_config(self) -> Dict[str, Any]:
+    def build_benchmark_config(
+        self,
+        repetition_override: Optional[int] = None,
+        metrics_file_path_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Assemble benchmark config payload to be written to disk."""
+        repetition = self.repetition if repetition_override is None else repetition_override
+        metrics_file_path = (
+            self.metrics_file_path
+            if metrics_file_path_override is None else metrics_file_path_override
+        )
+
         # Build running_num_requests and data_num_requests from request_rate dict
         # running_num_requests: list of request counts per stage
         # data_num_requests: list of data generation counts per stage
@@ -1384,18 +1553,34 @@ class BenchmarkSpec:
             "print_outputs": self.print_outputs,
             "burstiness": self.burstiness,
             "warmup": self.warmup.model_dump() if self.warmup else None,
-            "metrics_file_name": self.metrics_file_path,
-            "repetition": self.repetition,
+            "metrics_file_name": metrics_file_path,
+            "repetition": repetition,
             # Pipeline config for repetition reset
             "initial_pp_config": self.initial_pp_config,
             "alternative_configs": self.alternative_configs,
             "migration_steps": self.migration_steps,
             "migration_mode": self.migration_mode,
+            "weight_loading_mode": self.weight_loading_mode,
         }
 
-    def write_benchmark_config(self) -> None:
+    def write_benchmark_config(
+        self,
+        benchmark_config_path: Optional[str] = None,
+        repetition_override: Optional[int] = None,
+        metrics_file_path_override: Optional[str] = None,
+    ) -> None:
         """Persist benchmark config to benchmark_config_path."""
-        config_file_path = Path(self.benchmark_config_path)
+        config_file_path = Path(
+            self.benchmark_config_path if benchmark_config_path is None else benchmark_config_path
+        )
         config_file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(config_file_path, "w", encoding="utf-8") as f:
-            json.dump(self.build_benchmark_config(), f, indent=2, ensure_ascii=False)
+            json.dump(
+                self.build_benchmark_config(
+                    repetition_override=repetition_override,
+                    metrics_file_path_override=metrics_file_path_override,
+                ),
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )

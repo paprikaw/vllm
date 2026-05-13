@@ -11,7 +11,8 @@ import subprocess
 import time
 import threading
 import csv
-from dataclasses import dataclass, asdict, field
+import statistics
+from dataclasses import dataclass, asdict, field, replace
 from hashlib import sha1
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal, Iterable, Callable, Union
@@ -927,8 +928,6 @@ def start_benchmark(
         bench_args.extend(["--sharegpt-output-len", str(sharegpt_output_len)])
     
     C.print(f"start to run benchmark with args: {bench_args}")
-    if cfg.benchmark.print_outputs:
-        bench_args.append("--print-outputs")
 
     if cfg.benchmark.profile:
         bench_args.append("--profile")
@@ -1301,10 +1300,12 @@ def generate_experiment_specs(
             enable_nsight=exp_cfg.vllm.enable_nsight,
             weight_chunk_size_mb=exp_cfg.vllm.weight_chunk_size_mb,
             migration_approach=exp_cfg.vllm.migration_approach,
+            weight_loading_mode=exp_cfg.vllm.weight_loading_mode,
             fixed_num_gpu_blocks=exp_cfg.vllm.fixed_num_gpu_blocks,
             use_vmm=exp_cfg.vllm.use_vmm,
             enable_kv_resize=exp_cfg.vllm.enable_kv_resize,
             log_kv_memory_stats=exp_cfg.vllm.log_kv_memory_stats,
+            enable_cpu_weight_cache=exp_cfg.vllm.enable_cpu_weight_cache,
             pp_layer_partition=exp_cfg.vllm.pp_layer_partition,
             pp_layer_config=exp_cfg.vllm.pp_layer_config,
             alternative_configs=exp_cfg.vllm.get_alternative_configs(),
@@ -1331,6 +1332,7 @@ def generate_experiment_specs(
             pattern_batch_size=exp_cfg.benchmark.pattern_batch_size,
             burstiness=exp_cfg.benchmark.burstiness,
             repetition=exp_cfg.benchmark.repetition,
+            restart_server_between_repetitions=exp_cfg.benchmark.restart_server_between_repetitions,
             print_outputs=exp_cfg.benchmark.print_outputs,
             profile=exp_cfg.benchmark.profile,
             warmup=exp_cfg.benchmark.warmup,
@@ -1339,6 +1341,7 @@ def generate_experiment_specs(
             alternative_configs=exp_cfg.vllm.get_alternative_configs(),
             migration_steps=exp_cfg.vllm.get_migration_steps(),
             migration_mode=exp_cfg.vllm.migration_approach,
+            weight_loading_mode=exp_cfg.vllm.weight_loading_mode,
             # Dataset configuration
             dataset_name=exp_cfg.benchmark.dataset_name,
             dataset_path=exp_cfg.benchmark.dataset_path,
@@ -1445,6 +1448,10 @@ def start_vllm_for_sweep(
 
 def start_benchmark_for_sweep(
     spec: BenchmarkSpec,
+    repetition_override: Optional[int] = None,
+    benchmark_config_path_override: Optional[str] = None,
+    benchmark_log_path_override: Optional[str] = None,
+    metrics_file_path_override: Optional[str] = None,
 ) -> bool:
     """Start benchmark from spec.
     
@@ -1478,7 +1485,10 @@ def start_benchmark_for_sweep(
         "--temperature", "0",
         "--seed", "42",
         "--pattern-batch-size", str(spec.pattern_batch_size),
-        "--benchmark-config", str(spec.benchmark_config_path),
+        "--benchmark-config", str(
+            spec.benchmark_config_path
+            if benchmark_config_path_override is None else benchmark_config_path_override
+        ),
     ]
     
     # Add dataset-specific arguments
@@ -1487,23 +1497,31 @@ def start_benchmark_for_sweep(
     if dataset_name == "sharegpt" and sharegpt_output_len is not None:
         bench_args.extend(["--sharegpt-output-len", str(sharegpt_output_len)])
     
-    if spec.print_outputs:
-        bench_args.append("--print-outputs")
+    # Intentionally keep benchmark logs free of per-request generated text.
+    # Even if config asks for print_outputs, do not forward it to the benchmark CLI.
     if spec.profile:
         bench_args.append("--profile")
     
     # Write benchmark config (includes metrics path) via spec helper
-    spec.write_benchmark_config()
+    spec.write_benchmark_config(
+        benchmark_config_path=benchmark_config_path_override,
+        repetition_override=repetition_override,
+        metrics_file_path_override=metrics_file_path_override,
+    )
     
     C.print(f"[bold cyan]Starting benchmark with {spec.num_total_requests} requests[/]")
     C.print(f"[bold cyan]Request rate config: {spec.request_rate}[/]")
     
     # Prepare metrics output path defined in spec
-    metrics_file_path = Path(spec.metrics_file_path)
+    metrics_file_path = Path(
+        spec.metrics_file_path if metrics_file_path_override is None else metrics_file_path_override
+    )
     if metrics_file_path.exists():
         os.remove(metrics_file_path)
     
-    log_path = Path(spec.benchmark_log_path)
+    log_path = Path(
+        spec.benchmark_log_path if benchmark_log_path_override is None else benchmark_log_path_override
+    )
     if log_path.exists():
         os.remove(log_path)
     
@@ -1549,6 +1567,417 @@ def start_benchmark_for_sweep(
     return True
 
 
+def _append_text_file(src: Path, dst: Path, banner: Optional[str] = None) -> None:
+    """Append a text file to another text file, optionally with a banner."""
+    if not src.exists():
+        return
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst, "a", encoding="utf-8", errors="ignore") as dst_f:
+        if banner is not None:
+            dst_f.write(f"\n{'=' * 20} {banner} {'=' * 20}\n")
+        with open(src, "r", encoding="utf-8", errors="ignore") as src_f:
+            shutil.copyfileobj(src_f, dst_f)
+        dst_f.write("\n")
+
+
+def _extract_benchmark_result_summary(src: Path) -> str:
+    """Extract the compact benchmark result section from a benchmark log."""
+    if not src.exists():
+        return ""
+
+    content = src.read_text(encoding="utf-8", errors="ignore")
+    match = re.search(
+        r"------------ Benchmark Result \(Total\) ------------.*?--------------------------------------------------",
+        content,
+        re.DOTALL,
+    )
+    if match:
+        return match.group(0).strip()
+    return ""
+
+
+@dataclass
+class _BenchmarkAggregateMetrics:
+    completed: int
+    total_input: int
+    total_output: int
+    request_throughput: float
+    output_throughput: float
+    total_token_throughput: float
+    mean_ttft_ms: float
+    mean_tpot_ms: float
+    mean_itl_ms: float
+    mean_e2el_ms: Optional[float]
+    mean_normalized_latency_ms: float
+
+
+def _parse_benchmark_aggregate_metrics(src: Path) -> Optional[_BenchmarkAggregateMetrics]:
+    """Parse key benchmark result numbers from one repetition log."""
+    if not src.exists():
+        return None
+
+    content = src.read_text(encoding="utf-8", errors="ignore")
+
+    patterns: dict[str, tuple[type, str]] = {
+        "completed": (int, r"Successful requests:\s+(\d+)"),
+        "total_input": (int, r"Total input tokens:\s+(\d+)"),
+        "total_output": (int, r"Total generated tokens:\s+(\d+)"),
+        "request_throughput": (float, r"Request throughput \(req/s\):\s+([0-9.]+)"),
+        "output_throughput": (float, r"Output token throughput \(tok/s\):\s+([0-9.]+)"),
+        "total_token_throughput": (float, r"Total Token throughput \(tok/s\):\s+([0-9.]+)"),
+        "mean_ttft_ms": (float, r"Mean TTFT \(ms\):\s+([0-9.]+)"),
+        "mean_tpot_ms": (float, r"Mean TPOT \(ms\):\s+([0-9.]+)"),
+        "mean_itl_ms": (float, r"Mean ITL \(ms\):\s+([0-9.]+)"),
+        "mean_normalized_latency_ms": (float, r"Mean Normalized Latency \(ms/tok\):\s+([0-9.]+)"),
+    }
+    optional_patterns: dict[str, tuple[type, str]] = {
+        "mean_e2el_ms": (float, r"Mean E2EL \(ms\):\s+([0-9.]+)"),
+    }
+
+    values: dict[str, Any] = {}
+    for key, (cast, pattern) in patterns.items():
+        match = re.search(pattern, content)
+        if match is None:
+            return None
+        values[key] = cast(match.group(1))
+
+    for key, (cast, pattern) in optional_patterns.items():
+        match = re.search(pattern, content)
+        values[key] = cast(match.group(1)) if match is not None else None
+
+    return _BenchmarkAggregateMetrics(**values)
+
+
+def _build_benchmark_final_summary(
+    repetition: int,
+    metrics_list: list[_BenchmarkAggregateMetrics],
+) -> str:
+    """Build final aggregate summary text matching benchmark_serving output style."""
+    if not metrics_list:
+        return ""
+
+    throughputs = [m.request_throughput for m in metrics_list]
+    output_throughputs = [m.output_throughput for m in metrics_list]
+    total_token_throughputs = [m.total_token_throughput for m in metrics_list]
+    mean_ttfts = [m.mean_ttft_ms for m in metrics_list]
+    mean_tpots = [m.mean_tpot_ms for m in metrics_list]
+    mean_itls = [m.mean_itl_ms for m in metrics_list]
+    mean_e2els = [m.mean_e2el_ms for m in metrics_list if m.mean_e2el_ms is not None]
+    mean_normalized_latencies = [m.mean_normalized_latency_ms for m in metrics_list]
+
+    total_completed = sum(m.completed for m in metrics_list)
+    total_input = sum(m.total_input for m in metrics_list)
+    total_output = sum(m.total_output for m in metrics_list)
+
+    def _mean(values: list[float]) -> float:
+        return statistics.fmean(values)
+
+    def _median(values: list[float]) -> float:
+        return statistics.median(values)
+
+    def _std(values: list[float]) -> float:
+        return statistics.pstdev(values) if len(values) > 1 else 0.0
+
+    lines = [
+        "",
+        f"{'═' * 70}",
+        f"{'═' * 70}",
+        f"  FINAL SUMMARY: {repetition} REPETITIONS COMPLETED",
+        f"{'═' * 70}",
+        f"{'═' * 70}",
+        "",
+        f"┌{'─' * 68}┐",
+        f"│ {'Rep':>4} │ {'Completed':>10} │ {'Throughput':>12} │ {'Mean TTFT':>12} │ {'Mean TPOT':>12} │",
+        f"├{'─' * 68}┤",
+    ]
+
+    for idx, metric in enumerate(metrics_list, 1):
+        lines.append(
+            f"│ {idx:>4} │ {metric.completed:>10} │ {metric.request_throughput:>10.2f}/s │ {metric.mean_ttft_ms:>10.2f}ms │ {metric.mean_tpot_ms:>10.2f}ms │"
+        )
+
+    lines.extend([
+        f"└{'─' * 68}┘",
+        "",
+        f"{'─' * 70}",
+        f"  AGGREGATE STATISTICS ACROSS {repetition} REPETITIONS",
+        f"{'─' * 70}",
+        f"  Total Requests:     {total_completed}",
+        f"  Total Input:        {total_input} tokens",
+        f"  Total Output:       {total_output} tokens",
+        "",
+        "  REQUEST THROUGHPUT (req/s):",
+        f"    Average:          {_mean(throughputs):.2f}",
+        f"    Median:           {_median(throughputs):.2f}",
+        f"    Std Dev:          {_std(throughputs):.2f}",
+        f"    Min:              {min(throughputs):.2f}",
+        f"    Max:              {max(throughputs):.2f}",
+        "",
+        "  OUTPUT THROUGHPUT (tokens/s):",
+        f"    Average:          {_mean(output_throughputs):.2f}",
+        f"    Median:           {_median(output_throughputs):.2f}",
+        f"    Std Dev:          {_std(output_throughputs):.2f}",
+        "",
+        "  TOTAL TOKEN THROUGHPUT (tokens/s):",
+        f"    Average:          {_mean(total_token_throughputs):.2f}",
+        f"    Median:           {_median(total_token_throughputs):.2f}",
+        f"    Std Dev:          {_std(total_token_throughputs):.2f}",
+        "",
+        "  MEAN TTFT ACROSS REPETITIONS (ms):",
+        f"    Average:          {_mean(mean_ttfts):.2f}",
+        f"    Median:           {_median(mean_ttfts):.2f}",
+        f"    Std Dev:          {_std(mean_ttfts):.2f}",
+        f"    Min:              {min(mean_ttfts):.2f}",
+        f"    Max:              {max(mean_ttfts):.2f}",
+        "",
+        "  MEAN TPOT ACROSS REPETITIONS (ms):",
+        f"    Average:          {_mean(mean_tpots):.2f}",
+        f"    Median:           {_median(mean_tpots):.2f}",
+        f"    Std Dev:          {_std(mean_tpots):.2f}",
+        f"    Min:              {min(mean_tpots):.2f}",
+        f"    Max:              {max(mean_tpots):.2f}",
+        "",
+        "  MEAN ITL ACROSS REPETITIONS (ms):",
+        f"    Average:          {_mean(mean_itls):.2f}",
+        f"    Median:           {_median(mean_itls):.2f}",
+        f"    Std Dev:          {_std(mean_itls):.2f}",
+        "",
+        "  MEAN NORMALIZED LATENCY ACROSS REPETITIONS (ms/tok):",
+        f"    Average:          {_mean(mean_normalized_latencies):.2f}",
+        f"    Median:           {_median(mean_normalized_latencies):.2f}",
+        f"    Std Dev:          {_std(mean_normalized_latencies):.2f}",
+        f"    Min:              {min(mean_normalized_latencies):.2f}",
+        f"    Max:              {max(mean_normalized_latencies):.2f}",
+        "",
+        f"{'═' * 70}",
+    ])
+
+    if mean_e2els:
+        normalized_idx = lines.index("  MEAN NORMALIZED LATENCY ACROSS REPETITIONS (ms/tok):")
+        lines[normalized_idx:normalized_idx] = [
+            "  MEAN E2EL ACROSS REPETITIONS (ms):",
+            f"    Average:          {_mean(mean_e2els):.2f}",
+            f"    Median:           {_median(mean_e2els):.2f}",
+            f"    Std Dev:          {_std(mean_e2els):.2f}",
+            "",
+        ]
+
+    return "\n".join(lines)
+
+
+def _append_benchmark_final_summary(
+    dst: Path,
+    repetition: int,
+    metrics_list: list[_BenchmarkAggregateMetrics],
+) -> None:
+    """Append final aggregate statistics to benchmark.log."""
+    summary = _build_benchmark_final_summary(repetition, metrics_list)
+    if not summary:
+        return
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst, "a", encoding="utf-8", errors="ignore") as dst_f:
+        dst_f.write(summary)
+        dst_f.write("\n")
+
+
+def _append_csv_file(
+    src: Path,
+    dst: Path,
+    row_transform: Optional[Callable[[list[str]], list[str]]] = None,
+) -> None:
+    """Append CSV rows from src to dst while preserving only one header."""
+    if not src.exists():
+        return
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst_has_data = dst.exists() and dst.stat().st_size > 0
+
+    with open(src, "r", newline="", encoding="utf-8", errors="ignore") as src_f:
+        reader = csv.reader(src_f)
+        rows = list(reader)
+
+    if not rows:
+        return
+
+    with open(dst, "a", newline="", encoding="utf-8") as dst_f:
+        writer = csv.writer(dst_f)
+        for row_idx, row in enumerate(rows):
+            if not row:
+                continue
+            is_header = row_idx == 0 and row[0] == "timestamp"
+            if is_header and dst_has_data:
+                continue
+            out_row = row if is_header or row_transform is None else row_transform(row)
+            writer.writerow(out_row)
+            dst_has_data = True
+
+
+def _build_request_metrics_row_transform(repetition_index: int) -> Callable[[list[str]], list[str]]:
+    """Build a transformer that rewrites the repetition column."""
+    def _transform(row: list[str]) -> list[str]:
+        out_row = list(row)
+        while len(out_row) < 6:
+            out_row.append("")
+        out_row[5] = str(repetition_index)
+        return out_row
+
+    return _transform
+
+
+def _run_single_sweep_experiment_with_server_restart_between_repetitions(
+    vllm_spec: VllmServerSpec,
+    bench_spec: BenchmarkSpec,
+    logm: SweepLogManager,
+    vars_mapping: Dict[str, Any],
+) -> bool:
+    """Run one experiment by restarting the server between repetitions."""
+    ok = True
+
+    if not vllm_spec.server_raw_log_path or not vllm_spec.metrics_csv_path:
+        raise ValueError("vllm_spec 缺少 server_raw_log_path 或 metrics_csv_path")
+
+    aggregate_server_raw_path = Path(vllm_spec.server_raw_log_path)
+    aggregate_timestamp_metrics_path = Path(vllm_spec.metrics_csv_path)
+    benchmark_log_path = Path(bench_spec.benchmark_log_path)
+    request_metrics_path = Path(bench_spec.metrics_file_path)
+    benchmark_config_path = Path(bench_spec.benchmark_config_path)
+
+    for final_path in (
+        aggregate_server_raw_path,
+        aggregate_timestamp_metrics_path,
+        benchmark_log_path,
+        request_metrics_path,
+    ):
+        if final_path.exists():
+            os.remove(final_path)
+
+    try:
+        logm.write_constants_meta(vars_mapping)
+        aggregate_metrics: list[_BenchmarkAggregateMetrics] = []
+
+        for rep in range(1, bench_spec.repetition + 1):
+            proc = None
+            capture = None
+
+            rep_server_raw_path = aggregate_server_raw_path.with_name(
+                f"{aggregate_server_raw_path.name}.rep{rep}"
+            )
+            rep_timestamp_metrics_path = aggregate_timestamp_metrics_path.with_name(
+                f"{aggregate_timestamp_metrics_path.name}.rep{rep}"
+            )
+            rep_benchmark_log_path = benchmark_log_path.with_name(
+                f"{benchmark_log_path.name}.rep{rep}"
+            )
+            rep_request_metrics_path = request_metrics_path.with_name(
+                f"{request_metrics_path.name}.rep{rep}"
+            )
+            rep_benchmark_config_path = benchmark_config_path.with_name(
+                f"{benchmark_config_path.name}.rep{rep}"
+            )
+
+            for rep_path in (
+                rep_server_raw_path,
+                rep_timestamp_metrics_path,
+                rep_benchmark_log_path,
+                rep_request_metrics_path,
+                rep_benchmark_config_path,
+            ):
+                if rep_path.exists():
+                    os.remove(rep_path)
+
+            rep_vllm_spec = replace(
+                vllm_spec,
+                server_raw_log_path=str(rep_server_raw_path),
+                metrics_csv_path=str(rep_timestamp_metrics_path),
+            )
+
+            C.print(
+                f"[bold cyan]Running repetition {rep}/{bench_spec.repetition} with server restart[/]"
+            )
+
+            try:
+                proc, capture, _ = start_vllm_for_sweep(rep_vllm_spec)
+                if not wait_ready_or_fail(bench_spec.base_url, proc, rep_server_raw_path):
+                    return False
+
+                ok = start_benchmark_for_sweep(
+                    bench_spec,
+                    repetition_override=1,
+                    benchmark_config_path_override=str(rep_benchmark_config_path),
+                    benchmark_log_path_override=str(rep_benchmark_log_path),
+                    metrics_file_path_override=str(rep_request_metrics_path),
+                )
+                if not ok:
+                    C.print("[yellow]WARNING:[/] Benchmark failed during repetition-restart mode")
+                    return False
+            finally:
+                if proc:
+                    stop_tree(proc)
+                if capture:
+                    capture.close()
+
+            _append_text_file(
+                rep_server_raw_path,
+                aggregate_server_raw_path,
+                banner=f"server repetition {rep}/{bench_spec.repetition}",
+            )
+            _append_text_file(
+                rep_benchmark_log_path,
+                benchmark_log_path,
+                banner=f"benchmark repetition {rep}/{bench_spec.repetition}",
+            )
+
+            parsed_metric = _parse_benchmark_aggregate_metrics(rep_benchmark_log_path)
+            if parsed_metric is None:
+                C.print(f"[yellow]WARNING:[/] Failed to parse benchmark metrics from {rep_benchmark_log_path}")
+            else:
+                aggregate_metrics.append(parsed_metric)
+
+            _append_csv_file(
+                rep_request_metrics_path,
+                request_metrics_path,
+                row_transform=_build_request_metrics_row_transform(rep),
+            )
+            _append_csv_file(rep_timestamp_metrics_path, aggregate_timestamp_metrics_path)
+
+            if rep_benchmark_log_path.exists():
+                os.remove(rep_benchmark_log_path)
+
+        if len(aggregate_metrics) == bench_spec.repetition:
+            _append_benchmark_final_summary(
+                benchmark_log_path,
+                repetition=bench_spec.repetition,
+                metrics_list=aggregate_metrics,
+            )
+        else:
+            C.print("[yellow]WARNING:[/] Aggregate summary skipped because some repetition metrics could not be parsed")
+
+        server_main_path = logm.get_path_with_log_type("server", "log", vars_mapping)
+        if server_main_path.exists():
+            os.remove(server_main_path)
+        if aggregate_server_raw_path.exists():
+            shutil.copyfile(aggregate_server_raw_path, server_main_path)
+
+        ts_main_path = logm.get_path_with_log_type("timestamp_metrics", "csv", vars_mapping)
+        if ts_main_path.exists():
+            os.remove(ts_main_path)
+        if aggregate_timestamp_metrics_path.exists():
+            shutil.copyfile(aggregate_timestamp_metrics_path, ts_main_path)
+
+    except Exception as e:
+        C.print(f"[red]ERROR[/] {e}")
+        import traceback
+        traceback.print_exc()
+        ok = False
+    finally:
+        time.sleep(3)
+        generate_analysis_report(logm, vars_mapping)
+
+    return ok
+
+
 # =========================
 # Experiment Runner
 # =========================
@@ -1570,6 +1999,14 @@ def _run_single_sweep_experiment(
     Returns:
         True if experiment succeeded
     """
+    if bench_spec.restart_server_between_repetitions and bench_spec.repetition > 1:
+        return _run_single_sweep_experiment_with_server_restart_between_repetitions(
+            vllm_spec,
+            bench_spec,
+            logm,
+            vars_mapping,
+        )
+
     ok = False
     proc = None
     capture = None
@@ -1707,6 +2144,7 @@ async def call_set_pp_config(
     alternative_configs: Optional[Dict[int, Any]] = None,
     migration_steps: Optional[list[int]] = None,
     migration_mode: Optional[str] = None,
+    weight_loading_mode: Optional[str] = None,
     weight_chunk_size_mb: Optional[float] = None,
     fixed_num_gpu_blocks: Optional[int] = None,
     timeout: float = 120.0
@@ -1719,7 +2157,8 @@ async def call_set_pp_config(
         alternative_configs: Optional dict of migration targets. Keys are config indices,
                             values are pp_layer_config lists.
         migration_steps: Optional list of request indices at which to trigger migration.
-        migration_mode: Optional migration mode ('sync' or 'async').
+        migration_mode: Optional migration mode ('sync', 'async', or 'async_fast').
+        weight_loading_mode: Optional weight loading mode ('sync' or 'async').
         fixed_num_gpu_blocks: Optional fixed KV cache block count (-1 to disable).
         timeout: Request timeout in seconds
     
@@ -1728,7 +2167,7 @@ async def call_set_pp_config(
     """
     import aiohttp
     url = f"{base_url}/set_pp_config"
-    payload = {"pp_layer_config": pp_layer_config}
+    payload: Dict[str, Any] = {"pp_layer_config": pp_layer_config}
     
     # Add optional migration configuration
     if alternative_configs is not None:
@@ -1738,6 +2177,8 @@ async def call_set_pp_config(
         payload["migration_steps"] = migration_steps
     if migration_mode is not None:
         payload["migration_mode"] = migration_mode
+    if weight_loading_mode is not None:
+        payload["weight_loading_mode"] = weight_loading_mode
     if weight_chunk_size_mb is not None:
         payload["weight_chunk_size_mb"] = weight_chunk_size_mb
     if fixed_num_gpu_blocks is not None:
@@ -1775,6 +2216,7 @@ def call_set_pp_config_sync(
     alternative_configs: Optional[Dict[int, Any]] = None,
     migration_steps: Optional[list[int]] = None,
     migration_mode: Optional[str] = None,
+    weight_loading_mode: Optional[str] = None,
     weight_chunk_size_mb: Optional[float] = None,
     fixed_num_gpu_blocks: Optional[int] = None,
     timeout: float = 120.0
@@ -1786,7 +2228,8 @@ def call_set_pp_config_sync(
         pp_layer_config: Target configuration as list of [start, end] pairs per rank.
         alternative_configs: Optional dict of migration targets.
         migration_steps: Optional list of request indices for migration triggers.
-        migration_mode: Optional migration mode ('sync' or 'async').
+        migration_mode: Optional migration mode ('sync', 'async', or 'async_fast').
+        weight_loading_mode: Optional weight loading mode ('sync' or 'async').
         fixed_num_gpu_blocks: Optional fixed KV cache block count (-1 to disable).
         timeout: Request timeout in seconds
     
@@ -1801,7 +2244,7 @@ def call_set_pp_config_sync(
         asyncio.set_event_loop(loop)
     
     return loop.run_until_complete(
-        call_set_pp_config(base_url, pp_layer_config, alternative_configs, migration_steps, migration_mode, weight_chunk_size_mb, fixed_num_gpu_blocks, timeout)
+        call_set_pp_config(base_url, pp_layer_config, alternative_configs, migration_steps, migration_mode, weight_loading_mode, weight_chunk_size_mb, fixed_num_gpu_blocks, timeout)
     )
 
 
@@ -1952,6 +2395,10 @@ def _run_single_experiment_on_running_server(
         migration_mode = getattr(vllm_spec, 'migration_approach', None)
         if migration_mode:
             C.print(f"[dim]  Migration mode: {migration_mode}[/]")
+
+        weight_loading_mode = getattr(vllm_spec, 'weight_loading_mode', None)
+        if weight_loading_mode:
+            C.print(f"[dim]  Weight loading mode: {weight_loading_mode}[/]")
         
         # Pass weight_chunk_size_mb from spec
         exp_chunk_size = getattr(vllm_spec, 'weight_chunk_size_mb', None)
@@ -1969,6 +2416,7 @@ def _run_single_experiment_on_running_server(
             alternative_configs=alternative_configs,
             migration_steps=migration_steps,
             migration_mode=migration_mode,
+            weight_loading_mode=weight_loading_mode,
             weight_chunk_size_mb=exp_chunk_size,
             fixed_num_gpu_blocks=exp_fixed_blocks
         ):
@@ -2041,7 +2489,9 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
     
     IMPORTANT: Different sweep_config blocks (different - vllm: entries in 
     sweep_configs) will cause a server restart to ensure complete isolation
-    between different experiment configurations.
+    between different experiment configurations. Within the same
+    sweep_config block, parameters that cannot be updated through the
+    runtime API (for example `enable_kv_resize`) also force a restart.
     
     This provides:
     1. Complete isolation between different sweep_config blocks (server restart)
@@ -2091,13 +2541,30 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
         else:
             experiments_to_run = all_experiments
         
+        restart_between_repetition_experiments = [
+            exp for exp in experiments_to_run
+            if exp.bench_spec.restart_server_between_repetitions and exp.bench_spec.repetition > 1
+        ]
+        grouped_experiments_to_run = [
+            exp for exp in experiments_to_run
+            if not (exp.bench_spec.restart_server_between_repetitions and exp.bench_spec.repetition > 1)
+        ]
+
         C.print(f"[bold cyan]Starting single-server sweep test with {len(experiments_to_run)} experiments[/]")
+        if restart_between_repetition_experiments:
+            C.print(
+                "[bold yellow]"
+                f"{len(restart_between_repetition_experiments)} experiments require server restart between repetitions; "
+                "they will run in standalone mode.[/]"
+            )
         
         # Group experiments by parameters that require server restart:
         # - sweep_config_index (each - vllm: block gets its own server)
         # - attention_kernel (switching kernel requires restart)
         # - block_size (changing KV cache block size requires restart)
-        from itertools import groupby
+        # - migration_approach (user requires different migration modes to run on separate servers)
+        # - enable_cpu_weight_cache (changing CPU weight cache mode requires restart)
+        # - enable_kv_resize (not switchable through set_pp_config API)
         
         def get_server_group_key(exp: SweepExperimentSpec) -> tuple:
             """Return a tuple of parameters that require server restart when changed."""
@@ -2105,29 +2572,44 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 exp.sweep_config_index,
                 exp.vllm_spec.attention_kernel,
                 exp.vllm_spec.block_size,
+                exp.vllm_spec.migration_approach,
                 exp.vllm_spec.use_vmm,
+                exp.vllm_spec.enable_cpu_weight_cache,
+                exp.vllm_spec.enable_kv_resize,
             )
         
-        # Group experiments by server restart parameters
-        # Experiments are already ordered with restart-requiring params in outermost loops
-        server_groups = []
-        for group_key, group_iter in groupby(experiments_to_run, key=get_server_group_key):
-            server_groups.append((group_key, list(group_iter)))
+        # Group experiments by server restart parameters while preserving first-seen order.
+        # This is more robust than itertools.groupby because experiments with the same
+        # restart key may not always be adjacent in the sweep order.
+        server_groups_map: dict[tuple, list[SweepExperimentSpec]] = {}
+        for exp in grouped_experiments_to_run:
+            group_key = get_server_group_key(exp)
+            server_groups_map.setdefault(group_key, []).append(exp)
+        server_groups = list(server_groups_map.items())
         
         C.print(f"[bold cyan]Experiments grouped by server config: {len(server_groups)} groups[/]")
         for group_key, group_exps in server_groups:
-            sweep_idx, kernel, blk_size, use_vmm = group_key
-            C.print(f"  sweep[{sweep_idx}] kernel={kernel} block_size={blk_size} vmm={use_vmm}: {len(group_exps)} experiments")
+            sweep_idx, kernel, blk_size, migration_mode, use_vmm, cpu_cache, kv_resize = group_key
+            C.print(
+                f"  sweep[{sweep_idx}] kernel={kernel} block_size={blk_size} "
+                f"migration_mode={migration_mode} vmm={use_vmm} cpu_cache={cpu_cache} "
+                f"kv_resize={kv_resize}: "
+                f"{len(group_exps)} experiments"
+            )
         
         # Run experiments group by group, restarting server for each group
         for group_key, group_experiments in server_groups:
-            sweep_idx, kernel_val, block_size_val, use_vmm_val = group_key
+            sweep_idx, kernel_val, block_size_val, migration_mode_val, use_vmm_val, cpu_cache_val, kv_resize_val = group_key
             proc = None
             log_redirector = None
             
             try:
                 C.print(f"\n[bold blue]{'='*60}[/]")
-                C.print(f"[bold blue]Starting server for sweep[{sweep_idx}] kernel={kernel_val} block_size={block_size_val} vmm={use_vmm_val}[/]")
+                C.print(
+                    f"[bold blue]Starting server for sweep[{sweep_idx}] kernel={kernel_val} "
+                    f"block_size={block_size_val} migration_mode={migration_mode_val} "
+                    f"vmm={use_vmm_val} cpu_cache={cpu_cache_val} kv_resize={kv_resize_val}[/]"
+                )
                 C.print(f"[bold blue]This group has {len(group_experiments)} experiments[/]")
                 C.print(f"[bold blue]{'='*60}[/]\n")
                 
@@ -2136,8 +2618,11 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 
                 # Create a global metrics path for the server (per server group)
                 blk_str = f"_blk{block_size_val}" if block_size_val else ""
+                mig_mode_str = f"_mig{migration_mode_val}"
                 vmm_str = f"_vmm{1 if use_vmm_val else 0}"
-                group_suffix = f"sweep{sweep_idx}_{kernel_val}{blk_str}{vmm_str}"
+                cpu_str = f"_cpu{1 if cpu_cache_val else 0}"
+                kv_resize_str = f"_kvresize{1 if kv_resize_val else 0}"
+                group_suffix = f"sweep{sweep_idx}_{kernel_val}{blk_str}{mig_mode_str}{vmm_str}{cpu_str}{kv_resize_str}"
                 global_metrics_path = logm.get_dir() / f"global_metrics_raw_{group_suffix}.csv"
                 first_exp.vllm_spec.metrics_csv_path = str(global_metrics_path)
                 
@@ -2155,13 +2640,13 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 )
                 
                 # Wait for server to be ready
-                C.print(f"[bold cyan]Waiting for server to be ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val}, vmm={use_vmm_val})...[/]")
+                C.print(f"[bold cyan]Waiting for server to be ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val}, vmm={use_vmm_val}, kv_resize={kv_resize_val})...[/]")
                 C.print(f"[bold cyan]Monitor server status: tail -f {global_log_path}[/]")
                 if not wait_ready(first_exp.bench_spec.base_url, 300):
                     C.print(f"[red]ERROR: vLLM server not ready in time (sweep[{sweep_idx}])[/]")
                     continue
                 
-                C.print(f"[green]vLLM server is ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val}, vmm={use_vmm_val})[/]")
+                C.print(f"[green]vLLM server is ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val}, vmm={use_vmm_val}, kv_resize={kv_resize_val})[/]")
                 
                 # Run each experiment in this server group
                 for i, exp in enumerate(group_experiments):
@@ -2169,7 +2654,7 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                     is_first = (i == 0)
                     
                     C.print(f"\n[bold magenta]{'='*60}[/]")
-                    C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)} (sweep[{sweep_idx}], kernel={kernel_val}, blk={block_size_val}, vmm={use_vmm_val})[/]")
+                    C.print(f"[bold magenta]Experiment {experiment_count}/{len(experiments_to_run)} (sweep[{sweep_idx}], kernel={kernel_val}, blk={block_size_val}, vmm={use_vmm_val}, kv_resize={kv_resize_val})[/]")
                     C.print(f"[bold magenta]vars: {exp.vars_mapping}[/]")
                     C.print(f"[bold magenta]PP partition: {exp.vllm_spec.pp_layer_partition}[/]")
                     C.print(f"[bold magenta]{'='*60}[/]\n")
@@ -2198,6 +2683,28 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 if log_redirector:
                     log_redirector.close()
                 time.sleep(3)
+
+        for exp in restart_between_repetition_experiments:
+            experiment_count += 1
+            C.print(f"\n[bold magenta]{'='*60}[/]")
+            C.print(
+                f"[bold magenta]Standalone repetition-restart experiment {experiment_count}/{len(experiments_to_run)}[/]"
+            )
+            C.print(f"[bold magenta]vars: {exp.vars_mapping}[/]")
+            C.print(f"[bold magenta]{'='*60}[/]\n")
+
+            ok = _run_single_sweep_experiment(
+                exp.vllm_spec,
+                exp.bench_spec,
+                logm,
+                exp.vars_mapping,
+            )
+
+            if not ok:
+                all_ok = False
+                C.print(
+                    f"[yellow]Standalone repetition-restart experiment {experiment_count}/{len(experiments_to_run)} failed[/]"
+                )
         
         status = "All succeeded" if all_ok else "Some failed"
         if skipped_count > 0:

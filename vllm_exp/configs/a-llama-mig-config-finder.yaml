@@ -1,7 +1,7 @@
 # Debug Repetition Test Configuration (sweep_test format)
 # Run with: python -m vllm_exp.run sweep-test --config vllm_exp/configs/debug_repetition_sweep.yaml --log-dir logs/agent/
 
-project: "config-finder-llama-latest-4"
+project: "config-finder-llama-new"
 type: "sweep_test"
 
 envs:
@@ -18,7 +18,7 @@ envs:
   CUDA_LAUNCH_BLOCKING: "0"
   PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
   VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
-  VLLM_USE_RAY_COMPILED_DAG: "1"
+  VLLM_USE_RAY_COMPILED_DAG: "16.80"
   NCCL_SOCKET_IFNAME: "bond0.3027"
   GLOO_SOCKET_IFNAME: "bond0.3027"
   VLLM_SERVER_DEV_MODE: "1"  # Enable /set_pp_config endpoint
@@ -31,16 +31,16 @@ static_config:
   network:
     rank_to_ip:
       0: "spartan-gpgpu166"
-      1: "spartan-gpgpu002"
+      1: "spartan-gpgpu001"
     rank_to_node:
       0: "spartan-gpgpu166"
-      1: "spartan-gpgpu002"
+      1: "spartan-gpgpu001"
   vllm:
     head_addr: "localhost"
     pipeline_parallel_size: 2
     gpu_memory_utilization: 0.95
     max_model_len: 4000
-    disable_memory_overhead_monitor: true
+    disable_memory_overhead_monitor: false
     chunked_prefill: true
     enable_cuda_graph: false
     enable_nsight: false
@@ -52,7 +52,6 @@ static_config:
     profile: false
     num_total_requests: 100  # Shared across all sweep combinations
     print_outputs: true
-    repetition: 3  # Shared across all sweep combinations
     warmup:
       enabled: false
       num_total_requests: 25
@@ -63,29 +62,42 @@ sweep_configs:
   - vllm:
       attention_kernel: [direct]
       fixed_num_gpu_blocks: [-1] 
-      weight_chunk_size_mb: [160]
+      weight_chunk_size_mb: [5]
       migration_approach: [async]
       use_vmm: [true]
-      block_size: [128]
+      block_size: [256]
     benchmark:
-      repetition: 3          # 3 repetitions to test the feature
       num_total_requests: 100  # Small number for quick testing
       # pp_layer_configs: ["36, 44", "40,40"]  # pp_layer_partition strings
-      pp_layer_configs: ["36, 44", "40, 40", "44, 36", "48, 32", "52, 28", "56, 24", "60, 20", "64, 16"]  # pp_layer_partition strings
-      request_rates: [0.5, 1, 1.5, 2, 2.5, 3.0]
+      # pp_layer_configs: ["36, 44", "40, 40", "44, 36", "48, 32", "52, 28", "56, 24", "60, 20", "64, 16"]  # pp_layer_partition strings
+      pp_layer_configs: ["38, 42", "42, 38", "46, 34", "50, 30", "54, 26", "58, 22", "62, 18", "66, 14"]  # pp_layer_partition strings
+      # pp_layer_configs: ["40, 40", "44, 36", "48, 32", "52, 28", "56, 24", "60, 20"]  # pp_layer_partition strings
+      # pp_layer_configs: ["36, 44", "64, 16"]
+      # request_rates: [1, 2, 3]
+      request_rates: [3]
       input_lens: [512]
       output_lens: [16]
   - vllm:
       attention_kernel: [direct]
-      fixed_num_gpu_blocks: [-1]
-      weight_chunk_size_mb: [160]
+      fixed_num_gpu_blocks: [-1] 
+      weight_chunk_size_mb: [5]
       migration_approach: [async]
       use_vmm: [true]
-      block_size: [128]
+      block_size: [256]
     benchmark:
-      num_total_requests: 100  # Small number for quick testing
-      repetition: 3          # 3 repetitions to test the feature
-      pp_layer_configs: ["36, 44", "40, 40", "44, 36", "48, 32", "52, 28", "56, 24", "60, 20", "64, 16"]  # pp_layer_partition strings
-      request_rates: [0.5, 1, 1.5, 2, 2.5, 3.0]
-      input_lens: [128]
-      output_lens: [512]
+      num_total_requests: 50  # Small number for quick testing
+      # pp_layer_configs: ["36, 44", "40,40"]  # pp_layer_partition strings
+      # pp_layer_configs: ["36, 44", "40, 40", "44, 36", "48, 32", "52, 28", "56, 24", "60, 20", "64, 16"]  # pp_layer_partition strings
+      pp_layer_configs: ["38, 42", "42, 38", "46, 34", "50, 30", "54, 26", "58, 22", "62, 18", "66, 14"]  # pp_layer_partition strings
+      # pp_layer_configs: ["40, 40", "44, 36", "48, 32", "52, 28", "56, 24", "60, 20"]  # pp_layer_partition strings
+      # pp_layer_configs: ["36, 44", "64, 16"]
+      # request_rates: [1, 2, 3]
+      requests:
+        - 0:
+            request_rate: 2 
+            input_lens: 512
+            output_lens: 16
+          100:
+            request_rate: 2
+            input_lens: 128
+            output_lens: 512
