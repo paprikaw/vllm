@@ -266,10 +266,37 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # PtrTable should already be initialized via commit_ptr_tables()
             # called during dynamic_initialize_kv_cache_flexi or finish_migration
             if self.k_ptr_table is None or self.v_ptr_table is None:
-                raise RuntimeError(
-                    f"PtrTable not initialized. "
-                    "Ensure commit_ptr_tables() is called after KV cache initialization."
-                )
+                if self.k_ptr_tensors and self.v_ptr_tensors:
+                    start_layer = getattr(self.model.model, "start_layer", 0)
+                    logger.info(
+                        "PtrTable missing before first active forward; "
+                        "committing %d layers with start_layer=%d",
+                        len(self.k_ptr_tensors), start_layer)
+                    self.commit_ptr_tables(
+                        self.k_ptr_tensors,
+                        self.v_ptr_tensors,
+                        target_start_layer=start_layer)
+                else:
+                    raise RuntimeError(
+                        f"PtrTable not initialized. "
+                        "Ensure commit_ptr_tables() is called after KV cache initialization."
+                    )
+            else:
+                sched_start, sched_end = self.model.get_sched_layers()
+                ptr_start = self._ptr_table_start_layer
+                ptr_end = ptr_start + self.k_ptr_table.num_layers
+                if sched_start < ptr_start or sched_end > ptr_end:
+                    target_start = getattr(self.model.model, "start_layer", 0)
+                    logger.info(
+                        "PtrTable range [%d, %d) does not cover scheduled "
+                        "layers [%d, %d); recommitting %d layers with "
+                        "start_layer=%d",
+                        ptr_start, ptr_end, sched_start, sched_end,
+                        len(self.k_ptr_tensors), target_start)
+                    self.commit_ptr_tables(
+                        self.k_ptr_tensors,
+                        self.v_ptr_tensors,
+                        target_start_layer=target_start)
             
             # Use the committed PtrTable's num_layers, NOT len(k_ptr_tensors)
             # During migration, k_ptr_tensors may have been extended with new layer slots,
@@ -1458,6 +1485,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
             logger.info(f"[VMM init] Stored handles for {len(self.key_handles)} layers, "
                         f"first layer has {len(self.key_handles[0]) if self.key_handles else 0} handles, "
                         f"combined_mode={getattr(self, 'vmm_combined_mode', False)}")
+
+        if num_layers == 0:
+            logger.info("[VMM init] Skipping ptr table commit for inactive "
+                        "zero-layer PP rank")
+            del kv_caches
+            return
         
         # Initialize PtrTable stacked tensors after binding all KV caches (direct mode only)
         if self.vllm_config.dynamic_config.use_direct_ptr:
@@ -1535,6 +1568,17 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # This can happen for:
         # 1. is_first_time=True (initial setup)
         # 2. Sender calling commit after deleting layers (never called prepare)
+        if (self._pending_k_ptr_table is not None
+                and self._pending_k_ptr_table.num_layers
+                != len(k_ptr_tensor_list)):
+            logger.info(
+                "Discarding stale pending PtrTable with %d layers; "
+                "rebuilding for %d layers",
+                self._pending_k_ptr_table.num_layers,
+                len(k_ptr_tensor_list))
+            self._pending_k_ptr_table = None
+            self._pending_v_ptr_table = None
+
         if self._pending_k_ptr_table is None:
             self.prepare_ptr_tables(len(k_ptr_tensor_list))
         

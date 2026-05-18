@@ -3,8 +3,14 @@
 import os
 import sched
 import traceback
+from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Dict, Tuple, Union
 
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    set_pp_group_active_ranks,
+)
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.executor.ray_utils import RayWorkerWrapper
@@ -14,12 +20,116 @@ import torch
 from vllm.v1.core.sched.dynamic_scheduler import create_from_dynamic_scheduler_output
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 import time
+import vllm.envs as envs
 
 if TYPE_CHECKING:
     from vllm.v1.outputs import ModelRunnerOutput
 
 logger = init_logger(__name__)
 PG_WAIT_TIMEOUT = 1800
+
+
+@dataclass
+class PPNCCLIntermediateMetadata:
+    tensors: dict[str, tuple[tuple[int, ...], str]]
+    send_time: float
+
+
+def _dynamic_pp_nccl_transport_enabled() -> bool:
+    return os.getenv("VLLM_DYNAMIC_PP_NCCL_TRANSPORT", "0") == "1"
+
+
+def _sync_dynamic_pp_nccl_before_return() -> bool:
+    return os.getenv("VLLM_DYNAMIC_PP_NCCL_SYNC_BEFORE_RETURN", "0") == "1"
+
+
+def _pending_pp_nccl_send_limit(pp_group, tensors_per_batch: int) -> int:
+    env_limit = os.getenv("VLLM_DYNAMIC_PP_NCCL_PENDING_SEND_LIMIT")
+    if env_limit is not None:
+        return max(1, int(env_limit))
+    active_depth = len(pp_group.routing_ranks)
+    return max(16, active_depth * active_depth * max(1, tensors_per_batch))
+
+
+def _dtype_to_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _name_to_dtype(name: str) -> torch.dtype:
+    dtype = getattr(torch, name, None)
+    if dtype is None:
+        raise ValueError(f"Unsupported PP NCCL tensor dtype: {name}")
+    return dtype
+
+
+def _rank_to_group_index(pp_group, global_rank: int) -> int:
+    try:
+        return pp_group.ranks.index(global_rank)
+    except ValueError as exc:
+        raise ValueError(
+            f"Rank {global_rank} is not in PP group {pp_group.ranks}") from exc
+
+
+def _send_intermediate_tensors_nccl(
+    worker: DynamicGPUWorker,
+    tensors: IntermediateTensors,
+) -> PPNCCLIntermediateMetadata:
+    pp_group = get_pp_group()
+    dst = _rank_to_group_index(pp_group, pp_group.next_rank)
+    metadata = PPNCCLIntermediateMetadata(
+        tensors={
+            name: (tuple(tensor.shape), _dtype_to_name(tensor.dtype))
+            for name, tensor in tensors.tensors.items()
+        },
+        send_time=time.time(),
+    )
+    pending = getattr(worker, "_pending_pp_nccl_sends", None)
+    if pending is None:
+        pending = []
+        worker._pending_pp_nccl_sends = pending
+    for tensor in tensors.tensors.values():
+        send_tensor = tensor.contiguous()
+        pp_group.send(send_tensor, dst=dst)
+        pending.append(send_tensor)
+    keep_limit = _pending_pp_nccl_send_limit(pp_group, len(metadata.tensors))
+    if len(pending) > keep_limit:
+        del pending[:-keep_limit]
+    logger.info("[forward]: rank %s enqueued PP NCCL send to rank %s "
+                "for tensors %s", worker.rank, pp_group.next_rank,
+                list(metadata.tensors.keys()))
+    return metadata
+
+
+def _recv_intermediate_tensors_nccl(
+    metadata: PPNCCLIntermediateMetadata,
+) -> IntermediateTensors:
+    pp_group = get_pp_group()
+    src = _rank_to_group_index(pp_group, pp_group.prev_rank)
+    tensors = {}
+    for name, (shape, dtype_name) in metadata.tensors.items():
+        tensors[name] = pp_group.recv(torch.Size(shape),
+                                      _name_to_dtype(dtype_name),
+                                      src=src)
+    logger.info("[forward]: rank %s enqueued PP NCCL recv from rank %s "
+                "for tensors %s", pp_group.rank, pp_group.prev_rank,
+                list(tensors.keys()))
+    return IntermediateTensors(tensors)
+
+
+@contextmanager
+def _batch_pp_routing(pp_layer_config):
+    pp_group = get_pp_group()
+    previous_active_ranks = (list(pp_group.active_ranks)
+                             if pp_group.active_ranks is not None else None)
+    batch_active_ranks = [
+        rank for rank, (start, end) in enumerate(pp_layer_config)
+        if end >= start
+    ]
+    set_pp_group_active_ranks(batch_active_ranks)
+    try:
+        yield
+    finally:
+        set_pp_group_active_ranks(previous_active_ranks)
 
 try:
     import ray
@@ -38,6 +148,11 @@ try:
 
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
+
+        def reset_ray_compiled_dag_nccl_lock(self) -> None:
+            from ray.experimental.channel.nccl_group import set_global_nccl_lock
+            set_global_nccl_lock(None)
+
         def execute_model_ray(
             self,
             scheduler_output: Union["DynamicSchedulerOutput",
@@ -69,6 +184,13 @@ try:
                             scheduler_output, intermediate_tensors, upstream_send_time = scheduler_output
                         else:
                             scheduler_output, intermediate_tensors = scheduler_output
+                        if isinstance(intermediate_tensors,
+                                      PPNCCLIntermediateMetadata):
+                            upstream_send_time = (
+                                intermediate_tensors.send_time or None)
+                            intermediate_tensors = (
+                                _recv_intermediate_tensors_nccl(
+                                    intermediate_tensors))
                     else:
                         scheduler_output, intermediate_tensors = scheduler_output, None
 
@@ -124,32 +246,38 @@ try:
                         logger.info(f"[forward]: rank {self.rpc_rank} Acquired forward_lock for executing model, took {human_readable_duration(time.time() - time_before_lock)}")
                         assert isinstance(scheduler_output, DynamicSchedulerOutput), f"Scheduler output is not a DynamicSchedulerOutput:{type(scheduler_output)}"
 
-                        # 计算通信时间（如果有上游数据）
-                        self.worker.async_migration_before_execute_callback(scheduler_output)
-                        time_after_before_execute_callback = time.time()
+                        routing_context = (
+                            _batch_pp_routing(scheduler_output.pp_layer_config)
+                            if envs.VLLM_USE_RAY_COMPILED_DAG
+                            else nullcontext()
+                        )
+                        with routing_context:
+                            # 计算通信时间（如果有上游数据）
+                            self.worker.async_migration_before_execute_callback(scheduler_output)
+                            time_after_before_execute_callback = time.time()
 
-                        # Execute model in high priority stream
-                        exec_start = time.time()
-                        assert self.worker.inference_stream is not None, "high_priority_stream is not initialized"
-                        # with torch.cuda.stream(self.worker.inference_stream):
-                        try:
-                            logger.info(f"forwarding from layer{scheduler_output.pp_layer_config[self.worker.rank][0]} to layer{scheduler_output.pp_layer_config[self.worker.rank][1]}")
-                            output = self.worker.model_runner.execute_model(
-                            create_from_dynamic_scheduler_output(scheduler_output), 
-                            scheduler_output.pp_layer_config[self.rpc_rank],
-                            intermediate_tensors)
-                        except Exception as e:
-                            print(traceback.format_exc())
-                            print(f"scheduler_output: {scheduler_output}")
-                            print(f"error is raised within the compiled ray DAG graph, error: {e}")
-                            time.sleep(1)
-                            raise e
-                    time_after_execute = time.time()
+                            # Execute model in high priority stream
+                            exec_start = time.time()
+                            assert self.worker.inference_stream is not None, "high_priority_stream is not initialized"
+                            # with torch.cuda.stream(self.worker.inference_stream):
+                            try:
+                                logger.info(f"forwarding from layer{scheduler_output.pp_layer_config[self.worker.rank][0]} to layer{scheduler_output.pp_layer_config[self.worker.rank][1]}")
+                                output = self.worker.model_runner.execute_model(
+                                create_from_dynamic_scheduler_output(scheduler_output),
+                                scheduler_output.pp_layer_config[self.rpc_rank],
+                                intermediate_tensors)
+                            except Exception as e:
+                                print(traceback.format_exc())
+                                print(f"scheduler_output: {scheduler_output}")
+                                print(f"error is raised within the compiled ray DAG graph, error: {e}")
+                                time.sleep(1)
+                                raise e
+                        time_after_execute = time.time()
 
-                    assert(len(self.worker.model_runner.input_batch.block_table.block_tables) == 1) # Only for consistent shape of attention
+                        assert(len(self.worker.model_runner.input_batch.block_table.block_tables) == 1) # Only for consistent shape of attention
 
-                    self.worker.async_migration_after_execute_callback(scheduler_output)
-                    time_after_execute_callback = time.time()
+                        self.worker.async_migration_after_execute_callback(scheduler_output)
+                        time_after_execute_callback = time.time()
 
                     # 在发送给下游前，打包时间戳
                     if isinstance(output, IntermediateTensors):
@@ -174,7 +302,13 @@ try:
                         # if any(v.shape[0] != _diag_total for v in output.tensors.values()):
                         #     logger.error(f"[DIAG_SEND] MISMATCH DETECTED at sender! "
                         #                 f"sched_total={_diag_total} but tensor dim0={[v.shape[0] for v in output.tensors.values()]}")
-                        output = (scheduler_output, output, send_time)
+                        if (_dynamic_pp_nccl_transport_enabled()
+                                and not envs.VLLM_USE_RAY_COMPILED_DAG):
+                            metadata = _send_intermediate_tensors_nccl(
+                                self.worker, output)
+                            output = (scheduler_output, metadata)
+                        else:
+                            output = (scheduler_output, output, send_time)
 
                     if upstream_send_time is not None:
                         comm_time = (time_recv - upstream_send_time) * 1000  # ms
@@ -202,7 +336,13 @@ try:
                         else:
                             logger.info(f"[forward]: rank {self.rpc_rank} Communication time from upstream: {comm_time:.2f} ms, no received data")
                     before_sync = time.time()
-                    self.worker.inference_stream.synchronize() 
+                    if (not _dynamic_pp_nccl_transport_enabled()
+                            or envs.VLLM_USE_RAY_COMPILED_DAG
+                            or _sync_dynamic_pp_nccl_before_return()
+                            or not isinstance(output, tuple)
+                            or not isinstance(output[1],
+                                              PPNCCLIntermediateMetadata)):
+                        self.worker.inference_stream.synchronize()
                     logger.info(f"""
                     [forward]: forwarding from layer{scheduler_output.pp_layer_config[self.worker.rank][0]} to layer{scheduler_output.pp_layer_config[self.worker.rank][1]},
                     [forward]: before execute callback time: {time_after_before_execute_callback - time_recv:.2f} seconds,

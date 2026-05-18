@@ -700,6 +700,9 @@ def get_kv_cache_config(vllm_config: VllmConfig,
     Returns:
         The generated KVCacheConfigs
     """
+    if not kv_cache_spec:
+        return KVCacheConfig(num_blocks=0, tensors={}, kv_cache_groups=[])
+
     check_enough_kv_cache_memory(vllm_config, kv_cache_spec, available_memory)
     unify_hybrid_kv_cache_specs(kv_cache_spec)
     if is_kv_cache_type_uniform(kv_cache_spec):
@@ -730,10 +733,17 @@ def unify_kv_cache_configs(kv_cache_configs: list[KVCacheConfig]):
         kv_cache_config.kv_cache_groups.sort(
             key=lambda x: x.kv_cache_spec.type_id)
 
+    non_empty_configs = [
+        kv_cache_config for kv_cache_config in kv_cache_configs
+        if kv_cache_config.kv_cache_groups
+    ]
+    if not non_empty_configs:
+        return kv_cache_configs
+
     # Verify that the groups of each rank are the same.
-    for kv_cache_config in kv_cache_configs[1:]:
+    for kv_cache_config in non_empty_configs[1:]:
         for group_rank_0, group_rank_i in zip(
-                kv_cache_configs[0].kv_cache_groups,
+                non_empty_configs[0].kv_cache_groups,
                 kv_cache_config.kv_cache_groups):
             assert group_rank_0.kv_cache_spec == group_rank_i.kv_cache_spec
 
@@ -742,13 +752,15 @@ def unify_kv_cache_configs(kv_cache_configs: list[KVCacheConfig]):
     # do not need to shrink the tensor size because it is valid to only use the
     # first `num_blocks` blocks of the tensor.
     min_num_blocks = min(kv_cache_config.num_blocks
-                         for kv_cache_config in kv_cache_configs)
+                         for kv_cache_config in non_empty_configs)
     for kv_cache_config in kv_cache_configs:
         kv_cache_config.num_blocks = min_num_blocks
 
     # We do not need to shrink the tensor size because it is valid to only use
     # the first `num_blocks` blocks of the tensor.
     for kv_cache_config in kv_cache_configs:
+        if not kv_cache_config.kv_cache_groups:
+            continue
         kv_cache_config.tensors = {
             layer_name: KVCacheTensor(size=kv_cache_config.num_blocks * kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes)
             for layer_name in kv_cache_config.tensors

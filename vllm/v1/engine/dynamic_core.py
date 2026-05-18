@@ -51,6 +51,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.core.sched.dynamic_scheduler import ChangeConfigurationType
 from vllm.v1.core.sched.dynamic_scheduler import DynamicScheduler
 from vllm.v1.core.sched.dynamic_scheduler import MigrationStatus
 from vllm.dynamic_config import PPLayerConfigs
@@ -306,6 +307,32 @@ class DynamicEngineCore(EngineCore):
         logger.info(
             "Applied pipeline autoscaling placement generation=%s active_ranks=%s",
             self._placement_generation, active_ranks)
+        self._refresh_batch_queue_for_active_pp_ranks()
+
+    def _refresh_batch_queue_for_active_pp_ranks(self) -> None:
+        if not hasattr(self, "batch_queue_size"):
+            return
+        new_size = self.model_executor.max_concurrent_batches
+        if new_size == self.batch_queue_size:
+            return
+        current_queue = self.batch_queue
+        if current_queue is not None and not current_queue.empty():
+            self._pending_batch_queue_size = new_size
+            logger.info(
+                "Deferring batch queue resize from %s to %s until %s "
+                "queued batches finish",
+                self.batch_queue_size, new_size, _safe_queue_size(current_queue))
+            return
+
+        old_size = self.batch_queue_size
+        self.batch_queue_size = new_size
+        self.batch_queue = (queue.Queue(new_size) if new_size > 1 else None)
+        if hasattr(self, "step_fn"):
+            self.step_fn = (self.step if self.batch_queue is None else
+                            self.step_with_batch_queue)
+        self._pending_batch_queue_size = None
+        logger.info("Updated batch queue size from %s to %s for active PP ranks",
+                    old_size, new_size)
 
 
         
@@ -503,7 +530,11 @@ class DynamicEngineCore(EngineCore):
             max_blocks_per_layer = 6666666666
             for rank, mem_info in enumerate(mem_infos):
                 num_layers_on_rank = self.cur_pp_layer_config[rank][1] - self.cur_pp_layer_config[rank][0] + 1
+                if num_layers_on_rank <= 0:
+                    continue
                 max_blocks_per_layer = min(max_blocks_per_layer, self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes, num_layers_on_rank, mem_info.runtime_overhead_bytes))
+            if max_blocks_per_layer == 6666666666:
+                raise RuntimeError("No active layers found for KV cache initialization")
             logger.info(f"[operation]: initialize kv cache with max blocks per layer: {max_blocks_per_layer}")
         
         # Update kv_cache_configs with the calculated max_blocks_per_layer
@@ -705,6 +736,9 @@ class DynamicEngineCore(EngineCore):
                 engine_core_outputs = self.scheduler.update_from_output(
                     scheduler_output, model_output)
                 update_time = time.time() - update_start
+                if (getattr(self, "_pending_batch_queue_size", None)
+                        is not None and self.batch_queue.empty()):
+                    self._refresh_batch_queue_for_active_pp_ranks()
             logger.info(f"[forward]: step with batch queue in {time.time() - time_start:.2f} seconds")
 
             return engine_core_outputs
@@ -1094,6 +1128,13 @@ class DynamicEngineCore(EngineCore):
                     assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
 
                 resized_block_num = min(deleting_layer_assesses)
+                if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+                    current_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
+                    logger.info(
+                        "[autoscaling async] keeping current KV block count "
+                        "%s during PP expand switch; deferred growth target was %s",
+                        current_blocks, resized_block_num)
+                    resized_block_num = current_blocks
                 if not allow_resize:
                     # When fixed_num_gpu_blocks is set, keep the current block count
                     resized_block_num = self.scheduler.kv_cache_manager.num_gpu_blocks
@@ -1104,9 +1145,32 @@ class DynamicEngineCore(EngineCore):
                         assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
                         logger.info(f"[memory access] start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
 
-                self.scheduler.async_change_configuration(pp_layer_config, resized_block_num)
-                self.cur_pp_layer_config = pp_layer_config
-                self._apply_active_pp_ranks_for_config(pp_layer_config)
+                with self.engine_lock:
+                    drain_start = time.time()
+                    engine_core_outputs = self._drain_out_running_queue()
+                    for output in engine_core_outputs:
+                        if output is not None:
+                            self.output_queue.put_nowait(output)
+                    logger.info(
+                        "[autoscaling async] drained %d queued old-config "
+                        "outputs before switching active PP ranks in %s",
+                        len(engine_core_outputs),
+                        human_readable_duration(time.time() - drain_start))
+                    if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+                        self.scheduler.update_layer_config(pp_layer_config)
+                        self.scheduler.change_configuration_status = (
+                            ChangeConfigurationType.NOT_CHANGING)
+                        self.scheduler.next_pp_layer_config = None
+                        self.scheduler.next_new_kv_cache_block_num = 0
+                        self.scheduler.migration_in_process = False
+                        self.scheduler.sender_list_during_migration = None
+                        self.scheduler.receiver_list_during_migration = None
+                        self.scheduler.num_tokens_for_migration = 0
+                    else:
+                        self.scheduler.async_change_configuration(
+                            pp_layer_config, resized_block_num)
+                    self.cur_pp_layer_config = pp_layer_config
+                    self._apply_active_pp_ranks_for_config(pp_layer_config)
                 break
 
         assert resized_block_num != 0
@@ -2065,7 +2129,9 @@ class DynamicEngineCoreProc(DynamicEngineCore):
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
         waited = False
-        while not self.engines_running and not (self.scheduler.has_requests()) and self.batch_queue.empty():
+        while (not self.engines_running
+               and not self.scheduler.has_requests()
+               and (self.batch_queue is None or self.batch_queue.empty())):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True

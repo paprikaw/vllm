@@ -63,7 +63,8 @@ class PPLayerConfigs(BaseModel):
             )
         return norm
 
-    # 额外校验：确保每个 (start,end) 合法且不重叠、start<=end
+    # 额外校验：确保每个非空 (start,end) 合法且不重叠。
+    # Autoscaling uses (n, n - 1) to represent an inactive PP rank.
     @model_validator(mode='after')
     def validate_ranges(self) -> 'PPLayerConfigs':
         for k, ranges in self.pp_layer_configs.items():
@@ -72,7 +73,11 @@ class PPLayerConfigs(BaseModel):
             last_end = -1
             for (s, e) in ranges_sorted:
                 if s > e:
-                    raise ValueError(f"{k}: invalid range ({s},{e}), start must <= end")
+                    if s == e + 1:
+                        continue
+                    raise ValueError(
+                        f"{k}: invalid range ({s},{e}), start must <= end "
+                        "or be an empty autoscaling range (n,n-1)")
                 if s <= last_end:
                     raise ValueError(f"{k}: ranges overlap or not strictly increasing near {s},{e}")
                 last_end = e

@@ -213,3 +213,7 @@ new-logs/**
 new-logs-1/**
 
 draws/*.png
+
+# Local NCCL probe workspaces
+nccl_dynamic_group_probe/
+nccl_grow_shrink_probe/

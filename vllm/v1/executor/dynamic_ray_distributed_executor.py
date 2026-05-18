@@ -1,19 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
+from concurrent.futures import Future as StdFuture
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
+import msgspec
 import os
 from collections import defaultdict
+import torch
 from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
 from vllm.executor.ray_distributed_executor import RayWorkerMetaData
-from vllm.v1.executor.dynamic_utils import DynamicRayWorkerWrapper
+from vllm.executor.msgspec_utils import encode_hook
+from vllm.v1.executor.dynamic_utils import (
+    DynamicRayWorkerWrapper,
+    PPNCCLIntermediateMetadata,
+)
 from vllm.v1.core.sched.dynamic_scheduler import DynamicSchedulerOutput
 import vllm.envs as envs
-from vllm.executor.ray_utils import (RayWorkerWrapper, 
+from vllm.executor.ray_utils import (RayWorkerWrapper, initialize_ray_cluster,
                                      ray)
 from vllm.logger import init_logger
+from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.platforms import current_platform
 from vllm.utils import (get_distributed_init_method,
-                        get_ip, get_open_port)
+                        get_ip, get_open_port, make_async)
 from bitarray import bitarray
 if ray is not None:
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -27,6 +36,25 @@ from vllm.v1.executor.ray_distributed_executor import FutureWrapper
 from vllm.v1.utils import WorkerMemInfo
 from vllm.v1.worker.utils import KVBufferStatus
 logger = init_logger(__name__)
+
+
+class RayObjectRefFuture(StdFuture):
+    """Future wrapper for a plain Ray ObjectRef.
+
+    Ray Compiled DAG refs expose `.get()`, while regular Ray ObjectRefs are
+    consumed with `ray.get()`. The v1 engine only needs `result()`.
+    """
+
+    def __init__(self, ref, refs=None):
+        super().__init__()
+        self.ref = ref
+        self.refs = list(refs) if refs is not None else [ref]
+
+    def result(self, timeout=None):
+        if timeout is not None:
+            raise NotImplementedError("timeout is not supported")
+        return ray.get(self.ref)
+
 
 class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
@@ -268,6 +296,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             'NCCL_NET_GDR_LEVEL',
             'NCCL_P2P_LEVEL',
             'NCCL_SHM_DISABLE',
+            'VLLM_DYNAMIC_PP_NCCL_TRANSPORT',
         ]
         for var in nccl_env_vars:
             if var not in env_vars_to_copy:
@@ -405,11 +434,39 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         if self.parallel_config.tensor_parallel_size != 1:
             raise NotImplementedError(
                 "pipeline autoscaling currently supports TP=1 only")
+        if self.use_ray_compiled_dag:
+            if getattr(self, "forward_dag", None) is not None:
+                logger.info("Tearing down old compiled PP worker chain before "
+                            "switching active ranks")
+                self.forward_dag.teardown()
+            if getattr(self, "cpu_forward_dag", None) is not None:
+                logger.info("Tearing down old compiled CPU PP worker chain before "
+                            "switching active ranks")
+                self.cpu_forward_dag.teardown()
+            if self.workers:
+                ray.get([
+                    worker.reset_ray_compiled_dag_nccl_lock.remote()
+                    for worker in self.workers
+                ])
         self.pp_tp_workers = [[self.workers[rank]] for rank in active_ranks]
         self.forward_dag = None
         self.cpu_forward_dag = None
         logger.info("Updated active PP worker chain to ranks %s", active_ranks)
 
+    def _sync_request_states_for_autoscaling(self) -> None:
+        snapshots = self.collective_rpc(
+            "export_request_states_for_autoscaling")
+        if isinstance(snapshots, dict):
+            iterable = snapshots.values()
+        else:
+            iterable = snapshots
+        request_states = max(iterable, key=lambda states: len(states),
+                             default={})
+        if request_states:
+            self.collective_rpc("import_request_states_for_autoscaling",
+                                args=(request_states,))
+            logger.info("Synchronized %d request states for autoscaling",
+                        len(request_states))
 
     def _compiled_cpu_ray_dag(self, enable_asyncio: bool):
         assert self.parallel_config.use_ray
@@ -475,17 +532,118 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM)
 
     def _init_executor(self) -> None:
-        super()._init_executor()
+        dynamic_config = self.vllm_config.dynamic_config
+        use_dynamic_actor_chain = (
+            envs.VLLM_USE_V1
+            and getattr(dynamic_config, "pipeline_autoscaling_enabled", False)
+            and not envs.VLLM_USE_RAY_COMPILED_DAG
+        )
+        if not use_dynamic_actor_chain:
+            super()._init_executor()
+            self.cpu_forward_dag = None
+            return
+
+        self.forward_dag = None
+        # V1 normally forces Ray Compiled DAG. Autoscaling needs the PP chain
+        # to be selected at runtime, so keep the SPMD actor pool but avoid
+        # compiling a static DAG topology.
+        os.environ["VLLM_USE_RAY_SPMD_WORKER"] = "1"
+        os.environ["VLLM_USE_RAY_COMPILED_DAG"] = "0"
+        self.use_ray_compiled_dag = False
+        self.use_ray_spmd_worker = True
+
+        assert self.uses_ray
+        initialize_ray_cluster(self.parallel_config)
+        placement_group = self.parallel_config.placement_group
+
+        ray_usage = os.environ.get("RAY_USAGE_STATS_ENABLED", "0")
+        if ray_usage != "1":
+            os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
+
+        self._init_workers_ray(placement_group)
+        self.input_encoder = msgspec.msgpack.Encoder(enc_hook=encode_hook)
+        self.output_decoder = msgspec.msgpack.Decoder(
+            Optional[List[SamplerOutput]])
+        self.use_v1 = envs.VLLM_USE_V1
+        self.pp_locks: Optional[List[asyncio.Lock]] = None
         self.cpu_forward_dag = None
 
     def execute_model(
         self,
         scheduler_output,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
-        # 在这里我们也事先构建cpu的dag，减少migratin期间切换到cpu dag的延迟
-        # if self.cpu_forward_dag is None:  # type: ignore
-        #     self.cpu_forward_dag = self._compiled_cpu_ray_dag(enable_asyncio=False)
+        if not self.use_ray_compiled_dag and self.use_ray_spmd_worker:
+            return self._execute_model_dynamic_actor_chain(scheduler_output)
         return super().execute_model(scheduler_output)
+
+    def _execute_model_dynamic_actor_chain(
+        self,
+        scheduler_output,
+    ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
+        active_ranks = getattr(self, "active_pp_ranks", None)
+        if not active_ranks:
+            active_ranks = self._active_ranks_for_scheduler_output(
+                scheduler_output)
+        if self.parallel_config.tensor_parallel_size != 1:
+            raise NotImplementedError(
+                "dynamic Ray actor PP chain currently supports TP=1 only")
+
+        if os.getenv("VLLM_DYNAMIC_PP_NCCL_TRANSPORT", "0") == "1":
+            metadata = self._make_pp_nccl_intermediate_metadata(
+                scheduler_output)
+            refs = []
+            for index, rank in enumerate(active_ranks):
+                worker_input = (scheduler_output if index == 0 else
+                                (scheduler_output, metadata))
+                refs.append(self.workers[rank].execute_model_ray.remote(
+                    worker_input))
+            self._last_pp_nccl_refs = refs
+            final_ref = refs[-1]
+            if self.max_concurrent_batches == 1:
+                return ray.get(final_ref)
+            return RayObjectRefFuture(final_ref, refs=refs)
+
+        ref_or_value = scheduler_output
+        for rank in active_ranks:
+            ref_or_value = self.workers[rank].execute_model_ray.remote(
+                ref_or_value)
+
+        if self.max_concurrent_batches == 1:
+            return ray.get(ref_or_value)
+        return RayObjectRefFuture(ref_or_value)
+
+    def _active_ranks_for_scheduler_output(self, scheduler_output) -> list[int]:
+        pp_layer_config = getattr(scheduler_output, "pp_layer_config", None)
+        if pp_layer_config is None:
+            return list(range(self.parallel_config.pipeline_parallel_size))
+        return [
+            rank for rank, (start, end) in enumerate(pp_layer_config)
+            if end >= start
+        ]
+
+    def _make_pp_nccl_intermediate_metadata(
+        self,
+        scheduler_output,
+    ) -> PPNCCLIntermediateMetadata:
+        hidden_size = getattr(self.vllm_config.model_config.hf_config,
+                              "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(self.vllm_config.model_config,
+                                  "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError("Cannot infer hidden_size for PP NCCL transport")
+        dtype = self.vllm_config.model_config.dtype
+        if not isinstance(dtype, torch.dtype):
+            dtype = getattr(torch, str(dtype).removeprefix("torch."))
+        dtype_name = str(dtype).removeprefix("torch.")
+        shape = (scheduler_output.total_num_scheduled_tokens, hidden_size)
+        return PPNCCLIntermediateMetadata(
+            tensors={
+                "hidden_states": (shape, dtype_name),
+                "residual": (shape, dtype_name),
+            },
+            send_time=0.0,
+        )
 
     def execute_cpu_model(
         self,
@@ -629,5 +787,6 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
     def set_active_pp_ranks(self, active_ranks: Optional[list[int]]) -> None:
         """Set the active PP routing subset on all workers."""
-        self._set_active_pp_ranks_local(active_ranks)
+        self._sync_request_states_for_autoscaling()
         self.collective_rpc("set_active_pp_ranks", args=(active_ranks,))
+        self._set_active_pp_ranks_local(active_ranks)

@@ -27,7 +27,7 @@ from vllm.model_executor import set_random_seed
 from vllm.v1.core.dynamic_kv_cache_utils import compact_cache_with_record
 from vllm.v1.worker.utils import get_total_gpu_memory
 from vllm.model_executor.models.dynamic_model_base import DynamicModelBase
-from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import create_ptr_tensor_from_list, dynamic_bind_single_kv_tensor, dynamic_flexi_bind_single_kv_cache, dynamic_flexi_bind_single_kv_tensor, get_layer_name_for_index, report_usage_stats, WorkerMemInfo
 from vllm.v1.worker.gpu_worker import Worker
@@ -621,7 +621,23 @@ class DynamicGPUWorker(Worker):
             super().initialize_from_config(kv_cache_config)
             return
             
-        kv_cache_spec = kv_cache_configs[self.rank].kv_cache_groups[0].kv_cache_spec
+        kv_cache_config = kv_cache_configs[self.rank]
+        if not kv_cache_config.kv_cache_groups:
+            template_group = next(
+                (cfg.kv_cache_groups[0] for cfg in kv_cache_configs
+                 if cfg.kv_cache_groups), None)
+            if template_group is None:
+                raise RuntimeError("No KV cache spec found on any worker")
+            kv_cache_config = KVCacheConfig(
+                num_blocks=num_blocks,
+                tensors={},
+                kv_cache_groups=[
+                    KVCacheGroupSpec([], template_group.kv_cache_spec)
+                ],
+            )
+            kv_cache_configs[self.rank] = kv_cache_config
+
+        kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = kv_cache_spec.block_size
         self.per_block_kv_cache_bytes = kv_cache_spec.page_size_bytes  # K+V size per block per layer
         self.block_num = num_blocks
@@ -640,10 +656,10 @@ class DynamicGPUWorker(Worker):
         with context:
             if self.vllm_config.dynamic_config.use_flexi_kv:
                 logger.info("Using flexi flash attention dynamic initialize kv cache")
-                self.model_runner.dynamic_initialize_kv_cache_flexi(kv_cache_configs[self.rank], self.dynamic_kv_synchronizer, num_blocks)
+                self.model_runner.dynamic_initialize_kv_cache_flexi(kv_cache_config, self.dynamic_kv_synchronizer, num_blocks)
             else:
                 logger.info("Using standard flash attention dynamic initialize kv cache")
-                self.model_runner.dynamic_initialize_kv_cache(kv_cache_configs[self.rank], self.dynamic_kv_synchronizer, num_blocks)
+                self.model_runner.dynamic_initialize_kv_cache(kv_cache_config, self.dynamic_kv_synchronizer, num_blocks)
             self.dynamic_kv_synchronizer.create_slot_mappings(num_blocks * self.block_size)
 
     def set_env_var(self, key: str, value: str) -> None:
@@ -667,8 +683,22 @@ class DynamicGPUWorker(Worker):
         used by model forward and pipeline output handling.
         """
         set_pp_group_active_ranks(active_ranks)
-        logger.info("Updated active PP ranks to %s", active_ranks)
-        logger.debug(f"Worker {self.rank}: set log_stop_time={enabled}")
+        logger.info("Worker %s: updated active PP ranks to %s",
+                    self.rank, active_ranks)
+
+    def export_request_states_for_autoscaling(self):
+        return deepcopy(self.model_runner.requests)
+
+    def import_request_states_for_autoscaling(self, request_states) -> None:
+        if not request_states:
+            return
+        imported = 0
+        for req_id, req_state in request_states.items():
+            if req_id not in self.model_runner.requests:
+                self.model_runner.requests[req_id] = deepcopy(req_state)
+                imported += 1
+        logger.info("Worker %s imported %d request states for autoscaling",
+                    self.rank, imported)
 
     @torch.inference_mode()
     def execute_model(
@@ -1341,6 +1371,14 @@ class DynamicGPUWorker(Worker):
         logger.info(f"start to compact kv cache for layers {runner.model.model.start_layer} to {runner.model.model.end_layer}")
         time_start = time.time()
         num_blocks = len(bitmap)
+        if is_flexi and not runner.key_caches:
+            logger.info("Skipping KV compaction on rank %s with no local KV caches",
+                        self.rank)
+            return
+        if not is_flexi and not runner.kv_caches:
+            logger.info("Skipping KV compaction on rank %s with no local KV caches",
+                        self.rank)
+            return
         if is_flexi:
             assert num_blocks == len(runner.key_caches[0]), f"bitmap length mismatch: num_blocks: {num_blocks} != kv_cache_tensor_length: {len(runner.key_caches)}"
         else:
@@ -1489,6 +1527,17 @@ class DynamicGPUWorker(Worker):
         logger.info(f"[timeline]: compact kv cache total time taken: {human_readable_duration(time.time() - time_start)}")
     
     def _maybe_switch_block(self, scheduler_output: "DynamicSchedulerOutput") -> None:
+        if (scheduler_output.current_scheduler_output_version >
+                self.cur_scheduler_output_version and
+                not self.migration_records_for_specific_scheduler_output_version):
+            logger.info(
+                "Worker %s has no local block remap records; advancing "
+                "scheduler output version from %s to %s",
+                self.rank, self.cur_scheduler_output_version,
+                scheduler_output.current_scheduler_output_version)
+            self.cur_scheduler_output_version = (
+                scheduler_output.current_scheduler_output_version)
+            return
         if scheduler_output.current_scheduler_output_version != self.cur_scheduler_output_version:
             time_start = time.time()
             assert scheduler_output.current_scheduler_output_version < self.cur_scheduler_output_version, f"Scheduler output version {scheduler_output.current_scheduler_output_version} is greater than current version {self.cur_scheduler_output_version}"
@@ -1518,6 +1567,20 @@ class DynamicGPUWorker(Worker):
         old_length = self.block_num
         if new_length == old_length:
             logger.info(f"kv cache length is already {new_length}, no need to resize, sleep 2 seconds")
+            return
+        if is_flexi and not self.model_runner.key_caches:
+            logger.info("Skipping KV resize on rank %s with no local KV caches; "
+                        "recording block_num=%s", self.rank, new_length)
+            self.block_num = new_length
+            self.dynamic_kv_synchronizer.create_slot_mappings(
+                new_length * self.block_size)
+            return
+        if not is_flexi and not self.model_runner.kv_caches:
+            logger.info("Skipping KV resize on rank %s with no local KV caches; "
+                        "recording block_num=%s", self.rank, new_length)
+            self.block_num = new_length
+            self.dynamic_kv_synchronizer.create_slot_mappings(
+                new_length * self.block_size)
             return
         
         # Check overhead BEFORE operation (if monitoring enabled)
@@ -2337,14 +2400,16 @@ class DynamicGPUWorker(Worker):
         
         num_layers = pp_layer_config[self.rank][1] - pp_layer_config[self.rank][0] + 1
         self.target_pp_layer_config = pp_layer_config
-        # Only prepare ptr_tables in direct mode (flash/flexi don't use ptr_tables)
-        if self.vllm_config.dynamic_config.use_direct_ptr:
-            self.model_runner.prepare_ptr_tables(num_layers)
         assert len(self.rank_to_layers_ids) == 0
         if self.rank not in src_to_plan:
             logger.info(f"debug: rank {self.rank} is not sending kv cache")
             return None
         self.rank_to_layers_ids = src_to_plan[self.rank]
+
+        # Only sender ranks need to prepare direct ptr tables here. Expanding
+        # autoscaling receiver ranks may not have any current ptr tensors yet.
+        if self.vllm_config.dynamic_config.use_direct_ptr:
+            self.model_runner.prepare_ptr_tables(num_layers)
         
         # 初始化 sender 线程计数
         with self._sender_threads_cv:
@@ -2394,7 +2459,7 @@ class DynamicGPUWorker(Worker):
         assert all(patch_id == 0 for patch_id in self.dynamic_kv_synchronizer.last_patch_ids.values()), "The patch id of the rank should be 0."
         slot_mapping_dev = torch.tensor(slot_mapping, device=self.device) if slot_mapping is not None else None
         assert self.migration_stream is not None
-        with self.migration_stream:
+        with torch.cuda.stream(self.migration_stream):
             for layer_id in layer_ids:
                 time_start = time.time()
                 # A PP stage can be both a sender and a receiver during PP>2
