@@ -379,6 +379,9 @@ try:
                         else:
                             output = (scheduler_output, output, send_time)
 
+                    self.worker.async_migration_after_pp_transfer_callback(
+                        scheduler_output)
+
                     if upstream_send_time is not None:
                         comm_time = (time_recv - upstream_send_time) * 1000
                         if intermediate_tensors is not None:

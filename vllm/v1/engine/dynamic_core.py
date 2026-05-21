@@ -257,6 +257,7 @@ class DynamicEngineCore(EngineCore):
         # (including do_resize on workers). set_pp_config waits on this.
         self._migration_done_event = threading.Event()
         self._migration_done_event.set()  # initially no migration in progress
+        self._autoscaling_schedule_paused = False
 
         self.scheduler_kv_cache_config: Optional[KVCacheConfig]
 
@@ -678,6 +679,73 @@ class DynamicEngineCore(EngineCore):
                 self.scheduler.finish_sync_drain()
         return engine_core_outputs
 
+    def _is_autoscaling_sync_batch(
+        self,
+        scheduler_output: Optional[DynamicSchedulerOutput],
+    ) -> bool:
+        return bool(
+            scheduler_output is not None
+            and getattr(self.vllm_config.dynamic_config,
+                        "pipeline_autoscaling_enabled", False)
+            and getattr(scheduler_output, "is_sync_after_migration", False))
+
+    def _wait_for_autoscaling_sync_state(self) -> None:
+        """Pause scheduling until the sync batch has applied all KV patches."""
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        timeout_s = float(os.environ.get(
+            "VLLM_AUTOSCALING_SYNC_WAIT_TIMEOUT_S", "300"))
+        poll_s = float(os.environ.get(
+            "VLLM_AUTOSCALING_SYNC_WAIT_INTERVAL_S", "0.01"))
+        start = time.time()
+        last_log = 0.0
+
+        while True:
+            states = self.model_executor.get_async_migration_state()
+            patches_done = all(
+                state.get("all_patch_applied", False) for state in states)
+            cleanup_done = all(
+                state.get("resizing_done", False) for state in states)
+            if patches_done:
+                logger.info(
+                    "[autoscaling sync] all KV patches applied in %s; "
+                    "worker cleanup_done=%s",
+                    human_readable_duration(time.time() - start),
+                    cleanup_done)
+                return
+
+            now = time.time()
+            if now - start > timeout_s:
+                raise RuntimeError(
+                    "Timed out waiting for autoscaling KV patches to apply: "
+                    f"states={states}")
+            if now - last_log >= 5.0:
+                logger.info(
+                    "[autoscaling sync] waiting before scheduling target "
+                    "batch: patches_done=%s cleanup_done=%s states=%s",
+                    patches_done, cleanup_done, states)
+                last_log = now
+            time.sleep(poll_s)
+
+    def _mark_autoscaling_schedule_pause_if_needed(
+        self,
+        scheduler_output: DynamicSchedulerOutput,
+    ) -> None:
+        if self._is_autoscaling_sync_batch(scheduler_output):
+            self._autoscaling_schedule_paused = True
+            logger.info(
+                "[autoscaling sync] submitted sync batch; pausing scheduler "
+                "until all workers report KV patch application")
+
+    def _finish_autoscaling_schedule_pause_if_needed(
+        self,
+        scheduler_output: DynamicSchedulerOutput,
+    ) -> None:
+        if not self._is_autoscaling_sync_batch(scheduler_output):
+            return
+        self._wait_for_autoscaling_sync_state()
+        self._autoscaling_schedule_paused = False
+        logger.info("[autoscaling sync] scheduler pause released")
+
     def step_with_batch_queue(self) -> Optional[EngineCoreOutputs]:
         """
         Copied from vllm/vllm/v1/engine/core.py
@@ -709,7 +777,9 @@ class DynamicEngineCore(EngineCore):
             # the scheduler may return an empty batch if all requests are scheduled.
             # Note that this is not blocking.
             isinstance(self.scheduler, DynamicScheduler)
-            if _safe_queue_size(self.batch_queue) < self.batch_queue_size:
+            if (not self._autoscaling_schedule_paused
+                    and _safe_queue_size(self.batch_queue)
+                    < self.batch_queue_size):
                 schedule_start = time.time()
                 scheduler_output = self.scheduler.dynamic_schedule()
                 schedule_time = time.time() - schedule_start
@@ -723,6 +793,8 @@ class DynamicEngineCore(EngineCore):
                     logger.info(f"Scheduled tokens: {scheduler_output.total_num_scheduled_tokens}")
                     self.batch_queue.put_nowait(
                         (future, scheduler_output))  # type: ignore
+                    self._mark_autoscaling_schedule_pause_if_needed(
+                        scheduler_output)
 
             scheduled_batch = (scheduler_output is not None
                                and scheduler_output.total_num_scheduled_tokens > 0)
@@ -743,6 +815,9 @@ class DynamicEngineCore(EngineCore):
                 engine_core_outputs = self.scheduler.update_from_output(
                     scheduler_output, model_output)
                 update_time = time.time() - update_start
+                assert isinstance(scheduler_output, DynamicSchedulerOutput)
+                self._finish_autoscaling_schedule_pause_if_needed(
+                    scheduler_output)
                 if (getattr(self, "_pending_batch_queue_size", None)
                         is not None and self.batch_queue.empty()):
                     self._refresh_batch_queue_for_active_pp_ranks()

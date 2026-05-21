@@ -7,7 +7,7 @@ from operator import is_
 import os
 from pdb import run
 from sched import scheduler
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 import threading
 import math
 from regex import F
@@ -1470,6 +1470,27 @@ class DynamicGPUWorker(Worker):
 
     def get_is_kv_resizing_done(self) -> bool:
         return self.kv_resizing_done
+
+    def get_async_migration_state(self) -> dict[str, Any]:
+        with self._all_patch_applied_cv:
+            patch_status = dict(self.is_all_patch_applied)
+            all_patch_applied = all(patch_status.values())
+        with self._sender_threads_cv:
+            active_sender_threads = self._num_active_sender_threads
+        with self.resizing_done_cv:
+            resizing_done = self.resizing_done
+        return {
+            "rank": self.rank,
+            "all_patch_applied": all_patch_applied,
+            "patch_status": patch_status,
+            "active_sender_threads": active_sender_threads,
+            "receive_in_process": self.receive_in_process,
+            "resizing_done": resizing_done,
+            "kv_resizing_done": self.kv_resizing_done,
+            "after_migration_total_token": self.after_migration_total_token,
+            "after_migration_applied_token_num": (
+                self.after_migration_applied_token_num),
+        }
 
     def get_kv_cache_spec_for_layers(self, rank: int, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
         if self.rank != rank:
@@ -3160,6 +3181,21 @@ class DynamicGPUWorker(Worker):
     def all_patch_applied(self) -> bool:
         return all(self.is_all_patch_applied.values())
 
+    def wait_for_all_patch_applied(self, reason: str) -> None:
+        time_start = time.time()
+        with self._all_patch_applied_cv:
+            while not self.all_patch_applied():
+                logger.info(
+                    "[autoscaling sync] rank %s waiting for all KV patches "
+                    "before %s: status=%s",
+                    self.rank, reason, dict(self.is_all_patch_applied))
+                self._all_patch_applied_cv.wait(timeout=5.0)
+        logger.info(
+            "[timeline]: rank %s waited for all KV patches before %s, "
+            "time taken: %s",
+            self.rank, reason,
+            human_readable_duration(time.time() - time_start))
+
     # ########################################
     # Callback funtions executed inside the forwarding loop #
     # ######################################## 
@@ -3252,81 +3288,101 @@ class DynamicGPUWorker(Worker):
                 logger.info(f"Sender added kv patch to synchronizer, is finished: {is_sync}, num total new tokens: {num_total_new_tokens}")
 
             if is_sync:
-                time_start_to_sync = time.time()
+                logger.info(
+                    "[autoscaling sync] rank %s deferred sync KV cleanup "
+                    "until after PP hidden-state transfer",
+                    self.rank)
+
+    def async_migration_after_pp_transfer_callback(
+            self, scheduler_output: "DynamicSchedulerOutput"):
+        if not isinstance(self.model_runner.model, DynamicModelBase):
+            return
+        if (not scheduler_output.migration_in_process
+                or not scheduler_output.is_sync_after_migration):
+            return
+        assert scheduler_output.sender_list is not None
+        assert scheduler_output.receiver_list is not None
+        is_sender = self.rank in scheduler_output.sender_list
+        is_receiver = self.rank in scheduler_output.receiver_list
+        num_total_migration_tokens = scheduler_output.total_migration_tokens
+
+        time_start_to_sync = time.time()
+        # Set CUDA device for this thread - threads don't inherit CUDA context
+        torch.cuda.set_device(self.device)
+        time_start = time.time()
+        logger.info(f"[operation]: before finish kv cache transfer start to finish kv cache tansfer, delete layers, release kv cache, reinitialize kv cache")
+        if is_receiver:
+            self.wait_for_all_patch_applied("sync KV cache cleanup")
+        # Sender finishes transfer and cleans up; receiver no-ops.
+        layer_ranges = []
+        for layers in self.rank_to_layers_ids.values():
+            # Assert the layers are sorted
+            assert layers == sorted(layers), "The layers should be sorted"
+            layer_ranges.append((layers[0], layers[-1]))
+
+        assert self.target_pp_layer_config is not None, "target_pp_layer_config must be set"
+        handles_to_free_key: list[list[int]] = []
+        handles_to_free_value: list[list[int]] = []
+        grouped_handles_to_free: list[tuple[list[int], list[int]]] = []  # (handles, base_k_ptrs) tuples
+        if layer_ranges:
+            caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free = self.atomic_shelve_kv_cache(self.rank, layer_ranges)
+
+        start_layer, end_layer = self.target_pp_layer_config[self.rank]
+        target_num_layers = end_layer - start_layer + 1
+        is_direct = self.vllm_config.dynamic_config.use_direct_ptr
+        if is_direct and target_num_layers > 0:
+            self.model_runner.commit_ptr_tables(self.model_runner.k_ptr_tensors, self.model_runner.v_ptr_tensors, target_start_layer=start_layer)
+        elif is_direct:
+            logger.info(
+                "[autoscaling async] rank %s target PP range is empty "
+                "(%s, %s); skip PtrTable commit",
+                self.rank, start_layer, end_layer)
+        self.target_pp_layer_config = None
+
+        # Set resizing_done = False BEFORE starting the thread, unconditionally
+        # This ensures wait_for_resize_done() will block until do_resize completes
+        with self.resizing_done_cv:
+            self.resizing_done = False
+
+        # Also reset kv_resizing_done as a safety net (already reset in
+        # start_kv_cache_migration_async, but reinforce here at sync point)
+        self.kv_resizing_done = False
+
+        def do_resize():
+            try:
                 # Set CUDA device for this thread - threads don't inherit CUDA context
                 torch.cuda.set_device(self.device)
-                assert scheduler_output.sender_list is not None, "If is sync migration, the sender list should not be None"
-                time_start = time.time()
-                logger.info(f"[operation]: before finish kv cache transfer start to finish kv cache tansfer, delete layers, release kv cache, reinitialize kv cache")
-                # Sender finishes transfer and cleans up; receiver no-ops.
-                layer_ranges = []
-                for layers in self.rank_to_layers_ids.values():
-                    # Assert the layers are sorted
-                    assert layers == sorted(layers), "The layers should be sorted"
-                    layer_ranges.append((layers[0], layers[-1]))
+                if is_sender:
+                    # 等待所有 sender 线程完成后再释放 KV 缓存内存
+                    with self._sender_threads_cv:
+                        while self._num_active_sender_threads > 0:
+                            logger.info(f"[do_resize] Waiting for {self._num_active_sender_threads} sender threads...")
+                            self._sender_threads_cv.wait(timeout=5.0)
 
-                assert self.target_pp_layer_config is not None, "target_pp_layer_config must be set"
-                handles_to_free_key: list[list[int]] = []
-                handles_to_free_value: list[list[int]] = []
-                grouped_handles_to_free: list[tuple[list[int], list[int]]] = []  # (handles, base_k_ptrs) tuples
-                if layer_ranges:
-                    caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free = self.atomic_shelve_kv_cache(self.rank, layer_ranges)
-
-                start_layer, end_layer = self.target_pp_layer_config[self.rank]
-                target_num_layers = end_layer - start_layer + 1
-                is_direct = self.vllm_config.dynamic_config.use_direct_ptr
-                if is_direct and target_num_layers > 0:
-                    self.model_runner.commit_ptr_tables(self.model_runner.k_ptr_tensors, self.model_runner.v_ptr_tensors, target_start_layer=start_layer)
-                elif is_direct:
-                    logger.info(
-                        "[autoscaling async] rank %s target PP range is empty "
-                        "(%s, %s); skip PtrTable commit",
-                        self.rank, start_layer, end_layer)
-                self.target_pp_layer_config = None
-
-                # Set resizing_done = False BEFORE starting the thread, unconditionally
-                # This ensures wait_for_resize_done() will block until do_resize completes
+                    with self.model_runner.forward_lock:
+                        self.remove_layers(self.rank, layer_ranges)
+                    self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free)
+                    logger.info(f"[timeline]: after remove layers, time taken: {human_readable_duration(time.time() - time_start)}")
+                self.after_migration_total_token = num_total_migration_tokens
+                # For sender: directly set applied token count since sender doesn't receive patches
+                # For receiver: this will be overwritten by _listen_loop when all patches are applied
+                if is_sender:
+                    self.after_migration_applied_token_num = num_total_migration_tokens
+                fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
+                if fixed_blocks <= 0:
+                    self.resize_kv_cache(scheduler_output.new_kv_cache_block_num)
+                else:
+                    logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping worker-side resize (would be {scheduler_output.new_kv_cache_block_num} blocks), sleep for 4 seconds")
+                self.finish_migration()
+                self.kv_resizing_done = True
+            finally:
+                # Always signal completion, even on error
                 with self.resizing_done_cv:
-                    self.resizing_done = False
-                
-                # Also reset kv_resizing_done as a safety net (already reset in 
-                # start_kv_cache_migration_async, but reinforce here at sync point)
-                self.kv_resizing_done = False
+                    self.resizing_done = True
+                    self.resizing_done_cv.notify_all()
+        threading.Thread(target=do_resize, daemon=True).start()
+        logger.info(f"[timeline]: finish sync migration kv cache transfer, time taken: {human_readable_duration(time.time() - time_start_to_sync)}")
 
-                def do_resize():
-                    try:
-                        # Set CUDA device for this thread - threads don't inherit CUDA context
-                        torch.cuda.set_device(self.device)
-                        if is_sender:
-                            # 等待所有 sender 线程完成后再释放 KV 缓存内存
-                            with self._sender_threads_cv:
-                                while self._num_active_sender_threads > 0:
-                                    logger.info(f"[do_resize] Waiting for {self._num_active_sender_threads} sender threads...")
-                                    self._sender_threads_cv.wait(timeout=5.0)
-                            
-                            with self.model_runner.forward_lock:
-                                self.remove_layers(self.rank, layer_ranges)
-                            self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free)
-                            logger.info(f"[timeline]: after remove layers, time taken: {human_readable_duration(time.time() - time_start)}")
-                        self.after_migration_total_token = num_total_migration_tokens
-                        # For sender: directly set applied token count since sender doesn't receive patches
-                        # For receiver: this will be overwritten by _listen_loop when all patches are applied
-                        if is_sender:
-                            self.after_migration_applied_token_num = num_total_migration_tokens
-                        fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
-                        if fixed_blocks <= 0:
-                            self.resize_kv_cache(scheduler_output.new_kv_cache_block_num)
-                        else:
-                            logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping worker-side resize (would be {scheduler_output.new_kv_cache_block_num} blocks), sleep for 4 seconds")
-                        self.finish_migration()
-                        self.kv_resizing_done = True
-                    finally:
-                        # Always signal completion, even on error
-                        with self.resizing_done_cv:
-                            self.resizing_done = True
-                            self.resizing_done_cv.notify_all()
-                threading.Thread(target=do_resize, daemon=True).start()
-                logger.info(f"[timeline]: finish sync migration kv cache transfer, time taken: {human_readable_duration(time.time() - time_start_to_sync)}")
     def finish_migration(self):
         self.rank_to_layers_ids = {}
         

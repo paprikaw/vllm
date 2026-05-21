@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 from concurrent.futures import Future as StdFuture
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
 import msgspec
 import os
@@ -783,6 +783,9 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
     def get_is_kv_resizing_done(self) -> list[bool]:
         return self.collective_rpc("get_is_kv_resizing_done")
+
+    def get_async_migration_state(self) -> list[dict[str, Any]]:
+        return self.collective_rpc("get_async_migration_state")
 
     def get_applied_token_num(self, receiver_list: list[int]) -> list[list[int]]:
         """Return KV patch buffer status per rank.
