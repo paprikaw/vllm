@@ -87,3 +87,11 @@ class DynamicSchedulerOutput():
 
     sender_list: Optional[set[int]] = None
     receiver_list: Optional[set[int]] = None
+
+    # Debug-only PP NCCL tracing metadata. These fields let the dynamic
+    # executor correlate each in-flight micro-batch across PP NCCL send/recv
+    # logs without changing the scheduler contract.
+    pp_nccl_seq: int = -1
+    pp_nccl_active_ranks: Optional[tuple[int, ...]] = None
+    pp_nccl_request_ids: tuple[str, ...] = ()
+    pp_nccl_config_fingerprint: str = ""

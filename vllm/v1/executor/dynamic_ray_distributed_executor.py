@@ -580,15 +580,18 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         self,
         scheduler_output,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
-        active_ranks = getattr(self, "active_pp_ranks", None)
+        active_ranks = self._active_ranks_for_scheduler_output(
+            scheduler_output)
         if not active_ranks:
-            active_ranks = self._active_ranks_for_scheduler_output(
-                scheduler_output)
+            active_ranks = getattr(self, "active_pp_ranks", None)
+        self._sync_request_states_before_target_chain(active_ranks)
         if self.parallel_config.tensor_parallel_size != 1:
             raise NotImplementedError(
                 "dynamic Ray actor PP chain currently supports TP=1 only")
 
         if os.getenv("VLLM_DYNAMIC_PP_NCCL_TRANSPORT", "0") == "1":
+            self._annotate_pp_nccl_debug_metadata(
+                scheduler_output, active_ranks)
             metadata = self._make_pp_nccl_intermediate_metadata(
                 scheduler_output)
             refs = []
@@ -612,6 +615,40 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             return ray.get(ref_or_value)
         return RayObjectRefFuture(ref_or_value)
 
+    def _sync_request_states_before_target_chain(
+        self,
+        active_ranks: Optional[list[int]],
+    ) -> None:
+        dynamic_config = self.vllm_config.dynamic_config
+        if not getattr(dynamic_config, "pipeline_autoscaling_enabled", False):
+            return
+        if not active_ranks:
+            return
+
+        current_active = getattr(self, "active_pp_ranks", None)
+        if current_active is None:
+            current_active = list(range(
+                self.parallel_config.pipeline_parallel_size))
+
+        # During no-drain autoscaling, scheduler_output.pp_layer_config can
+        # route a target-config batch through newly activated ranks before
+        # set_active_pp_ranks() commits the final routing set. Those ranks
+        # have loaded weights/KV but may not have seen the original
+        # scheduled_new_reqs, so import request states before their first
+        # target-chain forward.
+        if not (set(active_ranks) - set(current_active)):
+            return
+
+        sync_key = tuple(active_ranks)
+        if getattr(self, "_autoscaling_request_state_sync_key", None) == sync_key:
+            return
+
+        self._sync_request_states_for_autoscaling()
+        self._autoscaling_request_state_sync_key = sync_key
+        logger.info(
+            "Synchronized request states before target PP actor chain %s",
+            active_ranks)
+
     def _active_ranks_for_scheduler_output(self, scheduler_output) -> list[int]:
         pp_layer_config = getattr(scheduler_output, "pp_layer_config", None)
         if pp_layer_config is None:
@@ -620,6 +657,31 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             rank for rank, (start, end) in enumerate(pp_layer_config)
             if end >= start
         ]
+
+    def _annotate_pp_nccl_debug_metadata(
+        self,
+        scheduler_output: DynamicSchedulerOutput,
+        active_ranks: list[int],
+    ) -> None:
+        seq = getattr(self, "_pp_nccl_seq_counter", 0)
+        self._pp_nccl_seq_counter = seq + 1
+        scheduler_output.pp_nccl_seq = seq
+        scheduler_output.pp_nccl_active_ranks = tuple(active_ranks)
+        scheduler_output.pp_nccl_config_fingerprint = "|".join(
+            f"{start}-{end}" for start, end in scheduler_output.pp_layer_config)
+
+        request_ids: list[str] = []
+        for req in scheduler_output.scheduled_new_reqs:
+            req_id = getattr(req, "request_id", None)
+            if req_id is not None:
+                request_ids.append(req_id)
+        for req in scheduler_output.scheduled_cached_reqs:
+            req_id = getattr(req, "req_id", None)
+            if req_id is not None:
+                request_ids.append(req_id)
+        if not request_ids:
+            request_ids.extend(scheduler_output.num_scheduled_tokens.keys())
+        scheduler_output.pp_nccl_request_ids = tuple(request_ids)
 
     def _make_pp_nccl_intermediate_metadata(
         self,
@@ -643,6 +705,15 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                 "residual": (shape, dtype_name),
             },
             send_time=0.0,
+            pp_nccl_seq=getattr(scheduler_output, "pp_nccl_seq", -1),
+            pp_config_fingerprint=getattr(
+                scheduler_output, "pp_nccl_config_fingerprint", ""),
+            active_ranks=getattr(scheduler_output,
+                                 "pp_nccl_active_ranks", ()) or (),
+            request_ids=getattr(scheduler_output,
+                                "pp_nccl_request_ids", ()) or (),
+            total_num_scheduled_tokens=getattr(
+                scheduler_output, "total_num_scheduled_tokens", 0),
         )
 
     def execute_cpu_model(
@@ -742,6 +813,15 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
     def remove_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
         self.collective_rpc("remove_layers", args=(rank, layers_list))
 
+    def remove_layers_and_release_kv_cache_for_layers(
+        self,
+        rank: int,
+        layers_list: list[Tuple[int, int]],
+    ):
+        self.collective_rpc(
+            "remove_layers_and_release_kv_cache_for_layers",
+            args=(rank, layers_list))
+
     def get_current_available_memory(self) -> List[int]:
         return self.collective_rpc("get_current_available_memory")
 
@@ -757,7 +837,13 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
     def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         self.collective_rpc("compact_kv_cache", args=(compacted_length, bitmap))
 
-    def resize_kv_cache(self, new_length: int) -> None:
+    def resize_kv_cache(self, new_length: int, ranks: Optional[list[int]] = None) -> None:
+        if ranks is not None:
+            ray_get_reqs = []
+            for rank in ranks:
+                ray_get_reqs.append(self.workers[rank].resize_kv_cache.remote(new_length))
+            ray.get(ray_get_reqs)
+            return
         self.collective_rpc("resize_kv_cache", args=(new_length,))
 
     def release_kv_cache_for_layers(self, rank: int, layers_list: list[Tuple[int, int]]):

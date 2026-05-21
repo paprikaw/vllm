@@ -711,7 +711,6 @@ def dynamic_flexi_bind_single_kv_tensor(
                        f"key_cache_ptr:{key_cache_ptr}, value_cache_ptr:{value_cache_ptr}, "
                        f"vmm_combined:{vmm_combined}, handles_count:{len(handles)}")
         
-        # PtrTensors only needed by direct kernel
         use_direct_ptr = runner.vllm_config.dynamic_config.use_direct_ptr
         if use_direct_ptr:
             time_start_ptr_tensor = time.time()

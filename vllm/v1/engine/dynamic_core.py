@@ -313,15 +313,24 @@ class DynamicEngineCore(EngineCore):
         if not hasattr(self, "batch_queue_size"):
             return
         new_size = self.model_executor.max_concurrent_batches
-        if new_size == self.batch_queue_size:
+        pending_resize = getattr(self, "_pending_batch_queue_size", None)
+        if new_size == self.batch_queue_size and pending_resize is None:
             return
         current_queue = self.batch_queue
         if current_queue is not None and not current_queue.empty():
+            old_size = self.batch_queue_size
+            if new_size < old_size:
+                self.batch_queue_size = new_size
+                logger.info(
+                    "Applied smaller batch queue scheduling limit from %s to "
+                    "%s; queue object resize deferred until %s queued "
+                    "batches finish",
+                    old_size, new_size, _safe_queue_size(current_queue))
             self._pending_batch_queue_size = new_size
             logger.info(
                 "Deferring batch queue resize from %s to %s until %s "
                 "queued batches finish",
-                self.batch_queue_size, new_size, _safe_queue_size(current_queue))
+                old_size, new_size, _safe_queue_size(current_queue))
             return
 
         old_size = self.batch_queue_size
@@ -334,8 +343,6 @@ class DynamicEngineCore(EngineCore):
         logger.info("Updated batch queue size from %s to %s for active PP ranks",
                     old_size, new_size)
 
-
-        
     def _estimate_max_blocks_per_layer(self, gpu_total_memory: int, memory_after_adding_weight: int, num_layers_on_rank: int, block_size: int) -> int:
         safe_margin = (1 - self.vllm_config.cache_config.gpu_memory_utilization) * gpu_total_memory
         memory_after_adding_weight -=  math.ceil(safe_margin)
@@ -702,7 +709,7 @@ class DynamicEngineCore(EngineCore):
             # the scheduler may return an empty batch if all requests are scheduled.
             # Note that this is not blocking.
             isinstance(self.scheduler, DynamicScheduler)
-            if not self.batch_queue.full():
+            if _safe_queue_size(self.batch_queue) < self.batch_queue_size:
                 schedule_start = time.time()
                 scheduler_output = self.scheduler.dynamic_schedule()
                 schedule_time = time.time() - schedule_start
@@ -801,7 +808,7 @@ class DynamicEngineCore(EngineCore):
                 adding_layer_list = []
                 if layers[0] < start_layer:
                     adding_layer_list.append((layers[0], start_layer - 1))
-                if layers[1] > end_layer:
+                elif layers[1] > end_layer:
                     adding_layer_list.append((end_layer + 1, layers[1]))
                 if len(adding_layer_list) == 0:
                     continue
@@ -905,19 +912,41 @@ class DynamicEngineCore(EngineCore):
         # 还有可能出现一些中间状态的migration config
         tmp_pp_layer_config = deepcopy(self.cur_pp_layer_config)
         bitmap = bitarray()
+
+        # When shrinking, do not deactivate ranks before existing batches have
+        # naturally completed. Each scheduled batch carries its own pp config,
+        # so new batches can use the target placement while old batches keep
+        # routing through the old ranks.
+        target_active_ranks = self._active_ranks_for_config(pp_layer_config)
+        deactivating_ranks = sorted(set(self.cur_active_pp_ranks) - set(target_active_ranks))
+        if deactivating_ranks:
+            logger.info(
+                "[autoscaling] shrink detected: ranks %s will be deactivated "
+                "for newly scheduled batches after migration sync",
+                deactivating_ranks)
+
         with self.engine_lock:
             time_start = time.time()
             for rank, layers in enumerate(pp_layer_config):
+                # Skip ranks that are being deactivated (target start > end indicates inactive).
+                # These ranks will have their layers removed later; no layers are added here.
+                if layers[0] > layers[1]:
+                    assess = self._assess_memory_for_layer_reconfiguration(rank, 0, mem_infos[rank], self.cur_pp_layer_config)
+                    maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
+                    continue
                 start_layer, end_layer = tmp_pp_layer_config[rank][0], tmp_pp_layer_config[rank][1]
                 adding_layer_list = []
-                if layers[0] < start_layer:
+                if start_layer > end_layer:
+                    adding_layer_list.append((layers[0], layers[1]))
+                    tmp_pp_layer_config[rank] = (layers[0], layers[1])
+                elif layers[0] < start_layer:
                     adding_layer_list.append((layers[0], start_layer - 1))
                     tmp_pp_layer_config[rank] = (layers[0], tmp_pp_layer_config[rank][1])
-                if layers[1] > end_layer:
+                elif layers[1] > end_layer:
                     adding_layer_list.append((end_layer + 1, layers[1]))
                     tmp_pp_layer_config[rank] = (tmp_pp_layer_config[rank][0], layers[1])
                 logger.info(f"rank {rank}:\n adding_layer_list: {adding_layer_list}")
-                # 在 adding 之前，校验对应 GPU 是否有足够可用显存容纳“将要新增的层”的权重；
+                # 在 adding 之前，校验对应 GPU 是否有足够可用显存容纳"将要新增的层"的权重；
                 # 如果不足，尝试评估：压缩（compact）KV cache 后释放的显存，是否足以腾挪出空间。
                 # 同时，如果当前的GPU available memory已经足够，则需要评估是否需要resize kv cache
                 adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
@@ -935,10 +964,6 @@ class DynamicEngineCore(EngineCore):
                         #     "Rank %s lacks memory even after KV compact estimate: max_blocks_per_layer: %s, current_used_blocks: %s",
                         #     rank, assess.max_blocks_per_layer, self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks - self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
                         # return []
-            # start_drain_out_time = time.time()
-            # outputs = self._drain_out_running_queue()
-            # engine_core_outputs.extend(outputs)
-            # logger.info(f"[timeline]: after drain out running queue, time taken: {human_readable_duration(time.time() - start_drain_out_time)}")
             assert isinstance(self.scheduler, DynamicScheduler)
             assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
             compacted_length = min(maximum_kv_block_num_after_compact)
@@ -955,8 +980,8 @@ class DynamicEngineCore(EngineCore):
                 bitmap = self.scheduler.compact_kv_cache(compacted_length)
                 logger.info(f"[memory access] compacted_length for scheduler in {human_readable_duration(time.time() - time_start_compact_kv)}, compacted to: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
 
-            if allow_resize and compacted_length < original_length:
-                self.scheduler.shrink_block_pool(compacted_length)
+                if compacted_length < original_length:
+                    self.scheduler.shrink_block_pool(compacted_length)
             engine_lock_time_ms = (time.time() - time_start) * 1000
             logger.info(f"[timeline]: engine locking time: {human_readable_duration(time.time() - time_start)}")
             logger.info(f"[STOP_TIME][async]: engine_lock_total={engine_lock_time_ms:.2f}ms")
@@ -969,15 +994,12 @@ class DynamicEngineCore(EngineCore):
 
             logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
 
-        # 需要resize kv cache来进行migration，这里的resize一定是缩小
-        # Only shrink when compacted_length < original_length (see sync path comment).
-        if allow_resize and compacted_length < original_length:
-            # 我理解这里只要shrink block pool在resize kv cache之前调用就行了
-            # TODO: 在resize之前，理论上需要保证没有shrink_kv_cache之前的in-flight request
-            # 这可能需要我实现一个scheduleroutput中的同步机制。
-            self.model_executor.resize_kv_cache(compacted_length)
-            logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
-            logger.info(f"[timeline]: after shrink block pool, time taken: {human_readable_duration(time.time() - time_start)}")
+            # 需要resize kv cache来进行migration，这里的resize一定是缩小
+            # Only shrink when compacted_length < original_length (see sync path comment).
+            if compacted_length < original_length:
+                self.model_executor.resize_kv_cache(compacted_length)
+                logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
+                logger.info(f"[timeline]: after shrink block pool, time taken: {human_readable_duration(time.time() - time_start)}")
             
         # self._compact_kv_cache(1700)
         # self.model_executor.resize_kv_cache(1700)
@@ -1003,22 +1025,37 @@ class DynamicEngineCore(EngineCore):
         # Ensure no in-flight work before snapshotting KV state
 
         # 计算 src->dst 传输对
-        # 辅助函数：根据当前分片配置找到包含区间 [lo, hi] 的源 rank
-        def find_src_rank_for_range(lo: int, hi: int) -> int:
+        # 辅助函数：根据当前分片配置找到包含区间 [lo, hi] 的所有源 rank
+        # 在 shrink 场景下，一个 target range 可能跨越多个 source rank
+        def find_src_ranks_for_range(lo: int, hi: int) -> list[tuple[int, list[int]]]:
+            result: list[tuple[int, list[int]]] = []
+            remaining_lo = lo
             for src_rank, (cur_lo, cur_hi) in enumerate(self.cur_pp_layer_config):
-                if lo >= cur_lo and hi <= cur_hi:
-                    return src_rank
-            raise AssertionError(f"No source rank found for range [{lo}, {hi}] in {self.cur_pp_layer_config}")
+                if cur_lo > cur_hi:
+                    continue  # skip inactive ranks
+                if remaining_lo > hi:
+                    break
+                if remaining_lo <= cur_hi and hi >= cur_lo:
+                    overlap_lo = max(remaining_lo, cur_lo)
+                    overlap_hi = min(hi, cur_hi)
+                    if overlap_lo <= overlap_hi:
+                        result.append((src_rank, list(range(overlap_lo, overlap_hi + 1))))
+                        remaining_lo = overlap_hi + 1
+            if remaining_lo <= hi:
+                raise AssertionError(
+                    f"Could not cover full range [{lo}, {hi}] from current config {self.cur_pp_layer_config}. "
+                    f"Remaining: [{remaining_lo}, {hi}]")
+            return result
 
         # 聚合为以 src_rank 为键的 rank_to_layers_ids 映射
         # src_to_plan[src_rank] = { dst_rank: [layer_ids...] }
         src_to_plan: dict[int, dict[int, list[int]]] = {}
         for dst_rank, add_list in adding_per_rank.items():
             for lo, hi in add_list:
-                src_rank = find_src_rank_for_range(lo, hi)
-                plan = src_to_plan.setdefault(src_rank, {})
-                layer_ids = plan.setdefault(dst_rank, [])
-                layer_ids.extend(range(lo, hi + 1))
+                for src_rank, layer_ids in find_src_ranks_for_range(lo, hi):
+                    plan = src_to_plan.setdefault(src_rank, {})
+                    dst_layer_ids = plan.setdefault(dst_rank, [])
+                    dst_layer_ids.extend(layer_ids)
 
         sender_list = list(src_to_plan.keys())
         receiver_list = list(adding_per_rank.keys())
@@ -1107,6 +1144,7 @@ class DynamicEngineCore(EngineCore):
             time.sleep(0.3)
 
             should_sync = sync_by_checking_leftover_tokens()
+
             final_pp_layer_config = deepcopy(tmp_pp_layer_config)
             if should_sync:
                 deleting_layer_assesses: list[int] = []
@@ -1114,12 +1152,17 @@ class DynamicEngineCore(EngineCore):
                     # 计算对于每一个rank而言，需要删除哪一些layers
                     start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
                     deleting_layer_list = []
-                    if layers[0] > start_layer:
-                        deleting_layer_list.append((start_layer, layers[0] - 1))
-                        final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
-                    if layers[1] < end_layer:
-                        deleting_layer_list.append((layers[1] + 1, end_layer))
-                        final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
+                    if layers[0] > layers[1]:
+                        if start_layer <= end_layer:
+                            deleting_layer_list.append((start_layer, end_layer))
+                        final_pp_layer_config[rank] = (layers[0], layers[1])
+                    else:
+                        if layers[0] > start_layer:
+                            deleting_layer_list.append((start_layer, layers[0] - 1))
+                            final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
+                        if layers[1] < end_layer:
+                            deleting_layer_list.append((layers[1] + 1, end_layer))
+                            final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
                     deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
                     assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
                     deleting_layer_assesses.append(assess.max_blocks_per_layer)
@@ -1128,13 +1171,6 @@ class DynamicEngineCore(EngineCore):
                     assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
 
                 resized_block_num = min(deleting_layer_assesses)
-                if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
-                    current_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
-                    logger.info(
-                        "[autoscaling async] keeping current KV block count "
-                        "%s during PP expand switch; deferred growth target was %s",
-                        current_blocks, resized_block_num)
-                    resized_block_num = current_blocks
                 if not allow_resize:
                     # When fixed_num_gpu_blocks is set, keep the current block count
                     resized_block_num = self.scheduler.kv_cache_manager.num_gpu_blocks
@@ -1146,31 +1182,15 @@ class DynamicEngineCore(EngineCore):
                         logger.info(f"[memory access] start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
 
                 with self.engine_lock:
-                    drain_start = time.time()
-                    engine_core_outputs = self._drain_out_running_queue()
-                    for output in engine_core_outputs:
-                        if output is not None:
-                            self.output_queue.put_nowait(output)
-                    logger.info(
-                        "[autoscaling async] drained %d queued old-config "
-                        "outputs before switching active PP ranks in %s",
-                        len(engine_core_outputs),
-                        human_readable_duration(time.time() - drain_start))
-                    if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
-                        self.scheduler.update_layer_config(pp_layer_config)
-                        self.scheduler.change_configuration_status = (
-                            ChangeConfigurationType.NOT_CHANGING)
-                        self.scheduler.next_pp_layer_config = None
-                        self.scheduler.next_new_kv_cache_block_num = 0
-                        self.scheduler.migration_in_process = False
-                        self.scheduler.sender_list_during_migration = None
-                        self.scheduler.receiver_list_during_migration = None
-                        self.scheduler.num_tokens_for_migration = 0
-                    else:
-                        self.scheduler.async_change_configuration(
-                            pp_layer_config, resized_block_num)
+                    self.scheduler.async_change_configuration(
+                        pp_layer_config, resized_block_num)
                     self.cur_pp_layer_config = pp_layer_config
-                    self._apply_active_pp_ranks_for_config(pp_layer_config)
+                    if not self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+                        self._apply_active_pp_ranks_for_config(pp_layer_config)
+                    else:
+                        logger.info(
+                            "[autoscaling async] queued PP config switch via "
+                            "scheduler output; active ranks remain batch-local")
                 break
 
         assert resized_block_num != 0
@@ -1243,16 +1263,24 @@ class DynamicEngineCore(EngineCore):
             time_start = time.time()
             # Phase 1: Assess memory and prepare layer lists
             for rank, layers in enumerate(pp_layer_config):
+                # Skip ranks that are being deactivated (target start > end indicates inactive).
+                if layers[0] > layers[1]:
+                    assess = self._assess_memory_for_layer_reconfiguration(rank, 0, mem_infos[rank], self.cur_pp_layer_config)
+                    maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
+                    continue
                 start_layer, end_layer = tmp_pp_layer_config[rank][0], tmp_pp_layer_config[rank][1]
                 adding_layer_list = []
-                if layers[0] < start_layer:
+                if start_layer > end_layer:
+                    adding_layer_list.append((layers[0], layers[1]))
+                    tmp_pp_layer_config[rank] = (layers[0], layers[1])
+                elif layers[0] < start_layer:
                     adding_layer_list.append((layers[0], start_layer - 1))
                     tmp_pp_layer_config[rank] = (layers[0], tmp_pp_layer_config[rank][1])
-                if layers[1] > end_layer:
+                elif layers[1] > end_layer:
                     adding_layer_list.append((end_layer + 1, layers[1]))
                     tmp_pp_layer_config[rank] = (tmp_pp_layer_config[rank][0], layers[1])
                 logger.info(f"[async_fast] rank {rank}: adding_layer_list: {adding_layer_list}")
-                
+
                 adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
                 assess = self._assess_memory_for_layer_reconfiguration(rank, adding_layer_num, mem_infos[rank], self.cur_pp_layer_config)
                 maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
@@ -1311,26 +1339,40 @@ class DynamicEngineCore(EngineCore):
 
         # Phase 3: Compute src->dst transfer plan
         original_pp_layer_config = deepcopy(self.cur_pp_layer_config)
-        
-        def find_src_rank_for_range(lo: int, hi: int) -> int:
+
+        def find_src_ranks_for_range(lo: int, hi: int) -> list[tuple[int, list[int]]]:
+            result: list[tuple[int, list[int]]] = []
+            remaining_lo = lo
             for src_rank, (cur_lo, cur_hi) in enumerate(original_pp_layer_config):
-                if lo >= cur_lo and hi <= cur_hi:
-                    return src_rank
-            raise AssertionError(f"[async_fast] No source rank found for range [{lo}, {hi}] in {original_pp_layer_config}")
+                if cur_lo > cur_hi:
+                    continue
+                if remaining_lo > hi:
+                    break
+                if remaining_lo <= cur_hi and hi >= cur_lo:
+                    overlap_lo = max(remaining_lo, cur_lo)
+                    overlap_hi = min(hi, cur_hi)
+                    if overlap_lo <= overlap_hi:
+                        result.append((src_rank, list(range(overlap_lo, overlap_hi + 1))))
+                        remaining_lo = overlap_hi + 1
+            if remaining_lo <= hi:
+                raise AssertionError(
+                    f"[async_fast] Could not cover full range [{lo}, {hi}] from original config {original_pp_layer_config}. "
+                    f"Remaining: [{remaining_lo}, {hi}]")
+            return result
 
         src_to_plan: dict[int, dict[int, list[int]]] = {}
         sending_plan_for_ranks: dict[int, dict[int, list[Tuple[int, int]]]] = {}
         for dst_rank, add_list in adding_per_rank.items():
             for lo, hi in add_list:
-                src_rank = find_src_rank_for_range(lo, hi)
-                # For src_to_plan (layer_ids as list)
-                plan = src_to_plan.setdefault(src_rank, {})
-                layer_ids = plan.setdefault(dst_rank, [])
-                layer_ids.extend(range(lo, hi + 1))
-                # For sending_plan_for_ranks (layer ranges as tuples)
-                plan_ranges = sending_plan_for_ranks.setdefault(src_rank, {})
-                layer_ranges = plan_ranges.setdefault(dst_rank, [])
-                layer_ranges.append((lo, hi))
+                for src_rank, layer_ids in find_src_ranks_for_range(lo, hi):
+                    # For src_to_plan (layer_ids as list)
+                    plan = src_to_plan.setdefault(src_rank, {})
+                    dst_layer_ids = plan.setdefault(dst_rank, [])
+                    dst_layer_ids.extend(layer_ids)
+                    # For sending_plan_for_ranks (layer ranges as tuples)
+                    plan_ranges = sending_plan_for_ranks.setdefault(src_rank, {})
+                    layer_ranges = plan_ranges.setdefault(dst_rank, [])
+                    layer_ranges.append((layer_ids[0], layer_ids[-1]))
 
         sender_list = list(src_to_plan.keys())
         receiver_list = list(adding_per_rank.keys())
@@ -1373,12 +1415,17 @@ class DynamicEngineCore(EngineCore):
         for rank, layers in enumerate(pp_layer_config):
             start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
             deleting_layer_list = []
-            if layers[0] > start_layer:
-                deleting_layer_list.append((start_layer, layers[0] - 1))
-                final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
-            if layers[1] < end_layer:
-                deleting_layer_list.append((layers[1] + 1, end_layer))
-                final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
+            if layers[0] > layers[1]:
+                if start_layer <= end_layer:
+                    deleting_layer_list.append((start_layer, end_layer))
+                final_pp_layer_config[rank] = (layers[0], layers[1])
+            else:
+                if layers[0] > start_layer:
+                    deleting_layer_list.append((start_layer, layers[0] - 1))
+                    final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
+                if layers[1] < end_layer:
+                    deleting_layer_list.append((layers[1] + 1, end_layer))
+                    final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
             deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
             assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
             deleting_layer_assesses.append(assess.max_blocks_per_layer)
@@ -1396,7 +1443,12 @@ class DynamicEngineCore(EngineCore):
                                                       resized_block_num)
 
         self.cur_pp_layer_config = pp_layer_config
-        self._apply_active_pp_ranks_for_config(pp_layer_config)
+        if not self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+            self._apply_active_pp_ranks_for_config(pp_layer_config)
+        else:
+            logger.info(
+                "[autoscaling async_fast] queued PP config switch via "
+                "scheduler output; active ranks remain batch-local")
         logger.info(f"[async_fast] config synced to {pp_layer_config}")
 
         assert resized_block_num != 0
@@ -1473,16 +1525,24 @@ class DynamicEngineCore(EngineCore):
             # 还有可能出现一些中间状态的migration config
             tmp_pp_layer_config = deepcopy(self.cur_pp_layer_config)
             for rank, layers in enumerate(pp_layer_config):
+                # Skip ranks that are being deactivated (target start > end indicates inactive).
+                if layers[0] > layers[1]:
+                    assess = self._assess_memory_for_layer_reconfiguration(rank, 0, mem_infos[rank], self.cur_pp_layer_config)
+                    maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
+                    continue
                 start_layer, end_layer = tmp_pp_layer_config[rank][0], tmp_pp_layer_config[rank][1]
                 adding_layer_list = []
-                if layers[0] < start_layer:
+                if start_layer > end_layer:
+                    adding_layer_list.append((layers[0], layers[1]))
+                    tmp_pp_layer_config[rank] = (layers[0], layers[1])
+                elif layers[0] < start_layer:
                     adding_layer_list.append((layers[0], start_layer - 1))
                     tmp_pp_layer_config[rank] = (layers[0], tmp_pp_layer_config[rank][1])
                 if layers[1] > end_layer:
                     adding_layer_list.append((end_layer + 1, layers[1]))
                     tmp_pp_layer_config[rank] = (tmp_pp_layer_config[rank][0], layers[1])
                 logger.info(f"rank {rank}:\n adding_layer_list: {adding_layer_list}")
-                # 在 adding 之前，校验对应 GPU 是否有足够可用显存容纳“将要新增的层”的权重；
+                # 在 adding 之前，校验对应 GPU 是否有足够可用显存容纳"将要新增的层"的权重；
                 # 如果不足，尝试评估：压缩（compact）KV cache 后释放的显存，是否足以腾挪出空间。
                 # 同时，如果当前的GPU available memory已经足够，则需要评估是否需要resize kv cache
                 adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
@@ -1571,22 +1631,37 @@ class DynamicEngineCore(EngineCore):
             # Ensure no in-flight work before snapshotting KV state
 
             # 计算 src->dst 传输对
-            # 辅助函数：根据原始分片配置找到包含区间 [lo, hi] 的源 rank
+            # 辅助函数：根据原始分片配置找到包含区间 [lo, hi] 的所有源 rank
             # Note: Use original_pp_layer_config (saved before add_layers), not cur_pp_layer_config
-            def find_src_rank_for_range(lo: int, hi: int) -> int:
+            # 在 shrink 场景下，一个 target range 可能跨越多个 source rank
+            def find_src_ranks_for_range(lo: int, hi: int) -> list[tuple[int, list[int]]]:
+                result: list[tuple[int, list[int]]] = []
+                remaining_lo = lo
                 for src_rank, (cur_lo, cur_hi) in enumerate(original_pp_layer_config):
-                    if lo >= cur_lo and hi <= cur_hi:
-                        return src_rank
-                raise AssertionError(f"No source rank found for range [{lo}, {hi}] in {original_pp_layer_config}")
+                    if cur_lo > cur_hi:
+                        continue
+                    if remaining_lo > hi:
+                        break
+                    if remaining_lo <= cur_hi and hi >= cur_lo:
+                        overlap_lo = max(remaining_lo, cur_lo)
+                        overlap_hi = min(hi, cur_hi)
+                        if overlap_lo <= overlap_hi:
+                            result.append((src_rank, list(range(overlap_lo, overlap_hi + 1))))
+                            remaining_lo = overlap_hi + 1
+                if remaining_lo <= hi:
+                    raise AssertionError(
+                        f"Could not cover full range [{lo}, {hi}] from original config {original_pp_layer_config}. "
+                        f"Remaining: [{remaining_lo}, {hi}]")
+                return result
 
             # 聚合为以 src_rank 为键的 rank_to_layers_ids 映射
             sending_plan_for_ranks: dict[int, dict[int, list[Tuple[int, int]]]] = {}
             for dst_rank, add_list in adding_per_rank.items():
                 for lo, hi in add_list:
-                    src_rank = find_src_rank_for_range(lo, hi)
-                    plan = sending_plan_for_ranks.setdefault(src_rank, {})
-                    layer_ranges = plan.setdefault(dst_rank, [])
-                    layer_ranges.extend([(lo, hi)])
+                    for src_rank, layer_ids in find_src_ranks_for_range(lo, hi):
+                        plan = sending_plan_for_ranks.setdefault(src_rank, {})
+                        layer_ranges = plan.setdefault(dst_rank, [])
+                        layer_ranges.append((layer_ids[0], layer_ids[-1]))
 
             # For sync migration, slot_mapping is None - receiver creates fresh empty KV caches
             self.model_executor.start_kv_cache_migration_sync(pp_layer_config, sending_plan_for_ranks, adding_per_rank, None)
@@ -1600,12 +1675,17 @@ class DynamicEngineCore(EngineCore):
                 # 计算对于每一个rank而言，需要删除哪一些layers
                 start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
                 deleting_layer_list = []
-                if layers[0] > start_layer:
-                    deleting_layer_list.append((start_layer, layers[0] - 1))
-                    final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
-                if layers[1] < end_layer:
-                    deleting_layer_list.append((layers[1] + 1, end_layer))
-                    final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
+                if layers[0] > layers[1]:
+                    if start_layer <= end_layer:
+                        deleting_layer_list.append((start_layer, end_layer))
+                    final_pp_layer_config[rank] = (layers[0], layers[1])
+                else:
+                    if layers[0] > start_layer:
+                        deleting_layer_list.append((start_layer, layers[0] - 1))
+                        final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
+                    if layers[1] < end_layer:
+                        deleting_layer_list.append((layers[1] + 1, end_layer))
+                        final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
                 deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
                 assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
                 deleting_layer_assesses.append(assess.max_blocks_per_layer)
