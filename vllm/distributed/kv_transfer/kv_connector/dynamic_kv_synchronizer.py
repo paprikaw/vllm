@@ -11,6 +11,7 @@ But the logic can be extended to support other pipe and lookup buffer.
 from typing import TYPE_CHECKING, Generator, Optional, Union, Dict, Tuple, Literal
 import threading
 import os
+from contextlib import nullcontext
 
 import bitarray
 from httpx import patch
@@ -116,7 +117,7 @@ class KVSlotMapping:
 
     def get_all_slot_mappings(self) -> Tuple[list[int], bool, int]:
         with self._cv:
-            while self.bitmap.count() == 0:
+            while self.bitmap.count() == 0 and not self.is_finished:
                 self._cv.wait()
             slot_mapping = list(self.bitmap.search(1))
             stored_tokens = self.stored_tokens
@@ -124,6 +125,7 @@ class KVSlotMapping:
 
             self.bitmap.setall(0)
             self.stored_tokens = 0
+            self.is_finished = False
         return slot_mapping, is_finished, stored_tokens
 
 class PairPipe:
@@ -251,7 +253,12 @@ class PairPipe:
         else:
             self.data_group.send_obj(tensor, dst=self.peer_rank)
 
-    def recv_data(self, dtype: torch.dtype, shape: torch.Size, stream=None, send_ack: bool = False) -> torch.Tensor:
+    def recv_data(self,
+                  dtype: torch.dtype,
+                  shape: torch.Size,
+                  stream=None,
+                  send_ack: bool = False,
+                  synchronize: bool = True) -> torch.Tensor:
         """Data-plane receive: allocate buffer and perform NCCL recv.
 
         Protocol for deadlock prevention:
@@ -289,12 +296,14 @@ class PairPipe:
                 
             # Now recv - sender will acquire lock and send after receiving our ACK
             self._nccl.recv(buf, src=self.peer_rank, stream=stream)
-            # NCCL recv is async - must synchronize within the lock
-            if stream is not None:
-                stream.synchronize()
-            else:
+            # NCCL recv is async. Most dynamic migration paths keep
+            # synchronize=True while holding the shared PP/KV NCCL lock.
+            # Older synchronous paths may request deferred synchronization.
+            if synchronize:
+                # NCCL can use an internal/non-current stream. Keep the shared
+                # PP/KV NCCL lock held until all local device work is complete.
                 torch.cuda.synchronize(device=buf.device)
-            logger.info(f"[PairPipe.recv_data] NCCL lock released after recv")
+                logger.info(f"[PairPipe.recv_data] NCCL recv synchronized")
             # else:
             #     # No ACK needed, but still use lock for safety
             #     logger.info(f"[PairPipe.recv_data] Acquiring NCCL lock for recv (no ACK)")
@@ -304,7 +313,7 @@ class PairPipe:
             #     else:
             #         torch.cuda.synchronize(device=buf.device)
             #     logger.info(f"[PairPipe.recv_data] NCCL lock released after recv")
-            logger.info(f"[PairPipe.recv_data] NCCL recv completed and synchronized")
+            logger.info(f"[PairPipe.recv_data] NCCL recv enqueued")
         else:
             buf = self.data_group.recv_obj(src=self.peer_rank)
             assert isinstance(buf, torch.Tensor), "The object should be a torch.Tensor"
@@ -532,19 +541,38 @@ class DynamicKVSynchronizer():
         pipe = self._ensure_pipe_and_buffer(rank, 'send')
         pipe = self._pair_pipes_send[rank]
         
-        # 使用专用的 KV 传输 stream（如果有），避免与模型计算 stream 冲突
-        if pipe.is_use_nccl and pipe._kv_transfer_stream is not None:
-            # 使用专用 stream 发送
-            pipe.send_data(kv_cache, stream=pipe._kv_transfer_stream, wait_for_ack=wait_for_ack)
-            # 如果需要同步，只等待这个专用 stream
-            if synchronize:
-                pipe._kv_transfer_stream.synchronize()
-        else:
-            pipe.send_data(kv_cache, wait_for_ack=wait_for_ack)
-            # 如果需要同步但没有专用 stream，等待整个设备
-            if synchronize:
-                torch.cuda.synchronize(device=kv_cache.device)
+        # Use the caller's current stream. Sender-side migration already
+        # gathers KV on migration_stream, so this preserves producer -> NCCL
+        # ordering without cross-stream handoffs. The shared _nccl_lock stays
+        # held until a device-wide sync confirms NCCL completion.
+        pipe.send_data(kv_cache, wait_for_ack=wait_for_ack)
+        if synchronize:
+            device = kv_cache.device if kv_cache.is_cuda else self.device
+            torch.cuda.synchronize(device=device)
 
+    def _send_slot_mapping_to_rank(self, rank: int,
+                                   slot_mapping: torch.Tensor,
+                                   synchronize: bool = True) -> None:
+        """Send slot mapping over the same NCCL data path as KV payload."""
+        self._send_data_to_rank(rank, slot_mapping, synchronize=synchronize,
+                                wait_for_ack=False)
+        logger.info("[slot_mapping_nccl]: sent slot mapping to rank %s, "
+                    "shape=%s", rank, tuple(slot_mapping.shape))
+
+    def _recv_slot_mapping_from_rank(self, rank: int,
+                                     dtype: torch.dtype,
+                                     shape: torch.Size,
+                                     synchronize: bool = True) -> torch.Tensor:
+        pipe = self._ensure_pipe_and_buffer(rank, 'recv')
+        pipe = self._pair_pipes_recv[rank]
+        slot_mapping = self._recv_data_from_rank(rank, dtype, shape,
+                                                 send_ack=False,
+                                                 synchronize=synchronize)
+        assert tuple(slot_mapping.shape) == tuple(shape), (
+            f"slot_mapping shape {slot_mapping.shape} does not match {shape}")
+        logger.info("[slot_mapping_nccl]: received slot mapping from rank %s, "
+                    "shape=%s", rank, tuple(slot_mapping.shape))
+        return slot_mapping
 
     def _recv_metadata_from_rank(self, rank: int) -> Union[KVTensorMeta, KVPatchMeta]:
         """Block to receive one metadata entry from peer.
@@ -558,7 +586,8 @@ class DynamicKVSynchronizer():
     def _recv_data_from_rank(self, rank: int,
                                dtype: torch.dtype,
                                shape: torch.Size,
-                               send_ack: bool = False) -> torch.Tensor:
+                               send_ack: bool = False,
+                               synchronize: bool = True) -> torch.Tensor:
         """Given previously received metadata, receive tensor payload via NCCL.
 
         Args:
@@ -573,7 +602,9 @@ class DynamicKVSynchronizer():
             torch.cuda.set_device(self.device)
             pipe = self._ensure_pipe_and_buffer(rank, 'recv')
             pipe = self._pair_pipes_recv[rank]
-            return pipe.recv_data(dtype, shape, stream=pipe._kv_transfer_stream, send_ack=send_ack)
+            return pipe.recv_data(dtype, shape,
+                                  send_ack=send_ack,
+                                  synchronize=synchronize)
 
     def get_recv_pipe(self, rank: int) -> PairPipe:
         self._ensure_pipe_and_buffer(rank, 'recv')
@@ -703,20 +734,35 @@ class DynamicKVSynchronizer():
     # Sender side functions                      #
     # ########################################## #
 
-    def get_kv_patch(self, rank: int, start_layer_id: int, layer_ids: list[int], kv_meta: torch.Tensor) -> Generator[KVPatch, None, None]:
+    def get_kv_patch(
+            self,
+            rank: int,
+            start_layer_id: int,
+            layer_ids: list[int],
+            kv_meta: torch.Tensor,
+            cuda_op_lock=None,
+            key_cache_ptrs: Optional[list[int]] = None,
+            value_cache_ptrs: Optional[list[int]] = None,
+    ) -> Generator[KVPatch, None, None]:
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         if is_flexi:
+            if key_cache_ptrs is None:
+                key_cache_ptrs = self.key_cache_ptrs
+            if value_cache_ptrs is None:
+                value_cache_ptrs = self.value_cache_ptrs
             return self._flexi_get_patch(rank,
                                             layer_ids=layer_ids,
                                             kv_cache_meta=kv_meta,
-                                            key_cache_ptrs=self.key_cache_ptrs,
-                                            value_cache_ptrs=self.value_cache_ptrs,
-                                            start_layer_id=start_layer_id)
+                                            key_cache_ptrs=key_cache_ptrs,
+                                            value_cache_ptrs=value_cache_ptrs,
+                                            start_layer_id=start_layer_id,
+                                            cuda_op_lock=cuda_op_lock)
         else:
             return self._get_patch(rank,
                                     layer_ids,
                                     self.kv_caches,
-                                    start_layer_id)
+                                    start_layer_id,
+                                    cuda_op_lock=cuda_op_lock)
 
     def _buffer_get_kv_patch(self, rank: int) -> Generator[KVPatch, None, None]:
         # 在发送完kv tensor之后开始发送kv patch
@@ -736,22 +782,47 @@ class DynamicKVSynchronizer():
                         kv_cache_meta: torch.Tensor, 
                         key_cache_ptrs: list[int],
                         value_cache_ptrs: list[int],
-                        start_layer_id: int) -> Generator[KVPatch, None, None]:
+                        start_layer_id: int,
+                        cuda_op_lock=None) -> Generator[KVPatch, None, None]:
         while True:
             logger.info(f"start to get slot mapping for rank {rank}")
             slot_mapping, is_finished, stored_tokens = self.slot_mappings[rank].get_all_slot_mappings()
-            slot_mapping_dev = torch.tensor(slot_mapping, device=kv_cache_meta.device, dtype=torch.int64)
             block_size, num_head, head_dim = kv_cache_meta.shape
-            # 为了匹配receiver端的期望，使用shape: [2, num_layers, num_tokens, num_heads, head_dim]
-            # 第0维是K/V区分，第1维是layers
-            kv_out = torch.empty(2, len(layer_ids), slot_mapping_dev.size(0), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
-            logger.info(f"layer_ids: {layer_ids}, kv_out shape: {kv_out.shape}, slot mapping shape: {slot_mapping_dev.shape}, start_layer_id: {start_layer_id}")
-            for idx, layer_id in enumerate(layer_ids):
-                local_layer_id = layer_id - start_layer_id
-                key_cache_ptr = key_cache_ptrs[local_layer_id]
-                value_cache_ptr = value_cache_ptrs[local_layer_id]
-                # 填充到 kv_out[0][idx] (keys) 和 kv_out[1][idx] (values)
-                ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[0][idx], kv_out[1][idx], block_size)
+            lock_context = cuda_op_lock if cuda_op_lock is not None else nullcontext()
+            with lock_context:
+                slot_mapping_dev = torch.tensor(slot_mapping,
+                                                device=kv_cache_meta.device,
+                                                dtype=torch.int64)
+                # 为了匹配receiver端的期望，使用shape: [2, num_layers, num_tokens, num_heads, head_dim]
+                # 第0维是K/V区分，第1维是layers
+                kv_out = torch.empty(2, len(layer_ids),
+                                     slot_mapping_dev.size(0), num_head,
+                                     head_dim, dtype=kv_cache_meta.dtype,
+                                     device=kv_cache_meta.device)
+                logger.info(f"layer_ids: {layer_ids}, kv_out shape: {kv_out.shape}, slot mapping shape: {slot_mapping_dev.shape}, start_layer_id: {start_layer_id}")
+                if slot_mapping_dev.numel() > 0:
+                    for idx, layer_id in enumerate(layer_ids):
+                        local_layer_id = layer_id - start_layer_id
+                        if (local_layer_id < 0
+                                or local_layer_id >= len(key_cache_ptrs)):
+                            raise IndexError(
+                                "KV patch sender layer index out of range: "
+                                f"layer_id={layer_id}, "
+                                f"start_layer_id={start_layer_id}, "
+                                f"local_layer_id={local_layer_id}, "
+                                f"num_key_cache_ptrs={len(key_cache_ptrs)}")
+                        key_cache_ptr = key_cache_ptrs[local_layer_id]
+                        value_cache_ptr = value_cache_ptrs[local_layer_id]
+                        if key_cache_ptr == 0 or value_cache_ptr == 0:
+                            raise RuntimeError(
+                                "KV patch sender resolved an empty cache "
+                                "pointer for non-empty slot mapping: "
+                                f"layer_id={layer_id}, "
+                                f"start_layer_id={start_layer_id}, "
+                                f"local_layer_id={local_layer_id}, "
+                                f"num_key_cache_ptrs={len(key_cache_ptrs)}")
+                        # 填充到 kv_out[0][idx] (keys) 和 kv_out[1][idx] (values)
+                        ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[0][idx], kv_out[1][idx], block_size)
             yield KVPatch(
                 KVPatchMeta(
                     type='kv_patch_meta' if not is_finished else "kv_patch_finished",
@@ -776,21 +847,25 @@ class DynamicKVSynchronizer():
     def _get_patch(self, rank: int, 
                         layer_ids: list[int],
                         kv_cache: list[torch.Tensor], 
-                        start_layer_id: int) -> Generator[KVPatch, None, None]:
+                        start_layer_id: int,
+                        cuda_op_lock=None) -> Generator[KVPatch, None, None]:
         while True:
             patch_id = self.last_patch_ids[rank]
             logger.info(f"start to get slot mapping for rank {rank}")
             slot_mapping, is_finished, stored_tokens = self.slot_mappings[rank].get_all_slot_mappings()
-            slot_mapping_dev = torch.tensor(slot_mapping, device=kv_cache[0].device, dtype=torch.int64)
-
-            kv_patch = self.kv_helper.extract_kv_patch_from_kv_cache(
-                patch_id=patch_id,
-                kv_caches=kv_cache,
-                layer_ids=layer_ids,
-                start_layer_id=start_layer_id,
-                slot_mapping=slot_mapping_dev,
-                is_finished=is_finished
-            )
+            lock_context = cuda_op_lock if cuda_op_lock is not None else nullcontext()
+            with lock_context:
+                slot_mapping_dev = torch.tensor(slot_mapping,
+                                                device=kv_cache[0].device,
+                                                dtype=torch.int64)
+                kv_patch = self.kv_helper.extract_kv_patch_from_kv_cache(
+                    patch_id=patch_id,
+                    kv_caches=kv_cache,
+                    layer_ids=layer_ids,
+                    start_layer_id=start_layer_id,
+                    slot_mapping=slot_mapping_dev,
+                    is_finished=is_finished
+                )
             kv_patch.meta.num_tokens = stored_tokens
             yield kv_patch
             self.last_patch_ids[rank] += 1
@@ -800,16 +875,29 @@ class DynamicKVSynchronizer():
                 self.last_patch_ids[rank] = 0
                 break
 
-    def get_kv_tensor_from_cache(self, layer_ids: list[int],layer_id: int, start_layer_id: int, kv_cache_meta: torch.Tensor, slot_mapping: Optional[torch.Tensor] = None) -> Tuple[Union[KVTensorMeta, FlexiKVTensorMeta], torch.Tensor]:
+    def get_kv_tensor_from_cache(
+            self,
+            layer_ids: list[int],
+            layer_id: int,
+            start_layer_id: int,
+            kv_cache_meta: torch.Tensor,
+            slot_mapping: Optional[torch.Tensor] = None,
+            key_cache_ptrs: Optional[list[int]] = None,
+            value_cache_ptrs: Optional[list[int]] = None,
+    ) -> Tuple[Union[KVTensorMeta, FlexiKVTensorMeta], torch.Tensor]:
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         if is_flexi:
             assert slot_mapping is not None, "slot_mapping should be provided when using flexi flash attention"
+            if key_cache_ptrs is None:
+                key_cache_ptrs = self.key_cache_ptrs
+            if value_cache_ptrs is None:
+                value_cache_ptrs = self.value_cache_ptrs
             return self._flexi_get_kv_tensor(
                                         layer_id=layer_id,
                                         layer_ids=layer_ids,
                                         kv_cache_meta=kv_cache_meta,
-                                        key_cache_ptrs=self.key_cache_ptrs,
-                                        value_cache_ptrs=self.value_cache_ptrs,
+                                        key_cache_ptrs=key_cache_ptrs,
+                                        value_cache_ptrs=value_cache_ptrs,
                                         slot_mapping=slot_mapping,
                                         start_layer_id=start_layer_id)
         else:
@@ -836,12 +924,28 @@ class DynamicKVSynchronizer():
                             slot_mapping: torch.Tensor,
                             start_layer_id: int) -> Tuple[FlexiKVTensorMeta, torch.Tensor]:
         local_layer_id = layer_id - start_layer_id
+        if local_layer_id < 0 or local_layer_id >= len(key_cache_ptrs):
+            raise IndexError(
+                "KV sender layer index out of range: "
+                f"layer_id={layer_id}, start_layer_id={start_layer_id}, "
+                f"local_layer_id={local_layer_id}, "
+                f"num_key_cache_ptrs={len(key_cache_ptrs)}")
         key_cache_ptr = key_cache_ptrs[local_layer_id]
         value_cache_ptr = value_cache_ptrs[local_layer_id]
         block_size, num_head, head_dim = kv_cache_meta.shape
         kv_out = torch.empty(2, slot_mapping.size(0), num_head, head_dim, dtype=kv_cache_meta.dtype, device=kv_cache_meta.device)
         logger.info(f"kv out device: {kv_out.device}, slot mapping device: {slot_mapping.device}")
-        ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping, kv_out[0], kv_out[1], block_size)
+        if slot_mapping.numel() > 0:
+            if key_cache_ptr == 0 or value_cache_ptr == 0:
+                raise RuntimeError(
+                    "KV sender resolved an empty cache pointer for non-empty "
+                    "slot mapping: "
+                    f"layer_id={layer_id}, start_layer_id={start_layer_id}, "
+                    f"local_layer_id={local_layer_id}, "
+                    f"num_key_cache_ptrs={len(key_cache_ptrs)}")
+            ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr,
+                                   slot_mapping, kv_out[0], kv_out[1],
+                                   block_size)
         # 第一次访问时默认置为 False，避免 KeyError
         return FlexiKVTensorMeta(
             type='kv_tensor',
@@ -889,27 +993,42 @@ class DynamicKVSynchronizer():
         recv_pipe = self._ensure_pipe_and_buffer(rank, 'send')
         recv_pipe.notify_ready_for_kv_patch()
 
-    def send_kv_tensor_to_rank(self, rank: int, kv_tensor_meta: Union[KVTensorMeta, FlexiKVTensorMeta], kv_tensor: torch.Tensor, slot_mapping: Optional[torch.Tensor] = None) -> None:
+    def send_kv_tensor_to_rank(self,
+            rank: int,
+            kv_tensor_meta: Union[KVTensorMeta, FlexiKVTensorMeta],
+            kv_tensor: torch.Tensor,
+            slot_mapping: Optional[torch.Tensor] = None,
+            cuda_op_lock=None) -> None:
         """Send a single KV tensor to a peer rank with deadlock-free protocol.
         
         Protocol:
         1. Acquire nccl_lock
         2. Send meta
         3. Wait for ACCEPT/REJECT from receiver
-        4. If ACCEPT: NCCL send, then release lock
+        4. If ACCEPT: send each NCCL payload and synchronize it before
+           enqueueing the next one, then release lock. The same lock is used
+           by PP NCCL, so this keeps KV and PP collectives mutually exclusive
+           on the local GPU.
         5. If REJECT: release lock, backoff, retry from step 1
         """
         self.kv_cache_transfer_in_process[rank] = True
         # Ensure pipe exists before using it
         self._ensure_pipe_and_buffer(rank, 'send')
         pipe = self._pair_pipes_send[rank]
+        nccl_lock = pipe._nccl_lock or self._nccl_lock
+        slot_mapping_to_send = slot_mapping
+        if not isinstance(kv_tensor_meta, KVTensorMeta):
+            assert slot_mapping is not None, (
+                "slot_mapping should be provided when sending "
+                "FlexiKVTensorMeta")
         
         retry_delay = 0.005  # 5ms fixed retry delay
         
         while True:
+            should_retry = False
             # Step 1: Acquire lock
-            self._nccl_lock.acquire()
-            
+            nccl_lock.acquire()
+
             try:
                 # Step 2: Send meta
                 self._send_meta_to_rank(rank, kv_tensor_meta)
@@ -922,55 +1041,63 @@ class DynamicKVSynchronizer():
                     # Step 4a: Receiver has lock, do NCCL send
                     logger.info(f"[send_kv_tensor_to_rank]: received ACCEPT from rank {rank}")
                     if isinstance(kv_tensor_meta, KVTensorMeta):
-                        self._send_data_to_rank(rank, kv_tensor, wait_for_ack=False)
+                        self._send_data_to_rank(rank, kv_tensor,
+                                                wait_for_ack=False)
                     else:
-                        assert slot_mapping is not None, "slot_mapping should be provided when sending FlexiKVTensorMeta"
-                        self._send_data_to_rank(rank, slot_mapping, wait_for_ack=False)
+                        assert slot_mapping_to_send is not None
+                        self._send_slot_mapping_to_rank(rank,
+                                                        slot_mapping_to_send)
                         logger.info(f"[send_kv_tensor_to_rank]: sent slot mapping to rank {rank}")
-                        self._send_data_to_rank(rank, kv_tensor, wait_for_ack=False)
+                        self._send_data_to_rank(rank, kv_tensor,
+                                                wait_for_ack=False)
                         logger.info(f"[send_kv_tensor_to_rank]: sent kv tensor to rank {rank}")
                     break  # Success
                 elif response == "REJECT":
                     # Step 4b: Retry after fixed delay
                     logger.info(f"[send_kv_tensor_to_rank]: received REJECT from rank {rank}, retry in 5ms")
-                    self._nccl_lock.release()
-                    time.sleep(retry_delay)
-                    continue
+                    should_retry = True
                 else:
                     raise RuntimeError(f"Unexpected response: {response}")
-            except Exception as e:
-                self._nccl_lock.release()
-                raise e
-        
-        self._nccl_lock.release()
+            finally:
+                nccl_lock.release()
+            if should_retry:
+                time.sleep(retry_delay)
+                continue
         logger.info(f"[send_kv_tensor_to_rank]: completed sending to rank {rank}")
     
     def send_kv_patch_to_rank(self, 
             target_rank: int,
-            kv_patches: KVPatch) -> None:
+            kv_patches: KVPatch,
+            cuda_op_lock=None) -> None:
         """Send KV patch to target rank with deadlock-free protocol.
         
         Protocol:
         1. Acquire nccl_lock
         2. Send meta
         3. Wait for ACCEPT/REJECT from receiver
-        4. If ACCEPT: NCCL send, then release lock
+        4. If ACCEPT: send each NCCL payload and synchronize it before
+           enqueueing the next one, then release lock. The same lock is used
+           by PP NCCL, so this keeps KV and PP collectives mutually exclusive
+           on the local GPU.
         5. If REJECT: release lock, backoff, retry from step 1
         """
         assert self.kv_cache_transfer_in_process[target_rank] == True, "The kv cache transfer in process of the rank should be True."
         meta, kv_payload, slot_mapping = kv_patches.meta, kv_patches.kv_payload, kv_patches.slot_mapping
+        slot_mapping_to_send = slot_mapping
         time_start = time.time()
         # Ensure pipe exists (should already exist from send_kv_tensor_to_rank, but be safe)
         self._ensure_pipe_and_buffer(target_rank, 'send')
         pipe = self._pair_pipes_send[target_rank]
+        nccl_lock = pipe._nccl_lock or self._nccl_lock
         
         retry_delay = 0.005  # 5ms fixed retry delay
         
         while True:
+            should_retry = False
             # Step 1: Acquire lock
-            self._nccl_lock.acquire()
+            nccl_lock.acquire()
             time_lock_acquired = time.time()
-            
+
             try:
                 # Step 2: Send meta
                 self._send_meta_to_rank(target_rank, meta)
@@ -982,26 +1109,25 @@ class DynamicKVSynchronizer():
                 if response == "ACCEPT":
                     # Step 4a: Receiver has lock, do NCCL send
                     logger.info(f"received ACCEPT from rank {target_rank}, sending data")
-                    self._send_data_to_rank(target_rank, slot_mapping, wait_for_ack=False)
+                    self._send_slot_mapping_to_rank(target_rank,
+                                                    slot_mapping_to_send)
                     logger.info(f"sent slot mapping to rank {target_rank}, patch id: {meta.id}")
-                    self._send_data_to_rank(target_rank, kv_payload, wait_for_ack=False)
+                    self._send_data_to_rank(target_rank, kv_payload,
+                                            wait_for_ack=False)
                     logger.info(f"sent kv payload to rank {target_rank}, patch id: {meta.id}, shape:{kv_payload.shape}")
                     break  # Success, exit loop
                 elif response == "REJECT":
                     # Step 4b: Retry after fixed delay
                     logger.info(f"received REJECT from rank {target_rank}, retry in 5ms")
-                    self._nccl_lock.release()
-                    time.sleep(retry_delay)
-                    continue  # Retry
+                    should_retry = True
                 else:
                     raise RuntimeError(f"Unexpected response: {response}")
-            except Exception as e:
-                self._nccl_lock.release()
-                raise e
-        
-        # Release lock after successful send
-        self._nccl_lock.release()
-        
+            finally:
+                nccl_lock.release()
+            if should_retry:
+                time.sleep(retry_delay)
+                continue  # Retry
+
         logger.info(f"send_kv_patch_to_rank completed: time to acquire lock: {time_lock_acquired - time_start}, total time: {time.time() - time_start}")
         if meta.type == "kv_patch_finished":
             self.kv_cache_transfer_in_process[target_rank] = False
@@ -1162,7 +1288,8 @@ class DynamicKVSynchronizer():
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         for rank in self.last_patch_ids:
             if is_flexi:
-                self.slot_mappings[rank].add_slot_mappings([], is_finished=True)
+                self.slot_mappings[rank].add_slot_mappings(
+                    [], is_finished=True, num_total_new_tokens=0)
             else:
                 meta = KVPatchMeta(
                     type='kv_patch_finished',
@@ -1177,18 +1304,12 @@ class DynamicKVSynchronizer():
                 self.buffers[rank].add_patch(KVPatch(meta, torch.empty(0, device='cpu'), torch.empty(0, device='cpu')))
         self.last_patch_ids = {}
 
-    def add_new_tokens_to_kv_synchronizer(self, rank: int, slot_mapping: torch.Tensor, is_finished: bool, num_total_new_tokens: int) -> None:
-        time_start = time.time()
-        # is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
-        # if is_flexi:
-        self.slot_mappings[rank].add_slot_mappings(slot_mapping.tolist(), is_finished=is_finished, num_total_new_tokens=num_total_new_tokens)
-        # else:
-        #     kv_patch = self.kv_synchronizer_helper.extract_kv_patch_from_kv_cache(self.last_patch_ids[rank], kv_caches, layer_ids, start_layer_id, slot_mapping, is_finished)
-        #     time_after_extract_kv_patch = time.time()
-        #     logger.info(f"debug: ---------------------extract kv patch time: {time_after_extract_kv_patch - time_start:.2f} seconds")
-        #     assert kv_patch is not None
-        #     self.last_patch_ids[rank] += 1
-        #     self.buffers[rank].add_patch(kv_patch)
+    def add_new_tokens_to_kv_synchronizer(self, rank: int, slot_mapping: Union[torch.Tensor, list[int]], is_finished: bool, num_total_new_tokens: int) -> None:
+        slot_mapping_list = (slot_mapping.tolist()
+                             if isinstance(slot_mapping, torch.Tensor)
+                             else slot_mapping)
+        self.slot_mappings[rank].add_slot_mappings(slot_mapping_list, is_finished=is_finished, num_total_new_tokens=num_total_new_tokens)
+
 
     # ########################################## #
     # Receiver side functions                      #
@@ -1202,22 +1323,29 @@ class DynamicKVSynchronizer():
         meta_obj = pipe.recv_meta()
         return self._control_adapter.validate_python(meta_obj)
 
-    def recv_kv_tensor(self, from_rank: int, meta: Union[KVTensorMeta, FlexiKVTensorMeta]) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def recv_kv_tensor(self,
+            from_rank: int,
+            meta: Union[KVTensorMeta, FlexiKVTensorMeta],
+            cuda_op_lock=None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Receive KV tensor from sender with deadlock-free protocol.
         
         Protocol:
         1. Meta already received by caller
         2. Try to acquire nccl_lock (non-blocking)
         3. If failed: send REJECT, receive new meta (sender will retry), go to step 2
-        4. If acquired: send ACCEPT, do NCCL recv, release lock
+        4. If acquired: send ACCEPT, receive each NCCL payload and
+           synchronize it before receiving the next one, then release lock.
+           The same lock is used by PP NCCL, so this keeps KV and PP
+           collectives mutually exclusive on the local GPU.
         """
         time_start = time.time()
         pipe = self._pair_pipes_recv[from_rank]
+        nccl_lock = pipe._nccl_lock or self._nccl_lock
         
         current_meta: Union[KVTensorMeta, FlexiKVTensorMeta] = meta
         while True:
             # Step 2: Try to acquire lock (non-blocking)
-            lock_acquired = self._nccl_lock.acquire(blocking=False)
+            lock_acquired = nccl_lock.acquire(blocking=False)
             
             if not lock_acquired:
                 # Step 3: Lock held by others - send REJECT immediately
@@ -1230,23 +1358,33 @@ class DynamicKVSynchronizer():
                 continue
             
             try:
-                # Step 4: Lock acquired - send ACCEPT and recv
+                # Step 4: Lock acquired - serialize against local PP forward,
+                # then send ACCEPT and recv.
                 time_lock_acquired = time.time()
                 pipe.signal_group.send_obj("ACCEPT", dst=pipe.peer_rank)
-                logger.info(f"recv_kv_tensor: lock acquired in {time_lock_acquired - time_start}s, sent ACCEPT")
-                
+                logger.info(
+                    "recv_kv_tensor: lock acquired in %ss, sent ACCEPT",
+                    time_lock_acquired - time_start)
+
                 if isinstance(current_meta, FlexiKVTensorMeta):
-                    slot_mapping = self._recv_data_from_rank(from_rank, current_meta.slot_mapping_dtype, current_meta.slot_mapping_shape, send_ack=False)
+                    slot_mapping = self._recv_slot_mapping_from_rank(
+                        from_rank, current_meta.slot_mapping_dtype,
+                        current_meta.slot_mapping_shape)
                     logger.info(f"recv_kv_tensor: received slot mapping, took {time.time() - time_start}s")
-                    kv_payload = self._recv_data_from_rank(from_rank, current_meta.kv_payload_dtype, current_meta.kv_payload_shape, send_ack=False)
+                    kv_payload = self._recv_data_from_rank(
+                        from_rank, current_meta.kv_payload_dtype,
+                        current_meta.kv_payload_shape, send_ack=False,
+                        synchronize=True)
                     logger.info(f"recv_kv_tensor: received kv payload, took {time.time() - time_start}s")
                 else:
-                    kv_payload = self._recv_data_from_rank(from_rank, current_meta.dtype, current_meta.shape, send_ack=False)
+                    kv_payload = self._recv_data_from_rank(
+                        from_rank, current_meta.dtype, current_meta.shape,
+                        send_ack=False)
                     slot_mapping = None
                 break  # Success, exit loop
             finally:
-                self._nccl_lock.release()
-        
+                nccl_lock.release()
+
         logger.info(f"recv_kv_tensor completed: lock wait: {time_lock_acquired - time_start}, total: {time.time() - time_start}")
         
         if isinstance(current_meta, FlexiKVTensorMeta):
@@ -1257,23 +1395,30 @@ class DynamicKVSynchronizer():
             assert kv_payload.dim() == 5 and kv_payload.size(0) == 2, f"kv_payload shape {kv_payload.shape} is not correct"
             return kv_payload
 
-    def recv_kv_patch(self, from_rank: int, meta: KVPatchMeta) -> Tuple[torch.Tensor, torch.Tensor]:
+    def recv_kv_patch(self,
+            from_rank: int,
+            meta: KVPatchMeta,
+            cuda_op_lock=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """Receive KV patch from sender with deadlock-free protocol.
         
         Protocol:
         1. Meta already received by caller
         2. Try to acquire nccl_lock (non-blocking)
         3. If failed: send REJECT, receive new meta (sender will retry), go to step 2
-        4. If acquired: send ACCEPT, do NCCL recv, release lock
+        4. If acquired: send ACCEPT, receive each NCCL payload and
+           synchronize it before receiving the next one, then release lock.
+           The same lock is used by PP NCCL, so this keeps KV and PP
+           collectives mutually exclusive on the local GPU.
         """
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         time_start = time.time()
         pipe = self._pair_pipes_recv[from_rank]
+        nccl_lock = pipe._nccl_lock or self._nccl_lock
         
         current_meta = meta
         while True:
             # Step 2: Try to acquire lock (non-blocking)
-            lock_acquired = self._nccl_lock.acquire(blocking=False)
+            lock_acquired = nccl_lock.acquire(blocking=False)
             
             if not lock_acquired:
                 # Step 3: Lock held by others - send REJECT immediately
@@ -1286,17 +1431,25 @@ class DynamicKVSynchronizer():
                 continue
             
             try:
-                # Step 4: Lock acquired - send ACCEPT and recv
+                # Step 4: Lock acquired - serialize against local PP forward,
+                # then send ACCEPT and recv.
                 time_lock_acquired = time.time()
                 pipe.signal_group.send_obj("ACCEPT", dst=pipe.peer_rank)
-                logger.info(f"recv_kv_patch: lock acquired in {time_lock_acquired - time_start}s, sent ACCEPT")
-                
-                slot_mapping = self._recv_data_from_rank(from_rank, current_meta.slot_mapping_dtype, current_meta.slot_mapping_shape, False)
-                kv_payload = self._recv_data_from_rank(from_rank, current_meta.kv_payload_dtype, current_meta.kv_payload_shape, False)
+                logger.info(
+                    "recv_kv_patch: lock acquired in %ss, sent ACCEPT",
+                    time_lock_acquired - time_start)
+
+                slot_mapping = self._recv_slot_mapping_from_rank(
+                    from_rank, current_meta.slot_mapping_dtype,
+                    current_meta.slot_mapping_shape)
+                kv_payload = self._recv_data_from_rank(
+                    from_rank, current_meta.kv_payload_dtype,
+                    current_meta.kv_payload_shape, False,
+                    synchronize=True)
                 break  # Success, exit loop
             finally:
-                self._nccl_lock.release()
-        
+                nccl_lock.release()
+
         logger.info(f"recv_kv_patch completed: lock wait: {time_lock_acquired - time_start}, total: {time.time() - time_start}")
         
         # For kv_patch_finished with empty data, skip the dimension assertion
@@ -1341,8 +1494,24 @@ class DynamicKVSynchronizer():
                 local_layer_id = layer_id - start_layer_id
                 if is_flexi:
                     assert page_meta is not None, "page_meta should be provided when using flexi flash attention"
+                    if (local_layer_id < 0
+                            or local_layer_id >= len(self.key_cache_ptrs)):
+                        raise IndexError(
+                            "KV receiver patch layer index out of range: "
+                            f"layer_id={layer_id}, "
+                            f"start_layer_id={start_layer_id}, "
+                            f"local_layer_id={local_layer_id}, "
+                            f"num_key_cache_ptrs={len(self.key_cache_ptrs)}")
                     key_cache_ptr = self.key_cache_ptrs[local_layer_id]
                     value_cache_ptr = self.value_cache_ptrs[local_layer_id]
+                    if key_cache_ptr == 0 or value_cache_ptr == 0:
+                        raise RuntimeError(
+                            "KV receiver patch resolved an empty cache "
+                            "pointer: "
+                            f"layer_id={layer_id}, "
+                            f"start_layer_id={start_layer_id}, "
+                            f"local_layer_id={local_layer_id}, "
+                            f"num_key_cache_ptrs={len(self.key_cache_ptrs)}")
                     self.kv_helper.flexi_put_kv_to_cache(
                         model_executable=self.model_executable,
                         page_meta=page_meta,

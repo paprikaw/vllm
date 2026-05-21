@@ -59,13 +59,15 @@ def add_layers(
     new_module = torch.nn.ModuleList()
     assert added_layers[0] <= added_layers[1], \
         "added_layers[0] must be <= added_layers[1]"
-    assert (added_layers[1] == old_layers[0] - 1
+    old_layers_empty = old_layers[0] > old_layers[1]
+    assert (old_layers_empty
+            or added_layers[1] == old_layers[0] - 1
             or added_layers[0] == old_layers[1] + 1), \
         (f"added_layers must be adjacent to old_layers, "
          f"added_layers:{added_layers}, old_layers:{old_layers}")
 
     for idx in range(num_layers):
-        if old_layers[0] <= idx <= old_layers[1]:
+        if not old_layers_empty and old_layers[0] <= idx <= old_layers[1]:
             new_module.append(module[idx])
         elif added_layers[0] <= idx <= added_layers[1]:
             new_module.append(

@@ -180,14 +180,20 @@ class DynamicQwen3Model(Qwen3Model):
                     ) -> None:
         # First update model's layers
         assert layers[0] <= layers[1], "layers[0] must be less than layers[1]"
-        assert layers[1] == self.start_layer - 1 or layers[0] == self.end_layer, f"layers must be adjacent to old_layers, layers: {layers}, start_layer: {self.start_layer}, end_layer: {self.end_layer}"
+        old_start_layer = self.start_layer
+        old_end_layer = self.end_layer
+        old_layers_empty = old_start_layer >= old_end_layer
+        assert (old_layers_empty or layers[1] == old_start_layer - 1
+                or layers[0] == old_end_layer), (
+                    f"layers must be adjacent to old_layers, layers: {layers}, "
+                    f"start_layer: {old_start_layer}, end_layer: {old_end_layer}")
         # 使用set_current_vllm_config上下文管理器，确保新层初始化时能访问到正确的vllm_config
         # 这与initialize_model中的逻辑保持一致
         with set_current_vllm_config(self.vllm_config):
             new_module = add_layers(
                 self.layers, 
                 layers,
-                (self.start_layer, self.end_layer-1),
+                (old_start_layer, old_end_layer - 1),
                 lambda prefix: decoder_layer_type(config=self.config,
                                                   cache_config=self.cache_config,
                                                   quant_config=self.quant_config,
@@ -196,10 +202,14 @@ class DynamicQwen3Model(Qwen3Model):
                 )
         with self.model_lock:
             self.layers = new_module
-            if layers[1] == self.start_layer-1:
+            if old_layers_empty:
                 self.start_layer = layers[0]
-            if layers[0] == self.end_layer:
                 self.end_layer = layers[1] + 1
+            else:
+                if layers[1] == old_start_layer - 1:
+                    self.start_layer = layers[0]
+                if layers[0] == old_end_layer:
+                    self.end_layer = layers[1] + 1
         
         # 🔴 关键修复：清除get_pp_missing_layer_names的缓存
         # add_layers后，原来的PPMissingLayer变成了真实的层，但缓存仍保存旧的missing列表
@@ -560,10 +570,14 @@ def add_layers(
     num_layers = len(module)
     new_module = torch.nn.ModuleList()
     assert added_layers[0] <= added_layers[1], "added_layers[0] must be less than added_layers[1]"
-    assert added_layers[1] == old_layers[0] - 1 or added_layers[0] == old_layers[1]+1, f"added_layers must be adjacent to old_layers, added_layers:{added_layers}, old_layers:{old_layers}"
+    old_layers_empty = old_layers[0] > old_layers[1]
+    assert (old_layers_empty or added_layers[1] == old_layers[0] - 1
+            or added_layers[0] == old_layers[1] + 1), (
+                f"added_layers must be adjacent to old_layers, "
+                f"added_layers:{added_layers}, old_layers:{old_layers}")
 
     for idx in range(num_layers):
-        if old_layers[0] <= idx <= old_layers[1]:
+        if not old_layers_empty and old_layers[0] <= idx <= old_layers[1]:
             new_module.append(module[idx])
         elif added_layers[0] <= idx <= added_layers[1]:
             new_module.append(maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}")))

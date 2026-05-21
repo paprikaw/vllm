@@ -331,7 +331,8 @@ class KVAllocator():
         block_shape: List[int],
         dtype: torch.dtype,
         device: torch.device,
-        granularity: int
+        granularity: int,
+        gate_mode: str = "background",
     ) -> Tuple[List[List[int]], List[List[int]], List[int], List[int], int, int, List[int], float]:
         """
         VMM API allocation with multiple layers combined in same physical pages.
@@ -373,8 +374,12 @@ class KVAllocator():
         
         start_time = time.perf_counter()
         
-        if self.fb_gate is not None:
+        if self.fb_gate is not None and gate_mode == "background":
             with self.fb_gate.background():
+                results = _cpp_module.allocate_with_cuda_vmm_combined_layers(
+                    num_blocks, block_shape, dtype, device, granularity)
+        elif self.fb_gate is not None and gate_mode == "foreground":
+            with self.fb_gate.foreground():
                 results = _cpp_module.allocate_with_cuda_vmm_combined_layers(
                     num_blocks, block_shape, dtype, device, granularity)
         else:
@@ -384,7 +389,8 @@ class KVAllocator():
         torch.cuda.synchronize(device)
         alloc_time_ms = (time.perf_counter() - start_time) * 1000
         logger.info(f"VMM combined layers allocation: alloc_time={alloc_time_ms:.2f}ms, "
-                    f"granularity={granularity}, aligned_combined_bytes={results[4]}, "
+                    f"granularity={granularity}, gate_mode={gate_mode}, "
+                    f"aligned_combined_bytes={results[4]}, "
                     f"bytes_per_kv={results[5]}")
         return results
 

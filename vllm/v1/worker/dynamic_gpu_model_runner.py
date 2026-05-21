@@ -239,6 +239,14 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 for request in scheduler_output.scheduled_new_reqs:
                     for block_id in request.block_ids:
                         logger.info(f"request {request.request_id} block id list: {block_id}")
+                for request in scheduler_output.scheduled_cached_reqs:
+                    logger.info(
+                        "cached request %s num_computed_tokens=%s "
+                        "new_token_ids=%s new_block_ids=%s",
+                        request.req_id,
+                        request.num_computed_tokens,
+                        request.new_token_ids,
+                        request.new_block_ids)
                 time.sleep(1)
                 raise
             return result
@@ -1839,13 +1847,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     if block_id in migrate_record:
                         row[idx] = migrate_record[block_id]
         
-        # # ===== 关键修复：将更新后的 block table 同步到 GPU =====
-        # # block_table_np 的修改已自动同步到 block_table_cpu (numpy view)
-        # # 但必须显式调用 commit() 将 CPU tensor 拷贝到 GPU tensor
-        # num_reqs = len(self.requests)
-        # logger.info(f"[debug]: committing block table updates to GPU for {num_reqs} requests")
-        # self.input_batch.block_table.commit(num_reqs)
-        # logger.info(f"[debug]: block table committed to GPU")
+        self.input_batch.block_table.commit(self.input_batch.num_reqs)
 
         torch.cuda.synchronize()
         time_end = time.time()
@@ -2102,7 +2104,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
                         list(block_shape),
                         kv_dtype,
                         self.device,
-                        granularity
+                        granularity,
+                        gate_mode="foreground",
                     )
                 
                 # vmm_result: (k_ptrs_per_layer, v_ptrs_per_layer, k_ptrs_dev_per_layer, v_ptrs_dev_per_layer,

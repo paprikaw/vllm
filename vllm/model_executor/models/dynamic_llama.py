@@ -215,16 +215,19 @@ class DynamicLlamaModel(LlamaModel):
         decoder_layer_type: type[nn.Module] = LlamaDecoderLayer,
     ) -> None:
         assert layers[0] <= layers[1], "layers[0] must be <= layers[1]"
-        assert (layers[1] == self.start_layer - 1
-                or layers[0] == self.end_layer), \
+        old_start_layer = self.start_layer
+        old_end_layer = self.end_layer
+        old_layers_empty = old_start_layer >= old_end_layer
+        assert (old_layers_empty or layers[1] == old_start_layer - 1
+                or layers[0] == old_end_layer), \
             (f"layers must be adjacent to old_layers, layers: {layers}, "
-             f"start_layer: {self.start_layer}, end_layer: {self.end_layer}")
+             f"start_layer: {old_start_layer}, end_layer: {old_end_layer}")
 
         with set_current_vllm_config(self.vllm_config):
             new_module = add_layers(
                 self.layers,
                 layers,
-                (self.start_layer, self.end_layer - 1),
+                (old_start_layer, old_end_layer - 1),
                 lambda prefix: decoder_layer_type(
                     config=self.config,
                     cache_config=self.cache_config,
@@ -235,10 +238,14 @@ class DynamicLlamaModel(LlamaModel):
 
         with self.model_lock:
             self.layers = new_module
-            if layers[1] == self.start_layer - 1:
+            if old_layers_empty:
                 self.start_layer = layers[0]
-            if layers[0] == self.end_layer:
                 self.end_layer = layers[1] + 1
+            else:
+                if layers[1] == old_start_layer - 1:
+                    self.start_layer = layers[0]
+                if layers[0] == old_end_layer:
+                    self.end_layer = layers[1] + 1
 
         # Clear PP missing-layer cache so new layers can receive weights
         from vllm.model_executor.models.utils import (
