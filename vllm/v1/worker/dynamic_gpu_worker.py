@@ -3302,17 +3302,69 @@ class DynamicGPUWorker(Worker):
             return
         assert scheduler_output.sender_list is not None
         assert scheduler_output.receiver_list is not None
-        is_sender = self.rank in scheduler_output.sender_list
-        is_receiver = self.rank in scheduler_output.receiver_list
-        num_total_migration_tokens = scheduler_output.total_migration_tokens
+        if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+            logger.info(
+                "[autoscaling sync] rank %s defers migration finalization "
+                "to all-worker RPC", self.rank)
+            return
+        self._finalize_async_migration_after_sync(
+            list(scheduler_output.sender_list),
+            list(scheduler_output.receiver_list),
+            scheduler_output.total_migration_tokens,
+            scheduler_output.new_kv_cache_block_num)
+
+    def finalize_async_migration_after_sync(
+        self,
+        sender_list: list[int],
+        receiver_list: list[int],
+        total_migration_tokens: int,
+        new_kv_cache_block_num: int,
+    ) -> None:
+        if not isinstance(self.model_runner.model, DynamicModelBase):
+            return
+        self._finalize_async_migration_after_sync(
+            sender_list, receiver_list, total_migration_tokens,
+            new_kv_cache_block_num)
+
+    def _finalize_async_migration_after_sync(
+        self,
+        sender_list: list[int],
+        receiver_list: list[int],
+        num_total_migration_tokens: int,
+        new_kv_cache_block_num: int,
+    ) -> None:
+        sender_set = set(sender_list)
+        receiver_set = set(receiver_list)
+        is_sender = self.rank in sender_set
+        is_receiver = self.rank in receiver_set
+
+        if not is_sender and not is_receiver:
+            self.after_migration_total_token = 0
+            self.after_migration_applied_token_num = 0
+            self.kv_resizing_done = True
+            with self.resizing_done_cv:
+                self.resizing_done = True
+                self.resizing_done_cv.notify_all()
+            logger.info(
+                "[autoscaling sync] rank %s has no sender/receiver work; "
+                "marked migration finalize done", self.rank)
+            return
+
+        if self.target_pp_layer_config is None:
+            logger.info(
+                "[autoscaling sync] rank %s migration already finalized; "
+                "sender=%s receiver=%s", self.rank, is_sender, is_receiver)
+            self.kv_resizing_done = True
+            with self.resizing_done_cv:
+                self.resizing_done = True
+                self.resizing_done_cv.notify_all()
+            return
 
         time_start_to_sync = time.time()
-        # Set CUDA device for this thread - threads don't inherit CUDA context
-        torch.cuda.set_device(self.device)
         time_start = time.time()
-        logger.info(f"[operation]: before finish kv cache transfer start to finish kv cache tansfer, delete layers, release kv cache, reinitialize kv cache")
-        if is_receiver:
-            self.wait_for_all_patch_applied("sync KV cache cleanup")
+        # Set CUDA device for this thread - threads don't inherit CUDA context
+        # torch.cuda.set_device(self.device)
+        # logger.info(f"[operation]: before finish kv cache transfer start to finish kv cache tansfer, delete layers, release kv cache, reinitialize kv cache")
         # Sender finishes transfer and cleans up; receiver no-ops.
         layer_ranges = []
         for layers in self.rank_to_layers_ids.values():
@@ -3321,6 +3373,10 @@ class DynamicGPUWorker(Worker):
             layer_ranges.append((layers[0], layers[-1]))
 
         assert self.target_pp_layer_config is not None, "target_pp_layer_config must be set"
+        caches_to_free_key = []
+        caches_to_free_value = []
+        ptrs_to_free_key = []
+        ptrs_to_free_value = []
         handles_to_free_key: list[list[int]] = []
         handles_to_free_value: list[list[int]] = []
         grouped_handles_to_free: list[tuple[list[int], list[int]]] = []  # (handles, base_k_ptrs) tuples
@@ -3352,6 +3408,8 @@ class DynamicGPUWorker(Worker):
             try:
                 # Set CUDA device for this thread - threads don't inherit CUDA context
                 torch.cuda.set_device(self.device)
+                if is_receiver:
+                    self.wait_for_all_patch_applied("sync KV cache cleanup")
                 if is_sender:
                     # 等待所有 sender 线程完成后再释放 KV 缓存内存
                     with self._sender_threads_cv:
@@ -3370,9 +3428,9 @@ class DynamicGPUWorker(Worker):
                     self.after_migration_applied_token_num = num_total_migration_tokens
                 fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
                 if fixed_blocks <= 0:
-                    self.resize_kv_cache(scheduler_output.new_kv_cache_block_num)
+                    self.resize_kv_cache(new_kv_cache_block_num)
                 else:
-                    logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping worker-side resize (would be {scheduler_output.new_kv_cache_block_num} blocks), sleep for 4 seconds")
+                    logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping worker-side resize (would be {new_kv_cache_block_num} blocks), sleep for 4 seconds")
                 self.finish_migration()
                 self.kv_resizing_done = True
             finally:

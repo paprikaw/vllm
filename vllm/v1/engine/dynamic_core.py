@@ -408,6 +408,48 @@ class DynamicEngineCore(EngineCore):
         logger.info(f"[memory access] assessed memory for adding layers: {num_changed_layers}, memory can not directly fit, max_blocks_per_layer: {max_blocks_per_layer}")
         return LayerAddingAssessResult(False, False, max_blocks_per_layer)
 
+    def _calculate_max_blocks_for_pp_config(
+        self,
+        pp_layer_config: list[Tuple[int, int]],
+        mem_infos: list[WorkerMemInfo],
+    ) -> int:
+        """Calculate the global KV block limit for a concrete PP config."""
+        max_blocks_per_rank: list[int] = []
+        for rank in range(len(pp_layer_config)):
+            assess = self._assess_memory_for_layer_reconfiguration(
+                rank, 0, mem_infos[rank], pp_layer_config)
+            max_blocks_per_rank.append(assess.max_blocks_per_layer)
+        return min(max_blocks_per_rank)
+
+    def _needs_pre_migration_kv_resize(
+        self,
+        rank: int,
+        assess: LayerAddingAssessResult,
+        context: str,
+    ) -> bool:
+        """Return whether the current KV cache is too large for temp config."""
+        assert isinstance(self.scheduler, DynamicScheduler)
+        assert isinstance(self.scheduler.kv_cache_manager, DynamicKVCacheManager)
+        current_blocks = self.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
+        if assess.max_blocks_per_layer >= current_blocks:
+            return False
+
+        used_blocks = (
+            current_blocks -
+            self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
+        if assess.max_blocks_per_layer <= used_blocks:
+            raise RuntimeError(
+                f"{context}: rank {rank} temporary PP config can hold only "
+                f"{assess.max_blocks_per_layer} KV blocks, but current used "
+                f"blocks is {used_blocks} (current total={current_blocks})")
+
+        logger.info(
+            "[memory access] %s rank %s requires pre-migration KV resize: "
+            "current_blocks=%s, target_max_blocks=%s, used_blocks=%s",
+            context, rank, current_blocks, assess.max_blocks_per_layer,
+            used_blocks)
+        return True
+
     def _get_max_num_blocks(self, total_gpu_memory: int, weight_size_per_layer: int, page_size: int, num_layers: int, runtime_overhead: int = 0) -> int:
         """Calculate max number of KV blocks per layer.
         
@@ -703,14 +745,10 @@ class DynamicEngineCore(EngineCore):
             states = self.model_executor.get_async_migration_state()
             patches_done = all(
                 state.get("all_patch_applied", False) for state in states)
-            cleanup_done = all(
-                state.get("resizing_done", False) for state in states)
             if patches_done:
                 logger.info(
-                    "[autoscaling sync] all KV patches applied in %s; "
-                    "worker cleanup_done=%s",
-                    human_readable_duration(time.time() - start),
-                    cleanup_done)
+                    "[autoscaling sync] all KV patches applied in %s",
+                    human_readable_duration(time.time() - start))
                 return
 
             now = time.time()
@@ -721,10 +759,31 @@ class DynamicEngineCore(EngineCore):
             if now - last_log >= 5.0:
                 logger.info(
                     "[autoscaling sync] waiting before scheduling target "
-                    "batch: patches_done=%s cleanup_done=%s states=%s",
-                    patches_done, cleanup_done, states)
+                    "batch: patches_done=%s states=%s",
+                    patches_done, states)
                 last_log = now
             time.sleep(poll_s)
+
+    def _finalize_autoscaling_sync_state_if_needed(
+        self,
+        scheduler_output: DynamicSchedulerOutput,
+    ) -> None:
+        if not self._is_autoscaling_sync_batch(scheduler_output):
+            return
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        sender_list = sorted(scheduler_output.sender_list or [])
+        receiver_list = sorted(scheduler_output.receiver_list or [])
+        logger.info(
+            "[autoscaling sync] finalizing migration on all workers: "
+            "senders=%s receivers=%s total_tokens=%s new_kv_blocks=%s",
+            sender_list, receiver_list,
+            scheduler_output.total_migration_tokens,
+            scheduler_output.new_kv_cache_block_num)
+        self.model_executor.finalize_async_migration_after_sync(
+            sender_list,
+            receiver_list,
+            scheduler_output.total_migration_tokens,
+            scheduler_output.new_kv_cache_block_num)
 
     def _mark_autoscaling_schedule_pause_if_needed(
         self,
@@ -742,6 +801,7 @@ class DynamicEngineCore(EngineCore):
     ) -> None:
         if not self._is_autoscaling_sync_batch(scheduler_output):
             return
+        self._finalize_autoscaling_sync_state_if_needed(scheduler_output)
         self._wait_for_autoscaling_sync_state()
         self._autoscaling_schedule_paused = False
         logger.info("[autoscaling sync] scheduler pause released")
@@ -1027,6 +1087,9 @@ class DynamicEngineCore(EngineCore):
                 adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
                 assess = self._assess_memory_for_layer_reconfiguration(rank, adding_layer_num, mem_infos[rank], self.cur_pp_layer_config)
                 maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
+                if self._needs_pre_migration_kv_resize(
+                        rank, assess, "async migration"):
+                    need_compact = True
                 if len(adding_layer_list) > 0:
                     adding_per_rank[rank] = adding_layer_list
                     if assess.enough_without_compact:
@@ -1359,6 +1422,9 @@ class DynamicEngineCore(EngineCore):
                 adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
                 assess = self._assess_memory_for_layer_reconfiguration(rank, adding_layer_num, mem_infos[rank], self.cur_pp_layer_config)
                 maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
+                if self._needs_pre_migration_kv_resize(
+                        rank, assess, "async_fast migration"):
+                    need_compact = True
                 if len(adding_layer_list) > 0:
                     adding_per_rank[rank] = adding_layer_list
                     if assess.enough_without_compact:
@@ -1485,30 +1551,9 @@ class DynamicEngineCore(EngineCore):
         # Phase 5: finalize scheduler/config after one-shot transfer is completed.
         assert isinstance(self.scheduler, DynamicScheduler)
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
-        final_pp_layer_config = deepcopy(tmp_pp_layer_config)
-        deleting_layer_assesses: list[int] = []
-        for rank, layers in enumerate(pp_layer_config):
-            start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
-            deleting_layer_list = []
-            if layers[0] > layers[1]:
-                if start_layer <= end_layer:
-                    deleting_layer_list.append((start_layer, end_layer))
-                final_pp_layer_config[rank] = (layers[0], layers[1])
-            else:
-                if layers[0] > start_layer:
-                    deleting_layer_list.append((start_layer, layers[0] - 1))
-                    final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
-                if layers[1] < end_layer:
-                    deleting_layer_list.append((layers[1] + 1, end_layer))
-                    final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
-            deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
-            assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
-            deleting_layer_assesses.append(assess.max_blocks_per_layer)
-
-        for rank, layers in enumerate(final_pp_layer_config):
-            assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
-
-        resized_block_num = min(deleting_layer_assesses)
+        final_pp_layer_config = deepcopy(pp_layer_config)
+        resized_block_num = self._calculate_max_blocks_for_pp_config(
+            final_pp_layer_config, mem_infos)
         if not allow_resize:
             resized_block_num = self.scheduler.kv_cache_manager.num_gpu_blocks
             logger.info(f"[async_fast] fixed_num_gpu_blocks={fixed_blocks}, keeping current block count: {resized_block_num}")
@@ -1623,6 +1668,9 @@ class DynamicEngineCore(EngineCore):
                 adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
                 assess = self._assess_memory_for_layer_reconfiguration(rank, adding_layer_num, mem_infos[rank], self.cur_pp_layer_config)
                 maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
+                if self._needs_pre_migration_kv_resize(
+                        rank, assess, "sync migration"):
+                    need_compact = True
                 if len(adding_layer_list) > 0:
                     adding_per_rank[rank] = adding_layer_list
                     if assess.enough_without_compact:
@@ -1744,30 +1792,9 @@ class DynamicEngineCore(EngineCore):
             logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
             time_kv_migration_end = time.time()
             logger.info(f"time taken to start kv cache migration: {human_readable_duration(time_kv_migration_end - time_start)}")
-            final_pp_layer_config = deepcopy(tmp_pp_layer_config)
-            deleting_layer_assesses: list[int] = []
-            for rank, layers in enumerate(pp_layer_config):
-                # 计算对于每一个rank而言，需要删除哪一些layers
-                start_layer, end_layer = final_pp_layer_config[rank][0], final_pp_layer_config[rank][1]
-                deleting_layer_list = []
-                if layers[0] > layers[1]:
-                    if start_layer <= end_layer:
-                        deleting_layer_list.append((start_layer, end_layer))
-                    final_pp_layer_config[rank] = (layers[0], layers[1])
-                else:
-                    if layers[0] > start_layer:
-                        deleting_layer_list.append((start_layer, layers[0] - 1))
-                        final_pp_layer_config[rank] = (layers[0], final_pp_layer_config[rank][1])
-                    if layers[1] < end_layer:
-                        deleting_layer_list.append((layers[1] + 1, end_layer))
-                        final_pp_layer_config[rank] = (final_pp_layer_config[rank][0], layers[1])
-                deleting_layer_num = -sum(layers[1] - layers[0] + 1 for layers in deleting_layer_list)
-                assess = self._assess_memory_for_layer_reconfiguration(rank, deleting_layer_num, mem_infos[rank], tmp_pp_layer_config)
-                deleting_layer_assesses.append(assess.max_blocks_per_layer)
-
-            for rank, layers in enumerate(final_pp_layer_config):
-                assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
-            calculated_max_blocks = min(deleting_layer_assesses)
+            final_pp_layer_config = deepcopy(pp_layer_config)
+            calculated_max_blocks = self._calculate_max_blocks_for_pp_config(
+                final_pp_layer_config, mem_infos)
             # Determine final KV block count
             if target_kv_blocks is not None and target_kv_blocks > 0:
                 resized_block_num = target_kv_blocks
