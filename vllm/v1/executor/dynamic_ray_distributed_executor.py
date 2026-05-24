@@ -13,6 +13,7 @@ from vllm.executor.msgspec_utils import encode_hook
 from vllm.v1.executor.dynamic_utils import (
     DynamicRayWorkerWrapper,
     PPNCCLIntermediateMetadata,
+    install_vllm_ray_rdt_gpu_object_patch,
 )
 from vllm.v1.core.sched.dynamic_scheduler import DynamicSchedulerOutput
 import vllm.envs as envs
@@ -38,6 +39,19 @@ from vllm.v1.worker.utils import KVBufferStatus
 logger = init_logger(__name__)
 
 
+def _dynamic_pp_rdt_transport() -> str:
+    transport = os.getenv("VLLM_DYNAMIC_PP_RDT_TRANSPORT", "").lower()
+    if transport in ("1", "true"):
+        return "nccl"
+    if transport in ("", "0", "false", "none", "object_store"):
+        return ""
+    return transport
+
+
+def _dynamic_pp_rdt_nccl_enabled() -> bool:
+    return _dynamic_pp_rdt_transport() == "nccl"
+
+
 class RayObjectRefFuture(StdFuture):
     """Future wrapper for a plain Ray ObjectRef.
 
@@ -60,6 +74,9 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
     @property
     def max_concurrent_batches(self) -> int:
+        override = os.getenv("VLLM_DYNAMIC_PP_MAX_CONCURRENT_BATCHES")
+        if override:
+            return max(1, int(override))
         active_ranks = getattr(self, "active_pp_ranks", None)
         if active_ranks:
             return len(active_ranks)
@@ -88,6 +105,12 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         if self.parallel_config.ray_workers_use_nsight:
             ray_remote_kwargs = self._configure_ray_workers_use_nsight(
                 ray_remote_kwargs)
+        if _dynamic_pp_rdt_nccl_enabled():
+            if current_platform.ray_device_key != "GPU":
+                raise ValueError(
+                    "VLLM_DYNAMIC_PP_RDT_TRANSPORT=nccl requires GPU Ray "
+                    f"actors, got {current_platform.ray_device_key}.")
+            ray_remote_kwargs["enable_tensor_transport"] = True
 
         logger.info("use_ray_spmd_worker: %s", self.use_ray_spmd_worker)
 
@@ -114,10 +137,11 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
         worker_metadata: List[RayWorkerMetaData] = []
         driver_ip = get_ip()
+        capture_child_tasks = not _dynamic_pp_rdt_nccl_enabled()
         for rank, bundle_id in enumerate(bundle_indices):
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=placement_group,
-                placement_group_capture_child_tasks=True,
+                placement_group_capture_child_tasks=capture_child_tasks,
                 placement_group_bundle_index=bundle_id,
             )
 
@@ -268,13 +292,22 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
         # Set environment variables for the driver and workers.
         # Include per-worker VLLM_HOST_IP based on the node's IP
+        rank_to_local_rank = [
+            node_workers[node_id].index(rank)
+            for rank, (node_id, _) in enumerate(worker_node_and_gpu_ids)
+        ]
+        rdt_rank_to_device = ",".join(str(rank)
+                                      for rank in rank_to_local_rank)
         all_args_to_update_environment_variables = []
-        for (node_id, _) in worker_node_and_gpu_ids:
+        for rank, (node_id, _) in enumerate(worker_node_and_gpu_ids):
             worker_ip = node_id_to_ip.get(node_id, driver_ip)
             args = {
                 current_platform.device_control_env_var:
                 ",".join(map(str, node_gpus[node_id])),
                 'VLLM_HOST_IP': worker_ip,  # Set per-worker IP
+                'VLLM_RAY_RDT_RANK_TO_DEVICE': rdt_rank_to_device,
+                'VLLM_RAY_RDT_LOCAL_DEVICE_INDEX':
+                str(rank_to_local_rank[rank]),
             }
             all_args_to_update_environment_variables.append(args)
             logger.info("Worker on node %s will use VLLM_HOST_IP=%s", node_id, worker_ip)
@@ -297,6 +330,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             'NCCL_P2P_LEVEL',
             'NCCL_SHM_DISABLE',
             'VLLM_DYNAMIC_PP_NCCL_TRANSPORT',
+            'VLLM_DYNAMIC_PP_RDT_TRANSPORT',
         ]
         for var in nccl_env_vars:
             if var not in env_vars_to_copy:
@@ -568,6 +602,8 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         self.pp_locks: Optional[List[asyncio.Lock]] = None
         self.cpu_forward_dag = None
 
+        self._init_dynamic_pp_rdt_transport()
+
     def execute_model(
         self,
         scheduler_output,
@@ -588,6 +624,26 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         if self.parallel_config.tensor_parallel_size != 1:
             raise NotImplementedError(
                 "dynamic Ray actor PP chain currently supports TP=1 only")
+
+        if _dynamic_pp_rdt_nccl_enabled():
+            if getattr(self, "_dynamic_pp_rdt_group", None) is None:
+                self._init_dynamic_pp_rdt_transport()
+            self._annotate_pp_nccl_debug_metadata(
+                scheduler_output, active_ranks)
+            ref_or_value = scheduler_output
+            refs = []
+            last_index = len(active_ranks) - 1
+            for index, rank in enumerate(active_ranks):
+                method = self.workers[rank].execute_model_ray
+                if index < last_index:
+                    ref_or_value = method.options(
+                        tensor_transport="nccl").remote(ref_or_value)
+                else:
+                    ref_or_value = method.remote(ref_or_value)
+                refs.append(ref_or_value)
+            if self.max_concurrent_batches == 1:
+                return ray.get(ref_or_value)
+            return RayObjectRefFuture(ref_or_value, refs=refs)
 
         if os.getenv("VLLM_DYNAMIC_PP_NCCL_TRANSPORT", "0") == "1":
             self._annotate_pp_nccl_debug_metadata(
@@ -614,6 +670,43 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         if self.max_concurrent_batches == 1:
             return ray.get(ref_or_value)
         return RayObjectRefFuture(ref_or_value)
+
+    def _init_dynamic_pp_rdt_transport(self) -> None:
+        transport = _dynamic_pp_rdt_transport()
+        if not transport:
+            return
+        if transport != "nccl":
+            raise ValueError(
+                "Unsupported VLLM_DYNAMIC_PP_RDT_TRANSPORT="
+                f"{transport!r}; Ray 2.49 dynamic PP path supports 'nccl'.")
+        if self.parallel_config.tensor_parallel_size != 1:
+            raise NotImplementedError(
+                "dynamic PP RDT transport currently supports TP=1 only")
+        if getattr(self, "_dynamic_pp_rdt_group", None) is not None:
+            return
+
+        install_vllm_ray_rdt_gpu_object_patch()
+
+        from ray.experimental.collective import (create_collective_group,
+                                                get_collective_groups)
+
+        existing_groups = get_collective_groups([self.workers[0]],
+                                                backend="nccl")
+        if existing_groups:
+            if len(existing_groups) > 1:
+                raise RuntimeError(
+                    "Ray RDT found multiple NCCL collective groups for "
+                    "dynamic PP workers; expected exactly one.")
+            self._dynamic_pp_rdt_group = existing_groups[0]
+            logger.info("Reusing Ray RDT NCCL collective group %s",
+                        self._dynamic_pp_rdt_group.name)
+            return
+
+        group_name = f"vllm_dynamic_pp_rdt_nccl_{id(self)}"
+        logger.info("Creating Ray RDT NCCL collective group %s for %d workers",
+                    group_name, len(self.workers))
+        self._dynamic_pp_rdt_group = create_collective_group(
+            self.workers, backend="nccl", name=group_name)
 
     def _sync_request_states_before_target_chain(
         self,
@@ -786,6 +879,18 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
     def get_async_migration_state(self) -> list[dict[str, Any]]:
         return self.collective_rpc("get_async_migration_state")
+
+    def finalize_async_migration_after_sync(
+        self,
+        sender_list: list[int],
+        receiver_list: list[int],
+        total_migration_tokens: int,
+        new_kv_cache_block_num: int,
+    ) -> None:
+        self.collective_rpc(
+            "finalize_async_migration_after_sync",
+            args=(sender_list, receiver_list, total_migration_tokens,
+                  new_kv_cache_block_num))
 
     def get_applied_token_num(self, receiver_list: list[int]) -> list[list[int]]:
         """Return KV patch buffer status per rank.

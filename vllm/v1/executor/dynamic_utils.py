@@ -41,7 +41,124 @@ class PPNCCLIntermediateMetadata:
 
 
 def _dynamic_pp_nccl_transport_enabled() -> bool:
+    if _dynamic_pp_rdt_transport_enabled():
+        return False
     return os.getenv("VLLM_DYNAMIC_PP_NCCL_TRANSPORT", "0") == "1"
+
+
+def _dynamic_pp_rdt_transport_enabled() -> bool:
+    transport = os.getenv("VLLM_DYNAMIC_PP_RDT_TRANSPORT", "").lower()
+    return transport in ("nccl", "1", "true")
+
+
+def _vllm_ray_rdt_rank_to_device() -> list[int]:
+    raw = os.getenv("VLLM_RAY_RDT_RANK_TO_DEVICE", "")
+    if not raw:
+        return []
+    return [int(item) for item in raw.split(",") if item != ""]
+
+
+def _vllm_ray_rdt_device_for_rank(rank: int) -> int:
+    mapping = _vllm_ray_rdt_rank_to_device()
+    if mapping and 0 <= rank < len(mapping):
+        return mapping[rank]
+    return int(os.getenv("VLLM_RAY_RDT_LOCAL_DEVICE_INDEX", "0"))
+
+
+def _vllm_ray_rdt_sync_after_transfer() -> bool:
+    return os.getenv("VLLM_RAY_RDT_SYNC_AFTER_TRANSFER", "1") == "1"
+
+
+def _vllm_ray_rdt_send(self, communicator_name: str, obj_id: str,
+                       dst_rank: int):
+    from ray._private.worker import global_worker
+    import ray.util.collective as collective
+    from ray.experimental.gpu_object_manager.gpu_object_store import (
+        COLLECTIVE_BACKEND_TO_TORCH_DEVICE,
+    )
+    from ray.util.collective.types import Backend
+
+    gpu_object_store = global_worker.gpu_object_manager._gpu_object_store
+    assert gpu_object_store.has_object(
+        obj_id), f"obj_id={obj_id} not found in GPU object store"
+    tensors = gpu_object_store.get_object(obj_id)
+
+    backend = collective.get_group_handle(communicator_name).backend()
+    device = COLLECTIVE_BACKEND_TO_TORCH_DEVICE[backend]
+    dst_gpu_index = _vllm_ray_rdt_device_for_rank(dst_rank)
+
+    for tensor in tensors:
+        if tensor.device.type != device.type:
+            raise ValueError(
+                f"tensor device {tensor.device} does not match device {device}"
+            )
+        if backend == Backend.NCCL:
+            torch.cuda.set_device(tensor.device)
+            collective.send_multigpu(
+                tensor,
+                dst_rank,
+                dst_gpu_index,
+                group_name=communicator_name,
+            )
+        else:
+            collective.send(tensor, dst_rank, group_name=communicator_name)
+    if (backend == Backend.NCCL and tensors
+            and _vllm_ray_rdt_sync_after_transfer()):
+        torch.cuda.synchronize(device=tensors[0].device)
+
+
+def _vllm_ray_rdt_recv(
+    self,
+    communicator_name: str,
+    obj_id: str,
+    src_rank: int,
+    tensor_meta: list[tuple["torch.Size", "torch.dtype"]],
+):
+    from ray._private.worker import global_worker
+    import ray.util.collective as collective
+    from ray.experimental.gpu_object_manager.gpu_object_store import (
+        COLLECTIVE_BACKEND_TO_TORCH_DEVICE,
+    )
+    from ray.util.collective.types import Backend
+
+    group = collective.get_group_handle(communicator_name)
+    backend = group.backend()
+
+    gpu_object_store = global_worker.gpu_object_manager.gpu_object_store
+    tensors = []
+    if backend == Backend.NCCL:
+        dst_gpu_index = _vllm_ray_rdt_device_for_rank(group.rank)
+        src_gpu_index = _vllm_ray_rdt_device_for_rank(src_rank)
+        target_device = torch.device(f"cuda:{dst_gpu_index}")
+        torch.cuda.set_device(target_device)
+        for shape, dtype in tensor_meta:
+            tensor = torch.zeros(shape, dtype=dtype, device=target_device)
+            collective.recv_multigpu(
+                tensor,
+                src_rank,
+                src_gpu_index,
+                group_name=communicator_name,
+            )
+            tensors.append(tensor)
+    else:
+        device = COLLECTIVE_BACKEND_TO_TORCH_DEVICE[backend]
+        for shape, dtype in tensor_meta:
+            tensor = torch.zeros(shape, dtype=dtype, device=device)
+            collective.recv(tensor, src_rank, group_name=communicator_name)
+            tensors.append(tensor)
+    if (backend == Backend.NCCL and tensors
+            and _vllm_ray_rdt_sync_after_transfer()):
+        torch.cuda.synchronize(device=tensors[0].device)
+    gpu_object_store.add_object(obj_id, tensors)
+
+
+def install_vllm_ray_rdt_gpu_object_patch() -> None:
+    if os.getenv("VLLM_RAY_RDT_MULTIGPU_PATCH", "1") != "1":
+        return
+    from ray.experimental.gpu_object_manager import gpu_object_store
+
+    gpu_object_store.__ray_send__ = _vllm_ray_rdt_send
+    gpu_object_store.__ray_recv__ = _vllm_ray_rdt_recv
 
 
 def _sync_dynamic_pp_nccl_before_return() -> bool:
@@ -261,6 +378,18 @@ try:
             from ray.experimental.channel.nccl_group import set_global_nccl_lock
             set_global_nccl_lock(None)
 
+        def init_device(self):
+            super().init_device()
+            if _dynamic_pp_rdt_transport_enabled():
+                assert self.worker is not None
+                assert self.worker.device is not None
+                os.environ["VLLM_RAY_RDT_LOCAL_DEVICE_INDEX"] = str(
+                    self.worker.device.index)
+                install_vllm_ray_rdt_gpu_object_patch()
+                logger.info(
+                    "Installed Ray RDT GPU object multigpu patch on %s",
+                    self.worker.device)
+
         def execute_model_ray(
             self,
             scheduler_output: Union["DynamicSchedulerOutput",
@@ -280,6 +409,10 @@ try:
             
             try:
                 self.setup_device_if_necessary()
+                if _dynamic_pp_rdt_transport_enabled():
+                    from ray.experimental.channel import ChannelContext
+                    ChannelContext.get_current().set_torch_device(
+                        torch.device(self.worker.device))
                 with self.worker.inference_stream:
                     assert self.worker is not None, "Worker is not initialized"
                     assert isinstance(self.worker, DynamicGPUWorker), "Worker is not a DynamicGPUWorker"
@@ -347,6 +480,27 @@ try:
                         assert (
                             len(self.worker.model_runner.input_batch.block_table
                                 .block_tables) == 1)
+                        sender_list = scheduler_output.sender_list
+                        sender_active = (
+                            scheduler_output.migration_in_process
+                            and sender_list is not None
+                            and self.worker.rank in sender_list)
+                        # Old-topology batches can finish after sender state is
+                        # installed. Sync under forward_lock before migration
+                        # threads can gather the just-written KV cache pages.
+                        sender_active = sender_active or bool(
+                            self.worker.rank_to_layers_ids)
+                        if sender_active:
+                            sync_start = time.time()
+                            torch.cuda.synchronize(device=self.worker.device)
+                            inference_stream_synced = True
+                            logger.info(
+                                "[forward]: rank %s synchronized CUDA device "
+                                "under forward_lock before KV sender can read "
+                                "cache, took %s",
+                                self.rpc_rank,
+                                human_readable_duration(time.time() -
+                                                        sync_start))
 
                     self.worker.async_migration_after_execute_callback(
                         scheduler_output)
@@ -355,14 +509,14 @@ try:
                     sender_list = scheduler_output.sender_list
                     if (scheduler_output.migration_in_process
                             and sender_list is not None
-                            and self.worker.rank in sender_list):
+                            and self.worker.rank in sender_list
+                            and not inference_stream_synced):
                         sync_start = time.time()
                         torch.cuda.synchronize(device=self.worker.device)
                         inference_stream_synced = True
                         logger.info(
                             "[forward]: rank %s synchronized CUDA device "
-                            "under forward_lock before KV sender "
-                            "can read cache, took %s",
+                            "before KV sender can read cache, took %s",
                             self.rpc_rank,
                             human_readable_duration(time.time() -
                                                     sync_start))
