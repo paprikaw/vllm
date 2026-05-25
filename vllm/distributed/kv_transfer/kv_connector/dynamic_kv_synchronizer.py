@@ -406,6 +406,7 @@ class DynamicKVSynchronizer():
         self.value_cache_list = []
         self.key_cache_ptrs = []
         self.value_cache_ptrs = []
+        self.kv_cache_start_layer = 0
     
     def get_nccl_lock(self) -> threading.Lock:
         """Return the NCCL lock for external use (e.g., Ray compiled_dag)."""

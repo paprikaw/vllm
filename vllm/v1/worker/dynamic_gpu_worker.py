@@ -191,7 +191,7 @@ class DynamicGPUWorker(Worker):
         if not isinstance(self.model_runner.model, DynamicModelBase):
             return 0, 0
         
-        start_layer = self.model_runner.model.model.start_layer
+        start_layer = self._kv_cache_start_layer()
         end_layer = self.model_runner.model.model.end_layer
         layer_count = end_layer - start_layer
         
@@ -217,7 +217,7 @@ class DynamicGPUWorker(Worker):
         if not self._debug_assert_kv:
             return
         assert isinstance(self.model_runner, DynamicGPUModelRunner)
-        start_layer = self.model_runner.model.model.start_layer
+        start_layer = self._kv_cache_start_layer()
         fctx = self.vllm_config.compilation_config.static_forward_context
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         for layer_id in sorted(layer_ids):
@@ -293,7 +293,7 @@ class DynamicGPUWorker(Worker):
         if not layer_ids:
             return True
         assert isinstance(self.model_runner, DynamicGPUModelRunner)
-        start_layer = self.model_runner.model.model.start_layer
+        start_layer = self._kv_cache_start_layer()
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         use_direct_ptr = self.vllm_config.dynamic_config.use_direct_ptr
 
@@ -410,6 +410,7 @@ class DynamicGPUWorker(Worker):
                     # 记录扩容前的起始 layer，便于在 start_layer 左移时重排本地 kv 索引基准
                     old_start_layer = self.model_runner.model.model.start_layer
                     old_end_layer = self.model_runner.model.model.end_layer
+                    old_kv_cache_start_layer = self._kv_cache_start_layer()
                     assert self.device is not None
                     enqueue_start = time.time()
                     self.model_runner.add_layers(layer_list, self.device)
@@ -443,12 +444,13 @@ class DynamicGPUWorker(Worker):
                             self.dynamic_kv_synchronizer.key_cache_ptrs)
                         self._autoscale_sender_value_cache_ptrs = list(
                             self.dynamic_kv_synchronizer.value_cache_ptrs)
-                        self._autoscale_sender_start_layer = old_start_layer
+                        self._autoscale_sender_start_layer = (
+                            old_kv_cache_start_layer)
                         logger.info(
                             "[autoscaling async] captured sender KV pointer "
                             "view before add_layers: start_layer=%s, "
                             "num_layers=%s",
-                            old_start_layer,
+                            old_kv_cache_start_layer,
                             len(self._autoscale_sender_key_cache_ptrs))
 
                     # 如果 start_layer 向更小的下标移动，需要对现有 self.kv_caches 做前置填充，
@@ -498,7 +500,7 @@ class DynamicGPUWorker(Worker):
                                                         self.dynamic_kv_synchronizer.key_cache_ptrs
                         self.dynamic_kv_synchronizer.value_cache_ptrs = [0] * left_added_layer_num + \
                                                         self.dynamic_kv_synchronizer.value_cache_ptrs
-                        
+
                         # Pad grouped_handles for combined_layers mode (VMM)
                         # This ensures grouped_handles indices align with key_caches after left-padding
                         if hasattr(self.model_runner, 'grouped_handles') and hasattr(self.model_runner, 'layer_group_granularity'):
@@ -530,7 +532,7 @@ class DynamicGPUWorker(Worker):
                         self.dynamic_kv_synchronizer.value_cache_list.extend([[] for _ in range(pad_right)])
                         self.dynamic_kv_synchronizer.key_cache_ptrs.extend([0] * pad_right)
                         self.dynamic_kv_synchronizer.value_cache_ptrs.extend([0] * pad_right)
-                        
+
                         # Pad grouped_handles for combined_layers mode (VMM)
                         # This ensures grouped_handles indices align with key_caches after right-padding
                         if hasattr(self.model_runner, 'grouped_handles') and hasattr(self.model_runner, 'layer_group_granularity'):
@@ -540,6 +542,11 @@ class DynamicGPUWorker(Worker):
                                 self.model_runner.grouped_handles.extend([[] for _ in range(n_groups_to_pad)])
                                 logger.info(f"[_add_layers] Padded grouped_handles right: added {n_groups_to_pad} empty groups, "
                                            f"total groups now: {len(self.model_runner.grouped_handles)}")
+
+                    if old_layers_empty or left_added_layer_num > 0:
+                        self._set_kv_cache_start_layer(
+                            new_start_layer,
+                            "add_layers left/empty KV cache padding")
 
                     logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
                     for i in range(len(self.model_runner.key_caches)):
@@ -566,6 +573,10 @@ class DynamicGPUWorker(Worker):
                         pad_right = right_added_layer_num
                         self.model_runner.kv_caches.extend([torch.tensor([])] * pad_right)
                         self.dynamic_kv_synchronizer.kv_caches.extend([torch.tensor([])] * pad_right)
+                    if old_layers_empty or left_added_layer_num > 0:
+                        self._set_kv_cache_start_layer(
+                            new_start_layer,
+                            "add_layers left/empty KV cache padding")
                     for i in range(len(self.model_runner.kv_caches)):
                         logger.info(f"kv cache {i}: {self.model_runner.kv_caches[i].shape}")
                 forward_lock_hold_ms = (time.time() - time_within_lock_start) * 1000
@@ -662,6 +673,45 @@ class DynamicGPUWorker(Worker):
         """Check if the loaded model is a DynamicModelBase instance."""
         return isinstance(self.model_runner.model, DynamicModelBase)
 
+    def _kv_cache_start_layer(self) -> int:
+        runner_start = getattr(
+            self.model_runner,
+            "kv_cache_start_layer",
+            getattr(self.model_runner.model.model, "start_layer", 0))
+        sync = getattr(self, "dynamic_kv_synchronizer", None)
+        if sync is not None:
+            sync_start = getattr(sync, "kv_cache_start_layer", runner_start)
+            if sync_start != runner_start:
+                raise RuntimeError(
+                    "KV cache start layer mismatch between runner and "
+                    f"synchronizer: runner={runner_start}, "
+                    f"synchronizer={sync_start}")
+        return int(runner_start)
+
+    def _set_kv_cache_start_layer(self, start_layer: int, reason: str) -> None:
+        assert isinstance(self.model_runner, DynamicGPUModelRunner)
+        self.model_runner.set_kv_cache_start_layer(start_layer, reason)
+        sync = getattr(self, "dynamic_kv_synchronizer", None)
+        if sync is not None:
+            old_sync_start = getattr(sync, "kv_cache_start_layer", None)
+            sync.kv_cache_start_layer = int(start_layer)
+            if old_sync_start != int(start_layer):
+                logger.info(
+                    "dynamic_kv_synchronizer.kv_cache_start_layer: %s -> %s "
+                    "(%s)", old_sync_start, start_layer, reason)
+
+    @staticmethod
+    def _kv_cache_start_after_deleting_layers(
+            current_start: int,
+            layers_list: list[Tuple[int, int]]) -> int:
+        new_start = int(current_start)
+        for start, end in sorted(layers_list):
+            if start <= new_start <= end:
+                new_start = end + 1
+            elif start > new_start:
+                break
+        return new_start
+
     def load_model(self) -> None:
         super().load_model()
         
@@ -694,6 +744,12 @@ class DynamicGPUWorker(Worker):
             device=self.device,
             nccl_lock=self._nccl_lock
         )
+        from vllm.v1.executor.dynamic_utils import (
+            set_vllm_ray_rdt_kv_nccl_lock,
+        )
+        set_vllm_ray_rdt_kv_nccl_lock(
+            self.dynamic_kv_synchronizer.get_nccl_lock())
+        logger.info("Registered KV NCCL lock for Ray RDT transport")
         # 启动所有监听其它rank的发送过来的kv cache的线程
         for rank in range(self.vllm_config.parallel_config.pipeline_parallel_size):
             if rank != self.rank:
@@ -816,7 +872,9 @@ class DynamicGPUWorker(Worker):
         slot_mapping = self.model_runner.input_batch.block_table[0].slot_mapping
         assert slot_mapping.device == torch.device("cuda")
         if self.model_runner.migration_in_process:
-            self.dynamic_kv_synchronizer.send_kv_cache_patch(self.rank_to_layers_ids, slot_mapping, self.model_runner.kv_caches, self.model_runner.model.model.start_layer)
+            self.dynamic_kv_synchronizer.send_kv_cache_patch(
+                self.rank_to_layers_ids, slot_mapping,
+                self.model_runner.kv_caches, self._kv_cache_start_layer())
         return result
 
 
@@ -1012,9 +1070,13 @@ class DynamicGPUWorker(Worker):
         from vllm.config import get_current_vllm_config
         vllm_config = get_current_vllm_config()
         is_flexi = vllm_config.dynamic_config.use_flexi_kv
-        start_layer = self.model_runner.model.model.start_layer
+        start_layer = self._kv_cache_start_layer()
         free_before, total = torch.cuda.mem_get_info()
-        logger.info(f"before release_kv_cache_for_layers: free={free_before / 1024 ** 3:.2f} GB, total={total / 1024 ** 3:.2f} GB")
+        logger.info(
+            "before release_kv_cache_for_layers: free=%.2f GB, total=%.2f "
+            "GB, kv_cache_start_layer=%s, model_start_layer=%s",
+            free_before / 1024 ** 3, total / 1024 ** 3, start_layer,
+            self.model_runner.model.model.start_layer)
         caches_to_free_key: list[list[int]] = []
         caches_to_free_value: list[list[int]] = []
         ptrs_to_free_key: list[int] = []
@@ -1094,7 +1156,8 @@ class DynamicGPUWorker(Worker):
                     ptrs_to_free_key.append(k_ptr)
                     ptrs_to_free_value.append(v_ptr)
 
-            self.model_runner.flexi_atomic_switch_kv_cache_config_for_layers(layers_list)
+            self.model_runner.flexi_atomic_switch_kv_cache_config_for_layers(
+                layers_list, kv_cache_start_layer=start_layer)
             
             self.dynamic_kv_synchronizer.key_cache_list = [
                 key_cache for idx, key_cache in enumerate(self.dynamic_kv_synchronizer.key_cache_list) 
@@ -1113,11 +1176,16 @@ class DynamicGPUWorker(Worker):
                 if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
             ]
         else:
-            self.model_runner.atomic_switch_kv_cache_config_for_layers(layers_list)
+            self.model_runner.atomic_switch_kv_cache_config_for_layers(
+                layers_list, kv_cache_start_layer=start_layer)
             self.dynamic_kv_synchronizer.kv_caches = [
                 kv_cache for idx, kv_cache in enumerate(self.dynamic_kv_synchronizer.kv_caches) 
                 if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
             ]
+        new_start_layer = self._kv_cache_start_after_deleting_layers(
+            start_layer, layers_list)
+        self._set_kv_cache_start_layer(new_start_layer,
+                                       "atomic_shelve_kv_cache")
         return caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free
 
     @staticmethod
@@ -1510,10 +1578,16 @@ class DynamicGPUWorker(Worker):
 
     def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         runner = self.model_runner
-        start_layer, end_layer = runner.model.model.start_layer, runner.model.model.end_layer
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+        start_layer = self._kv_cache_start_layer()
+        local_layer_count = (len(runner.key_caches) if is_flexi
+                             else len(runner.kv_caches))
+        end_layer = start_layer + local_layer_count
         assert isinstance(runner.model, DynamicModelBase)
-        logger.info(f"start to compact kv cache for layers {runner.model.model.start_layer} to {runner.model.model.end_layer}")
+        logger.info(
+            "start to compact kv cache for KV layers %s to %s "
+            "(model layers %s to %s)", start_layer, end_layer,
+            runner.model.model.start_layer, runner.model.model.end_layer)
         time_start = time.time()
         num_blocks = len(bitmap)
         if is_flexi and not runner.key_caches:
@@ -1773,6 +1847,7 @@ class DynamicGPUWorker(Worker):
             forward_context = self.vllm_config.compilation_config.static_forward_context
             kv, kv_length, T, H, Dh = runner.kv_caches[0].shape
             logger.info(f"num of kv tensors{len(runner.kv_caches)}")
+            start_layer = self._kv_cache_start_layer()
 
             for layer_name, attn_module in forward_context.items():
                 torch.cuda.synchronize()
@@ -1780,7 +1855,7 @@ class DynamicGPUWorker(Worker):
                 torch.cuda.empty_cache()
                 logger.info(f"rresizing kv cache for laye {layer_name}")
                 layer_idx = extract_layer_index(layer_name)
-                idx = layer_idx - runner.model.model.start_layer
+                idx = layer_idx - start_layer
                 cache = runner.kv_caches[idx]
                 tmp_cache = torch.zeros((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
                 logger.info(f"current thread: {threading.current_thread().name} tmp_cache shape: {tmp_cache.shape}, cache shape: {cache.shape}, tmp cache device: {tmp_cache.device}")
@@ -1791,8 +1866,8 @@ class DynamicGPUWorker(Worker):
                     tmp_cache[:, :new_length, ...].copy_(cache[:, :new_length, ...])
                 dynamic_bind_single_kv_tensor(
                     layer_idx,
-                    runner.model.model.start_layer,
-                    runner.model.model.end_layer,
+                    start_layer,
+                    start_layer + len(runner.kv_caches),
                     forward_context,
                     self.dynamic_kv_synchronizer,
                     runner,
@@ -1825,8 +1900,8 @@ class DynamicGPUWorker(Worker):
         T, H, Dh = self.model_runner.page_meta.shape
         cache_shape = (T, H, Dh)
         
-        start_layer = self.model_runner.model.model.start_layer
-        end_layer = self.model_runner.model.model.end_layer
+        start_layer = self._kv_cache_start_layer()
+        end_layer = start_layer + len(self.model_runner.key_caches)
         use_direct_ptr = self.vllm_config.dynamic_config.use_direct_ptr
         
         layer_group_granularity = getattr(self.model_runner, 'layer_group_granularity', 1)
@@ -2390,7 +2465,7 @@ class DynamicGPUWorker(Worker):
     ) -> None:
         """Grow KV cache using per-layer allocation mode."""
         for layer_name, attn_module in sorted_forward_context:
-            local_idx = extract_layer_index(layer_name) - self.model_runner.model.model.start_layer
+            local_idx = extract_layer_index(layer_name) - self._kv_cache_start_layer()
             logger.info(f"[resize_kv_cache debug] layer_name={layer_name}, local_idx={local_idx}")
             
             key_cache = self.model_runner.key_caches[local_idx]
@@ -2590,8 +2665,7 @@ class DynamicGPUWorker(Worker):
                         0 if sender_key_cache_ptrs is None else
                         len(sender_key_cache_ptrs))
             else:
-                sender_start_layer_id = (
-                    self.model_runner.model.model.start_layer)
+                sender_start_layer_id = self._kv_cache_start_layer()
 
         def migration_thread(rank: int, layer_ids: list[int],
                              start_layer_id: int,
@@ -2649,7 +2723,7 @@ class DynamicGPUWorker(Worker):
         assert all(transfer_in_process == False for transfer_in_process in self.dynamic_kv_synchronizer.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
         assert all(patch_id == 0 for patch_id in self.dynamic_kv_synchronizer.last_patch_ids.values()), "The patch id of the rank should be 0."
         if sender_start_layer_id is None:
-            sender_start_layer_id = self.model_runner.model.model.start_layer
+            sender_start_layer_id = self._kv_cache_start_layer()
         assert self.migration_stream is not None
         with torch.cuda.stream(self.migration_stream):
             slot_mapping_dev = None
@@ -2773,9 +2847,9 @@ class DynamicGPUWorker(Worker):
                 if self.log_stop_time:
                     logger.info(f"[STOP_TIME][worker][sync][forward_lock]: wait={forward_lock_acquired - forward_lock_wait_start:.4f}s")
                 self.dynamic_kv_synchronizer.send_kv_tensor_sync(
-                    sending_layers_list, 
-                    self.model_runner.kv_caches, 
-                    self.model_runner.model.model.start_layer,
+                    sending_layers_list,
+                    self.model_runner.kv_caches,
+                    self._kv_cache_start_layer(),
                     slot_mapping_tensor)
             forward_lock_total = time.time() - forward_lock_wait_start
             if self.log_stop_time:
@@ -2783,7 +2857,8 @@ class DynamicGPUWorker(Worker):
             all_layer_ranges = []
             for _, ranges in sending_layers_plans.items():
                 all_layer_ranges.extend(ranges)
-            caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free = self.atomic_shelve_kv_cache(self.rank, all_layer_ranges)
+            with self.model_runner.forward_lock:
+                caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free = self.atomic_shelve_kv_cache(self.rank, all_layer_ranges)
             # memory_snapshot(f"rank{self.rank}_after_atomic_shelve", self.device)
             self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free)
             # memory_snapshot(f"rank{self.rank}_after_release_kv_cache", self.device)
@@ -2885,9 +2960,9 @@ class DynamicGPUWorker(Worker):
                 if self.log_stop_time:
                     logger.info(f"[STOP_TIME][worker][async_fast][forward_lock]: wait={forward_lock_acquired - forward_lock_wait_start:.4f}s")
                 self.dynamic_kv_synchronizer.send_kv_tensor_sync(
-                    sending_layers_list, 
-                    self.model_runner.kv_caches, 
-                    self.model_runner.model.model.start_layer,
+                    sending_layers_list,
+                    self.model_runner.kv_caches,
+                    self._kv_cache_start_layer(),
                     slot_mapping_tensor)
             forward_lock_total = time.time() - forward_lock_wait_start
             if self.log_stop_time:
@@ -3005,7 +3080,7 @@ class DynamicGPUWorker(Worker):
                         self._layer_loaded_cv.wait()
             time_start_bind_kv_cache = time.time()
             
-            # Pre-allocate KV cache memory for all layers before binding
+            # Pre-allocate KV cache memory for all layers before binding.
             # IMPORTANT: Must acquire forward_lock to prevent concurrent allocation
             # with main forward thread. Otherwise both threads may try to allocate
             # memory simultaneously, causing OOM even when total memory would suffice.
@@ -3014,7 +3089,7 @@ class DynamicGPUWorker(Worker):
                 torch.cuda.synchronize()
                 gc.collect()
                 torch.cuda.empty_cache()
-                
+
                 # Check overhead BEFORE preallocate (if monitoring enabled)
                 if not self.vllm_config.dynamic_config.disable_memory_overhead_monitor:
                     layer_count, kv_cache_bytes = self._get_current_memory_params()
@@ -3024,7 +3099,7 @@ class DynamicGPUWorker(Worker):
                         current_layer_count=layer_count,
                         current_kv_cache_bytes=kv_cache_bytes
                     )
-                
+
                 free_before, _ = torch.cuda.mem_get_info()
                 logger.info(f"[timeline]: free memory before preallocate: {free_before / 1024**3:.2f} GB")
                 preallocated_caches = self.model_runner.preallocate_flexi_kv_caches_for_migration(
@@ -3033,7 +3108,7 @@ class DynamicGPUWorker(Worker):
                 free_after, _ = torch.cuda.mem_get_info()
                 logger.info(f"[timeline]: pre-allocation done, free memory after: {free_after / 1024**3:.2f} GB, allocated: {(free_before - free_after) / 1024**3:.2f} GB")
                 logger.info(f"[timeline]: pre-allocation done in {human_readable_duration(time.time() - time_start_bind_kv_cache)}")
-            
+
             for layer_id in layer_ids:
                 logger.info(f"current memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB, start to bind kv cache for layer {layer_id}")
                 kv_tensor = tmp_kv_tensors_dict[layer_id]
@@ -3044,8 +3119,8 @@ class DynamicGPUWorker(Worker):
                     # Use pre-allocated memory
                     preallocated = preallocated_caches.get(layer_id)
                     dynamic_flexi_bind_single_kv_tensor(
-                        self.model_runner.model.model.start_layer,
-                        self.model_runner.model.model.end_layer,
+                        self._kv_cache_start_layer(),
+                        self._kv_cache_start_layer() + len(self.model_runner.key_caches),
                         layer_id,
                         slot_mapping,
                         self.block_num,
@@ -3062,8 +3137,8 @@ class DynamicGPUWorker(Worker):
                     with self.model_runner.forward_lock:
                         dynamic_bind_single_kv_tensor(
                             layer_id,
-                            self.model_runner.model.model.start_layer,
-                            self.model_runner.model.model.end_layer,
+                            self._kv_cache_start_layer(),
+                            self._kv_cache_start_layer() + len(self.model_runner.kv_caches),
                             self.compilation_config.static_forward_context,
                             self.dynamic_kv_synchronizer,
                             runner=self.model_runner,
@@ -3210,11 +3285,10 @@ class DynamicGPUWorker(Worker):
 
     def _kv_patch_apply_start_layer(self) -> int:
         # Patch application indexes dynamic_kv_synchronizer.key_cache_ptrs,
-        # whose layout follows the worker's current loaded model range after
-        # add_layers/bind_kv_cache.  _ptr_table_start_layer may intentionally
-        # remain on the old forward layout until the autoscaling switch is
-        # committed, so using it here can address the wrong local KV index.
-        return self.model_runner.model.model.start_layer
+        # whose layout follows kv_cache_start_layer, not model.start_layer.
+        # During shrink, KV pointers can be switched to the final layout
+        # before model.delete_layers() updates model.start_layer.
+        return self._kv_cache_start_layer()
 
     def sync_migration_before_execute_callback(self, new_kv_cache_block_num: int) -> None:
         with self._receive_finished_cv:
@@ -3381,7 +3455,8 @@ class DynamicGPUWorker(Worker):
         handles_to_free_value: list[list[int]] = []
         grouped_handles_to_free: list[tuple[list[int], list[int]]] = []  # (handles, base_k_ptrs) tuples
         if layer_ranges:
-            caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free = self.atomic_shelve_kv_cache(self.rank, layer_ranges)
+            with self.model_runner.forward_lock:
+                caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free = self.atomic_shelve_kv_cache(self.rank, layer_ranges)
 
         start_layer, end_layer = self.target_pp_layer_config[self.rank]
         target_num_layers = end_layer - start_layer + 1

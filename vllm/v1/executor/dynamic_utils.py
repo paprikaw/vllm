@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 PG_WAIT_TIMEOUT = 1800
+_RDT_KV_NCCL_LOCK = None
 
 
 @dataclass
@@ -69,6 +70,23 @@ def _vllm_ray_rdt_sync_after_transfer() -> bool:
     return os.getenv("VLLM_RAY_RDT_SYNC_AFTER_TRANSFER", "1") == "1"
 
 
+def _vllm_ray_rdt_serialize_with_kv_nccl_lock() -> bool:
+    return os.getenv("VLLM_RAY_RDT_SERIALIZE_WITH_KV_NCCL_LOCK",
+                     "1") == "1"
+
+
+def set_vllm_ray_rdt_kv_nccl_lock(nccl_lock) -> None:
+    global _RDT_KV_NCCL_LOCK
+    _RDT_KV_NCCL_LOCK = nccl_lock
+
+
+def _vllm_ray_rdt_kv_nccl_lock_context():
+    if (_RDT_KV_NCCL_LOCK is not None
+            and _vllm_ray_rdt_serialize_with_kv_nccl_lock()):
+        return _RDT_KV_NCCL_LOCK
+    return nullcontext()
+
+
 def _vllm_ray_rdt_send(self, communicator_name: str, obj_id: str,
                        dst_rank: int):
     from ray._private.worker import global_worker
@@ -87,24 +105,29 @@ def _vllm_ray_rdt_send(self, communicator_name: str, obj_id: str,
     device = COLLECTIVE_BACKEND_TO_TORCH_DEVICE[backend]
     dst_gpu_index = _vllm_ray_rdt_device_for_rank(dst_rank)
 
-    for tensor in tensors:
-        if tensor.device.type != device.type:
-            raise ValueError(
-                f"tensor device {tensor.device} does not match device {device}"
-            )
-        if backend == Backend.NCCL:
-            torch.cuda.set_device(tensor.device)
-            collective.send_multigpu(
-                tensor,
-                dst_rank,
-                dst_gpu_index,
-                group_name=communicator_name,
-            )
-        else:
+    if backend == Backend.NCCL:
+        with _vllm_ray_rdt_kv_nccl_lock_context():
+            for tensor in tensors:
+                if tensor.device.type != device.type:
+                    raise ValueError(
+                        f"tensor device {tensor.device} does not match "
+                        f"device {device}")
+                torch.cuda.set_device(tensor.device)
+                collective.send_multigpu(
+                    tensor,
+                    dst_rank,
+                    dst_gpu_index,
+                    group_name=communicator_name,
+                )
+            if tensors and _vllm_ray_rdt_sync_after_transfer():
+                torch.cuda.synchronize(device=tensors[0].device)
+    else:
+        for tensor in tensors:
+            if tensor.device.type != device.type:
+                raise ValueError(
+                    f"tensor device {tensor.device} does not match device "
+                    f"{device}")
             collective.send(tensor, dst_rank, group_name=communicator_name)
-    if (backend == Backend.NCCL and tensors
-            and _vllm_ray_rdt_sync_after_transfer()):
-        torch.cuda.synchronize(device=tensors[0].device)
 
 
 def _vllm_ray_rdt_recv(
@@ -130,25 +153,25 @@ def _vllm_ray_rdt_recv(
         dst_gpu_index = _vllm_ray_rdt_device_for_rank(group.rank)
         src_gpu_index = _vllm_ray_rdt_device_for_rank(src_rank)
         target_device = torch.device(f"cuda:{dst_gpu_index}")
-        torch.cuda.set_device(target_device)
-        for shape, dtype in tensor_meta:
-            tensor = torch.zeros(shape, dtype=dtype, device=target_device)
-            collective.recv_multigpu(
-                tensor,
-                src_rank,
-                src_gpu_index,
-                group_name=communicator_name,
-            )
-            tensors.append(tensor)
+        with _vllm_ray_rdt_kv_nccl_lock_context():
+            torch.cuda.set_device(target_device)
+            for shape, dtype in tensor_meta:
+                tensor = torch.zeros(shape, dtype=dtype, device=target_device)
+                collective.recv_multigpu(
+                    tensor,
+                    src_rank,
+                    src_gpu_index,
+                    group_name=communicator_name,
+                )
+                tensors.append(tensor)
+            if tensors and _vllm_ray_rdt_sync_after_transfer():
+                torch.cuda.synchronize(device=tensors[0].device)
     else:
         device = COLLECTIVE_BACKEND_TO_TORCH_DEVICE[backend]
         for shape, dtype in tensor_meta:
             tensor = torch.zeros(shape, dtype=dtype, device=device)
             collective.recv(tensor, src_rank, group_name=communicator_name)
             tensors.append(tensor)
-    if (backend == Backend.NCCL and tensors
-            and _vllm_ray_rdt_sync_after_transfer()):
-        torch.cuda.synchronize(device=tensors[0].device)
     gpu_object_store.add_object(obj_id, tensors)
 
 
