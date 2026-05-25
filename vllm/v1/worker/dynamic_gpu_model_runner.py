@@ -2179,29 +2179,28 @@ class DynamicGPUModelRunner(GPUModelRunner):
                         layer_handles,
                         True  # vmm_combined
                     )
-            
-                # Update grouped_handles at the correct positions (not append!)
-                # The positions are determined by layer_ids relative to start_layer
-                # This ensures alignment with key_caches which was padded in _add_layers
-                if hasattr(self, 'grouped_handles'):
-                    start_layer = self.kv_cache_start_layer
-                    local_start = layer_ids[0] - start_layer
-                    start_group = local_start // granularity
+            # Update grouped_handles at the correct positions (not append!)
+            # The positions are determined by layer_ids relative to start_layer
+            # This ensures alignment with key_caches which was padded in _add_layers.
+            if hasattr(self, 'grouped_handles'):
+                start_layer = self.kv_cache_start_layer
+                local_start = layer_ids[0] - start_layer
+                start_group = local_start // granularity
 
-                    # Check if we need to grow grouped_handles (in case it wasn't pre-padded)
-                    needed_size = start_group + len(new_grouped_handles)
-                    if len(self.grouped_handles) < needed_size:
-                        # Extend with empty groups to make room
-                        self.grouped_handles.extend([[] for _ in range(needed_size - len(self.grouped_handles))])
+                # Check if we need to grow grouped_handles (in case it wasn't pre-padded)
+                needed_size = start_group + len(new_grouped_handles)
+                if len(self.grouped_handles) < needed_size:
+                    # Extend with empty groups to make room
+                    self.grouped_handles.extend([[] for _ in range(needed_size - len(self.grouped_handles))])
 
-                    # Assign new groups at the correct positions
-                    for i, new_group in enumerate(new_grouped_handles):
-                        target_idx = start_group + i
-                        self.grouped_handles[target_idx] = new_group
+                # Assign new groups at the correct positions
+                for i, new_group in enumerate(new_grouped_handles):
+                    target_idx = start_group + i
+                    self.grouped_handles[target_idx] = new_group
 
-                    logger.info(f"[Migration] Updated grouped_handles: assigned {len(new_grouped_handles)} groups at positions "
-                                f"{start_group} to {start_group + len(new_grouped_handles) - 1}, "
-                                f"total groups now: {len(self.grouped_handles)}")
+                logger.info(f"[Migration] Updated grouped_handles: assigned {len(new_grouped_handles)} groups at positions "
+                            f"{start_group} to {start_group + len(new_grouped_handles) - 1}, "
+                            f"total groups now: {len(self.grouped_handles)}")
             else:
                 self.grouped_handles = new_grouped_handles
                 logger.info(f"[Migration] Created grouped_handles: {len(new_grouped_handles)} groups")
