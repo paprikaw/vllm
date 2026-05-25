@@ -396,47 +396,48 @@ class DynamicGPUWorker(Worker):
         
         with DeadlockTimeoutContext(self._layer_loaded_cv, "_layer_loaded_cv", timeout=2):
             assert self.migration_stream is not None
+            with torch.cuda.stream(self.migration_stream):
+                logger.info(f"start to load layer, current stream:{torch.cuda.current_stream()}")
+                # 记录扩容前的起始 layer，便于在 start_layer 左移时重排本地 kv 索引基准
+                old_start_layer = self.model_runner.model.model.start_layer
+                old_end_layer = self.model_runner.model.model.end_layer
+                old_kv_cache_start_layer = self._kv_cache_start_layer()
+                assert self.device is not None
+                enqueue_start = time.time()
+                self.model_runner.add_layers(layer_list, self.device)
+                logger.info(
+                    "[dynamic-load-worker]: add_layers enqueued layers=%s took=%s on stream=%s",
+                    layer_list,
+                    human_readable_duration(time.time() - enqueue_start),
+                    self.migration_stream,
+                )
+
+            stream_sync_start = time.time()
+            self.migration_stream.synchronize()
+            free_after_weight_loading, _ = torch.cuda.mem_get_info()
+            logger.info(
+                "[dynamic-load-worker]: migration_stream synchronize after add_layers layers=%s took=%s free_gpu_after=%.2fGB",
+                layer_list,
+                human_readable_duration(time.time() - stream_sync_start),
+                free_after_weight_loading / 1024 ** 3,
+            )
+            logger.info(f"[timeline]: after weight loading, time taken: {human_readable_duration(time.time() - time_start)}")
+
+            # 接收完weights之后，在这里进行kv cache数据结构的扩展，保证后续kv cache tensor绑定的正确性
+            new_start_layer = self.model_runner.model.model.start_layer
+            new_end_layer = self.model_runner.model.model.end_layer
+            old_layers_empty = old_end_layer <= old_start_layer
+            logger.info(f"debug: ---------------------add layers, old_start_layer: {old_start_layer}, new_start_layer: {new_start_layer}, old_end_layer: {old_end_layer}, new_end_layer: {new_end_layer}")
+
             forward_lock_wait_start = time.time()
             with self.model_runner.forward_lock:
                 time_within_lock_start = time.time()
                 logger.info(
                     "[dynamic-load-worker]: add_layers acquired forward_lock "
-                    "after %s for layers=%s",
+                    "for KV structure update after %s for layers=%s",
                     human_readable_duration(time_within_lock_start -
                                             forward_lock_wait_start),
                     layer_list)
-                with torch.cuda.stream(self.migration_stream):
-                    logger.info(f"start to load layer, current stream:{torch.cuda.current_stream()}")
-                    # 记录扩容前的起始 layer，便于在 start_layer 左移时重排本地 kv 索引基准
-                    old_start_layer = self.model_runner.model.model.start_layer
-                    old_end_layer = self.model_runner.model.model.end_layer
-                    old_kv_cache_start_layer = self._kv_cache_start_layer()
-                    assert self.device is not None
-                    enqueue_start = time.time()
-                    self.model_runner.add_layers(layer_list, self.device)
-                    logger.info(
-                        "[dynamic-load-worker]: add_layers enqueued layers=%s took=%s on stream=%s",
-                        layer_list,
-                        human_readable_duration(time.time() - enqueue_start),
-                        self.migration_stream,
-                    )
-
-                stream_sync_start = time.time()
-                self.migration_stream.synchronize()
-                free_after_weight_loading, _ = torch.cuda.mem_get_info()
-                logger.info(
-                    "[dynamic-load-worker]: migration_stream synchronize after add_layers layers=%s took=%s free_gpu_after=%.2fGB",
-                    layer_list,
-                    human_readable_duration(time.time() - stream_sync_start),
-                    free_after_weight_loading / 1024 ** 3,
-                )
-                logger.info(f"[timeline]: after weight loading, time taken: {human_readable_duration(time.time() - time_start)}")
-
-                # 接收完weights之后，在这里进行kv cache数据结构的扩展，保证后续kv cache tensor绑定的正确性
-                new_start_layer = self.model_runner.model.model.start_layer
-                new_end_layer = self.model_runner.model.model.end_layer
-                old_layers_empty = old_end_layer <= old_start_layer
-                logger.info(f"debug: ---------------------add layers, old_start_layer: {old_start_layer}, new_start_layer: {new_start_layer}, old_end_layer: {old_end_layer}, new_end_layer: {new_end_layer}")
                 # 在这里更新kv_cache_group
                 if is_flexi:
                     if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
@@ -3033,8 +3034,6 @@ class DynamicGPUWorker(Worker):
 
                 assert meta.layer_id not in received_layer, "The layer should not be received twice"
                 assert meta.num_tokens == tmp_slot_token_num, "The num tokens should be the same for all kv tensor metas"
-                self._wait_for_kv_layer_structures_ready(
-                    layers_to_be_received, from_rank)
                 received_layer.add(meta.layer_id)
                 logger.info(f"[debug]: rank {self.rank} receive kv tensor meta {meta}")
 
@@ -3070,14 +3069,13 @@ class DynamicGPUWorker(Worker):
                 # logger.info(f"available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
             assert time_start is not None
             logger.info(f"[timeline]: receive kv tensor finished, time taken {human_readable_duration(time.time() - time_start)} start to bind kv cache")
-            # 在kv cache绑定前，weight必须loading结束
+            # Store incoming KV tensors in the temporary dictionaries above
+            # first. Only wait for local layer/KV structures once we are ready
+            # to bind them, so the sender does not hold the NCCL lock while this
+            # rank is still loading weights.
             layer_ids = list(tmp_kv_tensors_dict.keys())
-            for layer_id in layer_ids:
-                with self._layer_loaded_cv:
-                    logger.info(f"inside the layer_loaded_cv")
-                    while not self.model_runner.has_layer(layer_id):
-                        logger.info(f"[debug]: rank {self.rank} waiting for layer {layer_id} to be loaded")
-                        self._layer_loaded_cv.wait()
+            self._wait_for_kv_layer_structures_ready(set(layer_ids),
+                                                     from_rank)
             time_start_bind_kv_cache = time.time()
             
             # Pre-allocate KV cache memory for all layers before binding.

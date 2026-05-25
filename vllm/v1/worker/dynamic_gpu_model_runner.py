@@ -90,9 +90,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # PtrTable instances for flexi_direct - will be lazily initialized when num_layers is known
         self.k_ptr_table: Optional["PtrTable"] = None
         self.v_ptr_table: Optional["PtrTable"] = None
-        # Track the start_layer that corresponds to the committed PtrTable
-        # During migration, model.start_layer changes but PtrTable stays the same,
-        # so we need to use this value for correct indexing until commit_ptr_tables() is called
+        # Track the start_layer that corresponds to the committed PtrTable.
+        # Forward-context layer indexing must use this value, because the
+        # committed PtrTable can intentionally lag behind the KV cache list
+        # layout during live migration.
         self._ptr_table_start_layer: int = 0
         # Track the start layer that corresponds to the current KV cache lists
         # and per-layer KV pointer tensors. This may intentionally differ from
@@ -113,6 +114,14 @@ class DynamicGPUModelRunner(GPUModelRunner):
             suffix = f" ({reason})" if reason else ""
             logger.info("kv_cache_start_layer: %s -> %s%s",
                         old_start_layer, self.kv_cache_start_layer, suffix)
+
+    def set_ptr_table_start_layer(self, start_layer: int, reason: str = "") -> None:
+        old_start_layer = self._ptr_table_start_layer
+        self._ptr_table_start_layer = int(start_layer)
+        if old_start_layer != self._ptr_table_start_layer:
+            suffix = f" ({reason})" if reason else ""
+            logger.info("ptr_table_start_layer: %s -> %s%s",
+                        old_start_layer, self._ptr_table_start_layer, suffix)
     
     def set_inference_stream(self, stream: torch.cuda.Stream) -> None:
         """Set the inference stream for stream-specific synchronization."""
@@ -618,11 +627,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 num_input_tokens, intermediate_tensors, True)
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
-        # Get start_layer for computing local layer index in flexi_direct.
-        # This follows the KV cache layout rather than model.start_layer; during
-        # shrink, KV pointers may switch to the final layout before layers are
-        # deleted from the model.
-        start_layer = self.kv_cache_start_layer
+        # Get the committed PtrTable base for computing local layer indexes in
+        # flexi_direct. KV cache storage may already be padded/trimmed for
+        # migration while the committed PtrTable still serves old-config
+        # inference batches.
+        start_layer = self._ptr_table_start_layer
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens,
@@ -1620,19 +1629,14 @@ class DynamicGPUModelRunner(GPUModelRunner):
             f"k_ptr_tensor_list length {len(k_ptr_tensor_list)} != pending k_ptr_table num_layers {self._pending_k_ptr_table.num_layers}"
         assert len(v_ptr_tensor_list) == self._pending_v_ptr_table.num_layers, \
             f"v_ptr_tensor_list length {len(v_ptr_tensor_list)} != pending v_ptr_table num_layers {self._pending_v_ptr_table.num_layers}" 
-        # Update start_layer to match target KV configuration (not current
-        # model state). This is critical during migration when model.start_layer
-        # will change AFTER this commit.
-        old_start_layer = self._ptr_table_start_layer
         if target_start_layer is not None:
-            self._ptr_table_start_layer = target_start_layer
+            ptr_table_start_layer = target_start_layer
         else:
-            self._ptr_table_start_layer = getattr(
+            ptr_table_start_layer = getattr(
                 self, "kv_cache_start_layer",
                 getattr(self.model.model, 'start_layer', 0))
-        self.set_kv_cache_start_layer(
-            self._ptr_table_start_layer, "commit_ptr_tables")
-        logger.info(f"commit_ptr_tables: updating _ptr_table_start_layer from {old_start_layer} to {self._ptr_table_start_layer}")
+        self.set_ptr_table_start_layer(ptr_table_start_layer,
+                                       "commit_ptr_tables")
 
         # Atomic switch: replace current PtrTables with pending ones
         self.k_ptr_table = self._pending_k_ptr_table
@@ -1646,8 +1650,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self._pending_k_ptr_table = None
         self._pending_v_ptr_table = None
         
-        logger.info(f"commit_ptr_tables: committed stacked tensors with {self.k_ptr_table.num_layers} layers, "
-                    f"_ptr_table_start_layer updated to {self._ptr_table_start_layer}")
+        logger.info(
+            "commit_ptr_tables: committed stacked tensors with %s layers, "
+            "ptr_table_start_layer=%s, kv_cache_start_layer=%s",
+            self.k_ptr_table.num_layers, self._ptr_table_start_layer,
+            self.kv_cache_start_layer)
 
     def update_kv_ptr_tensor(self, k_ptr_tensor_list, v_ptr_tensor_list) -> None:
         """
