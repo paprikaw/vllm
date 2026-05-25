@@ -1309,15 +1309,31 @@ class DynamicEngineCore(EngineCore):
                     assert layers[0] == pp_layer_config[rank][0] and layers[1] == pp_layer_config[rank][1]
 
                 resized_block_num = min(deleting_layer_assesses)
+                current_kv_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
+                if (allow_resize
+                        and self.vllm_config.dynamic_config.pipeline_autoscaling_enabled
+                        and deactivating_ranks):
+                    # In autoscaling shrink, the pre-sync compact/resize has
+                    # already created enough KV headroom for add_layers and KV
+                    # transfer. Growing the KV cache again at the sync point is
+                    # a capacity optimization, not required for correctness,
+                    # and can OOM before inactive ranks finish releasing memory.
+                    if resized_block_num != current_kv_blocks:
+                        logger.info(
+                            "[autoscaling shrink] keeping current KV cache "
+                            "block count %s after sync; skip final resize "
+                            "target %s",
+                            current_kv_blocks, resized_block_num)
+                    resized_block_num = current_kv_blocks
                 if not allow_resize:
                     # When fixed_num_gpu_blocks is set, keep the current block count
-                    resized_block_num = self.scheduler.kv_cache_manager.num_gpu_blocks
+                    resized_block_num = current_kv_blocks
                     logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, keeping current block count: {resized_block_num}")
                 else:
                     logger.info(f"[memory access] all tokens to be sent is less than the threshold, start to synchronize the kv cache, resized_block_num: {resized_block_num}")
-                    if resized_block_num != self.scheduler.kv_cache_manager.num_gpu_blocks:
-                        assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
-                        logger.info(f"[memory access] start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
+                    if resized_block_num != current_kv_blocks:
+                        assert resized_block_num > current_kv_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {current_kv_blocks}"
+                        logger.info(f"[memory access] start to synchronize the kv cache after resizing from {current_kv_blocks} to {resized_block_num} blocks")
 
                 with self.engine_lock:
                     self.scheduler.async_change_configuration(
