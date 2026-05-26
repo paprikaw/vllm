@@ -32,6 +32,7 @@ from vllm.logger import init_logger
 from vllm.distributed.utils import StatelessProcessGroup
 import time
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+from vllm.utils import current_stream
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
 
@@ -232,7 +233,6 @@ class PairPipe:
         
         if self.is_use_nccl:
             assert self._nccl is not None, "The nccl communicator should be initialized"
-            dev_tensor = tensor.to(self.device)
             logger.info(f"[PairPipe.send_data] Calling NCCL send, nccl_rank={self._nccl.rank}, peer_rank={self.peer_rank}")
             # Acquire NCCL lock to prevent deadlock with Ray compiled_dag's NCCL operations
             # if wait_for_ack:
@@ -240,14 +240,21 @@ class PairPipe:
                 # ack = self.meta_group.recv_obj(src=self.peer_rank)
                 # assert ack == "SYC+ACK", f"Expected ACK, got {ack}"
                 # self.meta_group.send_obj("ACK", dst=self.peer_rank)
-
                 # logger.info(f"[PairPipe.send_data] Received ACK from peer {self.peer_rank}")
-            self._nccl.send(dev_tensor, dst=self.peer_rank, stream=stream)
+            if stream is not None:
+                with torch.cuda.device(self.device), torch.cuda.stream(stream):
+                    dev_tensor = tensor.to(self.device)
+                    self._nccl.send(dev_tensor,
+                                    dst=self.peer_rank,
+                                    stream=stream)
+            else:
+                dev_tensor = tensor.to(self.device)
+                self._nccl.send(dev_tensor, dst=self.peer_rank, stream=stream)
             # Synchronize within the lock to ensure the NCCL operation completes
             # if stream is not None:
             #     stream.synchronize()
             # else:
-            #     torch.cuda.synchronize(device=dev_tensor.device)
+            #     current_stream().synchronize()
             #     logger.info(f"[PairPipe.send_data] NCCL lock released after send")
             logger.info(f"[PairPipe.send_data] NCCL send completed")
         else:
@@ -296,14 +303,14 @@ class PairPipe:
                 
             # Now recv - sender will acquire lock and send after receiving our ACK
             self._nccl.recv(buf, src=self.peer_rank, stream=stream)
-            # NCCL recv is async. Most dynamic migration paths keep
-            # synchronize=True while holding the shared PP/KV NCCL lock.
-            # Older synchronous paths may request deferred synchronization.
+            # NCCL recv is async. Keep synchronization stream-scoped while
+            # holding the shared PP/KV NCCL lock.
             if synchronize:
-                # NCCL can use an internal/non-current stream. Keep the shared
-                # PP/KV NCCL lock held until all local device work is complete.
-                torch.cuda.synchronize(device=buf.device)
-                logger.info(f"[PairPipe.recv_data] NCCL recv synchronized")
+                if stream is not None:
+                    stream.synchronize()
+                else:
+                    current_stream().synchronize()
+                logger.info(f"[PairPipe.recv_data] NCCL recv stream synchronized")
             # else:
             #     # No ACK needed, but still use lock for safety
             #     logger.info(f"[PairPipe.recv_data] Acquiring NCCL lock for recv (no ACK)")
@@ -311,7 +318,7 @@ class PairPipe:
             #     if stream is not None:
             #         stream.synchronize()
             #     else:
-            #         torch.cuda.synchronize(device=buf.device)
+            #         current_stream().synchronize()
             #     logger.info(f"[PairPipe.recv_data] NCCL lock released after recv")
             logger.info(f"[PairPipe.recv_data] NCCL recv enqueued")
         else:
@@ -542,14 +549,20 @@ class DynamicKVSynchronizer():
         pipe = self._ensure_pipe_and_buffer(rank, 'send')
         pipe = self._pair_pipes_send[rank]
         
-        # Use the caller's current stream. Sender-side migration already
-        # gathers KV on migration_stream, so this preserves producer -> NCCL
-        # ordering without cross-stream handoffs. The shared _nccl_lock stays
-        # held until a device-wide sync confirms NCCL completion.
-        pipe.send_data(kv_cache, wait_for_ack=wait_for_ack)
-        if synchronize:
-            device = kv_cache.device if kv_cache.is_cuda else self.device
-            torch.cuda.synchronize(device=device)
+        if pipe.is_use_nccl and pipe._kv_transfer_stream is not None:
+            transfer_stream = pipe._kv_transfer_stream
+            if kv_cache.is_cuda:
+                with torch.cuda.device(kv_cache.device):
+                    transfer_stream.wait_stream(current_stream())
+            pipe.send_data(kv_cache,
+                           stream=transfer_stream,
+                           wait_for_ack=wait_for_ack)
+            if synchronize:
+                transfer_stream.synchronize()
+        else:
+            pipe.send_data(kv_cache, wait_for_ack=wait_for_ack)
+            if synchronize:
+                current_stream().synchronize()
 
     def _send_slot_mapping_to_rank(self, rank: int,
                                    slot_mapping: torch.Tensor,
@@ -603,7 +616,9 @@ class DynamicKVSynchronizer():
             torch.cuda.set_device(self.device)
             pipe = self._ensure_pipe_and_buffer(rank, 'recv')
             pipe = self._pair_pipes_recv[rank]
+            stream = pipe._kv_transfer_stream if pipe.is_use_nccl else None
             return pipe.recv_data(dtype, shape,
+                                  stream=stream,
                                   send_ack=send_ack,
                                   synchronize=synchronize)
 
@@ -637,7 +652,7 @@ class DynamicKVSynchronizer():
         assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
         
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
-        torch.cuda.synchronize()
+        current_stream().synchronize()
         
         for rank, layer_ids in rank_to_layers_ids.items():
             if is_flexi:
