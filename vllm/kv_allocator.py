@@ -386,9 +386,8 @@ class KVAllocator():
             results = _cpp_module.allocate_with_cuda_vmm_combined_layers(
                 num_blocks, block_shape, dtype, device, granularity)
         
-        torch.cuda.synchronize(device)
         alloc_time_ms = (time.perf_counter() - start_time) * 1000
-        logger.info(f"VMM combined layers allocation: alloc_time={alloc_time_ms:.2f}ms, "
+        logger.info(f"VMM combined layers allocation: call_time={alloc_time_ms:.2f}ms, "
                     f"granularity={granularity}, gate_mode={gate_mode}, "
                     f"aligned_combined_bytes={results[4]}, "
                     f"bytes_per_kv={results[5]}")

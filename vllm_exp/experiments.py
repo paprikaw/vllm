@@ -683,6 +683,18 @@ def load_config(path: str) -> MultiConfig:
     with open(path, "r") as f:
         return MultiConfig.model_validate(yaml.safe_load(f))
 
+def _server_ready_timeout(default_s: int) -> int:
+    raw_timeout = os.getenv("VLLM_EXP_SERVER_READY_TIMEOUT")
+    if raw_timeout is None:
+        return default_s
+    try:
+        return max(1, int(raw_timeout))
+    except ValueError:
+        C.print("[yellow]Ignoring invalid VLLM_EXP_SERVER_READY_TIMEOUT="
+                f"{raw_timeout!r}; using {default_s}s[/]")
+        return default_s
+
+
 def wait_ready(base_url: str, timeout_s: int = 180) -> bool:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -2668,7 +2680,9 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 # Wait for server to be ready
                 C.print(f"[bold cyan]Waiting for server to be ready (sweep[{sweep_idx}], kernel={kernel_val}, block_size={block_size_val}, vmm={use_vmm_val}, kv_resize={kv_resize_val})...[/]")
                 C.print(f"[bold cyan]Monitor server status: tail -f {global_log_path}[/]")
-                if not wait_ready(first_exp.bench_spec.base_url, 300):
+                if not wait_ready(
+                        first_exp.bench_spec.base_url,
+                        _server_ready_timeout(300)):
                     C.print(f"[red]ERROR: vLLM server not ready in time (sweep[{sweep_idx}])[/]")
                     continue
                 

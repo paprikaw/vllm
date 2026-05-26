@@ -90,16 +90,38 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # PtrTable instances for flexi_direct - will be lazily initialized when num_layers is known
         self.k_ptr_table: Optional["PtrTable"] = None
         self.v_ptr_table: Optional["PtrTable"] = None
-        # Track the start_layer that corresponds to the committed PtrTable
-        # During migration, model.start_layer changes but PtrTable stays the same,
-        # so we need to use this value for correct indexing until commit_ptr_tables() is called
+        # Track the start_layer that corresponds to the committed PtrTable.
+        # Forward-context layer indexing must use this value, because the
+        # committed PtrTable can intentionally lag behind the KV cache list
+        # layout during live migration.
         self._ptr_table_start_layer: int = 0
+        # Track the start layer that corresponds to the current KV cache lists
+        # and per-layer KV pointer tensors. This may intentionally differ from
+        # model.start_layer while a shrink is between KV shelving and layer
+        # deletion.
+        self.kv_cache_start_layer: int = 0
         # Create CustomModelLoader for weight preloading
         self.custom_loader = CustomModelLoader(self.vllm_config.load_config)
         # Inference stream for stream-specific synchronization (set by worker)
         self.inference_stream: Optional[torch.cuda.Stream] = None
         self._pending_k_ptr_table: Optional["PtrTable"] = None
         self._pending_v_ptr_table: Optional["PtrTable"] = None
+
+    def set_kv_cache_start_layer(self, start_layer: int, reason: str = "") -> None:
+        old_start_layer = self.kv_cache_start_layer
+        self.kv_cache_start_layer = int(start_layer)
+        if old_start_layer != self.kv_cache_start_layer:
+            suffix = f" ({reason})" if reason else ""
+            logger.info("kv_cache_start_layer: %s -> %s%s",
+                        old_start_layer, self.kv_cache_start_layer, suffix)
+
+    def set_ptr_table_start_layer(self, start_layer: int, reason: str = "") -> None:
+        old_start_layer = self._ptr_table_start_layer
+        self._ptr_table_start_layer = int(start_layer)
+        if old_start_layer != self._ptr_table_start_layer:
+            suffix = f" ({reason})" if reason else ""
+            logger.info("ptr_table_start_layer: %s -> %s%s",
+                        old_start_layer, self._ptr_table_start_layer, suffix)
     
     def set_inference_stream(self, stream: torch.cuda.Stream) -> None:
         """Set the inference stream for stream-specific synchronization."""
@@ -171,37 +193,37 @@ class DynamicGPUModelRunner(GPUModelRunner):
         kv_caches: dict[str, torch.Tensor] = {} 
         logger.info(f"kv_cache_specs: {kv_cache_specs}")
         for layer_name, kv_cache_spec in kv_cache_specs.items():
-                layer_index = extract_layer_index(layer_name)
-                if layer_index not in range(layers[0], layers[1]+1):
-                    continue
-                assert kv_cache_size % kv_cache_spec.page_size_bytes == 0
-                num_blocks = kv_cache_size // kv_cache_spec.page_size_bytes
-                assert num_blocks >= kv_cache_num_blocks
-                if isinstance(kv_cache_spec, AttentionSpec):
-                    kv_cache_shape = self.attn_backends[0].get_kv_cache_shape(
-                        num_blocks, kv_cache_spec.block_size,
-                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
-                    dtype = kv_cache_spec.dtype
-                    logger.info(f"layer_name: {layer_name}, kv_cache_shape: {kv_cache_shape}, dtype: {dtype}")
-                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
-                                                        dtype=dtype,
-                                                        device=self.device)
-                    dynamic_bind_single_kv_tensor(
-                        layer_index=layer_index,
-                        start_layer=self.model.model.start_layer,
-                        end_layer=self.model.model.end_layer,
-                        forward_context=self.vllm_config.compilation_config.static_forward_context,
-                        kv_synchronizer=kv_synchronizer,
-                        runner=self,
-                        kv_tensor=kv_caches[layer_name],
-                    )
-                else:
-                    # TODO: add new branches when introducing more types of
-                    # KV cache specs.
-                    raise ValueError("Unknown KV cache spec type.")
-                # Added the kv cache spec to kv cache config.
-                assert len(self.kv_cache_config.kv_cache_groups) == 1
-                self.kv_cache_config.kv_cache_groups[0].layer_names.append(layer_name)
+            layer_index = extract_layer_index(layer_name)
+            if layer_index not in range(layers[0], layers[1] + 1):
+                continue
+            assert kv_cache_size % kv_cache_spec.page_size_bytes == 0
+            num_blocks = kv_cache_size // kv_cache_spec.page_size_bytes
+            assert num_blocks >= kv_cache_num_blocks
+            if isinstance(kv_cache_spec, AttentionSpec):
+                kv_cache_shape = self.attn_backends[0].get_kv_cache_shape(
+                    num_blocks, kv_cache_spec.block_size,
+                    kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                dtype = kv_cache_spec.dtype
+                logger.info(f"layer_name: {layer_name}, kv_cache_shape: {kv_cache_shape}, dtype: {dtype}")
+                kv_caches[layer_name] = torch.zeros(kv_cache_shape,
+                                                    dtype=dtype,
+                                                    device=self.device)
+                dynamic_bind_single_kv_tensor(
+                    layer_index=layer_index,
+                    start_layer=self.kv_cache_start_layer,
+                    end_layer=self.kv_cache_start_layer + len(self.kv_caches),
+                    forward_context=self.vllm_config.compilation_config.static_forward_context,
+                    kv_synchronizer=kv_synchronizer,
+                    runner=self,
+                    kv_tensor=kv_caches[layer_name],
+                )
+            else:
+                # TODO: add new branches when introducing more types of
+                # KV cache specs.
+                raise ValueError("Unknown KV cache spec type.")
+            # Added the kv cache spec to kv cache config.
+            assert len(self.kv_cache_config.kv_cache_groups) == 1
+            self.kv_cache_config.kv_cache_groups[0].layer_names.append(layer_name)
         if self.speculative_config and self.speculative_config.use_eagle():
             raise NotImplementedError("Eagle is not supported for dynamic weights")
 
@@ -275,7 +297,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # called during dynamic_initialize_kv_cache_flexi or finish_migration
             if self.k_ptr_table is None or self.v_ptr_table is None:
                 if self.k_ptr_tensors and self.v_ptr_tensors:
-                    start_layer = getattr(self.model.model, "start_layer", 0)
+                    start_layer = getattr(
+                        self, "kv_cache_start_layer",
+                        getattr(self.model.model, "start_layer", 0))
                     logger.info(
                         "PtrTable missing before first active forward; "
                         "committing %d layers with start_layer=%d",
@@ -294,7 +318,9 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 ptr_start = self._ptr_table_start_layer
                 ptr_end = ptr_start + self.k_ptr_table.num_layers
                 if sched_start < ptr_start or sched_end > ptr_end:
-                    target_start = getattr(self.model.model, "start_layer", 0)
+                    target_start = getattr(
+                        self, "kv_cache_start_layer",
+                        getattr(self.model.model, "start_layer", 0))
                     logger.info(
                         "PtrTable range [%d, %d) does not cover scheduled "
                         "layers [%d, %d); recommitting %d layers with "
@@ -601,10 +627,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 num_input_tokens, intermediate_tensors, True)
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
-        # Get start_layer for computing local layer index in flexi_direct
-        # IMPORTANT: Use _ptr_table_start_layer (not model.start_layer) because during migration,
-        # model.start_layer changes when weights are loaded but PtrTable stays the same.
-        # Using model.start_layer would cause incorrect indexing into PtrTable.
+        # Get the committed PtrTable base for computing local layer indexes in
+        # flexi_direct. KV cache storage may already be padded/trimmed for
+        # migration while the committed PtrTable still serves old-config
+        # inference batches.
         start_layer = self._ptr_table_start_layer
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
@@ -1190,6 +1216,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 "supported yet.")
         self.kv_cache_config = kv_cache_config
         self.initialize_attn_backend(kv_cache_config)
+        initial_start_layer = getattr(self.model.model, "start_layer", 0)
+        self.set_kv_cache_start_layer(initial_start_layer,
+                                      "dynamic_initialize_kv_cache")
+        dynamic_kv_synchronizer.kv_cache_start_layer = initial_start_layer
 
         kv_caches: dict[str, torch.Tensor] = {}
 
@@ -1249,6 +1279,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 "supported yet.")
         self.kv_cache_config = kv_cache_config
         self.initialize_attn_backend(kv_cache_config)
+        initial_start_layer = getattr(self.model.model, "start_layer", 0)
+        self.set_kv_cache_start_layer(initial_start_layer,
+                                      "dynamic_initialize_kv_cache_flexi")
+        kv_synchronizer.kv_cache_start_layer = initial_start_layer
 
         kv_caches: dict[str, torch.Tensor] = {} 
         key_cache_ptrs: dict[str, int] = {}
@@ -1595,14 +1629,14 @@ class DynamicGPUModelRunner(GPUModelRunner):
             f"k_ptr_tensor_list length {len(k_ptr_tensor_list)} != pending k_ptr_table num_layers {self._pending_k_ptr_table.num_layers}"
         assert len(v_ptr_tensor_list) == self._pending_v_ptr_table.num_layers, \
             f"v_ptr_tensor_list length {len(v_ptr_tensor_list)} != pending v_ptr_table num_layers {self._pending_v_ptr_table.num_layers}" 
-        # Update start_layer to match target configuration (not current model state)
-        # This is critical during migration when model.start_layer will change AFTER this commit
-        old_start_layer = self._ptr_table_start_layer
         if target_start_layer is not None:
-            self._ptr_table_start_layer = target_start_layer
+            ptr_table_start_layer = target_start_layer
         else:
-            self._ptr_table_start_layer = getattr(self.model.model, 'start_layer', 0)
-        logger.info(f"commit_ptr_tables: updating _ptr_table_start_layer from {old_start_layer} to {self._ptr_table_start_layer}")
+            ptr_table_start_layer = getattr(
+                self, "kv_cache_start_layer",
+                getattr(self.model.model, 'start_layer', 0))
+        self.set_ptr_table_start_layer(ptr_table_start_layer,
+                                       "commit_ptr_tables")
 
         # Atomic switch: replace current PtrTables with pending ones
         self.k_ptr_table = self._pending_k_ptr_table
@@ -1616,8 +1650,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self._pending_k_ptr_table = None
         self._pending_v_ptr_table = None
         
-        logger.info(f"commit_ptr_tables: committed stacked tensors with {self.k_ptr_table.num_layers} layers, "
-                    f"_ptr_table_start_layer updated to {self._ptr_table_start_layer}")
+        logger.info(
+            "commit_ptr_tables: committed stacked tensors with %s layers, "
+            "ptr_table_start_layer=%s, kv_cache_start_layer=%s",
+            self.k_ptr_table.num_layers, self._ptr_table_start_layer,
+            self.kv_cache_start_layer)
 
     def update_kv_ptr_tensor(self, k_ptr_tensor_list, v_ptr_tensor_list) -> None:
         """
@@ -1626,8 +1663,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         Use this after resize/compact operations where the ptr_tensors content changes
         (different pointer values or different num_blocks) but num_layers stays the same.
         
-        This also updates _ptr_table_start_layer to match the current model.start_layer,
-        which is critical after layer deletion/addition.
+        The KV cache start layer is maintained separately from model.start_layer.
         """
         time_start = time.time()
         assert self.k_ptr_table is not None and self.k_ptr_tensors
@@ -1641,16 +1677,22 @@ class DynamicGPUModelRunner(GPUModelRunner):
         
         logger.info(f"refresh_ptr_tensors_cache: updated stacked tensors cache in {human_readable_duration(time.time() - time_start)}")
 
-    def flexi_atomic_switch_kv_cache_config_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
+    def flexi_atomic_switch_kv_cache_config_for_layers(
+            self,
+            layers_list: list[Tuple[int, int]],
+            kv_cache_start_layer: Optional[int] = None) -> None:
         '''
-        目前release_kv_cache依赖于model.start_layers来进行kv cache list的删除。
-        因此只能先release kv cache再删除layers
+        KV cache list deletion must use the start layer that matches the KV
+        cache layout, not model.start_layer. During shrink, KV pointers can be
+        switched to the target layout before model.delete_layers() updates the
+        model range.
         '''
         assert isinstance(self.model, DynamicModelBase)
         logger.info(f"before release_kv_cache_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
         # Delete the kv cache from kv_cache list
-        start_layer = self.model.model.start_layer
+        start_layer = (self.kv_cache_start_layer if kv_cache_start_layer is None
+                       else kv_cache_start_layer)
         
         # Validate granularity for combined_layers mode
         if hasattr(self, 'layer_group_granularity') and self.layer_group_granularity > 1:
@@ -1734,7 +1776,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
         for layer_name in deleted_layer_names:
             del forward_context[layer_name]
 
-    def atomic_switch_kv_cache_config_for_layers(self, layers_list: list[Tuple[int, int]]) -> None:
+    def atomic_switch_kv_cache_config_for_layers(
+            self,
+            layers_list: list[Tuple[int, int]],
+            kv_cache_start_layer: Optional[int] = None) -> None:
         '''
         目前release_kv_cache依赖于model.start_layers来进行kv cache list的删除。
         因此只能先release kv cache再删除layers
@@ -1748,7 +1793,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         logger.info(f"before atomic_switch_kv_cache_config_for_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, kv_caches length: {len(self.kv_caches)}")
 
         # Delete the kv cache from kv_cache list
-        start_layer = self.model.model.start_layer
+        start_layer = (self.kv_cache_start_layer if kv_cache_start_layer is None
+                       else kv_cache_start_layer)
         # First, explicitly delete the tensors to be removed
         indices_to_remove = set()
         for idx in range(len(self.kv_caches)):
@@ -1803,7 +1849,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
     def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         time_start = time.time()
         assert isinstance(self.model, DynamicModelBase)
-        logger.info(f"start to compact kv cache for layers {self.model.model.start_layer} to {self.model.model.end_layer}")
+        kv_start_layer = self.kv_cache_start_layer
+        logger.info(
+            "start to compact kv cache for KV layers %s to %s "
+            "(model layers %s to %s)", kv_start_layer,
+            kv_start_layer + len(self.key_caches),
+            self.model.model.start_layer, self.model.model.end_layer)
         num_blocks = len(bitmap)
         assert num_blocks == len(self.key_caches), f"bitmap length mismatch: num_blocks: {num_blocks} != kv_cache_tensor_length: {len(self.kv_caches[0][0])}"
 
@@ -1817,7 +1868,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             # Both flexi and direct kernels read from these GPU pointer arrays.
             forward_context = self.vllm_config.compilation_config.static_forward_context
             for layer_name, attn_module in forward_context.items():
-                idx = extract_layer_index(layer_name) - self.model.model.start_layer
+                idx = extract_layer_index(layer_name) - kv_start_layer
                 # Free old GPU pointer arrays to avoid memory leak
                 old_k_ptrs, old_v_ptrs = self.key_cache_ptrs[idx], self.value_cache_ptrs[idx]
                 kv_allocator.free_page_list(old_k_ptrs, self.device)
@@ -1846,7 +1897,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 for idx, block_id in enumerate(row):
                     if block_id in migrate_record:
                         row[idx] = migrate_record[block_id]
-        
+
         self.input_batch.block_table.commit(self.input_batch.num_reqs)
 
         torch.cuda.synchronize()
@@ -1865,7 +1916,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             logger.info(f"num of kv tensors{len(self.kv_caches)}")
             for layer_name, attn_module in forward_context.items():
                 logger.info(f"resizing kv cache for layer {layer_name}")
-                idx = extract_layer_index(layer_name) - self.model.model.start_layer
+                idx = extract_layer_index(layer_name) - self.kv_cache_start_layer
                 cache = self.kv_caches[idx]
                 # 使用 zeros 而不是 empty 来避免未初始化的数据导致错误生成EOS
                 tmp_cache = torch.zeros((kv, new_length, T, H, Dh), device=self.device, dtype=cache.dtype)
@@ -2135,26 +2186,25 @@ class DynamicGPUModelRunner(GPUModelRunner):
                         layer_handles,
                         True  # vmm_combined
                     )
-            
             # Update grouped_handles at the correct positions (not append!)
             # The positions are determined by layer_ids relative to start_layer
-            # This ensures alignment with key_caches which was padded in _add_layers
+            # This ensures alignment with key_caches which was padded in _add_layers.
             if hasattr(self, 'grouped_handles'):
-                start_layer = self.model.model.start_layer
+                start_layer = self.kv_cache_start_layer
                 local_start = layer_ids[0] - start_layer
                 start_group = local_start // granularity
-                
+
                 # Check if we need to grow grouped_handles (in case it wasn't pre-padded)
                 needed_size = start_group + len(new_grouped_handles)
                 if len(self.grouped_handles) < needed_size:
                     # Extend with empty groups to make room
                     self.grouped_handles.extend([[] for _ in range(needed_size - len(self.grouped_handles))])
-                
+
                 # Assign new groups at the correct positions
                 for i, new_group in enumerate(new_grouped_handles):
                     target_idx = start_group + i
                     self.grouped_handles[target_idx] = new_group
-                
+
                 logger.info(f"[Migration] Updated grouped_handles: assigned {len(new_grouped_handles)} groups at positions "
                             f"{start_group} to {start_group + len(new_grouped_handles) - 1}, "
                             f"total groups now: {len(self.grouped_handles)}")

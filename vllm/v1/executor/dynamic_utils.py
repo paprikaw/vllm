@@ -21,12 +21,14 @@ from vllm.v1.core.sched.dynamic_scheduler import create_from_dynamic_scheduler_o
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 import time
 import vllm.envs as envs
+from vllm.utils import current_stream
 
 if TYPE_CHECKING:
     from vllm.v1.outputs import ModelRunnerOutput
 
 logger = init_logger(__name__)
 PG_WAIT_TIMEOUT = 1800
+_RDT_KV_NCCL_LOCK = None
 
 
 @dataclass
@@ -69,6 +71,59 @@ def _vllm_ray_rdt_sync_after_transfer() -> bool:
     return os.getenv("VLLM_RAY_RDT_SYNC_AFTER_TRANSFER", "1") == "1"
 
 
+def _vllm_ray_rdt_serialize_with_kv_nccl_lock() -> bool:
+    return os.getenv("VLLM_RAY_RDT_SERIALIZE_WITH_KV_NCCL_LOCK",
+                     "1") == "1"
+
+
+def set_vllm_ray_rdt_kv_nccl_lock(nccl_lock) -> None:
+    global _RDT_KV_NCCL_LOCK
+    _RDT_KV_NCCL_LOCK = nccl_lock
+
+
+def _vllm_ray_rdt_kv_nccl_lock_context():
+    if (_RDT_KV_NCCL_LOCK is not None
+            and _vllm_ray_rdt_serialize_with_kv_nccl_lock()):
+        return _RDT_KV_NCCL_LOCK
+    return nullcontext()
+
+
+def _cuda_device_index(device: torch.device) -> int:
+    if device.index is not None:
+        return device.index
+    return torch.cuda.current_device()
+
+
+def _ray_collective_p2p_comm_key(my_rank: int, my_gpu_index: int,
+                                 peer_rank: int, peer_gpu_index: int) -> str:
+    if my_rank < peer_rank:
+        lower_key = f"{my_rank}_{my_gpu_index}"
+        higher_key = f"{peer_rank}_{peer_gpu_index}"
+    elif my_rank > peer_rank:
+        lower_key = f"{peer_rank}_{peer_gpu_index}"
+        higher_key = f"{my_rank}_{my_gpu_index}"
+    else:
+        raise RuntimeError(
+            "Ray RDT p2p transfer cannot synchronize a self-send stream.")
+    return f"{lower_key}:{higher_key}"
+
+
+def _sync_ray_collective_p2p_stream(group, *, local_gpu_index: int,
+                                    peer_rank: int, peer_gpu_index: int,
+                                    op_name: str) -> None:
+    comm_key = _ray_collective_p2p_comm_key(group.rank, local_gpu_index,
+                                            peer_rank, peer_gpu_index)
+    streams = (getattr(group, "_dev_streams_map", None) or {}).get(comm_key)
+    if not streams:
+        raise RuntimeError(
+            "Cannot locate Ray RDT NCCL stream for "
+            f"{op_name}: comm_key={comm_key}, local_rank={group.rank}, "
+            f"local_gpu={local_gpu_index}, peer_rank={peer_rank}, "
+            f"peer_gpu={peer_gpu_index}")
+    for stream in streams:
+        stream.synchronize()
+
+
 def _vllm_ray_rdt_send(self, communicator_name: str, obj_id: str,
                        dst_rank: int):
     from ray._private.worker import global_worker
@@ -83,28 +138,43 @@ def _vllm_ray_rdt_send(self, communicator_name: str, obj_id: str,
         obj_id), f"obj_id={obj_id} not found in GPU object store"
     tensors = gpu_object_store.get_object(obj_id)
 
-    backend = collective.get_group_handle(communicator_name).backend()
+    group = collective.get_group_handle(communicator_name)
+    backend = group.backend()
     device = COLLECTIVE_BACKEND_TO_TORCH_DEVICE[backend]
     dst_gpu_index = _vllm_ray_rdt_device_for_rank(dst_rank)
 
-    for tensor in tensors:
-        if tensor.device.type != device.type:
-            raise ValueError(
-                f"tensor device {tensor.device} does not match device {device}"
-            )
-        if backend == Backend.NCCL:
-            torch.cuda.set_device(tensor.device)
-            collective.send_multigpu(
-                tensor,
-                dst_rank,
-                dst_gpu_index,
-                group_name=communicator_name,
-            )
-        else:
+    if backend == Backend.NCCL:
+        stream_keys = set()
+        with _vllm_ray_rdt_kv_nccl_lock_context():
+            for tensor in tensors:
+                if tensor.device.type != device.type:
+                    raise ValueError(
+                        f"tensor device {tensor.device} does not match "
+                        f"device {device}")
+                torch.cuda.set_device(tensor.device)
+                collective.send_multigpu(
+                    tensor,
+                    dst_rank,
+                    dst_gpu_index,
+                    group_name=communicator_name,
+                )
+                stream_keys.add((_cuda_device_index(tensor.device), dst_rank,
+                                 dst_gpu_index))
+            if tensors and _vllm_ray_rdt_sync_after_transfer():
+                for local_gpu_index, peer_rank, peer_gpu_index in stream_keys:
+                    _sync_ray_collective_p2p_stream(
+                        group,
+                        local_gpu_index=local_gpu_index,
+                        peer_rank=peer_rank,
+                        peer_gpu_index=peer_gpu_index,
+                        op_name="send")
+    else:
+        for tensor in tensors:
+            if tensor.device.type != device.type:
+                raise ValueError(
+                    f"tensor device {tensor.device} does not match device "
+                    f"{device}")
             collective.send(tensor, dst_rank, group_name=communicator_name)
-    if (backend == Backend.NCCL and tensors
-            and _vllm_ray_rdt_sync_after_transfer()):
-        torch.cuda.synchronize(device=tensors[0].device)
 
 
 def _vllm_ray_rdt_recv(
@@ -130,25 +200,30 @@ def _vllm_ray_rdt_recv(
         dst_gpu_index = _vllm_ray_rdt_device_for_rank(group.rank)
         src_gpu_index = _vllm_ray_rdt_device_for_rank(src_rank)
         target_device = torch.device(f"cuda:{dst_gpu_index}")
-        torch.cuda.set_device(target_device)
-        for shape, dtype in tensor_meta:
-            tensor = torch.zeros(shape, dtype=dtype, device=target_device)
-            collective.recv_multigpu(
-                tensor,
-                src_rank,
-                src_gpu_index,
-                group_name=communicator_name,
-            )
-            tensors.append(tensor)
+        with _vllm_ray_rdt_kv_nccl_lock_context():
+            torch.cuda.set_device(target_device)
+            for shape, dtype in tensor_meta:
+                tensor = torch.zeros(shape, dtype=dtype, device=target_device)
+                collective.recv_multigpu(
+                    tensor,
+                    src_rank,
+                    src_gpu_index,
+                    group_name=communicator_name,
+                )
+                tensors.append(tensor)
+            if tensors and _vllm_ray_rdt_sync_after_transfer():
+                _sync_ray_collective_p2p_stream(
+                    group,
+                    local_gpu_index=dst_gpu_index,
+                    peer_rank=src_rank,
+                    peer_gpu_index=src_gpu_index,
+                    op_name="recv")
     else:
         device = COLLECTIVE_BACKEND_TO_TORCH_DEVICE[backend]
         for shape, dtype in tensor_meta:
             tensor = torch.zeros(shape, dtype=dtype, device=device)
             collective.recv(tensor, src_rank, group_name=communicator_name)
             tensors.append(tensor)
-    if (backend == Backend.NCCL and tensors
-            and _vllm_ray_rdt_sync_after_transfer()):
-        torch.cuda.synchronize(device=tensors[0].device)
     gpu_object_store.add_object(obj_id, tensors)
 
 
@@ -196,11 +271,16 @@ def _rank_to_group_index(pp_group, global_rank: int) -> int:
             f"Rank {global_rank} is not in PP group {pp_group.ranks}") from exc
 
 
-def _sync_current_cuda_stream() -> None:
-    if torch.cuda.is_available():
-        # NCCL may enqueue work on an internal/non-current stream. Keep the
-        # shared PP/KV NCCL lock held until all local CUDA work is complete.
-        torch.cuda.synchronize()
+def _sync_cuda_stream(stream: Optional[torch.cuda.Stream] = None) -> None:
+    if not torch.cuda.is_available():
+        return
+    if stream is None:
+        stream = current_stream()
+    stream.synchronize()
+
+
+def _sync_worker_inference_stream(worker: DynamicGPUWorker) -> None:
+    _sync_cuda_stream(getattr(worker, "inference_stream", None))
 
 
 def _tensor_debug_stats(tensor: torch.Tensor) -> tuple[float, float, float]:
@@ -285,7 +365,7 @@ def _send_intermediate_tensors_nccl(
                     tensor_mean_abs)
             pp_group.send(send_tensor, dst=dst)
             pending.append(send_tensor)
-        _sync_current_cuda_stream()
+        _sync_worker_inference_stream(worker)
     keep_limit = _pending_pp_nccl_send_limit(pp_group, len(metadata.tensors))
     if len(pending) > keep_limit:
         del pending[:-keep_limit]
@@ -322,7 +402,7 @@ def _recv_intermediate_tensors_nccl(
             tensors[name] = pp_group.recv(torch.Size(shape),
                                           _name_to_dtype(dtype_name),
                                           src=src)
-        _sync_current_cuda_stream()
+        _sync_worker_inference_stream(worker)
         if debug_enabled:
             for name, tensor in tensors.items():
                 tensor_sum, tensor_norm, tensor_mean_abs = (
@@ -492,10 +572,10 @@ try:
                             self.worker.rank_to_layers_ids)
                         if sender_active:
                             sync_start = time.time()
-                            torch.cuda.synchronize(device=self.worker.device)
+                            _sync_worker_inference_stream(self.worker)
                             inference_stream_synced = True
                             logger.info(
-                                "[forward]: rank %s synchronized CUDA device "
+                                "[forward]: rank %s synchronized CUDA stream "
                                 "under forward_lock before KV sender can read "
                                 "cache, took %s",
                                 self.rpc_rank,
@@ -512,10 +592,10 @@ try:
                             and self.worker.rank in sender_list
                             and not inference_stream_synced):
                         sync_start = time.time()
-                        torch.cuda.synchronize(device=self.worker.device)
+                        _sync_worker_inference_stream(self.worker)
                         inference_stream_synced = True
                         logger.info(
-                            "[forward]: rank %s synchronized CUDA device "
+                            "[forward]: rank %s synchronized CUDA stream "
                             "before KV sender can read cache, took %s",
                             self.rpc_rank,
                             human_readable_duration(time.time() -
@@ -579,7 +659,7 @@ try:
                             or not isinstance(output[1],
                                               PPNCCLIntermediateMetadata)):
                         if not inference_stream_synced:
-                            torch.cuda.synchronize(device=self.worker.device)
+                            _sync_worker_inference_stream(self.worker)
                     logger.info(f"""
                     [forward]: forwarding from layer{scheduler_output.pp_layer_config[self.worker.rank][0]} to layer{scheduler_output.pp_layer_config[self.worker.rank][1]},
                     [forward]: before execute callback time: {time_after_before_execute_callback - time_recv:.2f} seconds,
