@@ -2620,6 +2620,19 @@ class DynamicGPUWorker(Worker):
         # scheduler to read stale True value from receivers and prematurely extend
         # block pool during VMM allocation.
         self.kv_resizing_done = False
+
+        receiver_sources: list[int] = []
+        for src_rank, rank_to_layers_ids in src_to_plan.items():
+            if self.rank in rank_to_layers_ids:
+                receiver_sources.append(src_rank)
+        if receiver_sources:
+            with self._all_patch_applied_cv:
+                for src_rank in receiver_sources:
+                    self.is_all_patch_applied[src_rank] = False
+                self._all_patch_applied_cv.notify_all()
+            logger.info(
+                "[autoscaling async] rank %s waiting for KV patches from "
+                "sources %s", self.rank, receiver_sources)
         
         num_layers = pp_layer_config[self.rank][1] - pp_layer_config[self.rank][0] + 1
         self.target_pp_layer_config = pp_layer_config

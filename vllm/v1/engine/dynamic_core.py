@@ -253,10 +253,12 @@ class DynamicEngineCore(EngineCore):
         # Make sure dynamic_config is not in the kwargs, but pulling out from it.
         self.migration_status = MigrationStatus.NOT_MIGRATING
         self.engine_lock = threading.Lock()
-        # Event to signal that an async migration has fully completed
-        # (including do_resize on workers). set_pp_config waits on this.
+        # Event to signal that an async migration reached the correctness
+        # boundary: all workers have applied KV patches and the active PP chain
+        # has switched. Worker-side resize and cleanup may finish afterwards.
         self._migration_done_event = threading.Event()
         self._migration_done_event.set()  # initially no migration in progress
+        self._migration_timeline_start: Optional[float] = None
         self._autoscaling_schedule_paused = False
 
         self.scheduler_kv_cache_config: Optional[KVCacheConfig]
@@ -764,6 +766,49 @@ class DynamicEngineCore(EngineCore):
                 last_log = now
             time.sleep(poll_s)
 
+    def _wait_for_worker_resize_cleanup_after_patch_done(
+        self,
+        resized_block_num: int,
+        wait_start: float,
+    ) -> None:
+        """Finish scheduler block-pool resize after migration is already done.
+
+        Autoscaling can safely resume after all KV patches are applied. The
+        worker cleanup thread may still be removing old layers or resizing KV
+        storage, so scheduler block-pool extension is handled afterwards.
+        """
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        assert isinstance(self.scheduler, DynamicScheduler)
+        while True:
+            time.sleep(0.3)
+            resizing_done = self.model_executor.get_is_kv_resizing_done()
+            logger.info(
+                "[autoscaling async] background resize/cleanup status: %s",
+                resizing_done)
+            if all(resizing_done):
+                with self.scheduler.lock:
+                    current_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
+                    if resized_block_num > current_blocks:
+                        self.scheduler.extend_block_pool(resized_block_num)
+                        logger.info(
+                            "[autoscaling async] scheduler block pool extended "
+                            "from %s to %s after worker resize",
+                            current_blocks, resized_block_num)
+                    else:
+                        logger.info(
+                            "[autoscaling async] scheduler block pool extension "
+                            "not needed: target=%s current=%s",
+                            resized_block_num, current_blocks)
+                break
+        logger.info(
+            "[timeline]: background resize/cleanup after patch-applied "
+            "migration, time taken: %s",
+            human_readable_duration(time.time() - wait_start))
+
+    def _wait_cleanup_before_autoscaling_schedule_release(self) -> bool:
+        return os.environ.get(
+            "VLLM_AUTOSCALING_WAIT_CLEANUP_BEFORE_SCHEDULE", "0") == "1"
+
     def _finalize_autoscaling_sync_state_if_needed(
         self,
         scheduler_output: DynamicSchedulerOutput,
@@ -802,14 +847,43 @@ class DynamicEngineCore(EngineCore):
         if not self._is_autoscaling_sync_batch(scheduler_output):
             return
         self._finalize_autoscaling_sync_state_if_needed(scheduler_output)
+        time_start_waiting_patches = time.time()
         self._wait_for_autoscaling_sync_state()
+        logger.info(
+            "[timeline]: after check KV patches applied process, time taken: %s",
+            human_readable_duration(time.time() - time_start_waiting_patches))
+        waited_cleanup = False
+        if self._wait_cleanup_before_autoscaling_schedule_release():
+            if scheduler_output.new_kv_cache_block_num <= 0:
+                raise RuntimeError(
+                    "Autoscaling cleanup wait requested but "
+                    "new_kv_cache_block_num is not set")
+            logger.info(
+                "[autoscaling sync] waiting for worker cleanup/resize before "
+                "releasing scheduler pause")
+            self._wait_for_worker_resize_cleanup_after_patch_done(
+                scheduler_output.new_kv_cache_block_num, time.time())
+            waited_cleanup = True
         assert isinstance(self.scheduler, DynamicScheduler)
         self._apply_active_pp_ranks_for_config(
             self.scheduler.pp_layer_config_status.get_cur_pp_layer_config())
         self._autoscaling_schedule_paused = False
-        logger.info(
-            "[autoscaling sync] scheduler pause released after KV patches "
-            "applied; worker cleanup/resize may continue asynchronously")
+        self.migration_status = MigrationStatus.NOT_MIGRATING
+        self._migration_done_event.set()
+        if waited_cleanup:
+            logger.info(
+                "[autoscaling sync] scheduler pause released after KV patches "
+                "applied and worker cleanup/resize finished")
+        else:
+            logger.info(
+                "[autoscaling sync] scheduler pause released after KV patches "
+                "applied; worker cleanup/resize may continue asynchronously")
+        if self._migration_timeline_start is not None:
+            logger.info(
+                "[timeline]: migration process time taken: %s",
+                human_readable_duration(time.time() -
+                                        self._migration_timeline_start))
+            self._migration_timeline_start = None
 
     def step_with_batch_queue(self) -> Optional[EngineCoreOutputs]:
         """
@@ -1069,6 +1143,7 @@ class DynamicEngineCore(EngineCore):
 
         with self.engine_lock:
             time_start = time.time()
+            self._migration_timeline_start = time_start
             for rank, layers in enumerate(pp_layer_config):
                 # Skip ranks that are being deactivated (target start > end indicates inactive).
                 # These ranks will have their layers removed later; no layers are added here.
@@ -1342,6 +1417,22 @@ class DynamicEngineCore(EngineCore):
                 break
 
         assert resized_block_num != 0
+        if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+            timeout_s = float(os.environ.get(
+                "VLLM_AUTOSCALING_SYNC_WAIT_TIMEOUT_S", "300"))
+            if not self._migration_done_event.wait(timeout=timeout_s):
+                raise RuntimeError(
+                    "Timed out waiting for autoscaling config switch after "
+                    "KV patches were applied")
+            if self._wait_cleanup_before_autoscaling_schedule_release():
+                logger.info(
+                    "[autoscaling async] worker cleanup/resize completed "
+                    "before scheduler pause release")
+            else:
+                self._wait_for_worker_resize_cleanup_after_patch_done(
+                    resized_block_num, time.time())
+            return
+
         if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
             logger.info(f"no need to resize kv cache during migration, directly synchronize the kv cache, sleep for 4 seconds")
             time.sleep(4)
@@ -1873,8 +1964,8 @@ class DynamicEngineCore(EngineCore):
         outputs = []
         pp_layer_config = self._normalize_pp_layer_config(pp_layer_config)
         
-        # Wait for any ongoing async migration to fully complete
-        # (including worker-side do_resize / finish_migration) before resetting state
+        # Wait for any ongoing async migration to reach the autoscaling
+        # correctness boundary before resetting state.
         if not self._migration_done_event.wait(timeout=120):
             raise RuntimeError("Timeout waiting for ongoing migration to complete before setting new PP config. Current migration may be stuck.")
         
