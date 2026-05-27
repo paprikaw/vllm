@@ -470,11 +470,48 @@ try:
                     "Installed Ray RDT GPU object multigpu patch on %s",
                     self.worker.device)
 
+        def _set_ray_rdt_torch_device(self) -> torch.device:
+            self.setup_device_if_necessary()
+            assert self.worker is not None
+            assert self.worker.device is not None
+            device = torch.device(self.worker.device)
+            if _dynamic_pp_rdt_transport_enabled():
+                from ray.experimental.channel import ChannelContext
+                ChannelContext.get_current().set_torch_device(device)
+            return device
+
+        def prewarm_ray_rdt_send(self, src_rank: int, dst_rank: int,
+                                 numel: int = 1) -> torch.Tensor:
+            device = self._set_ray_rdt_torch_device()
+            with torch.cuda.device(device):
+                tensor = torch.ones(numel, dtype=torch.float32, device=device)
+            logger.info(
+                "[pp_rdt_prewarm] rank %s produced warmup tensor for edge "
+                "%s->%s on %s", self.rpc_rank, src_rank, dst_rank, device)
+            return tensor
+
+        def prewarm_ray_rdt_recv(self, tensor: torch.Tensor, src_rank: int,
+                                 dst_rank: int) -> float:
+            device = self._set_ray_rdt_torch_device()
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError("Ray RDT prewarm expected a torch.Tensor, got "
+                                f"{type(tensor)!r}")
+            if tensor.is_cuda:
+                torch.cuda.set_device(tensor.device)
+            checksum = float(tensor.sum().item())
+            logger.info(
+                "[pp_rdt_prewarm] rank %s received warmup tensor for edge "
+                "%s->%s on %s, tensor_device=%s, checksum=%.1f",
+                self.rpc_rank, src_rank, dst_rank, device, tensor.device,
+                checksum)
+            return checksum
+
         def execute_model_ray(
             self,
             scheduler_output: Union["DynamicSchedulerOutput",
                                     Tuple["DynamicSchedulerOutput",
-                                          "IntermediateTensors", float]],
+                                          "IntermediateTensors", float],
+                                    "ModelRunnerOutput"],
         ) -> Union["ModelRunnerOutput", Tuple["DynamicSchedulerOutput",
                                               "IntermediateTensors", float]]:
             # This method is used by Ray Compiled Graph to execute the model,
@@ -518,6 +555,14 @@ try:
                     else:
                         scheduler_output, intermediate_tensors = (
                             scheduler_output, None)
+
+                    if not isinstance(scheduler_output,
+                                      DynamicSchedulerOutput):
+                        logger.warning(
+                            "[forward]: rank %s received %s instead of "
+                            "DynamicSchedulerOutput; returning it unchanged",
+                            self.rpc_rank, type(scheduler_output).__name__)
+                        return scheduler_output
 
                     time_before_lock = time.time()
                     inference_stream_synced = False

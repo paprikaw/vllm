@@ -1,0 +1,144 @@
+# Qwen3-32B-FP8 PP autoscaling expansion benchmark.
+# Each sweep_config block starts from one active PP rank and expands to a
+# different active-rank count. Blocks are intentionally duplicated so
+# --single-server restarts vLLM between 1->2, 1->3, and 1->4 runs.
+
+project: "qwen_pp4_autoscaling_expand_100"
+type: "sweep_test"
+is_log_cover: true
+overwrite: true
+
+envs:
+  RAY_DEDUP_LOGS: "0"
+  NCCL_DEBUG: INFO
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+  RAY_CGRAPH_get_timeout: "10000"
+  KV_SYNC_USE_CPU: "0"
+  VLLM_USE_CPU_MODEL: "0"
+  CUDA_LAUNCH_BLOCKING: "0"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+  VLLM_USE_RAY_COMPILED_DAG: "0"
+  VLLM_USE_RAY_SPMD_WORKER: "1"
+  VLLM_DYNAMIC_PP_NCCL_TRANSPORT: "0"
+  VLLM_DYNAMIC_PP_RDT_TRANSPORT: "nccl"
+  VLLM_RAY_RDT_MULTIGPU_PATCH: "1"
+  VLLM_RAY_RDT_SYNC_AFTER_TRANSFER: "1"
+  VLLM_RAY_RDT_SERIALIZE_WITH_KV_NCCL_LOCK: "1"
+  VLLM_DYNAMIC_PP_MAX_CONCURRENT_BATCHES: "1"
+  NCCL_SOCKET_IFNAME: "bond0.3027"
+  GLOO_SOCKET_IFNAME: "bond0.3027"
+  VLLM_SERVER_DEV_MODE: "1"
+  VLLM_DISABLE_CUTLASS_FP8: "1"
+
+static_config:
+  model:
+    path: "/home/bxb1/data/huggingface/Qwen3-32B-FP8"
+    name: "Qwen3-32B-FP8"
+  network:
+    placements:
+      - {pp_stage: 0, node: "spartan-gpgpu069", ip: "spartan-gpgpu069"}
+      - {pp_stage: 1, node: "spartan-gpgpu069", ip: "spartan-gpgpu069"}
+      - {pp_stage: 2, node: "spartan-gpgpu069", ip: "spartan-gpgpu069"}
+      - {pp_stage: 3, node: "spartan-gpgpu069", ip: "spartan-gpgpu069"}
+  vllm:
+    head_addr: "localhost"
+    pipeline_parallel_size: 4
+    pipeline_autoscaling_enabled: true
+    autoscaling_candidate_ranks: [0, 1, 2, 3]
+    gpu_memory_utilization: 0.85
+    max_model_len: 1024
+    max_num_batched_tokens: 512
+    chunked_prefill: true
+    enable_cuda_graph: false
+    enable_nsight: false
+    weight_chunk_size_mb: 160
+    block_size: 128
+    log_kv_memory_stats: true
+    disable_memory_overhead_monitor: false
+  benchmark:
+    benchmark_script_path: "/data/gpfs/projects/punim2715/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
+    num_total_requests: 100
+    repetition: 1
+    burstiness: 100.0
+    print_outputs: true
+    profile: false
+    warmup:
+      enabled: false
+
+sweep_configs:
+  - vllm:
+      attention_kernel: [direct]
+      fixed_num_gpu_blocks: [-1]
+      weight_chunk_size_mb: [160]
+      migration_approach: [async]
+      weight_loading_mode: [async]
+      use_vmm: [true]
+      enable_kv_resize: [true]
+      enable_cpu_weight_cache: [true]
+    benchmark_config:
+      - num_total_requests: 100
+        repetition: 1
+        pp_layer_config:
+          0: "64,0,0,0"
+          50: "32,32,0,0"
+        requests:
+          0:
+            request_rate: 4.0
+            input_lens: 64
+            output_lens: 64
+          50:
+            request_rate: 4.0
+            input_lens: 64
+            output_lens: 64
+
+  - vllm:
+      attention_kernel: [direct]
+      fixed_num_gpu_blocks: [-1]
+      weight_chunk_size_mb: [160]
+      migration_approach: [async]
+      weight_loading_mode: [async]
+      use_vmm: [true]
+      enable_kv_resize: [true]
+      enable_cpu_weight_cache: [true]
+    benchmark_config:
+      - num_total_requests: 100
+        repetition: 1
+        pp_layer_config:
+          0: "64,0,0,0"
+          50: "24,20,20,0"
+        requests:
+          0:
+            request_rate: 4.0
+            input_lens: 64
+            output_lens: 64
+          50:
+            request_rate: 4.0
+            input_lens: 64
+            output_lens: 64
+
+  - vllm:
+      attention_kernel: [direct]
+      fixed_num_gpu_blocks: [-1]
+      weight_chunk_size_mb: [160]
+      migration_approach: [async]
+      weight_loading_mode: [async]
+      use_vmm: [true]
+      enable_kv_resize: [true]
+      enable_cpu_weight_cache: [true]
+    benchmark_config:
+      - num_total_requests: 100
+        repetition: 1
+        pp_layer_config:
+          0: "64,0,0,0"
+          50: "16,16,16,16"
+        requests:
+          0:
+            request_rate: 4.0
+            input_lens: 64
+            output_lens: 64
+          50:
+            request_rate: 4.0
+            input_lens: 64
+            output_lens: 64

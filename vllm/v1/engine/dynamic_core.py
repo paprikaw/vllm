@@ -803,8 +803,13 @@ class DynamicEngineCore(EngineCore):
             return
         self._finalize_autoscaling_sync_state_if_needed(scheduler_output)
         self._wait_for_autoscaling_sync_state()
+        assert isinstance(self.scheduler, DynamicScheduler)
+        self._apply_active_pp_ranks_for_config(
+            self.scheduler.pp_layer_config_status.get_cur_pp_layer_config())
         self._autoscaling_schedule_paused = False
-        logger.info("[autoscaling sync] scheduler pause released")
+        logger.info(
+            "[autoscaling sync] scheduler pause released after KV patches "
+            "applied; worker cleanup/resize may continue asynchronously")
 
     def step_with_batch_queue(self) -> Optional[EngineCoreOutputs]:
         """
@@ -913,6 +918,8 @@ class DynamicEngineCore(EngineCore):
                 model_output = model_output.result()
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output)
+            self._finish_autoscaling_schedule_pause_if_needed(
+                scheduler_output)
             return engine_core_outputs
 
     def change_model_configuration_by_reinitialize_kv_cache(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
@@ -1329,6 +1336,9 @@ class DynamicEngineCore(EngineCore):
                         logger.info(
                             "[autoscaling async] queued PP config switch via "
                             "scheduler output; active ranks remain batch-local")
+                    logger.info(
+                        "[timeline]: migration switch-ready time taken: %s",
+                        human_readable_duration(time.time() - time_start))
                 break
 
         assert resized_block_num != 0

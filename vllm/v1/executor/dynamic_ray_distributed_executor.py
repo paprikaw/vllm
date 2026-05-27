@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
 import msgspec
 import os
+import time
 from collections import defaultdict
 import torch
 from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
@@ -50,6 +51,11 @@ def _dynamic_pp_rdt_transport() -> str:
 
 def _dynamic_pp_rdt_nccl_enabled() -> bool:
     return _dynamic_pp_rdt_transport() == "nccl"
+
+
+def _dynamic_pp_rdt_prewarm_enabled() -> bool:
+    value = os.getenv("VLLM_DYNAMIC_PP_RDT_PREWARM", "0").lower()
+    return value in ("1", "true", "yes", "on")
 
 
 class RayObjectRefFuture(StdFuture):
@@ -683,6 +689,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             raise NotImplementedError(
                 "dynamic PP RDT transport currently supports TP=1 only")
         if getattr(self, "_dynamic_pp_rdt_group", None) is not None:
+            self._prewarm_dynamic_pp_rdt_edges()
             return
 
         install_vllm_ray_rdt_gpu_object_patch()
@@ -700,6 +707,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             self._dynamic_pp_rdt_group = existing_groups[0]
             logger.info("Reusing Ray RDT NCCL collective group %s",
                         self._dynamic_pp_rdt_group.name)
+            self._prewarm_dynamic_pp_rdt_edges()
             return
 
         group_name = f"vllm_dynamic_pp_rdt_nccl_{id(self)}"
@@ -707,6 +715,59 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                     group_name, len(self.workers))
         self._dynamic_pp_rdt_group = create_collective_group(
             self.workers, backend="nccl", name=group_name)
+        self._prewarm_dynamic_pp_rdt_edges()
+
+    def _dynamic_pp_rdt_prewarm_ranks(self) -> list[int]:
+        dynamic_config = self.vllm_config.dynamic_config
+        ranks = getattr(dynamic_config, "autoscaling_candidate_ranks", None)
+        if not ranks:
+            ranks = list(range(self.parallel_config.pipeline_parallel_size))
+        ranks = [int(rank) for rank in ranks]
+        return sorted(dict.fromkeys(ranks))
+
+    def _dynamic_pp_rdt_prewarm_edges(self) -> list[tuple[int, int]]:
+        ranks = self._dynamic_pp_rdt_prewarm_ranks()
+        if len(ranks) < 2:
+            return []
+        mode = os.getenv("VLLM_DYNAMIC_PP_RDT_PREWARM_MODE",
+                         "adjacent").lower()
+        if mode == "all":
+            return [(src, dst) for i, src in enumerate(ranks)
+                    for dst in ranks[i + 1:]]
+        if mode not in ("adjacent", "pipeline"):
+            raise ValueError("Unsupported VLLM_DYNAMIC_PP_RDT_PREWARM_MODE="
+                             f"{mode!r}; expected 'adjacent' or 'all'.")
+        return list(zip(ranks, ranks[1:]))
+
+    def _prewarm_dynamic_pp_rdt_edges(self) -> None:
+        if not _dynamic_pp_rdt_prewarm_enabled():
+            return
+        if getattr(self, "_dynamic_pp_rdt_prewarmed", False):
+            return
+        if getattr(self, "_dynamic_pp_rdt_group", None) is None:
+            return
+
+        edges = self._dynamic_pp_rdt_prewarm_edges()
+        if not edges:
+            self._dynamic_pp_rdt_prewarmed = True
+            return
+
+        start = time.time()
+        logger.info("Prewarming Ray RDT NCCL PP edges: %s", edges)
+        for src_rank, dst_rank in edges:
+            edge_start = time.time()
+            src_ref = self.workers[src_rank].prewarm_ray_rdt_send.options(
+                tensor_transport="nccl").remote(src_rank, dst_rank)
+            dst_ref = self.workers[dst_rank].prewarm_ray_rdt_recv.remote(
+                src_ref, src_rank, dst_rank)
+            checksum = ray.get(dst_ref)
+            logger.info(
+                "Prewarmed Ray RDT NCCL PP edge %s->%s in %.3fs "
+                "(checksum=%.1f)", src_rank, dst_rank,
+                time.time() - edge_start, checksum)
+        self._dynamic_pp_rdt_prewarmed = True
+        logger.info("Finished Ray RDT NCCL PP prewarm for %d edges in %.3fs",
+                    len(edges), time.time() - start)
 
     def _sync_request_states_before_target_chain(
         self,
