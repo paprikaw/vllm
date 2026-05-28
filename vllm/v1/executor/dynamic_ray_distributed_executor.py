@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import threading
 from concurrent.futures import Future as StdFuture
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
@@ -56,6 +57,10 @@ def _dynamic_pp_rdt_nccl_enabled() -> bool:
 def _dynamic_pp_rdt_prewarm_enabled() -> bool:
     value = os.getenv("VLLM_DYNAMIC_PP_RDT_PREWARM", "0").lower()
     return value in ("1", "true", "yes", "on")
+
+
+def _autoscaling_request_metadata_rpc_enabled() -> bool:
+    return os.getenv("VLLM_AUTOSCALING_REQUEST_METADATA_RPC", "1") == "1"
 
 
 class RayObjectRefFuture(StdFuture):
@@ -494,8 +499,12 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         logger.info("Updated active PP worker chain to ranks %s", active_ranks)
 
     def _sync_request_states_for_autoscaling(self) -> None:
+        total_start = time.time()
+        export_start = time.time()
         snapshots = self.collective_rpc(
             "export_request_states_for_autoscaling")
+        logger.info("[autoscaling rpc timing] export_request_states_for_autoscaling took %.3fs",
+                    time.time() - export_start)
         if isinstance(snapshots, dict):
             iterable = snapshots.values()
         else:
@@ -503,11 +512,23 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         request_states = max(iterable, key=lambda states: len(states),
                              default={})
         if request_states:
+            import_start = time.time()
             self.collective_rpc("import_request_states_for_autoscaling",
                                 args=(request_states,))
+            logger.info(
+                "[autoscaling rpc timing] import_request_states_for_autoscaling "
+                "took %.3fs for %d requests",
+                time.time() - import_start, len(request_states))
+            reset_start = time.time()
             self.collective_rpc("reset_input_batch_for_autoscaling")
+            logger.info("[autoscaling rpc timing] reset_input_batch_for_autoscaling "
+                        "took %.3fs",
+                        time.time() - reset_start)
             logger.info("Synchronized %d request states for autoscaling",
                         len(request_states))
+        logger.info("[autoscaling rpc timing] _sync_request_states_for_autoscaling "
+                    "total took %.3fs, request_states=%d",
+                    time.time() - total_start, len(request_states))
 
     def _compiled_cpu_ray_dag(self, enable_asyncio: bool):
         assert self.parallel_config.use_ray
@@ -779,6 +800,8 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             return
         if not active_ranks:
             return
+        if _autoscaling_request_metadata_rpc_enabled():
+            return
 
         current_active = getattr(self, "active_pp_ranks", None)
         if current_active is None:
@@ -940,7 +963,65 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         return self.collective_rpc("get_is_kv_resizing_done")
 
     def get_async_migration_state(self) -> list[dict[str, Any]]:
-        return self.collective_rpc("get_async_migration_state")
+        start = time.time()
+        states = self.collective_rpc("get_async_migration_state")
+        logger.info("[autoscaling rpc timing] get_async_migration_state took %.3fs",
+                    time.time() - start)
+        return states
+
+    def prepare_autoscaling_request_states_async(
+        self,
+        target_ranks: list[int],
+        generation: int,
+    ) -> StdFuture:
+        future: StdFuture = StdFuture()
+
+        def run() -> None:
+            total_start = time.time()
+            try:
+                export_start = time.time()
+                snapshots = self.collective_rpc(
+                    "export_request_states_for_autoscaling")
+                logger.info(
+                    "[autoscaling rpc timing] async "
+                    "export_request_states_for_autoscaling took %.3fs",
+                    time.time() - export_start)
+                if isinstance(snapshots, dict):
+                    iterable = snapshots.values()
+                else:
+                    iterable = snapshots
+                request_states = max(iterable, key=lambda states: len(states),
+                                     default={})
+                import_start = time.time()
+                self.collective_rpc(
+                    "prepare_autoscaling_request_states_for_target_ranks",
+                    args=(request_states, target_ranks, generation))
+                logger.info(
+                    "[autoscaling rpc timing] async "
+                    "prepare_autoscaling_request_states import took %.3fs",
+                    time.time() - import_start)
+                reset_start = time.time()
+                self.collective_rpc("reset_input_batch_for_autoscaling")
+                logger.info(
+                    "[autoscaling rpc timing] async "
+                    "reset_input_batch_for_autoscaling took %.3fs",
+                    time.time() - reset_start)
+                logger.info(
+                    "[autoscaling rpc timing] prepare_autoscaling_request_states "
+                    "took %.3fs, requests=%d target_ranks=%s generation=%s",
+                    time.time() - total_start, len(request_states),
+                    target_ranks, generation)
+                future.set_result(None)
+            except BaseException as exc:
+                logger.exception(
+                    "prepare_autoscaling_request_states failed")
+                future.set_exception(exc)
+
+        threading.Thread(
+            target=run,
+            name="autoscaling-request-states-rpc",
+            daemon=True).start()
+        return future
 
     def finalize_async_migration_after_sync(
         self,
@@ -949,10 +1030,16 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         total_migration_tokens: int,
         new_kv_cache_block_num: int,
     ) -> None:
+        start = time.time()
         self.collective_rpc(
             "finalize_async_migration_after_sync",
             args=(sender_list, receiver_list, total_migration_tokens,
                   new_kv_cache_block_num))
+        logger.info(
+            "[autoscaling rpc timing] finalize_async_migration_after_sync took "
+            "%.3fs, senders=%s receivers=%s total_tokens=%s new_kv_blocks=%s",
+            time.time() - start, sender_list, receiver_list,
+            total_migration_tokens, new_kv_cache_block_num)
 
     def get_applied_token_num(self, receiver_list: list[int]) -> list[list[int]]:
         """Return KV patch buffer status per rank.
@@ -1043,6 +1130,17 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
     def set_active_pp_ranks(self, active_ranks: Optional[list[int]]) -> None:
         """Set the active PP routing subset on all workers."""
-        self._sync_request_states_for_autoscaling()
+        total_start = time.time()
+        if not _autoscaling_request_metadata_rpc_enabled():
+            self._sync_request_states_for_autoscaling()
+        collective_start = time.time()
         self.collective_rpc("set_active_pp_ranks", args=(active_ranks,))
+        logger.info("[autoscaling rpc timing] set_active_pp_ranks collective took "
+                    "%.3fs for active_ranks=%s",
+                    time.time() - collective_start, active_ranks)
+        local_start = time.time()
         self._set_active_pp_ranks_local(active_ranks)
+        logger.info("[autoscaling rpc timing] set_active_pp_ranks local took %.3fs",
+                    time.time() - local_start)
+        logger.info("[autoscaling rpc timing] set_active_pp_ranks total took %.3fs",
+                    time.time() - total_start)

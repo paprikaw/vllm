@@ -847,11 +847,23 @@ class DynamicEngineCore(EngineCore):
         if not self._is_autoscaling_sync_batch(scheduler_output):
             return
         self._finalize_autoscaling_sync_state_if_needed(scheduler_output)
+        request_states_future = None
+        if os.environ.get("VLLM_AUTOSCALING_REQUEST_METADATA_RPC", "1") == "1":
+            request_states_future = self.model_executor.prepare_autoscaling_request_states_async(
+                sorted(scheduler_output.receiver_list or []),
+                self._placement_generation + 1)
+            logger.info(
+                "[autoscaling sync] started async request state RPC: "
+                "receivers=%s generation=%s",
+                sorted(scheduler_output.receiver_list or []),
+                self._placement_generation + 1)
         time_start_waiting_patches = time.time()
         self._wait_for_autoscaling_sync_state()
         logger.info(
             "[timeline]: after check KV patches applied process, time taken: %s",
             human_readable_duration(time.time() - time_start_waiting_patches))
+        if request_states_future is not None:
+            request_states_future.result()
         waited_cleanup = False
         if self._wait_cleanup_before_autoscaling_schedule_release():
             if scheduler_output.new_kv_cache_block_num <= 0:

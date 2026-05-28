@@ -99,6 +99,9 @@ class DynamicGPUWorker(Worker):
         # 独立的条件变量：等待 KV cache 绑定到位（与“层已加载”解耦）
         self._kv_bound_lock = threading.Lock()
         self._kv_bound_cv = threading.Condition(self._kv_bound_lock)
+        self._autoscaling_request_metadata_cv = threading.Condition(
+            threading.Lock())
+        self._autoscaling_request_metadata_generation = -1
 
 
         pp_size = int(self.vllm_config.parallel_config.pipeline_parallel_size)
@@ -872,6 +875,65 @@ class DynamicGPUWorker(Worker):
         logger.info(
             "Worker %s reset input_batch for autoscaling; removed %d reqs",
             self.rank, len(removed_req_indices))
+
+    def prepare_autoscaling_request_states_for_target_ranks(
+        self,
+        request_states,
+        target_ranks: list[int],
+        generation: int,
+    ) -> None:
+        if self.rank not in set(target_ranks):
+            return
+        start = time.time()
+        imported = 0
+        with self._autoscaling_request_metadata_cv:
+            for req_id, req_state in request_states.items():
+                if req_id in self.model_runner.requests:
+                    continue
+                self.model_runner.requests[req_id] = deepcopy(req_state)
+                imported += 1
+            self._autoscaling_request_metadata_generation = max(
+                self._autoscaling_request_metadata_generation, generation)
+            self._autoscaling_request_metadata_cv.notify_all()
+        logger.info(
+            "[autoscaling request states] rank %s imported %d/%d request states "
+            "for generation %s in %s",
+            self.rank, imported, len(request_states), generation,
+            human_readable_duration(time.time() - start))
+
+    def _wait_for_autoscaling_request_metadata_if_needed(
+        self,
+        scheduler_output: DynamicSchedulerOutput,
+    ) -> None:
+        if os.environ.get("VLLM_AUTOSCALING_REQUEST_METADATA_RPC", "1") != "1":
+            return
+        missing = [
+            req.req_id for req in scheduler_output.scheduled_cached_reqs
+            if req.req_id not in self.model_runner.requests
+        ]
+        if not missing:
+            return
+        timeout_s = float(os.environ.get(
+            "VLLM_AUTOSCALING_METADATA_WAIT_TIMEOUT_S", "300"))
+        start = time.time()
+        with self._autoscaling_request_metadata_cv:
+            while True:
+                missing = [
+                    req_id for req_id in missing
+                    if req_id not in self.model_runner.requests
+                ]
+                if not missing:
+                    break
+                elapsed = time.time() - start
+                if elapsed > timeout_s:
+                    raise RuntimeError(
+                        "Timed out waiting for autoscaling request states "
+                        f"on rank {self.rank}; missing={missing}")
+                self._autoscaling_request_metadata_cv.wait(
+                    timeout=min(0.05, timeout_s - elapsed))
+        logger.info(
+            "[autoscaling request states] rank %s waited %s for request states",
+            self.rank, human_readable_duration(time.time() - start))
 
     @torch.inference_mode()
     def execute_model(
@@ -3352,6 +3414,8 @@ class DynamicGPUWorker(Worker):
             self.after_migration_total_token = 0
             self.after_migration_applied_token_num = 0
 
+        self._wait_for_autoscaling_request_metadata_if_needed(scheduler_output)
+
 
     def async_migration_after_execute_callback(self, scheduler_output: "DynamicSchedulerOutput"):
         if not isinstance(self.model_runner.model, DynamicModelBase):
@@ -3471,6 +3535,16 @@ class DynamicGPUWorker(Worker):
             # Assert the layers are sorted
             assert layers == sorted(layers), "The layers should be sorted"
             layer_ranges.append((layers[0], layers[-1]))
+
+        if is_sender and layer_ranges:
+            # All migration KV patches have already been applied before this
+            # finalize path runs. Keep using the copied layer_ranges for
+            # cleanup, but stop marking target-topology forwards as sender
+            # work while background KV resize is still in progress.
+            self.rank_to_layers_ids = {}
+            logger.info(
+                "[autoscaling sync] rank %s cleared sender routing state "
+                "before background cleanup/resize", self.rank)
 
         assert self.target_pp_layer_config is not None, "target_pp_layer_config must be set"
         caches_to_free_key = []
