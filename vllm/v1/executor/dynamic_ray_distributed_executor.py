@@ -505,6 +505,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         if request_states:
             self.collective_rpc("import_request_states_for_autoscaling",
                                 args=(request_states,))
+            self.collective_rpc("reset_input_batch_for_autoscaling")
             logger.info("Synchronized %d request states for autoscaling",
                         len(request_states))
 

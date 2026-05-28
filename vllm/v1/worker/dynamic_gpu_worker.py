@@ -858,6 +858,21 @@ class DynamicGPUWorker(Worker):
         logger.info("Worker %s imported %d request states for autoscaling",
                     self.rank, imported)
 
+    def reset_input_batch_for_autoscaling(self) -> None:
+        input_batch = self.model_runner.input_batch
+        req_ids = list(input_batch.req_id_to_index.keys())
+        removed_req_indices: list[int] = []
+        for req_id in req_ids:
+            req_index = input_batch.remove_request(req_id)
+            if req_index is not None:
+                removed_req_indices.append(req_index)
+        removed_req_indices.sort(reverse=True)
+        input_batch.condense(removed_req_indices)
+        input_batch.refresh_sampling_metadata()
+        logger.info(
+            "Worker %s reset input_batch for autoscaling; removed %d reqs",
+            self.rank, len(removed_req_indices))
+
     @torch.inference_mode()
     def execute_model(
         self,
