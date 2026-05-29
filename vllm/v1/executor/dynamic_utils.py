@@ -506,6 +506,29 @@ try:
                 checksum)
             return checksum
 
+        def activate_pp_ranks_for_autoscaling_chain(
+            self,
+            active_ranks: list[int],
+            generation: int,
+            upstream_marker: Optional[dict] = None,
+        ) -> dict:
+            self.setup_device_if_necessary()
+            assert isinstance(self.worker, DynamicGPUWorker)
+            start = time.time()
+            self.worker.set_active_pp_ranks(active_ranks)
+            marker = {
+                "rank": self.rpc_rank,
+                "generation": generation,
+                "active_ranks": list(active_ranks),
+                "upstream": upstream_marker,
+            }
+            logger.info(
+                "[autoscaling active ranks] rank %s activated PP ranks %s "
+                "for generation %s via actor chain in %s",
+                self.rpc_rank, active_ranks, generation,
+                human_readable_duration(time.time() - start))
+            return marker
+
         def execute_model_ray(
             self,
             scheduler_output: Union["DynamicSchedulerOutput",

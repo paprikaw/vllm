@@ -95,3 +95,9 @@ class DynamicSchedulerOutput():
     pp_nccl_active_ranks: Optional[tuple[int, ...]] = None
     pp_nccl_request_ids: tuple[str, ...] = ()
     pp_nccl_config_fingerprint: str = ""
+
+    # Autoscaling active-rank update carried by the sync batch. The executor
+    # starts a lightweight Ray actor chain so workers can update PP routing
+    # before the scheduler pause is released.
+    autoscaling_activate_pp_ranks: Optional[list[int]] = None
+    autoscaling_activate_pp_ranks_generation: int = -1

@@ -112,6 +112,8 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         # the TP group of workers for a PP rank.
         self.pp_tp_workers: List[List[DynamicRayWorkerWrapper]] = []
         self.active_pp_ranks: Optional[list[int]] = None
+        self._autoscaling_active_pp_ranks_generation: int = -1
+        self._autoscaling_active_pp_ranks_ref = None
 
         if self.parallel_config.ray_workers_use_nsight:
             ray_remote_kwargs = self._configure_ray_workers_use_nsight(
@@ -498,6 +500,60 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         self.cpu_forward_dag = None
         logger.info("Updated active PP worker chain to ranks %s", active_ranks)
 
+    def commit_active_pp_ranks_local(
+        self,
+        active_ranks: Optional[list[int]],
+    ) -> None:
+        """Commit the driver-side PP actor chain after worker routing is ready."""
+        start = time.time()
+        self._set_active_pp_ranks_local(active_ranks)
+        logger.info(
+            "[autoscaling active ranks] committed local PP worker chain to "
+            "ranks %s in %.3fs", active_ranks, time.time() - start)
+
+    def _start_autoscaling_active_pp_ranks_chain(
+        self,
+        scheduler_output,
+    ) -> None:
+        active_ranks = getattr(scheduler_output,
+                               "autoscaling_activate_pp_ranks", None)
+        if active_ranks is None:
+            return
+        generation = getattr(
+            scheduler_output, "autoscaling_activate_pp_ranks_generation", -1)
+        if generation <= self._autoscaling_active_pp_ranks_generation:
+            return
+        start = time.time()
+        worker_ranks = list(range(len(self.workers)))
+        marker = None
+        for rank in worker_ranks:
+            marker = self.workers[
+                rank].activate_pp_ranks_for_autoscaling_chain.remote(
+                    active_ranks, generation, marker)
+        self._autoscaling_active_pp_ranks_generation = generation
+        self._autoscaling_active_pp_ranks_ref = marker
+        logger.info(
+            "[autoscaling active ranks] started actor-chain activation for "
+            "generation=%s active_ranks=%s worker_ranks=%s in %.3fs",
+            generation, active_ranks, worker_ranks, time.time() - start)
+
+    def wait_for_autoscaling_active_pp_ranks(
+        self,
+        generation: int,
+    ) -> None:
+        ref = self._autoscaling_active_pp_ranks_ref
+        if ref is None or generation > self._autoscaling_active_pp_ranks_generation:
+            logger.info(
+                "[autoscaling active ranks] no actor-chain activation to wait "
+                "for generation=%s; latest_generation=%s",
+                generation, self._autoscaling_active_pp_ranks_generation)
+            return
+        start = time.time()
+        ray.get(ref)
+        logger.info(
+            "[autoscaling active ranks] actor-chain activation ready for "
+            "generation=%s in %.3fs", generation, time.time() - start)
+
     def _sync_request_states_for_autoscaling(self) -> None:
         total_start = time.time()
         export_start = time.time()
@@ -644,6 +700,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         self,
         scheduler_output,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
+        self._start_autoscaling_active_pp_ranks_chain(scheduler_output)
         active_ranks = self._active_ranks_for_scheduler_output(
             scheduler_output)
         if not active_ranks:

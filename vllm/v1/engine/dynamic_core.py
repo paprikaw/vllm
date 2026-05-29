@@ -301,12 +301,16 @@ class DynamicEngineCore(EngineCore):
     def _apply_active_pp_ranks_for_config(
         self,
         pp_layer_config: list[Tuple[int, int]],
+        update_workers: bool = True,
     ) -> None:
         active_ranks = self._active_ranks_for_config(pp_layer_config)
         self.cur_active_pp_ranks = active_ranks
         self._placement_generation += 1
         if isinstance(self.model_executor, DynamicRayDistributedExecutor):
-            self.model_executor.set_active_pp_ranks(active_ranks)
+            if update_workers:
+                self.model_executor.set_active_pp_ranks(active_ranks)
+            else:
+                self.model_executor.commit_active_pp_ranks_local(active_ranks)
         logger.info(
             "Applied pipeline autoscaling placement generation=%s active_ranks=%s",
             self._placement_generation, active_ranks)
@@ -714,6 +718,8 @@ class DynamicEngineCore(EngineCore):
                         len(cur_running), len(cur_waiting))
                     break
 
+                self._mark_autoscaling_active_pp_ranks_if_needed(
+                    scheduler_output)
                 future = execute_func(scheduler_output)
                 model_output = future.result()
                 engine_core_outputs.append(self.scheduler.update_from_output(
@@ -840,6 +846,25 @@ class DynamicEngineCore(EngineCore):
                 "[autoscaling sync] submitted sync batch; pausing scheduler "
                 "until all workers report KV patch application")
 
+    def _mark_autoscaling_active_pp_ranks_if_needed(
+        self,
+        scheduler_output: DynamicSchedulerOutput,
+    ) -> None:
+        if not self._is_autoscaling_sync_batch(scheduler_output):
+            return
+        assert isinstance(self.scheduler, DynamicScheduler)
+        pp_layer_config = (
+            self.scheduler.pp_layer_config_status.get_cur_pp_layer_config())
+        active_ranks = self._active_ranks_for_config(pp_layer_config)
+        scheduler_output.autoscaling_activate_pp_ranks = active_ranks
+        scheduler_output.autoscaling_activate_pp_ranks_generation = (
+            self._placement_generation + 1)
+        logger.info(
+            "[autoscaling active ranks] marked sync batch for actor-chain "
+            "activation, generation=%s active_ranks=%s",
+            scheduler_output.autoscaling_activate_pp_ranks_generation,
+            active_ranks)
+
     def _finish_autoscaling_schedule_pause_if_needed(
         self,
         scheduler_output: DynamicSchedulerOutput,
@@ -864,6 +889,12 @@ class DynamicEngineCore(EngineCore):
             human_readable_duration(time.time() - time_start_waiting_patches))
         if request_states_future is not None:
             request_states_future.result()
+        activation_generation = getattr(
+            scheduler_output, "autoscaling_activate_pp_ranks_generation", -1)
+        if (activation_generation >= 0 and isinstance(
+                self.model_executor, DynamicRayDistributedExecutor)):
+            self.model_executor.wait_for_autoscaling_active_pp_ranks(
+                activation_generation)
         waited_cleanup = False
         if self._wait_cleanup_before_autoscaling_schedule_release():
             if scheduler_output.new_kv_cache_block_num <= 0:
@@ -878,7 +909,8 @@ class DynamicEngineCore(EngineCore):
             waited_cleanup = True
         assert isinstance(self.scheduler, DynamicScheduler)
         self._apply_active_pp_ranks_for_config(
-            self.scheduler.pp_layer_config_status.get_cur_pp_layer_config())
+            self.scheduler.pp_layer_config_status.get_cur_pp_layer_config(),
+            update_workers=(activation_generation < 0))
         self._autoscaling_schedule_paused = False
         self.migration_status = MigrationStatus.NOT_MIGRATING
         self._migration_done_event.set()
@@ -938,6 +970,8 @@ class DynamicEngineCore(EngineCore):
                 # if scheduler_output.total_migration_tokens > 0:
                     # logger.info(f"[forward]: scheduled a total {scheduler_output.total_migration_tokens} tokens, total_num_scheduled_tokens: {scheduler_output.total_num_scheduled_tokens}, is_sync_after_migration: {scheduler_output.is_sync_after_migration}")
                 if scheduler_output.total_num_scheduled_tokens > 0:
+                    self._mark_autoscaling_active_pp_ranks_if_needed(
+                        scheduler_output)
                     exec_start = time.time()
                     future = execute_func(scheduler_output)
                     exec_submit_time = time.time() - exec_start
@@ -992,6 +1026,8 @@ class DynamicEngineCore(EngineCore):
             assert isinstance(self.scheduler, DynamicScheduler)
             scheduler_output = self.scheduler.dynamic_schedule()
             assert isinstance(scheduler_output, DynamicSchedulerOutput)
+            self._mark_autoscaling_active_pp_ranks_if_needed(
+                scheduler_output)
             
             is_ray_use_cpu = os.getenv("VLLM_USE_CPU_MODEL", "0") == "1"
             execute_func = (self.model_executor.execute_cpu_model
@@ -1000,6 +1036,7 @@ class DynamicEngineCore(EngineCore):
             # With PP=1, execute_model returns ModelRunnerOutput directly
             # (not a future), since max_concurrent_batches==1.
             model_output = execute_func(scheduler_output)
+            self._mark_autoscaling_schedule_pause_if_needed(scheduler_output)
             if hasattr(model_output, 'result'):
                 model_output = model_output.result()
             engine_core_outputs = self.scheduler.update_from_output(
