@@ -589,6 +589,8 @@ try:
 
                     time_before_lock = time.time()
                     inference_stream_synced = False
+                    self.worker.prepare_autoscaling_request_states_from_sync_batch(
+                        scheduler_output)
                     self.worker.async_migration_before_execute_callback(
                         scheduler_output)
                     time_after_before_execute_callback = time.time()

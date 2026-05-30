@@ -63,6 +63,46 @@ import traceback
 import faulthandler
 logger = init_logger(__name__)
 
+
+def _sync_current_cuda_stream(device: Optional[torch.device]) -> None:
+    if device is not None:
+        torch.cuda.current_stream(device).synchronize()
+    else:
+        torch.cuda.current_stream().synchronize()
+
+
+def _memory_snapshot_no_device_sync(
+    tag: str,
+    device: Optional[torch.device],
+) -> dict[str, float]:
+    if device is not None:
+        torch.cuda.set_device(device)
+
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    cached_not_used = reserved - allocated
+    snapshot = {
+        "free_gb": free_mem / 1024**3,
+        "total_gb": total_mem / 1024**3,
+        "allocated_gb": allocated / 1024**3,
+        "reserved_gb": reserved / 1024**3,
+        "cached_unused_gb": cached_not_used / 1024**3,
+        "max_allocated_gb": torch.cuda.max_memory_allocated() / 1024**3,
+    }
+    logger.info(
+        "[MEM_SNAPSHOT_STREAM_LOCAL] [%s] free=%.3fGB allocated=%.3fGB "
+        "reserved=%.3fGB cached_unused=%.3fGB max_alloc=%.3fGB total=%.3fGB",
+        tag,
+        snapshot["free_gb"],
+        snapshot["allocated_gb"],
+        snapshot["reserved_gb"],
+        snapshot["cached_unused_gb"],
+        snapshot["max_allocated_gb"],
+        snapshot["total_gb"],
+    )
+    return snapshot
+
 # Import validate_layers_granularity from utils
 from vllm.v1.worker.utils import validate_layers_granularity, validate_layers_count_granularity
 
@@ -99,11 +139,6 @@ class DynamicGPUWorker(Worker):
         # 独立的条件变量：等待 KV cache 绑定到位（与“层已加载”解耦）
         self._kv_bound_lock = threading.Lock()
         self._kv_bound_cv = threading.Condition(self._kv_bound_lock)
-        self._autoscaling_request_metadata_cv = threading.Condition(
-            threading.Lock())
-        self._autoscaling_request_metadata_generation = -1
-
-
         pp_size = int(self.vllm_config.parallel_config.pipeline_parallel_size)
         # Used for waiting all patch applied
         self._all_patch_applied_cv = threading.Condition(threading.Lock()) 
@@ -371,12 +406,14 @@ class DynamicGPUWorker(Worker):
                 layer_list,
                 self.model_runner.layer_group_granularity,
                 operation="add_layers"
-            )
+        )
         
         cleanup_start = time.time()
-        torch.cuda.synchronize() 
+        if self.migration_stream is not None:
+            self.migration_stream.synchronize()
+        else:
+            _sync_current_cuda_stream(self.device)
         gc.collect()
-        torch.cuda.empty_cache()
         free_after_cleanup, _ = torch.cuda.mem_get_info()
         logger.info(
             "[dynamic-load-worker]: pre_add_cleanup layers=%s took=%s free_gpu_before=%.2fGB free_gpu_after=%.2fGB total_gpu=%.2fGB",
@@ -847,25 +884,69 @@ class DynamicGPUWorker(Worker):
         logger.info("Worker %s: updated active PP ranks to %s",
                     self.rank, active_ranks)
 
-    def export_request_states_for_autoscaling(self):
-        return deepcopy(self.model_runner.requests)
-
-    def import_request_states_for_autoscaling(self, request_states) -> None:
-        if not request_states:
+    def prepare_autoscaling_request_states_from_sync_batch(
+        self,
+        scheduler_output: DynamicSchedulerOutput,
+    ) -> None:
+        if not getattr(scheduler_output, "autoscaling_request_state_sync",
+                       False):
             return
-        imported = 0
-        for req_id, req_state in request_states.items():
-            if req_id not in self.model_runner.requests:
-                self.model_runner.requests[req_id] = deepcopy(req_state)
-                imported += 1
-        logger.info("Worker %s imported %d request states for autoscaling",
-                    self.rank, imported)
 
-    def reset_input_batch_for_autoscaling(self) -> None:
+        request_states = getattr(scheduler_output,
+                                 "autoscaling_request_states", None)
+        if request_states is None:
+            request_states = self._export_autoscaling_request_states_for_batch(
+                scheduler_output)
+            if request_states:
+                scheduler_output.autoscaling_request_states = request_states
+                scheduler_output.autoscaling_request_state_source_rank = (
+                    self.rank)
+                logger.info(
+                    "[autoscaling request states] rank %s attached %d "
+                    "request states to target PP batch",
+                    self.rank, len(request_states))
+
+        request_states = getattr(scheduler_output,
+                                 "autoscaling_request_states", None)
+        missing = [
+            req.req_id for req in scheduler_output.scheduled_cached_reqs
+            if req.req_id not in self.model_runner.requests
+        ]
+        if missing and not request_states:
+            raise RuntimeError(
+                "Autoscaling target batch was marked for request-state sync "
+                f"but did not carry states for missing requests on rank "
+                f"{self.rank}: {missing}")
+
+        start = time.time()
+        imported = 0
+        for req_id in missing:
+            req_state = request_states.get(req_id)
+            if req_state is None:
+                continue
+            self.model_runner.requests[req_id] = deepcopy(req_state)
+            imported += 1
+
+        if imported:
+            logger.info(
+                "[autoscaling request states] rank %s imported %d/%d "
+                "missing request states from sync batch source_rank=%s in %s",
+                self.rank, imported, len(missing),
+                scheduler_output.autoscaling_request_state_source_rank,
+                human_readable_duration(time.time() - start))
+
+        self._reset_input_batch_for_autoscaling_sync_batch(scheduler_output)
+
+    def _reset_input_batch_for_autoscaling_sync_batch(
+        self,
+        scheduler_output: DynamicSchedulerOutput,
+    ) -> None:
         input_batch = self.model_runner.input_batch
-        req_ids = list(input_batch.req_id_to_index.keys())
+        old_num_reqs = input_batch.num_reqs
+        planned_num_reqs = (len(scheduler_output.scheduled_new_reqs) +
+                            len(scheduler_output.scheduled_cached_reqs))
         removed_req_indices: list[int] = []
-        for req_id in req_ids:
+        for req_id in list(input_batch.req_id_to_index.keys()):
             req_index = input_batch.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
@@ -873,67 +954,22 @@ class DynamicGPUWorker(Worker):
         input_batch.condense(removed_req_indices)
         input_batch.refresh_sampling_metadata()
         logger.info(
-            "Worker %s reset input_batch for autoscaling; removed %d reqs",
-            self.rank, len(removed_req_indices))
+            "[autoscaling request states] rank %s reset input_batch before "
+            "target sync batch; old_num_reqs=%d planned_num_reqs=%d "
+            "removed=%d",
+            self.rank, old_num_reqs, planned_num_reqs,
+            len(removed_req_indices))
 
-    def prepare_autoscaling_request_states_for_target_ranks(
-        self,
-        request_states,
-        target_ranks: list[int],
-        generation: int,
-    ) -> None:
-        if self.rank not in set(target_ranks):
-            return
-        start = time.time()
-        imported = 0
-        with self._autoscaling_request_metadata_cv:
-            for req_id, req_state in request_states.items():
-                if req_id in self.model_runner.requests:
-                    continue
-                self.model_runner.requests[req_id] = deepcopy(req_state)
-                imported += 1
-            self._autoscaling_request_metadata_generation = max(
-                self._autoscaling_request_metadata_generation, generation)
-            self._autoscaling_request_metadata_cv.notify_all()
-        logger.info(
-            "[autoscaling request states] rank %s imported %d/%d request states "
-            "for generation %s in %s",
-            self.rank, imported, len(request_states), generation,
-            human_readable_duration(time.time() - start))
-
-    def _wait_for_autoscaling_request_metadata_if_needed(
+    def _export_autoscaling_request_states_for_batch(
         self,
         scheduler_output: DynamicSchedulerOutput,
-    ) -> None:
-        if os.environ.get("VLLM_AUTOSCALING_REQUEST_METADATA_RPC", "1") != "1":
-            return
-        missing = [
-            req.req_id for req in scheduler_output.scheduled_cached_reqs
-            if req.req_id not in self.model_runner.requests
-        ]
-        if not missing:
-            return
-        timeout_s = float(os.environ.get(
-            "VLLM_AUTOSCALING_METADATA_WAIT_TIMEOUT_S", "300"))
-        start = time.time()
-        with self._autoscaling_request_metadata_cv:
-            while True:
-                missing = [
-                    req_id for req_id in missing
-                    if req_id not in self.model_runner.requests
-                ]
-                if not missing:
-                    break
-                elapsed = time.time() - start
-                if elapsed > timeout_s:
-                    raise RuntimeError(
-                        "Timed out waiting for autoscaling request states "
-                        f"on rank {self.rank}; missing={missing}")
-                self._autoscaling_request_metadata_cv.wait(
-                    timeout=min(0.05, timeout_s - elapsed))
-        logger.info(
-            "[autoscaling request states] rank %s waited %s for request states",
-            self.rank, human_readable_duration(time.time() - start))
+    ) -> dict[str, Any]:
+        request_states: dict[str, Any] = {}
+        for req in scheduler_output.scheduled_cached_reqs:
+            req_state = self.model_runner.requests.get(req.req_id)
+            if req_state is not None:
+                request_states[req.req_id] = deepcopy(req_state)
+        return request_states
 
     @torch.inference_mode()
     def execute_model(
@@ -1307,8 +1343,9 @@ class DynamicGPUWorker(Worker):
         vllm_config = get_current_vllm_config()
         is_flexi = vllm_config.dynamic_config.use_flexi_kv
         
-        # Take memory snapshot before release
-        before_snapshot = memory_snapshot(f"rank{self.rank}_before_release_kv", self.device)
+        # Take memory snapshot before release without a device-wide sync.
+        before_snapshot = _memory_snapshot_no_device_sync(
+            f"rank{self.rank}_before_release_kv", self.device)
         free_before = before_snapshot['free_gb'] * 1024 ** 3
         total = before_snapshot['total_gb'] * 1024 ** 3
         logger.info(f"before release_kv_cache_for_layers: free={free_before / 1024 ** 3:.2f} GB, total={total / 1024 ** 3:.2f} GB")
@@ -1508,9 +1545,11 @@ class DynamicGPUWorker(Worker):
         #     expected_delta_gb=expected_delta_gb
         # )
         
-        # Take memory snapshot after release
-        torch.cuda.synchronize()
-        after_snapshot = memory_snapshot(f"rank{self.rank}_after_release_kv", self.device)
+        # Take memory snapshot after release. Only synchronize the stream that
+        # enqueued the release work.
+        _sync_current_cuda_stream(self.device)
+        after_snapshot = _memory_snapshot_no_device_sync(
+            f"rank{self.rank}_after_release_kv", self.device)
         
         # Calculate actual freed memory
         actual_freed_bytes = (after_snapshot['free_gb'] - before_snapshot['free_gb']) * 1024 ** 3
@@ -1543,9 +1582,8 @@ class DynamicGPUWorker(Worker):
         - runtime_overhead_bytes: overhead measured by profile_run (activations,
           CUDA context, NCCL buffers, etc.)
         """
-        torch.cuda.synchronize()  # Ensure all GPU operations are complete for accurate memory reporting
+        _sync_current_cuda_stream(self.device)
         gc.collect()  # Trigger Python GC to free any unreferenced memory
-        torch.cuda.empty_cache()  # Clear PyTorch's cache to release unoccupied memory back to the system
         if hasattr(self.model_runner.model, 'get_layer_weight_size'):
             layer_size = int(self.model_runner.model.get_layer_weight_size())
         else:
@@ -1805,7 +1843,7 @@ class DynamicGPUWorker(Worker):
                             if block_id in migrate_record:
                                 row[local_idx] = migrate_record[block_id]
                 runner.input_batch.block_table.commit(runner.input_batch.num_reqs)
-                torch.cuda.synchronize()
+                _sync_current_cuda_stream(self.device)
                 logger.info(f"[timeline]: kv cache compaction within lock take {human_readable_duration(time.time() - time_start_within_lock)}")
                 forward_lock_hold_ms = (time.time() - time_start_within_lock) * 1000
                 if self.log_stop_time:
@@ -1822,7 +1860,7 @@ class DynamicGPUWorker(Worker):
         # logger.info(f"[debug]: committing block table updates to GPU for {num_reqs} requests")
         # self.input_batch.block_table.commit(num_reqs)
         # logger.info(f"[debug]: block table committed to GPU")
-        torch.cuda.synchronize()
+        _sync_current_cuda_stream(self.device)
         logger.info(f"[timeline]: compact kv cache total time taken: {human_readable_duration(time.time() - time_start)}")
     
     def _maybe_switch_block(self, scheduler_output: "DynamicSchedulerOutput") -> None:
@@ -1928,9 +1966,8 @@ class DynamicGPUWorker(Worker):
             start_layer = self._kv_cache_start_layer()
 
             for layer_name, attn_module in forward_context.items():
-                torch.cuda.synchronize()
+                _sync_current_cuda_stream(self.device)
                 gc.collect()
-                torch.cuda.empty_cache()
                 logger.info(f"rresizing kv cache for laye {layer_name}")
                 layer_idx = extract_layer_index(layer_name)
                 idx = layer_idx - start_layer
@@ -1955,9 +1992,8 @@ class DynamicGPUWorker(Worker):
         forward_lock_hold_ms = (time.time() - forward_lock_start) * 1000
         if self.log_stop_time:
             logger.info(f"[STOP_TIME][worker][resize_nonflexi][forward_lock]: hold={forward_lock_hold_ms:.2f}ms")
-        torch.cuda.synchronize()
+        _sync_current_cuda_stream(self.device)
         gc.collect()
-        torch.cuda.empty_cache()
         logger.info(f"[timeline]: resize kv cache within: {human_readable_duration(time.time() - time_start)}")
 
     # =========================================================================
@@ -2039,10 +2075,10 @@ class DynamicGPUWorker(Worker):
          num_local_layers, use_combined_layers) = ctx
         T, H, Dh = cache_shape
         
-        # Memory monitoring: capture before state
-        torch.cuda.synchronize()
+        # Memory monitoring: capture before state. Keep the dependency local to
+        # the current stream instead of draining the whole device.
+        _sync_current_cuda_stream(self.device)
         gc.collect()
-        torch.cuda.empty_cache()
         mem_before = torch.cuda.mem_get_info()
         gpu_free_before, gpu_total = mem_before
         gpu_used_before = gpu_total - gpu_free_before
@@ -2168,7 +2204,7 @@ class DynamicGPUWorker(Worker):
             tmp_new_key_ptr_tensors.append(new_key_ptr_tensor)
             tmp_new_value_ptr_tensors.append(new_value_ptr_tensor)
         
-        torch.cuda.synchronize()
+        _sync_current_cuda_stream(self.device)
         time_before_in_lock = time.time()
         
         # Phase 2: Bind new caches under lock
@@ -2213,9 +2249,8 @@ class DynamicGPUWorker(Worker):
         # Phase 3: Free old resources with detailed memory tracking
         assert self.device is not None
         
-        # Track memory at each step
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        # Track memory at each step using stream-local synchronization.
+        _sync_current_cuda_stream(self.device)
         mem_step0 = torch.cuda.mem_get_info()
         used_step0 = (gpu_total - mem_step0[0]) / 1024**2  # MB
         
@@ -2225,8 +2260,7 @@ class DynamicGPUWorker(Worker):
                 kv_allocator.free_page_list(old_key_ptr, self.device)
                 kv_allocator.free_page_list(old_value_ptr, self.device)
         
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        _sync_current_cuda_stream(self.device)
         mem_step1 = torch.cuda.mem_get_info()
         used_step1 = (gpu_total - mem_step1[0]) / 1024**2
         freed_step1 = used_step0 - used_step1
@@ -2239,8 +2273,7 @@ class DynamicGPUWorker(Worker):
             layer_group_granularity
         )
         
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        _sync_current_cuda_stream(self.device)
         mem_step2 = torch.cuda.mem_get_info()
         used_step2 = (gpu_total - mem_step2[0]) / 1024**2
         freed_step2 = used_step1 - used_step2
@@ -2350,9 +2383,9 @@ class DynamicGPUWorker(Worker):
          num_local_layers, use_combined_layers) = ctx
         T, H, Dh = cache_shape
         
-        # Memory monitoring: capture before state
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        # Memory monitoring: capture before state. This is stream-local so
+        # inference work on other streams is not drained.
+        _sync_current_cuda_stream(self.device)
         mem_before = torch.cuda.mem_get_info()
         gpu_free_before, gpu_total = mem_before
         gpu_used_before = gpu_total - gpu_free_before
@@ -2395,7 +2428,7 @@ class DynamicGPUWorker(Worker):
             )
         
         time_before_in_lock = time.time()
-        torch.cuda.synchronize()
+        _sync_current_cuda_stream(self.device)
         
         # Bind new caches under lock
         with self.model_runner.forward_lock:
@@ -2456,9 +2489,8 @@ class DynamicGPUWorker(Worker):
         
         time_after_free = time.time()
         
-        # Memory monitoring: calculate metrics
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        # Memory monitoring: calculate metrics.
+        _sync_current_cuda_stream(self.device)
         mem_after = torch.cuda.mem_get_info()
         gpu_used_after = gpu_total - mem_after[0]
         actual_allocated = gpu_used_after - gpu_used_before
@@ -2627,8 +2659,7 @@ class DynamicGPUWorker(Worker):
         assert isinstance(self.model_runner.model, DynamicModelBase)
         time_start = time.time()
         
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        _sync_current_cuda_stream(self.device)
         
         cache_length = len(self.model_runner.key_caches[0])
         logger.info(f"resizing kv cache from {cache_length} to {new_length}")
@@ -2649,8 +2680,7 @@ class DynamicGPUWorker(Worker):
             logger.info(f"[resize_kv_cache] new_length == cache_length ({new_length}), no resize needed")
             return
         
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        _sync_current_cuda_stream(self.device)
         
         logger.info(f"[forward]: resized kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
         logger.info(f"[timeline]: time before in lock: {time_after_in_lock - time_before_in_lock:.4f} seconds")
@@ -3174,9 +3204,8 @@ class DynamicGPUWorker(Worker):
             # memory simultaneously, causing OOM even when total memory would suffice.
             preallocated_caches: dict[int, tuple] = {}
             if is_flexi:
-                torch.cuda.synchronize()
+                _sync_current_cuda_stream(self.device)
                 gc.collect()
-                torch.cuda.empty_cache()
 
                 # Check overhead BEFORE preallocate (if monitoring enabled)
                 if not self.vllm_config.dynamic_config.disable_memory_overhead_monitor:
@@ -3240,9 +3269,9 @@ class DynamicGPUWorker(Worker):
                     f"[timeline]: migration stream synchronize after bind took {human_readable_duration(time.time() - sync_start)}"
                 )
             else:
-                torch.cuda.synchronize()
+                _sync_current_cuda_stream(self.device)
                 logger.info(
-                    f"[timeline]: cuda synchronize after bind took {human_readable_duration(time.time() - sync_start)}"
+                    f"[timeline]: current stream synchronize after bind took {human_readable_duration(time.time() - sync_start)}"
                 )
             # memory_snapshot(f"rank{self.rank}_after_bind_all_kv_caches_from_rank{from_rank}", self.device)
             logger.info(f"[timeline]: bind kv cache time taken: {human_readable_duration(time.time() - time_start_bind_kv_cache)}")
@@ -3414,9 +3443,6 @@ class DynamicGPUWorker(Worker):
             self.after_migration_total_token = 0
             self.after_migration_applied_token_num = 0
 
-        self._wait_for_autoscaling_request_metadata_if_needed(scheduler_output)
-
-
     def async_migration_after_execute_callback(self, scheduler_output: "DynamicSchedulerOutput"):
         if not isinstance(self.model_runner.model, DynamicModelBase):
             return
@@ -3583,6 +3609,7 @@ class DynamicGPUWorker(Worker):
             try:
                 # Set CUDA device for this thread - threads don't inherit CUDA context
                 torch.cuda.set_device(self.device)
+                assert self.migration_stream is not None
                 if is_receiver:
                     self.wait_for_all_patch_applied("sync KV cache cleanup")
                 if is_sender:
@@ -3594,7 +3621,8 @@ class DynamicGPUWorker(Worker):
 
                     with self.model_runner.forward_lock:
                         self.remove_layers(self.rank, layer_ranges)
-                    self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free)
+                    with torch.cuda.stream(self.migration_stream):
+                        self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free)
                     logger.info(f"[timeline]: after remove layers, time taken: {human_readable_duration(time.time() - time_start)}")
                 self.after_migration_total_token = num_total_migration_tokens
                 # For sender: directly set applied token count since sender doesn't receive patches
@@ -3603,7 +3631,14 @@ class DynamicGPUWorker(Worker):
                     self.after_migration_applied_token_num = num_total_migration_tokens
                 fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
                 if fixed_blocks <= 0:
-                    self.resize_kv_cache(new_kv_cache_block_num)
+                    with torch.cuda.stream(self.migration_stream):
+                        self.resize_kv_cache(new_kv_cache_block_num)
+                    stream_sync_start = time.time()
+                    self.migration_stream.synchronize()
+                    logger.info(
+                        "[autoscaling async] migration stream synchronized "
+                        "after worker cleanup/resize, took %s",
+                        human_readable_duration(time.time() - stream_sync_start))
                 else:
                     logger.info(f"fixed_num_gpu_blocks={fixed_blocks}, skipping worker-side resize (would be {new_kv_cache_block_num} blocks), sleep for 4 seconds")
                 self.finish_migration()

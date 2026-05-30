@@ -1,7 +1,7 @@
 
 from dataclasses import dataclass
 from operator import is_
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 from .output import NewRequestData, CachedRequestData
 import numpy as np
 import numpy.typing as npt
@@ -101,3 +101,12 @@ class DynamicSchedulerOutput():
     # before the scheduler pause is released.
     autoscaling_activate_pp_ranks: Optional[list[int]] = None
     autoscaling_activate_pp_ranks_generation: int = -1
+
+    # Autoscaling request-state handoff carried by the first target-topology
+    # batch. This replaces the separate export/import collective RPC path:
+    # the first worker that already has the request states attaches them to
+    # this scheduler output, and newly activated ranks import them before
+    # running the batch.
+    autoscaling_request_state_sync: bool = False
+    autoscaling_request_states: Optional[dict[str, Any]] = None
+    autoscaling_request_state_source_rank: int = -1

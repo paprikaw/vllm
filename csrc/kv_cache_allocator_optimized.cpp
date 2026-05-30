@@ -769,7 +769,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("size"),
           py::arg("block_shape"),
           py::arg("dtype"),
-          py::arg("device"));
+          py::arg("device"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("allocate_with_cuda_vmm_combined",
           &allocate_with_cuda_vmm_combined,
@@ -777,7 +778,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("size"),
           py::arg("block_shape"),
           py::arg("dtype"),
-          py::arg("device"));
+          py::arg("device"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("free_vmm_blocks",
           &free_vmm_blocks,
@@ -785,7 +787,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("ptrs"),
           py::arg("handles"),
           py::arg("aligned_bytes"),
-          py::arg("device_id"));
+          py::arg("device_id"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("free_vmm_blocks_combined",
           &free_vmm_blocks_combined,
@@ -793,7 +796,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("k_ptrs"),
           py::arg("handles"),
           py::arg("aligned_combined_bytes"),
-          py::arg("device_id"));
+          py::arg("device_id"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("allocate_with_cuda_vmm_combined_layers",
           &allocate_with_cuda_vmm_combined_layers,
@@ -802,7 +806,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("block_shape"),
           py::arg("dtype"),
           py::arg("device"),
-          py::arg("granularity"));
+          py::arg("granularity"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("free_vmm_blocks_combined_layers",
           &free_vmm_blocks_combined_layers,
@@ -812,7 +817,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("aligned_combined_bytes"),
           py::arg("device_id"),
           py::arg("granularity"),
-          py::arg("bytes_per_kv"));
+          py::arg("bytes_per_kv"),
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("free_vmm_va_range",
           &free_vmm_va_range,
