@@ -127,6 +127,9 @@ class DynamicGPUWorker(Worker):
         self._debug_assert_kv: bool = str(os.getenv("VLLM_DEBUG_ASSERT_KV", "1")).lower() not in ("0", "", "false", "no")
         self._listen_kv_cache_threads: list[threading.Thread] = []
         self.rank_to_layers_ids: dict[int, list[int]] = {}
+        self._pending_deleted_model_layers: list[list[object]] = []
+        self._pending_deleted_model_layers_events: list[threading.Event] = []
+        self._pending_deleted_model_layers_lock = threading.Lock()
 
         self.sending_kv_cache_patch_in_process: bool = False
         self.receive_in_process: bool = False
@@ -1135,10 +1138,13 @@ class DynamicGPUWorker(Worker):
         _do_add()
         logger.info(f"[timeline]: after add layers, time taken: {human_readable_duration(time.time() - time_start)}")
 
-    def remove_layers(self, rank: int, layer_list: list[Tuple[int, int]]) -> None:
+    def remove_layers(self,
+                      rank: int,
+                      layer_list: list[Tuple[int, int]],
+                      release_immediately: bool = True) -> list[list[object]]:
         if self.rank != rank:
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip removing model layers")
-            return None
+            return []
         layer_list = self._merge_contiguous_layer_ranges(layer_list)
         logger.info(f"Remove Model Layers: {layer_list}")
         assert self.device is not None
@@ -1153,7 +1159,8 @@ class DynamicGPUWorker(Worker):
                 current_kv_cache_bytes=kv_cache_bytes
             )
         
-        self.model_runner.remove_layers(layer_list, self.device)
+        detached_layers = self.model_runner.remove_layers(
+            layer_list, self.device, release_immediately=release_immediately)
         
         # Check overhead AFTER operation (if monitoring enabled)
         if not self.vllm_config.dynamic_config.disable_memory_overhead_monitor:
@@ -1164,6 +1171,44 @@ class DynamicGPUWorker(Worker):
                 new_layer_count=layer_count_after,
                 new_kv_cache_bytes=kv_cache_bytes_after
             )
+        return detached_layers
+
+    def _queue_deleted_model_layers_after_inference(
+            self,
+            detached_layers: list[list[object]]) -> Optional[threading.Event]:
+        if not detached_layers:
+            return None
+        release_event = threading.Event()
+        with self._pending_deleted_model_layers_lock:
+            self._pending_deleted_model_layers.extend(detached_layers)
+            self._pending_deleted_model_layers_events.append(release_event)
+            pending_count = sum(len(group)
+                                for group in self._pending_deleted_model_layers)
+        logger.info("[delete_layers] queued %d detached layer objects for "
+                    "after-inference release", pending_count)
+        return release_event
+
+    def _release_deleted_model_layers_after_inference(self) -> None:
+        with self._pending_deleted_model_layers_lock:
+            if not self._pending_deleted_model_layers:
+                return
+            detached_layers = self._pending_deleted_model_layers
+            release_events = self._pending_deleted_model_layers_events
+            self._pending_deleted_model_layers = []
+            self._pending_deleted_model_layers_events = []
+        assert self.device is not None
+        release_start = time.time()
+        layer_count = sum(len(group) for group in detached_layers)
+        logger.info("[delete_layers] after inference releasing %d detached "
+                    "layer objects", layer_count)
+        try:
+            self.model_runner.release_removed_layers(detached_layers,
+                                                     self.device)
+        finally:
+            for event in release_events:
+                event.set()
+            logger.info("[delete_layers] after inference release took %s",
+                        human_readable_duration(time.time() - release_start))
 
     def atomic_shelve_kv_cache(self, rank: int, layers_list: list[Tuple[int, int]]) -> Tuple[list[list[int]], list[list[int]], list[int], list[int], list[list[int]], list[list[int]], list[tuple[list[int], list[int]]]]:
         """
@@ -3482,6 +3527,8 @@ class DynamicGPUWorker(Worker):
                     "[autoscaling sync] rank %s deferred sync KV cleanup "
                     "until after PP hidden-state transfer",
                     self.rank)
+        else:
+            self._release_deleted_model_layers_after_inference()
 
     def async_migration_after_pp_transfer_callback(
             self, scheduler_output: "DynamicSchedulerOutput"):
@@ -3619,10 +3666,28 @@ class DynamicGPUWorker(Worker):
                             logger.info(f"[do_resize] Waiting for {self._num_active_sender_threads} sender threads...")
                             self._sender_threads_cv.wait(timeout=5.0)
 
-                    with self.model_runner.forward_lock:
-                        self.remove_layers(self.rank, layer_ranges)
+                    detached_layers = self.remove_layers(
+                        self.rank, layer_ranges, release_immediately=False)
+                    deleted_layers_released = self._queue_deleted_model_layers_after_inference(
+                        detached_layers)
                     with torch.cuda.stream(self.migration_stream):
                         self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free)
+                    if deleted_layers_released is not None:
+                        wait_deleted_layers_start = time.time()
+                        deleted_layers_released.wait()
+                        logger.info(
+                            "[delete_layers] background resize waited %s for "
+                            "after-inference model weight release",
+                            human_readable_duration(
+                                time.time() - wait_deleted_layers_start))
+                        empty_cache_start = time.time()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        logger.info(
+                            "[delete_layers] background empty_cache before KV "
+                            "resize took %s",
+                            human_readable_duration(time.time() -
+                                                    empty_cache_start))
                     logger.info(f"[timeline]: after remove layers, time taken: {human_readable_duration(time.time() - time_start)}")
                 self.after_migration_total_token = num_total_migration_tokens
                 # For sender: directly set applied token count since sender doesn't receive patches

@@ -1,7 +1,6 @@
 from collections.abc import Iterable
 from typing import Optional, Union, Tuple
 import gc
-import threading
 
 from huggingface_hub import delete_space_secret
 import torch
@@ -94,6 +93,16 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM, DynamicModelBase):
 
     def delete_layers(self, layers: Tuple[int, int]):
         self.model.delete_layers(layers)
+
+    def detach_layers_for_later_release(self, layers: Tuple[int, int]
+                                        ) -> list[object]:
+        return self.model.detach_layers_for_later_release(layers)
+
+    def release_deleted_layers(self,
+                               old_layers: list[object],
+                               empty_cuda_cache: bool = False) -> None:
+        self.model.release_deleted_layers(
+            old_layers, empty_cuda_cache=empty_cuda_cache)
 
     def forward(self, 
                 input_ids: torch.Tensor, 
@@ -223,9 +232,9 @@ class DynamicQwen3Model(Qwen3Model):
         # gc.collect()
         # torch.cuda.empty_cache()
 
-    def delete_layers(self, layers: Tuple[int, int]):
-        """Delete the layer module and its parameters at the given index."""
-
+    def detach_layers_for_later_release(self, layers: Tuple[int, int]
+                                        ) -> list[object]:
+        """Detach layer modules from execution and return references to free."""
         # Adapt input layers to the model's layers open internal representation
         deleted_start_layer, deleted_end_layer = layers[0], layers[1] + 1
         old_start_layer, old_end_layer = self.start_layer, self.end_layer
@@ -245,28 +254,38 @@ class DynamicQwen3Model(Qwen3Model):
                 old_layers.append(layer)
                 self.layers[layer_idx] = PPMissingLayer()  # 占位符
                 logger.info(f"Layer {layer_idx} deleted successfully.")
-            
+
+            # Keep the model's visible routing state consistent with the layer
+            # list mutation. The actual memory release below is intentionally
+            # outside model_lock so inference does not wait on GC/empty_cache.
+            if deleted_start_layer == old_start_layer:
+                self.start_layer = deleted_end_layer
+            if deleted_end_layer == old_end_layer:
+                self.end_layer = deleted_start_layer
+            self.sync_sched_layers()
             logger.info(f"Deleted layers took {human_readable_duration(time.time() - time_start)}")
-        
-        # Actually delete the layer objects to free GPU memory
+
+        return old_layers
+
+    def release_deleted_layers(self,
+                               old_layers: list[object],
+                               empty_cuda_cache: bool = False) -> None:
+        release_start = time.time()
         free_before = torch.cuda.memory_allocated()
         for layer in old_layers:
             del layer
         old_layers.clear()
         del old_layers
-        gc.collect()
-        torch.cuda.empty_cache()
+        if empty_cuda_cache:
+            gc.collect()
+            torch.cuda.empty_cache()
         free_after = torch.cuda.memory_allocated()
-        logger.info(f"[delete_layers] Freed {(free_before - free_after) / 1024**3:.2f} GB of GPU memory for model weights")
+        logger.info(f"[delete_layers] Freed {(free_before - free_after) / 1024**3:.2f} GB of GPU memory for model weights in {human_readable_duration(time.time() - release_start)}")
 
-        # Update the start_layer and end_layer
-        if deleted_start_layer == old_start_layer:
-            self.start_layer = deleted_end_layer
-        if deleted_end_layer == old_end_layer:
-            self.end_layer = deleted_start_layer
-        
-        # Update the scheduled layers
-        self.sync_sched_layers()
+    def delete_layers(self, layers: Tuple[int, int]):
+        """Delete the layer module and its parameters at the given index."""
+        old_layers = self.detach_layers_for_later_release(layers)
+        self.release_deleted_layers(old_layers, empty_cuda_cache=True)
         logger.info(f"after delete_layers, start_layer: {self.start_layer}, end_layer: {self.end_layer}")
         return
     def set_sched_layers(self, 

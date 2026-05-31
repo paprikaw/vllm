@@ -1174,7 +1174,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
         t: torch.Tensor = self.kv_caches[0]
         return int(t.numel() * t.element_size())
 
-    def remove_layers(self, layers_list: list[Tuple[int, int]], device: torch.device) -> None:
+    def remove_layers(self,
+                      layers_list: list[Tuple[int, int]],
+                      device: torch.device,
+                      release_immediately: bool = True) -> list[list[object]]:
+        detached_layers: list[list[object]] = []
         with device:
             torch.cuda.set_device(device)
             if not isinstance(self.model, DynamicModelBase):
@@ -1182,7 +1186,11 @@ class DynamicGPUModelRunner(GPUModelRunner):
             logger.info(f"before delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
             for layers in layers_list:
                 logger.info(f"Deleting layers {layers}")
-                self.model.delete_layers(layers)
+                if release_immediately:
+                    self.model.delete_layers(layers)
+                else:
+                    detached_layers.append(
+                        self.model.detach_layers_for_later_release(layers))
 
             deleted_layers = set(layer for layers in layers_list for layer in range(layers[0], layers[1]+1))
             logger.info(f"deleted layer set {deleted_layers}")
@@ -1193,11 +1201,32 @@ class DynamicGPUModelRunner(GPUModelRunner):
             }
             for i in range(len(self.kv_caches)):
                 logger.info(f"kv_caches[{i}] shape: {self.kv_caches[i].shape}")
-            # Force garbage collection and clear CUDA cache to release GPU memory for deleted layer weights
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
+            if release_immediately:
+                # Force garbage collection and clear CUDA cache to release GPU memory for deleted layer weights
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+            else:
+                logger.info("[delete_layers] deferred model weight release "
+                            "until after inference")
             logger.info(f"after delete_layers: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+        return detached_layers
+
+    def release_removed_layers(self,
+                               detached_layers: list[list[object]],
+                               device: torch.device,
+                               empty_cuda_cache: bool = False) -> None:
+        if not detached_layers:
+            return
+        with device:
+            torch.cuda.set_device(device)
+            if not isinstance(self.model, DynamicModelBase):
+                raise AssertionError(f"model is not a DynamicModelBase: {self.model.__class__.__name__}")
+            logger.info("[delete_layers] releasing %d detached layer groups "
+                        "after inference", len(detached_layers))
+            for old_layers in detached_layers:
+                self.model.release_deleted_layers(
+                    old_layers, empty_cuda_cache=empty_cuda_cache)
 
     def dynamic_initialize_kv_cache(self, 
                                     kv_cache_config: KVCacheConfig, 
