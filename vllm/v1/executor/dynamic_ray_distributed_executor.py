@@ -121,7 +121,6 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                     "VLLM_DYNAMIC_PP_RDT_TRANSPORT=nccl requires GPU Ray "
                     f"actors, got {current_platform.ray_device_key}.")
             ray_remote_kwargs["enable_tensor_transport"] = True
-
         logger.info("use_ray_spmd_worker: %s", self.use_ray_spmd_worker)
 
         # Create the workers.
@@ -1079,10 +1078,15 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         if ranks is not None:
             ray_get_reqs = []
             for rank in ranks:
-                ray_get_reqs.append(self.workers[rank].resize_kv_cache.remote(new_length))
+                ray_get_reqs.append(
+                    self.workers[rank].execute_method.remote(
+                        "resize_kv_cache", new_length))
             ray.get(ray_get_reqs)
             return
         self.collective_rpc("resize_kv_cache", args=(new_length,))
+
+    def start_resize_kv_cache_async(self, new_length: int) -> None:
+        self.collective_rpc("start_resize_kv_cache_async", args=(new_length,))
 
     def release_kv_cache_for_layers(self, rank: int, layers_list: list[Tuple[int, int]]):
         self.collective_rpc("release_kv_cache_for_layers", args=(rank, layers_list))

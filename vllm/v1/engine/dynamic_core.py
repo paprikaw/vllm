@@ -1254,8 +1254,9 @@ class DynamicEngineCore(EngineCore):
             # 需要resize kv cache来进行migration，这里的resize一定是缩小
             # Only shrink when compacted_length < original_length (see sync path comment).
             if compacted_length < original_length:
-                self.model_executor.resize_kv_cache(compacted_length)
-                logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
+                self.model_executor.start_resize_kv_cache_async(
+                    compacted_length)
+                logger.info(f"[timeline]: dispatched async resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
                 logger.info(f"[timeline]: after shrink block pool, time taken: {human_readable_duration(time.time() - time_start)}")
             
         # self._compact_kv_cache(1700)
@@ -1600,8 +1601,8 @@ class DynamicEngineCore(EngineCore):
             logger.info(f"[async_fast] KV cache compacted to {compacted_length} blocks in {human_readable_duration(time.time() - time_start_compact_kv)}")
 
         if allow_resize and compacted_length < original_length:
-            self.model_executor.resize_kv_cache(compacted_length)
-            logger.info(f"[async_fast timeline]: after resize kv cache: {human_readable_duration(time.time() - time_start)}")
+            self.model_executor.start_resize_kv_cache_async(compacted_length)
+            logger.info(f"[async_fast timeline]: dispatched async resize kv cache: {human_readable_duration(time.time() - time_start)}")
 
         logger.info(f"[async_fast] adding_per_rank: {adding_per_rank}")
         if not adding_per_rank:

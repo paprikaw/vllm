@@ -150,6 +150,10 @@ class DynamicGPUWorker(Worker):
             self.is_all_patch_applied[rank] = True
         self.resizing_done_cv = threading.Condition(threading.Lock())
         self.resizing_done = True
+        self._async_resize_lock = threading.Lock()
+        self._async_resize_thread: Optional[threading.Thread] = None
+        self._async_resize_error: Optional[BaseException] = None
+        self._async_resize_target: Optional[int] = None
         self.new_kv_cache_block_num = 0 # 用于记录新配置的kv cache block数量，用于后续的kv cache resize
         logger.info(torch.__config__.show())
 
@@ -1102,6 +1106,7 @@ class DynamicGPUWorker(Worker):
         def _do_add():
             # Set CUDA device for this thread - threads don't inherit CUDA context
             torch.cuda.set_device(self.device)
+            self._wait_for_async_resize("async add layers")
             self._add_layers(layer_list)
         # 异步调用：与工作的 commit 9ed5ec00f2c94 保持一致
         # 注意：daemon=False 确保线程在进程退出前完成
@@ -1940,7 +1945,73 @@ class DynamicGPUWorker(Worker):
                             req.new_block_ids[i][j] = migrate_record[block_id]
             logger.info(f"Worker {self.rank} switched block ids for scheduler output version {scheduler_output.current_scheduler_output_version} with time taken: {human_readable_duration(time.time() - time_start)}")
 
+    def start_resize_kv_cache_async(self, new_length: int) -> None:
+        with self._async_resize_lock:
+            if (self._async_resize_thread is not None
+                    and self._async_resize_thread.is_alive()):
+                if self._async_resize_target == new_length:
+                    logger.info(
+                        "[autoscaling async resize] rank %s resize to %s "
+                        "already in progress", self.rank, new_length)
+                    return
+                raise RuntimeError(
+                    f"rank {self.rank} already resizing KV cache to "
+                    f"{self._async_resize_target}, cannot start {new_length}")
+
+            self._async_resize_error = None
+            self._async_resize_target = new_length
+            with self.resizing_done_cv:
+                self.resizing_done = False
+
+            def _run_resize() -> None:
+                try:
+                    self._resize_kv_cache_impl(new_length)
+                except BaseException as exc:
+                    with self._async_resize_lock:
+                        self._async_resize_error = exc
+                    logger.exception(
+                        "[autoscaling async resize] rank %s failed resizing "
+                        "KV cache to %s", self.rank, new_length)
+                finally:
+                    with self.resizing_done_cv:
+                        self.resizing_done = True
+                        self.resizing_done_cv.notify_all()
+
+            thread = threading.Thread(
+                target=_run_resize,
+                name=f"kv-resize-rank{self.rank}-to-{new_length}",
+                daemon=True)
+            self._async_resize_thread = thread
+            thread.start()
+            logger.info(
+                "[autoscaling async resize] rank %s started background KV "
+                "resize to %s", self.rank, new_length)
+
+    def _wait_for_async_resize(self, reason: str) -> None:
+        with self._async_resize_lock:
+            thread = self._async_resize_thread
+        if thread is not None and thread.is_alive():
+            wait_start = time.time()
+            logger.info(
+                "[autoscaling async resize] rank %s waiting for background "
+                "KV resize before %s", self.rank, reason)
+            thread.join()
+            logger.info(
+                "[autoscaling async resize] rank %s waited %s before %s",
+                self.rank,
+                human_readable_duration(time.time() - wait_start),
+                reason)
+        with self._async_resize_lock:
+            error = self._async_resize_error
+            if error is not None:
+                self._async_resize_error = None
+                raise error
+
     def resize_kv_cache(self, new_length: int) -> None:
+        self._wait_for_async_resize("synchronous KV resize")
+        self._resize_kv_cache_impl(new_length)
+
+    def _resize_kv_cache_impl(self, new_length: int) -> None:
         start_time = time.time()
         # Ensure correct CUDA device is set for this worker (important for Ray RPC calls)
         if self.device is not None:
@@ -2842,6 +2913,7 @@ class DynamicGPUWorker(Worker):
                 torch.cuda.set_device(self.device)
                 assert isinstance(self.model_runner.model, DynamicModelBase)
                 time_start = time.time()
+                self._wait_for_async_resize("KV sender start")
                 if self.rank not in src_to_plan:
                     return None
                 # self.dynamic_kv_synchronizer.start_kv_tensor_transfer_async(rank_to_layers_ids, self.model_runner.kv_caches, self.model_runner.model.model.start_layer)
@@ -3165,6 +3237,7 @@ class DynamicGPUWorker(Worker):
     def _listen_loop(self, from_rank: int):
         # IMPORTANT: Set CUDA device for this thread - threads don't inherit CUDA context
         torch.cuda.set_device(self.device)
+        self._wait_for_async_resize("KV receiver listen loop")
         
         assert isinstance(self.model_runner.model, DynamicModelBase)
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
