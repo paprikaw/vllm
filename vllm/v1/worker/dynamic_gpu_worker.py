@@ -415,16 +415,21 @@ class DynamicGPUWorker(Worker):
                 operation="add_layers"
         )
         
+        with self._pending_deleted_model_layers_lock:
+            has_pending_deleted_layers = bool(self._pending_deleted_model_layers)
+
         cleanup_start = time.time()
-        if self.migration_stream is not None:
-            self.migration_stream.synchronize()
-        else:
-            _sync_current_cuda_stream(self.device)
-        gc.collect()
+        if has_pending_deleted_layers:
+            if self.migration_stream is not None:
+                self.migration_stream.synchronize()
+            else:
+                _sync_current_cuda_stream(self.device)
+            gc.collect()
         free_after_cleanup, _ = torch.cuda.mem_get_info()
         logger.info(
-            "[dynamic-load-worker]: pre_add_cleanup layers=%s took=%s free_gpu_before=%.2fGB free_gpu_after=%.2fGB total_gpu=%.2fGB",
+            "[dynamic-load-worker]: pre_add_cleanup layers=%s ran=%s took=%s free_gpu_before=%.2fGB free_gpu_after=%.2fGB total_gpu=%.2fGB",
             layer_list,
+            has_pending_deleted_layers,
             human_readable_duration(time.time() - cleanup_start),
             free_before_cleanup / 1024 ** 3,
             free_after_cleanup / 1024 ** 3,

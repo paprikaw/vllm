@@ -1,26 +1,27 @@
-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.utils import extract_layer_index
-from vllm.model_executor.model_loader.utils import set_default_torch_dtype
-from vllm.model_executor.models.dynamic_model_base import DynamicModelBase
-from vllm.logger import init_logger
-from typing import cast, Tuple, Generator, Iterable, Optional
 from collections import defaultdict
+import os
+import time
+from typing import cast, Tuple, Generator, Iterable, Optional
+
+from safetensors import safe_open
+import torch
+from torch import nn
 from tqdm.auto import tqdm
 
 from .weight_utils import _BAR_FORMAT
-import time
-
-import torch
-from torch import nn
+from vllm.attention import Attention
 from vllm.config import LoadConfig, LoadFormat, ModelConfig, VllmConfig, set_current_vllm_config
-from vllm.model_executor.model_loader.weight_utils import enable_tqdm
-from safetensors import safe_open
-from vllm.platforms import current_platform
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import QKVCrossParallelLinear
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
-from vllm.model_executor.model_loader.utils import device_loading_context
-from vllm.attention import Attention
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.utils import (
+    device_loading_context, set_default_torch_dtype)
+from vllm.model_executor.model_loader.weight_utils import enable_tqdm
+from vllm.model_executor.models.dynamic_model_base import DynamicModelBase
+from vllm.model_executor.utils import extract_layer_index
+from vllm.platforms import current_platform
 from vllm.v1.utils import human_readable_duration
 logger = init_logger(__name__)
 
@@ -35,6 +36,9 @@ class CustomModelLoader(DefaultModelLoader):
         self._weights_preloaded = False
         # Store prepared weights info for disk-based loading
         self._prepared_weights_info: Optional[tuple] = None
+        self._pin_cpu_weight_cache = (
+            os.getenv("VLLM_PIN_CPU_WEIGHT_CACHE", "1").lower()
+            in ("1", "true", "yes", "on"))
 
     def _preload_all_weights(
             self, 
@@ -91,7 +95,21 @@ class CustomModelLoader(DefaultModelLoader):
                         libc.madvise(ctypes.c_void_p(aligned_ptr),
                                      ctypes.c_size_t(aligned_len),
                                      MADV_WILLNEED)
-                    materialized_param = torch.empty_like(param, device="cpu")
+                    try:
+                        materialized_param = torch.empty_like(
+                            param,
+                            device="cpu",
+                            pin_memory=self._pin_cpu_weight_cache)
+                    except RuntimeError:
+                        if self._pin_cpu_weight_cache:
+                            logger.exception(
+                                "Failed to allocate pinned CPU weight cache "
+                                "tensor for %s; falling back to pageable CPU "
+                                "memory for the remaining weights",
+                                name)
+                            self._pin_cpu_weight_cache = False
+                        materialized_param = torch.empty_like(
+                            param, device="cpu")
                     materialized_param.copy_(param)
                     self._preloaded_weights[name] = materialized_param
                     total_size += materialized_param.numel() * materialized_param.element_size()
@@ -100,6 +118,7 @@ class CustomModelLoader(DefaultModelLoader):
         self._weights_preloaded = True
         logger.info(f"[timeline]: Preloaded {len(self._preloaded_weights)} weights into materialized CPU cache, "
                f"total size: {total_size / (1024**3):.2f} GB, "
+               f"pinned={self._pin_cpu_weight_cache}, "
                f"time taken: {human_readable_duration(time.time() - time_start)}")
 
     def _get_layer_weights_iterator(
