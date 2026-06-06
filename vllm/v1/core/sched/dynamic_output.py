@@ -1,6 +1,5 @@
 
 from dataclasses import dataclass
-from operator import is_
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 from .output import NewRequestData, CachedRequestData
 import numpy as np

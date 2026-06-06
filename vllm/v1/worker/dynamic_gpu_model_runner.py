@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-from hmac import new
 import threading
 import copy
 import gc
@@ -8,8 +7,6 @@ import weakref
 from typing import TYPE_CHECKING, Optional, Union, Tuple
 import sys
 from compressed_tensors import Tensor
-import humanize
-from matplotlib.pylab import dtype
 import numpy as np
 import torch
 import torch.distributed

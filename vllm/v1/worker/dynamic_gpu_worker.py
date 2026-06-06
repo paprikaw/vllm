@@ -1,17 +1,10 @@
 from collections import defaultdict
-from concurrent.futures import thread
 from copy import deepcopy
 import gc
-from hmac import new
-from operator import is_
 import os
-from pdb import run
-from sched import scheduler
 from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 import threading
 import math
-from regex import F
-from responses import start
 import torch
 import torch.distributed
 from torch.cuda import Stream
@@ -981,6 +974,21 @@ class DynamicGPUWorker(Worker):
             req_state = self.model_runner.requests.get(req.req_id)
             if req_state is not None:
                 request_states[req.req_id] = deepcopy(req_state)
+        return request_states
+
+    def export_autoscaling_request_states(
+        self,
+        req_ids: list[str],
+    ) -> dict[str, Any]:
+        request_states: dict[str, Any] = {}
+        for req_id in req_ids:
+            req_state = self.model_runner.requests.get(req_id)
+            if req_state is not None:
+                request_states[req_id] = deepcopy(req_state)
+        logger.info(
+            "[autoscaling request states] rank %s exported %d/%d request "
+            "states for target sync batch",
+            self.rank, len(request_states), len(req_ids))
         return request_states
 
     @torch.inference_mode()

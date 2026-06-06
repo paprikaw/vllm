@@ -15,7 +15,6 @@ from contextlib import nullcontext
 
 import bitarray
 from httpx import patch
-from responses import start
 import torch
 from pydantic import TypeAdapter
 from vllm import _custom_ops as ops
@@ -32,6 +31,9 @@ from vllm.logger import init_logger
 from vllm.distributed.utils import StatelessProcessGroup
 import time
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+from vllm.distributed.kv_transfer.kv_connector.dynamic_nixl_tensor import (
+    DirectNixlTensorTransport,
+)
 from vllm.utils import current_stream
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -139,7 +141,8 @@ class PairPipe:
 
     def __init__(self, local_rank: int, host: str, port: int, pair_rank: int, 
                  store_timeout_s: int = 30000, device: Optional[torch.device] = None,
-                 nccl_lock: Optional[threading.Lock] = None):
+                 nccl_lock: Optional[threading.Lock] = None,
+                 data_transport: str = "nccl"):
         assert pair_rank in (0, 1)
         self.pair_rank = pair_rank
         self.peer_rank = 1 - pair_rank
@@ -174,7 +177,9 @@ class PairPipe:
         self.signal_group.barrier()
 
 
-        self.is_use_nccl = not os.getenv("KV_SYNC_USE_CPU", "0") == "1"
+        self.data_transport = data_transport.lower()
+        self.is_use_nccl = (self.data_transport == "nccl"
+                            and not os.getenv("KV_SYNC_USE_CPU", "0") == "1")
         logger.info(f"[debug]: is_use_nccl: {self.is_use_nccl}")
         if self.is_use_nccl:
         # NCCL data-plane communicator
@@ -401,6 +406,41 @@ class DynamicKVSynchronizer():
         # This lock ensures that only one NCCL operation can be executed at a time
         # in the same process. If not provided, create a local one.
         self._nccl_lock = nccl_lock
+        self._data_transport = os.getenv("VLLM_DYNAMIC_KV_TRANSPORT",
+                                         "nccl").lower()
+        self._nixl_data_lock = threading.Lock()
+        self._nixl_transport: Optional[DirectNixlTensorTransport] = None
+        if self._data_transport in ("nixl", "direct_nixl"):
+            mapping = getattr(self.config, 'rank_to_ip', {}) or {}
+            if self.rank not in mapping:
+                raise RuntimeError(
+                    "VLLM_DYNAMIC_KV_TRANSPORT=nixl requires rank_to_ip to "
+                    f"contain local rank {self.rank}")
+            kv_port = self.config.kv_port
+            if kv_port is None:
+                kv_port = 5557
+            base_port = int(
+                os.getenv("VLLM_DYNAMIC_KV_NIXL_PORT",
+                          str(int(kv_port) + 10000)))
+            self._nixl_transport = DirectNixlTensorTransport(
+                rank=self.rank,
+                local_rank=self.local_rank,
+                device=self.device,
+                rank_to_ip=mapping,
+                base_port=base_port,
+                backend=os.getenv("VLLM_DYNAMIC_KV_NIXL_BACKEND", "UCX"),
+                timeout_s=float(
+                    os.getenv("VLLM_DYNAMIC_KV_NIXL_TIMEOUT_S", "30")),
+                agent_prefix=os.getenv("VLLM_DYNAMIC_KV_NIXL_AGENT_PREFIX",
+                                       "vllm-dynamic-kv-rank"),
+            )
+            logger.info(
+                "DynamicKVSynchronizer using direct NIXL data transport "
+                "rank=%s base_port=%s", self.rank, base_port)
+        elif self._data_transport != "nccl":
+            raise ValueError(
+                "Unsupported VLLM_DYNAMIC_KV_TRANSPORT="
+                f"{self._data_transport!r}; expected 'nccl' or 'nixl'")
         # Eagerly initialize NCCL pipes for all peers (both directions).
         # This avoids first-use latency and surfaces connectivity issues early.
         try:
@@ -523,7 +563,8 @@ class DynamicKVSynchronizer():
                              pair_rank=pair_rank,
                              store_timeout_s=self.config.store_timeout_s,
                              device=self.device,
-                             nccl_lock=self._nccl_lock)
+                             nccl_lock=self._nccl_lock,
+                             data_transport=self._data_transport)
             max_kv_patch_buffer_size = int(os.environ.get('MAX_KV_PATCH_BUFFER_SIZE', 5000))
             if direction == 'send':
                 self._pair_pipes_send[peer_rank] = pipe
@@ -548,6 +589,11 @@ class DynamicKVSynchronizer():
         """
         pipe = self._ensure_pipe_and_buffer(rank, 'send')
         pipe = self._pair_pipes_send[rank]
+
+        if self._data_transport in ("nixl", "direct_nixl"):
+            assert self._nixl_transport is not None
+            self._nixl_transport.send_tensor(rank, kv_cache, pipe)
+            return
         
         if pipe.is_use_nccl and pipe._kv_transfer_stream is not None:
             transfer_stream = pipe._kv_transfer_stream
@@ -616,6 +662,10 @@ class DynamicKVSynchronizer():
             torch.cuda.set_device(self.device)
             pipe = self._ensure_pipe_and_buffer(rank, 'recv')
             pipe = self._pair_pipes_recv[rank]
+            if self._data_transport in ("nixl", "direct_nixl"):
+                assert self._nixl_transport is not None
+                return self._nixl_transport.recv_tensor(rank, dtype, shape,
+                                                        pipe)
             stream = pipe._kv_transfer_stream if pipe.is_use_nccl else None
             return pipe.recv_data(dtype, shape,
                                   stream=stream,
@@ -1031,7 +1081,8 @@ class DynamicKVSynchronizer():
         # Ensure pipe exists before using it
         self._ensure_pipe_and_buffer(rank, 'send')
         pipe = self._pair_pipes_send[rank]
-        nccl_lock = pipe._nccl_lock or self._nccl_lock
+        nccl_lock = ((pipe._nccl_lock or self._nccl_lock)
+                     if pipe.is_use_nccl else self._nixl_data_lock)
         slot_mapping_to_send = slot_mapping
         if not isinstance(kv_tensor_meta, KVTensorMeta):
             assert slot_mapping is not None, (
@@ -1104,7 +1155,8 @@ class DynamicKVSynchronizer():
         # Ensure pipe exists (should already exist from send_kv_tensor_to_rank, but be safe)
         self._ensure_pipe_and_buffer(target_rank, 'send')
         pipe = self._pair_pipes_send[target_rank]
-        nccl_lock = pipe._nccl_lock or self._nccl_lock
+        nccl_lock = ((pipe._nccl_lock or self._nccl_lock)
+                     if pipe.is_use_nccl else self._nixl_data_lock)
         
         retry_delay = 0.005  # 5ms fixed retry delay
         
@@ -1356,7 +1408,8 @@ class DynamicKVSynchronizer():
         """
         time_start = time.time()
         pipe = self._pair_pipes_recv[from_rank]
-        nccl_lock = pipe._nccl_lock or self._nccl_lock
+        nccl_lock = ((pipe._nccl_lock or self._nccl_lock)
+                     if pipe.is_use_nccl else self._nixl_data_lock)
         
         current_meta: Union[KVTensorMeta, FlexiKVTensorMeta] = meta
         while True:
@@ -1429,7 +1482,8 @@ class DynamicKVSynchronizer():
         is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
         time_start = time.time()
         pipe = self._pair_pipes_recv[from_rank]
-        nccl_lock = pipe._nccl_lock or self._nccl_lock
+        nccl_lock = ((pipe._nccl_lock or self._nccl_lock)
+                     if pipe.is_use_nccl else self._nixl_data_lock)
         
         current_meta = meta
         while True:

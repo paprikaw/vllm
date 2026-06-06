@@ -3,7 +3,7 @@
 import os
 import sched
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
@@ -22,6 +22,10 @@ from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 import time
 import vllm.envs as envs
 from vllm.utils import current_stream
+from vllm.distributed.kv_transfer.kv_connector.dynamic_nixl_tensor import (
+    DirectNixlTensorTransport,
+    NixlRemoteTensor,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.outputs import ModelRunnerOutput
@@ -40,12 +44,24 @@ class PPNCCLIntermediateMetadata:
     active_ranks: tuple[int, ...] = ()
     request_ids: tuple[str, ...] = ()
     total_num_scheduled_tokens: int = 0
+    transport: str = "nccl"
+    nixl_tensors: dict[str, NixlRemoteTensor] = field(default_factory=dict)
 
 
 def _dynamic_pp_nccl_transport_enabled() -> bool:
-    if _dynamic_pp_rdt_transport_enabled():
+    if (_dynamic_pp_rdt_transport_enabled()
+            or _dynamic_pp_nixl_transport_enabled()):
         return False
     return os.getenv("VLLM_DYNAMIC_PP_NCCL_TRANSPORT", "0") == "1"
+
+
+def _dynamic_pp_nixl_transport_enabled() -> bool:
+    if _dynamic_pp_rdt_transport_enabled():
+        return False
+    transport = os.getenv("VLLM_DYNAMIC_PP_TRANSPORT", "").lower()
+    if transport in ("nixl", "direct_nixl"):
+        return True
+    return os.getenv("VLLM_DYNAMIC_PP_NIXL_TRANSPORT", "0") == "1"
 
 
 def _dynamic_pp_rdt_transport_enabled() -> bool:
@@ -283,6 +299,38 @@ def _sync_worker_inference_stream(worker: DynamicGPUWorker) -> None:
     _sync_cuda_stream(getattr(worker, "inference_stream", None))
 
 
+def _get_dynamic_pp_nixl_transport(
+        worker: DynamicGPUWorker) -> DirectNixlTensorTransport:
+    transport = getattr(worker, "_dynamic_pp_nixl_transport", None)
+    if transport is not None:
+        return transport
+
+    config = worker.vllm_config.layer_kv_connector_config
+    rank_to_ip = getattr(config, "rank_to_ip", {}) or {}
+    if worker.rank not in rank_to_ip:
+        raise RuntimeError(
+            "VLLM_DYNAMIC_PP_TRANSPORT=nixl requires rank_to_ip to contain "
+            f"local rank {worker.rank}")
+    kv_port = getattr(config, "kv_port", None)
+    if kv_port is None:
+        kv_port = 5557
+    base_port = int(
+        os.getenv("VLLM_DYNAMIC_PP_NIXL_PORT", str(int(kv_port) + 20000)))
+    transport = DirectNixlTensorTransport(
+        rank=worker.rank,
+        local_rank=worker.local_rank,
+        device=torch.device(worker.device),
+        rank_to_ip=rank_to_ip,
+        base_port=base_port,
+        backend=os.getenv("VLLM_DYNAMIC_PP_NIXL_BACKEND", "UCX"),
+        timeout_s=float(os.getenv("VLLM_DYNAMIC_PP_NIXL_TIMEOUT_S", "30")),
+        agent_prefix=os.getenv("VLLM_DYNAMIC_PP_NIXL_AGENT_PREFIX",
+                               "vllm-dynamic-pp-rank"),
+    )
+    worker._dynamic_pp_nixl_transport = transport
+    return transport
+
+
 def _tensor_debug_stats(tensor: torch.Tensor) -> tuple[float, float, float]:
     if tensor.numel() == 0:
         return 0.0, 0.0, 0.0
@@ -375,6 +423,47 @@ def _send_intermediate_tensors_nccl(
     return metadata
 
 
+def _send_intermediate_tensors_nixl(
+    worker: DynamicGPUWorker,
+    tensors: IntermediateTensors,
+    scheduler_output: Optional[DynamicSchedulerOutput] = None,
+) -> PPNCCLIntermediateMetadata:
+    pp_group = get_pp_group()
+    transport = _get_dynamic_pp_nixl_transport(worker)
+    metadata = _metadata_from_scheduler_output(
+        scheduler_output,
+        {
+            name: (tuple(tensor.shape), _dtype_to_name(tensor.dtype))
+            for name, tensor in tensors.tensors.items()
+        },
+        time.time(),
+    )
+    metadata.transport = "nixl"
+    metadata.nixl_tensors = {}
+
+    debug_enabled = _dynamic_pp_nccl_debug_enabled()
+    for name, tensor in tensors.tensors.items():
+        send_tensor = tensor.contiguous()
+        if debug_enabled:
+            tensor_sum, tensor_norm, tensor_mean_abs = (
+                _tensor_debug_stats(send_tensor))
+            logger.info(
+                "[pp_nixl_debug] send seq=%s edge=%s->%s config=%s "
+                "active=%s reqs=%s tensor=%s shape=%s dtype=%s sum=%.6e "
+                "norm=%.6e mean_abs=%.6e",
+                metadata.pp_nccl_seq, worker.rank, pp_group.next_rank,
+                metadata.pp_config_fingerprint, metadata.active_ranks,
+                metadata.request_ids, name, tuple(send_tensor.shape),
+                send_tensor.dtype, tensor_sum, tensor_norm, tensor_mean_abs)
+        metadata.nixl_tensors[name] = transport.prepare_read_source(
+            pp_group.next_rank, send_tensor)
+    _sync_worker_inference_stream(worker)
+    logger.info("[forward]: rank %s exposed PP NIXL tensors to rank %s "
+                "for tensors %s, seq=%s", worker.rank, pp_group.next_rank,
+                list(metadata.tensors.keys()), metadata.pp_nccl_seq)
+    return metadata
+
+
 def _recv_intermediate_tensors_nccl(
     metadata: PPNCCLIntermediateMetadata,
     worker: DynamicGPUWorker,
@@ -416,6 +505,44 @@ def _recv_intermediate_tensors_nccl(
                     metadata.request_ids, name, tuple(tensor.shape),
                     tensor.dtype, tensor_sum, tensor_norm, tensor_mean_abs)
     logger.info("[forward]: rank %s enqueued PP NCCL recv from rank %s "
+                "for tensors %s, seq=%s", pp_group.rank, pp_group.prev_rank,
+                list(tensors.keys()), metadata.pp_nccl_seq)
+    return IntermediateTensors(tensors)
+
+
+def _recv_intermediate_tensors_nixl(
+    metadata: PPNCCLIntermediateMetadata,
+    worker: DynamicGPUWorker,
+) -> IntermediateTensors:
+    pp_group = get_pp_group()
+    transport = _get_dynamic_pp_nixl_transport(worker)
+    tensors = {}
+    debug_enabled = _dynamic_pp_nccl_debug_enabled()
+    for name, (shape, dtype_name) in metadata.tensors.items():
+        remote_tensor = metadata.nixl_tensors.get(name)
+        if remote_tensor is None:
+            raise RuntimeError(
+                f"Missing NIXL descriptor for PP tensor {name}")
+        tensors[name] = transport.read_remote_tensor(
+            peer_rank=pp_group.prev_rank,
+            remote_tensor=remote_tensor,
+            dtype=_name_to_dtype(dtype_name),
+            shape=torch.Size(shape),
+        )
+    _sync_worker_inference_stream(worker)
+    if debug_enabled:
+        for name, tensor in tensors.items():
+            tensor_sum, tensor_norm, tensor_mean_abs = (
+                _tensor_debug_stats(tensor))
+            logger.info(
+                "[pp_nixl_debug] recv_post_sync seq=%s edge=%s->%s "
+                "config=%s active=%s reqs=%s tensor=%s shape=%s dtype=%s "
+                "sum=%.6e norm=%.6e mean_abs=%.6e",
+                metadata.pp_nccl_seq, pp_group.prev_rank, worker.rank,
+                metadata.pp_config_fingerprint, metadata.active_ranks,
+                metadata.request_ids, name, tuple(tensor.shape), tensor.dtype,
+                tensor_sum, tensor_norm, tensor_mean_abs)
+    logger.info("[forward]: rank %s completed PP NIXL recv from rank %s "
                 "for tensors %s, seq=%s", pp_group.rank, pp_group.prev_rank,
                 list(tensors.keys()), metadata.pp_nccl_seq)
     return IntermediateTensors(tensors)
@@ -572,9 +699,16 @@ try:
                                               DynamicSchedulerOutput)
                             with _batch_pp_routing(
                                     scheduler_output.pp_layer_config):
-                                intermediate_tensors = (
-                                    _recv_intermediate_tensors_nccl(
-                                        intermediate_tensors, self.worker))
+                                if intermediate_tensors.transport == "nixl":
+                                    intermediate_tensors = (
+                                        _recv_intermediate_tensors_nixl(
+                                            intermediate_tensors,
+                                            self.worker))
+                                else:
+                                    intermediate_tensors = (
+                                        _recv_intermediate_tensors_nccl(
+                                            intermediate_tensors,
+                                            self.worker))
                     else:
                         scheduler_output, intermediate_tensors = (
                             scheduler_output, None)
@@ -673,7 +807,14 @@ try:
 
                     if isinstance(output, IntermediateTensors):
                         send_time = time.time()
-                        if (_dynamic_pp_nccl_transport_enabled()
+                        if (_dynamic_pp_nixl_transport_enabled()
+                                and not envs.VLLM_USE_RAY_COMPILED_DAG):
+                            with _batch_pp_routing(
+                                    scheduler_output.pp_layer_config):
+                                metadata = _send_intermediate_tensors_nixl(
+                                    self.worker, output, scheduler_output)
+                            output = (scheduler_output, metadata)
+                        elif (_dynamic_pp_nccl_transport_enabled()
                                 and not envs.VLLM_USE_RAY_COMPILED_DAG):
                             with _batch_pp_routing(
                                     scheduler_output.pp_layer_config):

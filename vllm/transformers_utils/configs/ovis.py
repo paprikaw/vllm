@@ -72,7 +72,7 @@ IMAGE_TOKEN = "<image>"
 IMAGE_ATOM_ID = -300
 IMAGE_INDICATOR_IDS = [-301, -302, -303, -304, -305]
 
-AutoConfig.register("aimv2", AIMv2Config)
+AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)
 
 
 # ----------------------------------------------------------------------
@@ -135,8 +135,12 @@ class SiglipVisualTokenizerConfig(BaseVisualTokenizerConfig):
             self.backbone_kwargs['num_hidden_layers'] = self.depths[0]
 
 
-AutoConfig.register("siglip_visual_tokenizer", SiglipVisualTokenizerConfig)
-AutoConfig.register("aimv2_visual_tokenizer", Aimv2VisualTokenizerConfig)
+AutoConfig.register("siglip_visual_tokenizer",
+                    SiglipVisualTokenizerConfig,
+                    exist_ok=True)
+AutoConfig.register("aimv2_visual_tokenizer",
+                    Aimv2VisualTokenizerConfig,
+                    exist_ok=True)
 
 
 # ----------------------------------------------------------------------

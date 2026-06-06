@@ -705,6 +705,16 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             return RayObjectRefFuture(ref_or_value, refs=refs)
 
         if os.getenv("VLLM_DYNAMIC_PP_NCCL_TRANSPORT", "0") == "1":
+            if os.getenv("VLLM_DYNAMIC_PP_NCCL_SERIALIZE_BATCHES",
+                         "1") == "1":
+                previous_refs = getattr(self, "_last_pp_nccl_refs", None)
+                if previous_refs:
+                    wait_start = time.time()
+                    ray.get(previous_refs)
+                    logger.info(
+                        "waited %.3fs for previous dynamic PP NCCL batch "
+                        "before dispatching the next batch",
+                        time.time() - wait_start)
             self._annotate_pp_nccl_debug_metadata(
                 scheduler_output, active_ranks)
             metadata = self._make_pp_nccl_intermediate_metadata(
@@ -722,13 +732,15 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             return RayObjectRefFuture(final_ref, refs=refs)
 
         ref_or_value = scheduler_output
+        refs = []
         for rank in active_ranks:
             ref_or_value = self.workers[rank].execute_model_ray.remote(
                 ref_or_value)
+            refs.append(ref_or_value)
 
         if self.max_concurrent_batches == 1:
             return ray.get(ref_or_value)
-        return RayObjectRefFuture(ref_or_value)
+        return RayObjectRefFuture(ref_or_value, refs=refs)
 
     def _init_dynamic_pp_rdt_transport(self) -> None:
         transport = _dynamic_pp_rdt_transport()
@@ -854,12 +866,54 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             return
 
         scheduler_output.autoscaling_request_state_sync = True
+        request_states = self._collect_autoscaling_request_states_for_batch(
+            scheduler_output)
+        if request_states:
+            scheduler_output.autoscaling_request_states = request_states
+            scheduler_output.autoscaling_request_state_source_rank = -2
         self._autoscaling_request_state_sync_key = sync_key
         self._autoscaling_request_state_sync_pending = None
         logger.info(
             "Marked target PP actor chain %s to carry autoscaling request "
-            "states in-band",
-            active_ranks)
+            "states in-band, states=%d",
+            active_ranks, len(request_states))
+
+    def _collect_autoscaling_request_states_for_batch(
+        self,
+        scheduler_output: DynamicSchedulerOutput,
+    ) -> dict[str, Any]:
+        req_ids = [
+            req.req_id for req in scheduler_output.scheduled_cached_reqs
+        ]
+        if not req_ids:
+            return {}
+
+        start = time.time()
+        refs = [
+            worker.execute_method.remote(
+                "export_autoscaling_request_states", req_ids)
+            for worker in self.workers
+        ]
+        worker_states = ray.get(refs)
+        merged: dict[str, Any] = {}
+        for states in worker_states:
+            if not states:
+                continue
+            for req_id, req_state in states.items():
+                merged.setdefault(req_id, req_state)
+
+        missing = [req_id for req_id in req_ids if req_id not in merged]
+        if missing:
+            logger.warning(
+                "[autoscaling request states] collected %d/%d states for "
+                "target sync batch in %.3fs; missing=%s",
+                len(merged), len(req_ids), time.time() - start, missing)
+        else:
+            logger.info(
+                "[autoscaling request states] collected %d/%d states for "
+                "target sync batch in %.3fs",
+                len(merged), len(req_ids), time.time() - start)
+        return merged
 
     def _active_ranks_for_scheduler_output(self, scheduler_output) -> list[int]:
         pp_layer_config = getattr(scheduler_output, "pp_layer_config", None)

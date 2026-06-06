@@ -51,7 +51,7 @@ short_host() {
 
 if [[ "$LOCAL_MODE" -eq 0 && "$(short_host)" != "$TARGET_HOST" ]]; then
   exec ssh "$TARGET_HOST" \
-    "cd '$ROOT_DIR' && ROOT_DIR='$ROOT_DIR' VENV_ACTIVATE='$VENV_ACTIVATE' PYTHON_BIN='$PYTHON_BIN' TARGET_HOST='$TARGET_HOST' CONFIG_PATH='$CONFIG_PATH' RUN_LOG_DIR='$RUN_LOG_DIR' TMP_ROOT='$TMP_ROOT' PORT='$PORT' RUN_TIMEOUT_SECONDS='$RUN_TIMEOUT_SECONDS' CLEANUP_ON_EXIT='$CLEANUP_ON_EXIT' bash '$ROOT_DIR/scripts/run_qwen_expand_1to2_smoke.sh' --local"
+    "cd '$ROOT_DIR' && ROOT_DIR='$ROOT_DIR' VENV_ACTIVATE='$VENV_ACTIVATE' PYTHON_BIN='$PYTHON_BIN' TARGET_HOST='$TARGET_HOST' CONFIG_PATH='$CONFIG_PATH' RUN_LOG_DIR='$RUN_LOG_DIR' TMP_ROOT='$TMP_ROOT' PORT='$PORT' RUN_TIMEOUT_SECONDS='$RUN_TIMEOUT_SECONDS' CLEANUP_ON_EXIT='$CLEANUP_ON_EXIT' PYTHONPATH='$ROOT_DIR:${PYTHONPATH:-}' bash '$ROOT_DIR/scripts/run_qwen_expand_1to2_smoke.sh' --local"
 fi
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
@@ -92,6 +92,7 @@ nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader
 source "$VENV_ACTIVATE"
 cd "$ROOT_DIR"
 
+export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 export BENCHMARK_CONFIG_PATH
 export DEPLOYMENT_CONFIG_PATH
 
