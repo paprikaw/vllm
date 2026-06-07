@@ -100,6 +100,25 @@ class KVSlotMapping:
         self.is_finished = False
         self.stored_tokens = 0
 
+    def resize(self, size: int) -> None:
+        with self._cv:
+            old_size = len(self.bitmap)
+            if size == old_size:
+                return
+
+            new_bitmap = bitarray.bitarray(size)
+            new_bitmap.setall(0)
+            copy_len = min(old_size, size)
+            if copy_len:
+                new_bitmap[:copy_len] = self.bitmap[:copy_len]
+            if size < old_size and self.bitmap[size:].any():
+                logger.warning(
+                    "Dropping pending KV slot mappings outside resized "
+                    "capacity: old_size=%s new_size=%s",
+                    old_size, size)
+            self.bitmap = new_bitmap
+            self._cv.notify_all()
+
     def add_slot_mappings(self, slot_mapping: list[int], is_finished: bool, num_total_new_tokens: int) -> None:
         with self._cv:
             trimmed_slot_mapping = []
@@ -430,7 +449,11 @@ class DynamicKVSynchronizer():
         for peer in range(pp_size):
             if peer == self.rank:
                 continue
-            self.slot_mappings[peer] = KVSlotMapping(num_block)
+            existing = self.slot_mappings.get(peer)
+            if existing is None:
+                self.slot_mappings[peer] = KVSlotMapping(num_block)
+            else:
+                existing.resize(num_block)
 
     def _initialize_all_pipes(self) -> None:
         """Initialize send/recv pipes to all peer ranks upfront.
