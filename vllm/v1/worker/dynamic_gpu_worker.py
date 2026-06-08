@@ -754,6 +754,25 @@ class DynamicGPUWorker(Worker):
                     "(%s)", old_sync_start, start_layer, reason)
 
     @staticmethod
+    def _kv_ptr_view_covers_layers(start_layer: Optional[int],
+                                   key_cache_ptrs: Optional[list[int]],
+                                   value_cache_ptrs: Optional[list[int]],
+                                   layer_ids: list[int]) -> bool:
+        if (start_layer is None or key_cache_ptrs is None
+                or value_cache_ptrs is None):
+            return False
+        if len(key_cache_ptrs) != len(value_cache_ptrs):
+            return False
+        for layer_id in layer_ids:
+            local_layer_id = layer_id - start_layer
+            if local_layer_id < 0 or local_layer_id >= len(key_cache_ptrs):
+                return False
+            if (key_cache_ptrs[local_layer_id] == 0
+                    or value_cache_ptrs[local_layer_id] == 0):
+                return False
+        return True
+
+    @staticmethod
     def _kv_cache_start_after_deleting_layers(
             current_start: int,
             layers_list: list[Tuple[int, int]]) -> int:
@@ -2894,9 +2913,17 @@ class DynamicGPUWorker(Worker):
             if (self.vllm_config.dynamic_config.use_direct_ptr
                     and self.vllm_config.dynamic_config.
                     pipeline_autoscaling_enabled):
-                sender_start_layer_id = self.model_runner._ptr_table_start_layer
-                if (self._autoscale_sender_start_layer
-                        == sender_start_layer_id):
+                sender_layer_ids = sorted({
+                    layer_id
+                    for layer_ids in self.rank_to_layers_ids.values()
+                    for layer_id in layer_ids
+                })
+                if self._kv_ptr_view_covers_layers(
+                        self._autoscale_sender_start_layer,
+                        self._autoscale_sender_key_cache_ptrs,
+                        self._autoscale_sender_value_cache_ptrs,
+                        sender_layer_ids):
+                    sender_start_layer_id = self._autoscale_sender_start_layer
                     sender_key_cache_ptrs = self._autoscale_sender_key_cache_ptrs
                     sender_value_cache_ptrs = (
                         self._autoscale_sender_value_cache_ptrs)
@@ -2906,6 +2933,28 @@ class DynamicGPUWorker(Worker):
                         self.rank, sender_start_layer_id,
                         0 if sender_key_cache_ptrs is None else
                         len(sender_key_cache_ptrs))
+                else:
+                    sender_start_layer_id = self._kv_cache_start_layer()
+                    sender_key_cache_ptrs = list(
+                        self.dynamic_kv_synchronizer.key_cache_ptrs)
+                    sender_value_cache_ptrs = list(
+                        self.dynamic_kv_synchronizer.value_cache_ptrs)
+                    logger.info(
+                        "[autoscaling async] rank %s captured sender KV "
+                        "pointer view at migration start: start_layer=%s, "
+                        "num_layers=%s",
+                        self.rank, sender_start_layer_id,
+                        len(sender_key_cache_ptrs))
+
+                if not self._kv_ptr_view_covers_layers(
+                        sender_start_layer_id, sender_key_cache_ptrs,
+                        sender_value_cache_ptrs, sender_layer_ids):
+                    raise RuntimeError(
+                        "KV migration sender could not capture a pointer view "
+                        "covering all sending layers: "
+                        f"rank={self.rank}, start_layer={sender_start_layer_id}, "
+                        f"num_key_cache_ptrs={0 if sender_key_cache_ptrs is None else len(sender_key_cache_ptrs)}, "
+                        f"layers={sender_layer_ids}")
             else:
                 sender_start_layer_id = self._kv_cache_start_layer()
 
