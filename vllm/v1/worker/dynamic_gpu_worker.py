@@ -3500,11 +3500,34 @@ class DynamicGPUWorker(Worker):
                 
                 # Only apply patch if there's actual data (skip for empty kv_patch_finished)
                 if kv_payload.numel() > 0:
+                    with self._layer_loaded_cv:
+                        receiver_start_layer_id = self._kv_patch_apply_start_layer()
+                        receiver_key_cache_ptrs = None
+                        receiver_value_cache_ptrs = None
+                        if self.vllm_config.dynamic_config.use_flexi_kv:
+                            receiver_key_cache_ptrs = list(
+                                self.dynamic_kv_synchronizer.key_cache_ptrs)
+                            receiver_value_cache_ptrs = list(
+                                self.dynamic_kv_synchronizer.value_cache_ptrs)
+                            if not self._kv_ptr_view_covers_layers(
+                                    receiver_start_layer_id,
+                                    receiver_key_cache_ptrs,
+                                    receiver_value_cache_ptrs,
+                                    list(meta.layer_ids)):
+                                raise RuntimeError(
+                                    "KV migration receiver could not capture "
+                                    "a pointer view covering patch layers: "
+                                    f"rank={self.rank}, from_rank={from_rank}, "
+                                    f"start_layer={receiver_start_layer_id}, "
+                                    f"num_key_cache_ptrs={len(receiver_key_cache_ptrs)}, "
+                                    f"layers={meta.layer_ids}")
                     with self.model_runner.forward_lock:
                         self.dynamic_kv_synchronizer.apply_one_patch_to_kv_cache(
-                            self._kv_patch_apply_start_layer(), meta,
+                            receiver_start_layer_id, meta,
                             kv_payload, slot_mapping,
-                            self.model_runner.page_meta)
+                            self.model_runner.page_meta,
+                            key_cache_ptrs=receiver_key_cache_ptrs,
+                            value_cache_ptrs=receiver_value_cache_ptrs)
                     self.receiver_num_applied_token_dict[from_rank] += meta.num_tokens
                     logger.info(f"[num tokens]: receiver side: rank {from_rank} applied token: {meta.num_tokens}, total applied token: {self.receiver_num_applied_token_dict[from_rank]}")
                 else:

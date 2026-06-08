@@ -1517,7 +1517,16 @@ class DynamicKVSynchronizer():
         kv_patch = self.buffers[rank].pop_patch()
         return kv_patch
 
-    def apply_one_patch_to_kv_cache(self, start_layer_id: int, meta: KVPatchMeta, kv_payload: torch.Tensor,  slot_mapping: torch.Tensor, page_meta: Optional[torch.Tensor] = None,) -> int:
+    def apply_one_patch_to_kv_cache(
+            self,
+            start_layer_id: int,
+            meta: KVPatchMeta,
+            kv_payload: torch.Tensor,
+            slot_mapping: torch.Tensor,
+            page_meta: Optional[torch.Tensor] = None,
+            key_cache_ptrs: Optional[list[int]] = None,
+            value_cache_ptrs: Optional[list[int]] = None,
+    ) -> int:
         keys = kv_payload[0]
         values = kv_payload[1]
         logger.info(f"apply one patch with id {meta.id}, num_tokens: {meta.num_tokens}")
@@ -1529,20 +1538,25 @@ class DynamicKVSynchronizer():
         # The operations below are executed in the default stream and will be properly ordered.
         with self.device:
             logger.info(f"[listen loop] apply kv patch to kv cache on device {self.device}")
+            if is_flexi:
+                if key_cache_ptrs is None:
+                    key_cache_ptrs = self.key_cache_ptrs
+                if value_cache_ptrs is None:
+                    value_cache_ptrs = self.value_cache_ptrs
             for layer_id, key, value in zip(meta.layer_ids, keys, values):
                 local_layer_id = layer_id - start_layer_id
                 if is_flexi:
                     assert page_meta is not None, "page_meta should be provided when using flexi flash attention"
                     if (local_layer_id < 0
-                            or local_layer_id >= len(self.key_cache_ptrs)):
+                            or local_layer_id >= len(key_cache_ptrs)):
                         raise IndexError(
                             "KV receiver patch layer index out of range: "
                             f"layer_id={layer_id}, "
                             f"start_layer_id={start_layer_id}, "
                             f"local_layer_id={local_layer_id}, "
-                            f"num_key_cache_ptrs={len(self.key_cache_ptrs)}")
-                    key_cache_ptr = self.key_cache_ptrs[local_layer_id]
-                    value_cache_ptr = self.value_cache_ptrs[local_layer_id]
+                            f"num_key_cache_ptrs={len(key_cache_ptrs)}")
+                    key_cache_ptr = key_cache_ptrs[local_layer_id]
+                    value_cache_ptr = value_cache_ptrs[local_layer_id]
                     if key_cache_ptr == 0 or value_cache_ptr == 0:
                         raise RuntimeError(
                             "KV receiver patch resolved an empty cache "
@@ -1550,7 +1564,7 @@ class DynamicKVSynchronizer():
                             f"layer_id={layer_id}, "
                             f"start_layer_id={start_layer_id}, "
                             f"local_layer_id={local_layer_id}, "
-                            f"num_key_cache_ptrs={len(self.key_cache_ptrs)}")
+                            f"num_key_cache_ptrs={len(key_cache_ptrs)}")
                     self.kv_helper.flexi_put_kv_to_cache(
                         model_executable=self.model_executable,
                         page_meta=page_meta,
