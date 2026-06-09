@@ -1157,6 +1157,7 @@ class DynamicEngineCore(EngineCore):
 
         # Adding/removing
         need_compact = False
+        pre_migration_resize_ranks: list[int] = []
         adding_per_rank: dict[int, list[Tuple[int, int]]] = {}
         maximum_kv_block_num_after_compact: list[int] = []
 
@@ -1209,6 +1210,7 @@ class DynamicEngineCore(EngineCore):
                 if self._needs_pre_migration_kv_resize(
                         rank, assess, "async migration"):
                     need_compact = True
+                    pre_migration_resize_ranks.append(rank)
                 if len(adding_layer_list) > 0:
                     adding_per_rank[rank] = adding_layer_list
                     if assess.enough_without_compact:
@@ -1254,9 +1256,14 @@ class DynamicEngineCore(EngineCore):
             # 需要resize kv cache来进行migration，这里的resize一定是缩小
             # Only shrink when compacted_length < original_length (see sync path comment).
             if compacted_length < original_length:
-                self.model_executor.start_resize_kv_cache_async(
-                    compacted_length)
-                logger.info(f"[timeline]: dispatched async resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
+                self.model_executor.resize_kv_cache(
+                    compacted_length,
+                    ranks=pre_migration_resize_ranks)
+                logger.info(
+                    "[timeline]: synchronously resized pre-migration KV "
+                    "cache on ranks %s, time taken: %s",
+                    pre_migration_resize_ranks,
+                    human_readable_duration(time.time() - time_start))
                 logger.info(f"[timeline]: after shrink block pool, time taken: {human_readable_duration(time.time() - time_start)}")
             
         # self._compact_kv_cache(1700)
