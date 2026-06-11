@@ -302,6 +302,9 @@ class cmake_build_ext(build_ext):
         for file in files:
             dst_file = os.path.join("vllm/vllm_flash_attn",
                                     file.split("vllm/vllm_flash_attn/")[-1])
+            if os.path.exists(dst_file):
+                print(f"Skipping existing source file {dst_file}")
+                continue
             print(f"Copying {file} to {dst_file}")
             os.makedirs(os.path.dirname(dst_file), exist_ok=True)
             self.copy_file(file, dst_file)
@@ -676,7 +679,10 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-    if envs.VLLM_USE_PRECOMPILED or get_nvcc_cuda_version() >= Version("12.3"):
+    disable_fa3 = os.getenv("FLASH_ATTN_DISABLE_FA3", "").upper() in (
+        "1", "TRUE", "ON", "YES")
+    if (envs.VLLM_USE_PRECOMPILED
+            or get_nvcc_cuda_version() >= Version("12.3")) and not disable_fa3:
         # FA3 requires CUDA 12.3 or later
         ext_modules.append(
             CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))

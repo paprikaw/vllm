@@ -28,8 +28,13 @@ if (DEFINED ENV{VLLM_FLASH_ATTN_SRC_DIR})
   set(VLLM_FLASH_ATTN_SRC_DIR $ENV{VLLM_FLASH_ATTN_SRC_DIR})
 endif()
 
-# Force use local flash-attention for development (commented out to use env var)
-# set(VLLM_FLASH_ATTN_SRC_DIR "/home/bxb1/vllm_workbench/flash-attention")
+if(NOT VLLM_FLASH_ATTN_SRC_DIR)
+  get_filename_component(_LOCAL_VLLM_FLASH_ATTN_SRC_DIR
+    "${CMAKE_SOURCE_DIR}/../flash-attention" ABSOLUTE)
+  if(EXISTS "${_LOCAL_VLLM_FLASH_ATTN_SRC_DIR}/CMakeLists.txt")
+    set(VLLM_FLASH_ATTN_SRC_DIR "${_LOCAL_VLLM_FLASH_ATTN_SRC_DIR}")
+  endif()
+endif()
 
 if(VLLM_FLASH_ATTN_SRC_DIR)
   message(STATUS "Using local vllm-flash-attn source directory: ${VLLM_FLASH_ATTN_SRC_DIR}")
