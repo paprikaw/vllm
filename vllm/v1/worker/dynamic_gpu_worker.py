@@ -3602,15 +3602,6 @@ class DynamicGPUWorker(Worker):
         # before model.delete_layers() updates model.start_layer.
         return self._kv_cache_start_layer()
 
-    def sync_migration_before_execute_callback(self, new_kv_cache_block_num: int) -> None:
-        with self._receive_finished_cv:
-            while self.receive_in_process:
-                logger.info(f"debug: ---------------------rank {self.rank} waiting for migration to be finished")
-                self._receive_finished_cv.wait()
-            logger.info(f"debug: ---------------------rank {self.rank} is good for forwarding")
-        # if new_kv_cache_block_num != 0:
-        #     self.resize_kv_cache(new_kv_cache_block_num)
-
     def async_migration_before_execute_callback(self,
                                                 scheduler_output: "DynamicSchedulerOutput" 
                                                ) -> None:

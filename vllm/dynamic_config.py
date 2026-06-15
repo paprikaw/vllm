@@ -100,7 +100,6 @@ class PPLayerConfigs(BaseModel):
 class MigrationConfig(BaseModel):
     alternative_configs: PPLayerConfigs
     migration_steps: list[int] = Field(default_factory=list)
-    compact_steps: list[int] = Field(default_factory=list)
     migration_mode: str = Field(default="async")  # "async", "async_fast", or "sync" - determines which migration method to use
     weight_loading_mode: str = Field(default="async")  # "async" or "sync" - determines how weights are loaded during migration
     """

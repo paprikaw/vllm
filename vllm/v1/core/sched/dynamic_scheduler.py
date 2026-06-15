@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from regex import P
 from vllm.v1.core.dynamic_kv_cache_manager import DynamicKVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
-from typing import List, Tuple, Optional, TypeVar, Union, Any, Dict
-from vllm.v1.core.sched.snapshot import KVCacheSnapshot, KVCacheSnapshotEntry
+from typing import List, Tuple, Optional, Union
 from threading import Lock
 import vllm.envs as envs
 from enum import Enum
-from concurrent.futures import Future
 import torch
 import gc
 from collections import defaultdict, deque
@@ -18,7 +15,6 @@ from bitarray import bitarray
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.dynamic_config import PPLayerConfigs
 from vllm.distributed.kv_events import EventPublisherFactory
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
@@ -28,7 +24,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData, SchedulerOutput)
 from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -37,13 +33,6 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 
 logger = init_logger(__name__)
-T = TypeVar("T")
-
-class ChangeConfigurationType(Enum):
-    NOT_CHANGING = 0
-    ASYNC_CHANGING = 1
-    SYNC_CHANGING = 2
-
 class DynamicScheduler(Scheduler):
     def __init__(
         self,
@@ -175,35 +164,14 @@ class DynamicScheduler(Scheduler):
             start_layer = sum(partitions[:pp_rank])
             end_layer = start_layer + partitions[pp_rank] - 1
             layer_configs.append((start_layer, end_layer))
-        self.pp_layer_config_status = SchedulerPPLayerConfigStatus(layer_configs)
-        
-        # # Used to track the config of each request
-        # self.config_request_ids: Dict[str, List[str]] = {}
-
-        self.migration_status = MigrationStatus.NOT_MIGRATING
-
-        # Used to track the round robin index
-        # The round robin is implmented to schedule the requests from the
-        # current configuration and next configuration.
-        self.round_robin_index = 0
-        self.running_controller = RunningQueueMigrationController()
-        self.waiting_controller = WaitingQueueMigrationController()
+        self.pp_layer_config = layer_configs
         self._sync_drain_pending_waiting: Optional[deque[Request]] = None
-        # self.cur_running = []
-        # self.cur_waiting = deque()
-        # self.next_running = []
-        # self.next_waiting = deque()
-        self.next_pp_layer_config = None # This is only used when switching fron old configuration to new configuration in the 
+
         # When scheduler executes schedule or migration operation, it needs
         # to acquire the lock.
         self.lock = Lock()
-        self._migration_future: Optional[Future] = None
-
-        # These flags are used to indicate the type of configuration change
-        # Once the flag is set, the scheduler will schedule the according scheduleroutput
-        # on the next scheduling step
-        self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
-        self.next_new_kv_cache_block_num = 0
+        self._pending_pp_layer_config: Optional[List[Tuple[int, int]]] = None
+        self._pending_new_kv_cache_block_num = 0
 
         self.migration_in_process = False # 控制在每一次scheduler schedule的时候是否需要同时发送slot_mapping
         self.num_tokens_for_migration = 0 # 记录已经发送的slot数量，用来和worker端已处理的slot数量进行对比
@@ -215,11 +183,10 @@ class DynamicScheduler(Scheduler):
         self.receiver_list_during_migration: Optional[set[int]] = None
 
     def async_change_configuration(self, pp_layer_config: List[Tuple[int,int]], new_kv_cache_block_num: int):
-        self.change_configuration_status = ChangeConfigurationType.ASYNC_CHANGING
-        assert self.next_new_kv_cache_block_num == 0 
-        assert self.next_pp_layer_config is None
-        self.next_pp_layer_config = pp_layer_config
-        self.next_new_kv_cache_block_num = new_kv_cache_block_num
+        assert self._pending_new_kv_cache_block_num == 0
+        assert self._pending_pp_layer_config is None
+        self._pending_pp_layer_config = pp_layer_config
+        self._pending_new_kv_cache_block_num = new_kv_cache_block_num
 
     def start_migration(self, sender_list: list[int], receiver_list: list[int], should_increase_scheduler_output_version: bool) -> Union[list[int], None]:
         with self.lock:
@@ -269,64 +236,18 @@ class DynamicScheduler(Scheduler):
         Therefore it is common to firstly call _drain_out_running_queue to drain out the running queue, then call this function to change the scheduler configuration.
         The actual configuration change will be done by invoking collective operation "start_kv_cache_migration_sync" in the model executor.
         """
-        self.change_configuration_status = ChangeConfigurationType.SYNC_CHANGING
         self.update_layer_config(pp_layer_config)
-        # if new_kv_cache_block_num > self.kv_cache_manager.num_gpu_blocks:
-        #     self.extend_kv_cache(new_kv_cache_block_num)
-
-    def v1_start_migration(self, layer_config: List[Tuple[int,int]])->Future:
-        # Start the migration process
-        # This function will only be called when doing concurrent serving old and new requests in migration 
-        # In the latest style of migration, we don't use this function
-        # 1. When doing migration, we maintain two sets of running 
-        #    and waiting requests. 
-        # 2. cur_waiting and cur_running are the requests that are 
-        #    running when the migration starts. 
-        # 3. next_waiting and next_running are the new requests that 
-        #    will be run when the migraion is in process. 
-        assert self.migration_status == MigrationStatus.NOT_MIGRATING, \
-            "Migration is already in process, cannot start a new one"
-        with self.lock:
-            self.migration_status = MigrationStatus.MIGRATING
-            # self.next_running = []
-            # self.next_waiting = self.cur_waiting
-            # self.cur_waiting = deque()
-            self.running_controller.start_migration()
-            self.waiting_controller.start_migration()
-            self._add_layer_config(layer_config)
-            self._migration_future = Future()
-            return self._migration_future
 
     def update_layer_config(self, layer_config: List[Tuple[int,int]]):
-        # Update the configuration of layers stored in the scheduler
-        self.pp_layer_config_status.update_pp_layer_config(layer_config)
+        self.pp_layer_config = layer_config
 
-    def _complete_migration(self):
-        assert self.migration_status == MigrationStatus.MIGRATING
-        assert len(self.running_controller.get_cur()[1]) == 0
-        assert len(self.waiting_controller.get_cur()) == 0
-        self.running_controller.finish_migration()
-        self.waiting_controller.finish_migration()
-
-        # Update the running and waiting status
-        self.migration_status = MigrationStatus.NOT_MIGRATING
-
-        # Update the pp layer config status
-        self.pp_layer_config_status.finish_migration_and_update_config()
-
-        self.round_robin_index = 0
-
-         # resolve the future
-        assert self._migration_future is not None and not self._migration_future.done()
-        self._migration_future.set_result(True)
-
-    def _schedule(self,is_old_request: bool) -> DynamicSchedulerOutput:
+    def _schedule(self) -> DynamicSchedulerOutput:
         """
         In this function, we control the behavior of scheduler during the migration process
         There are three types of migration process at the moment:
             1. sync migration with kv cache transfer 
             2. async migration with kv cache transfer
-            3. drain-out style of migration (depreciated)
+            3. drain-out style of migration (deprecated)
 
         sync migration: 
             Drain out the running batches and interupt the inference process.
@@ -337,27 +258,9 @@ class DynamicScheduler(Scheduler):
             When the timing is right, we inject a sync msg to scheduleroutput to tell the gpu worker sending out all the kv patches. After this async msg, we change the configuration of the scheduler.
             In the next scheduling step, the scheduler is scheduling with the new configuration.
         """
-        if is_old_request:
-            id, cur_running = self.running_controller.get_cur()
-            cur_waiting = self.waiting_controller.get_cur()
-            self.running = cur_running
-            self.waiting = cur_waiting 
-            pp_layer_config = self.pp_layer_config_status.get_cur_pp_layer_config()
-            scheduler_output = super().schedule()
-
-            self.waiting_controller.cur = self.waiting
-            self.running_controller.set_queue_by_id(id, self.running)
-        else:
-            id, next_running = self.running_controller.get_next()
-            next_waiting = self.waiting_controller.get_next()
-
-            self.running = next_running
-            self.waiting = next_waiting
-            pp_layer_config = self.pp_layer_config_status.get_next_pp_layer_config()
-            scheduler_output = super().schedule()
-
-            self.waiting_controller.next = self.waiting
-            self.running_controller.set_queue_by_id(id, self.running)
+        pp_layer_config = self.pp_layer_config
+        scheduler_output = super().schedule()
+        is_sync_after_migration = self._pending_pp_layer_config is not None
 
         # When inject_sync_msg is True, it means we need to sync the kv cache between layers belongs to old and new configuration
         # The logic here will result in a two step scheduling process
@@ -380,12 +283,11 @@ class DynamicScheduler(Scheduler):
                 grammar_bitmask=scheduler_output.grammar_bitmask,
                 kv_connector_metadata=scheduler_output.kv_connector_metadata,
                 pp_layer_config=pp_layer_config,
-                request_queue_id=id,
                 current_scheduler_output_version=self.cur_scheduler_output_version,
-                is_sync_after_migration=True if self.change_configuration_status == ChangeConfigurationType.ASYNC_CHANGING else False,
+                is_sync_after_migration=is_sync_after_migration,
                 total_migration_tokens=self.num_tokens_for_migration + scheduler_output.total_num_scheduled_tokens,
                 # total_migration_tokens=self.num_tokens_for_migration,
-                new_kv_cache_block_num=self.next_new_kv_cache_block_num,
+                new_kv_cache_block_num=self._pending_new_kv_cache_block_num,
                 migration_in_process=self.migration_in_process,
                 sender_list= self.sender_list_during_migration,
                 receiver_list= self.receiver_list_during_migration,
@@ -400,64 +302,22 @@ class DynamicScheduler(Scheduler):
             logger.info(f"[num tokens]: scheduler output token {output.total_num_scheduled_tokens} added, total tokens for migration: {self.num_tokens_for_migration} ")
 
 
-        if self.change_configuration_status == ChangeConfigurationType.ASYNC_CHANGING:
-            self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
-            assert self.next_pp_layer_config is not None
+        if self._pending_pp_layer_config is not None:
             # 在最后的阶段，只有可能是expand，不可能shrink
-            assert self.next_new_kv_cache_block_num >= self.kv_cache_manager.num_gpu_blocks, f"next_new_kv_cache_block_num: {self.next_new_kv_cache_block_num} is less than the current kv cache size: {self.kv_cache_manager.num_gpu_blocks}"
+            assert self._pending_new_kv_cache_block_num >= self.kv_cache_manager.num_gpu_blocks, f"pending_new_kv_cache_block_num: {self._pending_new_kv_cache_block_num} is less than the current kv cache size: {self.kv_cache_manager.num_gpu_blocks}"
             # In here, we update the layer configuration to the next configuration
             # In the next scheduling step, we will use the next configuration
-            self.update_layer_config(self.next_pp_layer_config)
+            self.update_layer_config(self._pending_pp_layer_config)
 
-            self.next_pp_layer_config = None
-            self.next_new_kv_cache_block_num = 0
+            self._pending_pp_layer_config = None
+            self._pending_new_kv_cache_block_num = 0
             self.migration_in_process = False
             self.sender_list_during_migration = None
             self.receiver_list_during_migration = None
             # self.total_migration_tokens = self.num_tokens_for_migration 
             self.num_tokens_for_migration = 0
 
-        if self.change_configuration_status == ChangeConfigurationType.SYNC_CHANGING:
-            assert self.next_new_kv_cache_block_num == 0
-            self.change_configuration_status = ChangeConfigurationType.NOT_CHANGING
         return output
-
-    def get_kv_cache_snapshot(self) -> KVCacheSnapshot:
-        """Capture a snapshot of current KV cache state per request.
-
-        Returns a mapping: request_id -> {"num_computed_tokens": int,
-                                           "block_ids": list[list[int]]}
-        It includes requests from both current/next running & waiting queues
-        when migration is ongoing; otherwise only the current queues.
-        """
-        entries: dict[str, KVCacheSnapshotEntry] = {}
-        with self.lock:
-            # Collect from both CUR and NEXT queues to be robust during migration
-            cur_run_id, cur_running = self.running_controller.get_cur()
-            cur_waiting = self.waiting_controller.get_cur()
-            next_run_id, next_running = self.running_controller.get_next()
-            next_waiting = self.waiting_controller.get_next()
-            # 此时我们并不涉及到next的迁移，所以next_running和next_waiting都为空
-            assert next_run_id is None and next_waiting is None
-
-            def _collect(reqs: list[Request]) -> None:
-                for req in reqs:
-                    req_id = req.request_id
-                    # Some waiting requests may have no allocated blocks yet
-                    if req_id in self.kv_cache_manager.single_type_manager.req_to_blocks:
-                        block_ids = self.kv_cache_manager.get_block_ids(req_id)
-                    else:
-                        block_ids = []
-                    entries[req_id] = KVCacheSnapshotEntry(
-                        request_id=req_id,
-                        num_computed_tokens=int(req.num_computed_tokens),
-                        block_ids=block_ids,
-                    )
-
-            _collect(cur_running)
-            _collect(list(cur_waiting))
-
-        return KVCacheSnapshot(entries_by_id=entries)
 
     def re_initialize_kv_cache_manager(self,  kv_cache_config: KVCacheConfig):
         # When doing naive stop and go layer migration, we free the old kv cache
@@ -486,33 +346,8 @@ class DynamicScheduler(Scheduler):
             self.waiting.appendleft(preempt_request)
 
     def dynamic_schedule(self) -> DynamicSchedulerOutput:
-        import time
-        schedule_start_time = time.time()
         with self.lock:
-            if self.migration_status == MigrationStatus.NOT_MIGRATING:
-                _, next_running  = self.running_controller.get_next()
-                assert len(next_running) == 0, f"next_running should be empty:{next_running}"
-                assert len(self.waiting_controller.get_next()) == 0, "next_waiting should be empty"
-                assert self.round_robin_index == 0, "round_robin_index should be 0"
-                # Log queue status
-                _, cur_running = self.running_controller.get_cur()
-                cur_waiting = self.waiting_controller.get_cur()
-                for req in list(cur_waiting)[:5]:  # Log first 5 waiting requests
-                    wait_time = (time.time() - req.arrival_time) * 1000
-                    # logger.info(f"[ttft_trace] Waiting request {req.request_id}: wait_time={wait_time:.2f}ms, num_tokens={req.num_tokens}, num_computed_tokens={req.num_computed_tokens}")
-                scheduler_output = self._schedule(is_old_request=True)
-                schedule_total_time = (time.time() - schedule_start_time) * 1000
-                # logger.info(f"[ttft_trace] Scheduler: dynamic_schedule() took {schedule_total_time:.2f}ms")
-                return scheduler_output
-
-            _, cur_running = self.running_controller.get_cur()
-            if len(cur_running) == 0:
-                self._complete_migration()
-                return self._schedule(is_old_request=True)
-                                     
-            scheduler_output = self._schedule(is_old_request=self.round_robin_index == 0)
-            self.round_robin_index = (self.round_robin_index + 1) % 2
-            return scheduler_output
+            return self._schedule()
 
     def add_request(self, request: Request) -> None:
         if self._sync_drain_pending_waiting is not None:
@@ -522,14 +357,7 @@ class DynamicScheduler(Scheduler):
                 request.record_event(EngineCoreEventType.QUEUED)
             return
 
-        if self.migration_status == MigrationStatus.MIGRATING:
-            self.waiting = self.waiting_controller.get_next()
-            super().add_request(request)
-            self.waiting_controller.next = self.waiting
-        else:
-            self.waiting = self.waiting_controller.get_cur()
-            super().add_request(request)
-            self.waiting_controller.cur = self.waiting
+        super().add_request(request)
 
     def begin_sync_drain(self) -> None:
         assert self._sync_drain_pending_waiting is None, (
@@ -540,15 +368,12 @@ class DynamicScheduler(Scheduler):
         if self._sync_drain_pending_waiting is None:
             return
 
-        _, cur_running = self.running_controller.get_cur()
-        cur_waiting = self.waiting_controller.get_cur()
-        assert len(cur_running) == 0, (
-            f"sync drain finished with running requests: {cur_running}")
-        assert len(cur_waiting) == 0, (
-            f"sync drain finished with waiting requests: {cur_waiting}")
+        assert len(self.running) == 0, (
+            f"sync drain finished with running requests: {self.running}")
+        assert len(self.waiting) == 0, (
+            f"sync drain finished with waiting requests: {self.waiting}")
 
-        self.waiting_controller.cur = self._sync_drain_pending_waiting
-        self.waiting = self.waiting_controller.cur
+        self.waiting = self._sync_drain_pending_waiting
         self._sync_drain_pending_waiting = None
 
     def finish_requests(
@@ -576,20 +401,22 @@ class DynamicScheduler(Scheduler):
                     continue
 
                 if request.status == RequestStatus.RUNNING:
-                    _, cur_running = self.running_controller.get_cur()
-                    _, next_running = self.running_controller.get_next()
-                    cur_running.remove(request)
-                    next_running.remove(request)
+                    self.running.remove(request)
+                elif request in self.waiting:
+                    self.waiting.remove(request)
+                elif (self._sync_drain_pending_waiting is not None
+                      and request in self._sync_drain_pending_waiting):
+                    self._sync_drain_pending_waiting.remove(request)
                 else:
-                    self.waiting_controller.cur.remove(request)
-                    self.waiting_controller.next.remove(request)
+                    logger.warning("Request %s is not in scheduler queues",
+                                   req_id)
+                    continue
                 request.status = finished_status
                 self._free_request(request)
 
     def get_num_unfinished_requests(self) -> int:
         """Get the number of unfinished requests."""
-        return self.running_controller.get_total_length() + \
-            self.waiting_controller.get_total_length()
+        return len(self.waiting) + len(self.running)
 
     def update_from_output(
         self,
@@ -600,35 +427,9 @@ class DynamicScheduler(Scheduler):
         assert isinstance(scheduler_output, DynamicSchedulerOutput), \
             "Expected DynamicSchedulerOutput"
         with self.lock:
-            self.running = self.running_controller.get_by_id(scheduler_output.request_queue_id)
-            if self.migration_status == MigrationStatus.MIGRATING:
-                self.waiting = self.waiting_controller.get_next()
-            else:
-                self.waiting = self.waiting_controller.get_cur()
-            output =  super().update_from_output(
-            create_from_dynamic_scheduler_output(scheduler_output), 
-            model_runner_output)
-            self.running_controller.set_queue_by_id(
-                scheduler_output.request_queue_id, self.running)
-
-            if self.migration_status == MigrationStatus.MIGRATING:
-                self.waiting_controller.next = self.waiting
-            else:
-                self.waiting_controller.cur = self.waiting
-            return output
-
-            # self.running = self.cur_running
-            # self.waiting = self.cur_waiting
-            # output =  super().update_from_output(
-            # create_from_dynamic_scheduler_output(scheduler_output), 
-            # model_runner_output)
-            # self.cur_running = self.running
-            # self.cur_waiting = self.waiting
-
-            # return output
-
-    def _add_layer_config(self, layer_config: List[Tuple[int,int]]):
-            self.pp_layer_config_status.update_with_next_pp_layer_config(layer_config)
+            return super().update_from_output(
+                create_from_dynamic_scheduler_output(scheduler_output),
+                model_runner_output)
 
     def make_stats(
         self,
@@ -650,8 +451,8 @@ class DynamicScheduler(Scheduler):
                 self.requests, page_size_bytes, num_layers)
         
         return SchedulerStats(
-            num_running_reqs=self.running_controller.get_total_length(),
-            num_waiting_reqs=self.waiting_controller.get_total_length(),
+            num_running_reqs=len(self.running),
+            num_waiting_reqs=len(self.waiting),
             gpu_cache_usage=self.kv_cache_manager.usage,
             actual_kv_memory_bytes=actual_kv_mem,
             allocated_kv_memory_bytes=allocated_kv_mem,
@@ -681,50 +482,6 @@ class DynamicScheduler(Scheduler):
         assert isinstance(self.kv_cache_manager, DynamicKVCacheManager)
         return self.kv_cache_manager.get_bitmap()
 
-class SchedulerPPLayerConfigStatus:
-    #   Keep two list, first one represent current pp layer configuration, 
-    #   second one represent next pp layer configuration
-    #   For each configuration, we keep a list of layer range ids
-    #   .e.g: 
-    #       Assume we have a 10 layers model and a size 2 pipeline deployment 
-    #       we want pipeline stage 1 has first 5 layers, stage 2 has last 5 layers, 
-    #       then the pp_layer_configs will be:
-    #           cur_pp_layer_configs: [(0, 4), (5, 9)]
-    #           next_pp_layer_configs: None # Haven't update yet
-    #       After a while, we decide to update the layer configuration with 3 layers 
-    #       in stage 1 and 2 layers in stage 2. When live migration is processing, 
-    #       the pp_layer_configs will be:
-    #           cur_pp_layer_configs: [(0, 4), (5, 9)]
-    #           next_pp_layer_configs: [(0, 3), (4, 9)]
-    #       After live migration is finished, the pp_layer_configs will be updated to:
-    #           cur_pp_layer_configs: [(0, 3), (4, 9)]
-    #           next_pp_layer_configs: None
-    def __init__(self, pp_layer_configs: Optional[List[Tuple[int,int]]] = None):
-        self.pp_layer_configs = PPLayerConfigs()
-        if pp_layer_configs is not None:
-            self.pp_layer_configs.set_pp_layer_config("cur", pp_layer_configs)
-
-    def update_with_next_pp_layer_config(self, pp_layer_configs: List[Tuple[int,int]]):
-        self.pp_layer_configs.set_pp_layer_config("next", pp_layer_configs)
-
-    def finish_migration_and_update_config(self):
-        self.pp_layer_configs.set_pp_layer_config("cur", self.pp_layer_configs.get_pp_layer_config("next"))
-        self.pp_layer_configs.delete_pp_layer_config("next")
-
-    def get_cur_pp_layer_config(self) -> List[Tuple[int,int]]:
-        return self.pp_layer_configs.get_pp_layer_config("cur")
-        
-    def get_next_pp_layer_config(self) -> List[Tuple[int,int]]:
-        return self.pp_layer_configs.get_pp_layer_config("next")
-
-    def update_pp_layer_config(self, pp_layer_configs: List[Tuple[int,int]]):
-        # At the moment, we only support update current pp layer config
-        # without next pp layer config
-        # This is because we only update current pp layer configuration 
-        # when using v0 style migration 
-        assert not self.pp_layer_configs.is_key_exist("next"), "Next pp layer config is not None"
-        self.pp_layer_configs.set_pp_layer_config("cur", pp_layer_configs)
-
 class MigrationStatus(Enum):
     NOT_MIGRATING = 0 
     MIGRATING = 1
@@ -745,96 +502,3 @@ def create_from_dynamic_scheduler_output(dynamic_scheduler_output: DynamicSchedu
                 grammar_bitmask=dynamic_scheduler_output.grammar_bitmask,
                 kv_connector_metadata=dynamic_scheduler_output.kv_connector_metadata
             )
-
-
-
-# 我希望构造一个MigrationList的数据结构
-# 这个数据结构是用于对当前数据结构内的collection进行迁移的
-# 我们假设collection内的元素都是可被消费的
-# 所以这个迁移的本质是，在迁移的过程中，保持旧的collection中的元素可以被消费
-# 新的元素被加入的时候会被添加到新的collection中
-# 当所有旧的collection中的元素都被消费完毕后，新的collection就成为了当前的collection，迁移操作完毕
-
-# 这个数据结构有一个catch，即当迁移操作开始的时候，新的元素会被添加到新的collection中，而此时迁移操作可能会结束
-# 在collection中的新元素会变成旧元素。当消费者开始进行消费的时候，消费者需要能够知道这个元素在哪一个collection中
-# 所以我们需要一个迁移列表，记录每个元素的collection id
-# 当消费者消费的时候，需要知道这个元素的collection id，使用collection id进行消费
-
-# 关于数据结构本身的要求：
-# 支持使用数据结构本身可以支持list
-class RunningQueueMigrationController():
-    def __init__(self):
-
-        self.migration_in_progress = False
-        self.head_id = 0
-
-        self.id_map: dict[int, list] = {self.head_id: []}
-
-    def start_migration(self):
-        assert not self.migration_in_progress, "Migration already in progress"
-        self.migration_in_progress = True
-        self.head_id += 1
-        self.id_map[self.head_id] = []
-
-    def get_cur(self) -> Tuple[int, list]:
-        if self.migration_in_progress:
-            return self.head_id - 1, self.id_map[self.head_id - 1] 
-        else:
-            return self.head_id, self.id_map[self.head_id]
-
-    def get_next(self) -> Tuple[int, list]:
-        if self.migration_in_progress:
-            return self.head_id, self.id_map[self.head_id]
-        else:
-            return self.head_id+1, []
-
-    def finish_migration(self):
-        assert self.migration_in_progress, "No migration in progress"
-
-        del self.id_map[self.head_id-1] # remove the old list
-        self.migration_in_progress = False
-
-    def get_by_id(self, id: int) -> list:
-        assert id in self.id_map, f"ID {id} not found in id_map"
-        return self.id_map[id]
-
-    def set_queue_by_id(self, id: int, queue: list):
-        assert id in self.id_map, f"ID {id} not found in id_map"
-        self.id_map[id] = queue
-
-    def get_total_length(self) -> int:
-        """Get the total length of the current queue."""
-        sum = 0
-        for id, queue in self.id_map.items():
-            sum += len(queue)
-        return sum
-
-class WaitingQueueMigrationController():
-    def __init__(self):
-
-        self.migration_in_progress = False
-        self.head_id = 0
-
-        self.cur = deque()
-        self.next = deque()
-
-    def start_migration(self):
-        assert not self.migration_in_progress, "Migration already in progress"
-        self.next = self.cur
-        self.cur = deque()
-        self.migration_in_progress = True
-
-    def get_cur(self) -> deque:
-        return self.cur
-
-    def get_next(self) -> deque:
-        return self.next
-
-    def finish_migration(self):
-        assert self.migration_in_progress, "No migration in progress"
-        self.cur = self.next
-        self.next = deque()
-        self.migration_in_progress = False
-    def get_total_length(self) -> int:
-        """Get the total length of the current queue."""
-        return len(self.cur) + len(self.next)

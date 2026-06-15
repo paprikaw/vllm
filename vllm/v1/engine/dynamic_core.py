@@ -1,10 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-from pprint import pp
-import re
-from cv2 import resize
-from numpy import isin
-from torch import jagged
-
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from .core import EngineCore
 import traceback
@@ -18,7 +12,7 @@ from collections import deque
 from concurrent.futures import Future
 from inspect import isclass, signature
 from logging import DEBUG
-from typing import Any, Callable, Dict, Optional, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 import math
 
 import msgspec
@@ -26,7 +20,6 @@ import zmq
 from bitarray import bitarray
 
 from vllm.config import ParallelConfig, VllmConfig
-from vllm import envs
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
@@ -51,13 +44,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.core.sched.dynamic_scheduler import ChangeConfigurationType
 from vllm.v1.core.sched.dynamic_scheduler import DynamicScheduler
 from vllm.v1.core.sched.dynamic_scheduler import MigrationStatus
-from vllm.dynamic_config import PPLayerConfigs
 from vllm.version import __version__ as VLLM_VERSION
-from .utils import get_new_layer_config_with_migration_action
-from vllm.v1.utils import WorkerMemInfo, LayerAddingAssessResult, human_readable_duration, StopTimeMetrics
+from vllm.v1.utils import WorkerMemInfo, LayerAddingAssessResult, human_readable_duration
 from dataclasses import dataclass
 from vllm.dynamic_config import MigrationConfig
 from copy import deepcopy
@@ -67,9 +57,6 @@ logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
-
-_R = TypeVar('_R')  # Return type for collective_rpc
-
 
 def _safe_queue_size(q: Any) -> int:
     if q is None:
@@ -134,7 +121,6 @@ class DynamicEngineCore(EngineCore):
         self._placement_generation = 0
         self.cur_active_pp_ranks = self._active_ranks_for_config(
             self.cur_pp_layer_config)
-        self.migration_in_process = False
         
         # Event to signal migration_thread to reset its request counter
         # This is triggered by set_pp_config between benchmark repetitions
@@ -705,9 +691,7 @@ class DynamicEngineCore(EngineCore):
                 if not finish_waiting:
                     break
 
-                _, cur_running = self.scheduler.running_controller.get_cur()
-                cur_waiting = self.scheduler.waiting_controller.get_cur()
-                if not cur_running and not cur_waiting:
+                if not self.scheduler.running and not self.scheduler.waiting:
                     break
 
                 scheduler_output = self.scheduler.dynamic_schedule()
@@ -715,7 +699,7 @@ class DynamicEngineCore(EngineCore):
                     logger.warning(
                         "sync drain could not schedule remaining work: "
                         "running=%d waiting=%d",
-                        len(cur_running), len(cur_waiting))
+                        len(self.scheduler.running), len(self.scheduler.waiting))
                     break
 
                 self._mark_autoscaling_active_pp_ranks_if_needed(
@@ -853,8 +837,7 @@ class DynamicEngineCore(EngineCore):
         if not self._is_autoscaling_sync_batch(scheduler_output):
             return
         assert isinstance(self.scheduler, DynamicScheduler)
-        pp_layer_config = (
-            self.scheduler.pp_layer_config_status.get_cur_pp_layer_config())
+        pp_layer_config = self.scheduler.pp_layer_config
         active_ranks = self._active_ranks_for_config(pp_layer_config)
         scheduler_output.autoscaling_activate_pp_ranks = active_ranks
         scheduler_output.autoscaling_activate_pp_ranks_generation = (
@@ -897,7 +880,7 @@ class DynamicEngineCore(EngineCore):
             waited_cleanup = True
         assert isinstance(self.scheduler, DynamicScheduler)
         self._apply_active_pp_ranks_for_config(
-            self.scheduler.pp_layer_config_status.get_cur_pp_layer_config(),
+            self.scheduler.pp_layer_config,
             update_workers=(activation_generation < 0))
         self._autoscaling_schedule_paused = False
         self.migration_status = MigrationStatus.NOT_MIGRATING
@@ -942,8 +925,6 @@ class DynamicEngineCore(EngineCore):
             scheduler_output = None
             is_ray_use_cpu = os.getenv("VLLM_USE_CPU_MODEL", "0") == "1"
             execute_func = self.model_executor.execute_cpu_model if is_ray_use_cpu else self.model_executor.execute_model
-                # if not self.migration_in_process \
-                # else self.model_executor.execute_cpu_model
             # Try to schedule a new batch if the batch queue is not full, but
             # the scheduler may return an empty batch if all requests are scheduled.
             # Note that this is not blocking.
@@ -2131,10 +2112,9 @@ class DynamicEngineCore(EngineCore):
         batch_queue_size = _safe_queue_size(self.batch_queue)
         input_queue_size = _safe_queue_size(self.input_queue)
         unfinished_requests = self.scheduler.get_num_unfinished_requests()
-        running_requests = self.scheduler.running_controller.get_total_length()
-        waiting_requests = self.scheduler.waiting_controller.get_total_length()
-        migration_in_process = (self.migration_in_process
-                                or not self._migration_done_event.is_set())
+        running_requests = len(self.scheduler.running)
+        waiting_requests = len(self.scheduler.waiting)
+        migration_in_process = not self._migration_done_event.is_set()
 
         is_idle = (unfinished_requests == 0 and batch_queue_size == 0
                    and input_queue_size == 0 and not self.engines_running
@@ -2153,117 +2133,9 @@ class DynamicEngineCore(EngineCore):
             "current_pp_layer_config": self.cur_pp_layer_config,
         }
 
-    def migrate_layer_v1(self, rank_from: int, rank_to: int, num_layers: int) -> list[EngineCoreOutputs]:
-        with self.engine_lock:
-            logger.info(f"migrating layer from {rank_from} to {rank_to} with {num_layers} layers")
-            start_time = time.time()
-            # First, we need to wait for all batch to be finished
-            assert self.batch_queue is not None
-            assert isinstance(self.scheduler, DynamicScheduler)
-            assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
-            engine_core_outputs = []
-            while not self.batch_queue.empty():
-                future, scheduler_output = self.batch_queue.get_nowait()
-                # Blocking until the first result is available.
-                model_output = future.result()
-                self.batch_queue.task_done()
-                engine_core_outputs.append(self.scheduler.update_from_output(
-                    scheduler_output, model_output))
-            drain_out_time = time.time()
-            self.scheduler.preempt_all_requests()
-            preempt_time = time.time()
-            # Release the kv cache
-            self.model_executor.release_kv_cache()
-            release_kv_cache_time = time.time()
-            # Doing the model layer weight migration 
-            layers, next_layer_config = \
-                get_new_layer_config_with_migration_action(
-                    rank_from,
-                    rank_to, 
-                    num_layers, 
-                    self.scheduler.pp_layer_config_status.get_cur_pp_layer_config()
-                    )
-            
-            self.model_executor.async_add_layers(rank_to, [layers])
-            self.model_executor.remove_layers(rank_from, [layers])
-            self.scheduler.update_layer_config(next_layer_config)
-            weight_migration_time = time.time()
-
-            # Reinitialize the kv cache
-            _, _, kv_cache_config = self._reinitialize_kv_caches(self.vllm_config)
-            reinitialize_kv_cache_time = time.time()
-            self.scheduler.re_initialize_kv_cache_manager(kv_cache_config)
-            end_time = time.time()
-
-            from datetime import timedelta
-
-            def format_duration(seconds):
-                return str(timedelta(seconds=seconds))
-
-            logger.info(f"drain_out_time: {format_duration(drain_out_time - start_time)}")
-            logger.info(f"preempt_time: {format_duration(preempt_time - drain_out_time)}")
-            logger.info(f"release_kv_cache_time: {format_duration(release_kv_cache_time - preempt_time)}")
-            logger.info(f"weight_migration_time: {format_duration(weight_migration_time - release_kv_cache_time)}")
-            logger.info(f"reinitialize_kv_cache_time: {format_duration(reinitialize_kv_cache_time - weight_migration_time)}")
-            logger.info(f"end_time: {format_duration(end_time - reinitialize_kv_cache_time)}")
-
-            return engine_core_outputs
-
-    def migrate_layers_v0(self, rank_from: int, rank_to: int, num_layers: int) -> Future:
-        assert False
-        logger.info(f"migrating layers from {rank_from} to {rank_to} with {num_layers} layers")
-        start = time.time()
-        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
-        assert isinstance(self.scheduler, DynamicScheduler)
-        assert self.scheduler.migration_status == MigrationStatus.NOT_MIGRATING
-        assert self.migration_status == MigrationStatus.NOT_MIGRATING
-        # Check if the memory is enough for the new layers
-
-        self.migration_status = MigrationStatus.MIGRATING
-        available_gpu_memory = self.model_executor.get_current_available_memory()[rank_to]
-        logger.info(f"available_gpu_memory: {available_gpu_memory}")
-        logger.info(f"self.kv_cache_size: {self.kv_cache_size}")
-        logger.info(f"self.kv_cache_num_blocks: {self.kv_cache_num_blocks}")
-        logger.info(f"num_layers: {num_layers}")
-        assert available_gpu_memory > self.kv_cache_size * num_layers
-
-        # Get the new layer configuration 
-        layers, next_layer_config = get_new_layer_config_with_migration_action(rank_from, 
-                                                                       rank_to, 
-                                                                       num_layers, 
-                                                                       self.scheduler.pp_layer_config_status.get_cur_pp_layer_config())
-        self.migrating_layers = layers
-        self.rank_from = rank_from
-        self.model_executor.add_layers(rank_to, layers)
-        # Get the kv cache spec for the new layers
-        kv_cache_spec = self.model_executor.get_kv_cache_spec_for_layers(rank_to, layers)
-        self.model_executor.initialize_kv_cache_for_layers(rank_to, 
-            kv_cache_spec, 
-            self.kv_cache_size, 
-            self.kv_cache_num_blocks, 
-            layers)
-
-        # Start migration process in the scheduler
-        future = self.scheduler.v1_start_migration(next_layer_config)
-        end = time.time()
-        logger.info(f"Added layers to {rank_to} took {end - start} seconds")
-        return future
-
     def execute_model(self, scheduler_output: SchedulerOutput):
         with self.engine_lock:
             return super().execute_model(scheduler_output)
-
-    def done_migration(self):
-        assert False
-        assert self.migration_status == MigrationStatus.MIGRATING
-        assert self.migrating_layers is not None
-        assert self.rank_from is not None
-        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
-        self.model_executor.remove_layers(self.rank_from, self.migrating_layers)
-        self.model_executor.release_kv_cache_for_layers(self.rank_from, self.migrating_layers)
-        self.migration_status = MigrationStatus.NOT_MIGRATING
-        self.layers_to_be_removed = None
-        self.rank_from = None
 
     def _compact_kv_cache(self, compacted_length: int, bitmap: bitarray):
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
@@ -2354,7 +2226,6 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             threading.Thread(target=self.migration_thread, daemon=True).start()
             threading.Thread(target=self.stress_tester_thread, daemon=True).start()
             threading.Thread(target=self.metrics_thread, daemon=True).start()
-            threading.Thread(target=self.test_kv_cache_compact_thread, daemon=True).start()
             logger.info(f"kv cache config: {self.vllm_config.cache_config}")
         finally:
             if input_socket is not None:
@@ -2599,27 +2470,6 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                     # Keep at most 2 buffers to reuse.
                     reuse_buffers.append(buffer)
 
-    def migration_thread_rr(self):
-        assert False
-        if self.vllm_config.dynamic_config.is_migration:
-            migration_interval = envs.MIGRATION_INTERVAL
-            assert migration_interval > 0
-            step = 0
-            while True:
-                logger.info(f"sleep for {migration_interval} seconds")
-                time.sleep(migration_interval)
-                if step % 2 == 0:
-                    engine_core_outputs = self.migrate_layer_v0(0, 1, 10)
-                else:
-                    engine_core_outputs = self.migrate_layer_v0(1, 0, 10)
-                if engine_core_outputs is not None:
-                    for output in engine_core_outputs:
-                        self.output_queue.put_nowait(output)
-                step += 1
-        else:
-            logger.info(f"is_migration is not set, skipping migration")
-            return
-
     def stress_tester_thread(self):
         """Thread to start memory stress tester at specified request count."""
         import os
@@ -2653,14 +2503,10 @@ class DynamicEngineCoreProc(DynamicEngineCore):
 
     def migration_thread(self):
         import os
-        from collections import deque
 
         if not self.vllm_config.dynamic_config.is_migration:
             logger.info("is_migration is not set, skipping migration")
             return
-
-        # --- sliding window settings ---
-        WINDOW = 50 
 
         num_of_requests = 0 
         # Start from 0: alternative_configs now represents migration targets only
@@ -2730,37 +2576,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
 
                 else:
                     logger.warning(f"migration_thread: cur_config {cur_config} not found in alternative_configs, skipping migration")
-                # outputs = self.migrate_layer_v1(1, 0, 24)
-                # logger.info("debug-------- engineoutput when migration: " + str(outputs))
-                # for output in outputs:
-                #     self.output_queue.put_nowait(output)
 
-    def test_kv_cache_compact_thread(self):
-        return
-        import os
-        assert isinstance(self.scheduler, DynamicScheduler)
-        if not self.vllm_config.dynamic_config.is_compact_kv:
-            logger.info("is_compact_kv is not set, skipping migration")
-            return
-
-        compact_steps = set(self.migration_config.compact_steps)
-        logger.info(f"compact kv when steps: {compact_steps}")
-        assert len(compact_steps) > 0, "compact_steps must be set"
-
-        num_of_requests = 0
-        while True:
-            num_of_requests += self.request_num_queue.get()
-            logger.info("num_of_requests: " + str(num_of_requests))
-            if num_of_requests in compact_steps:
-                logger.info("compact kv cache")
-                num_kv_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
-                kv_cache_ratio = self.scheduler.get_kv_cache_utilization()
-                if kv_cache_ratio >= 0.9:
-                    continue
-                compact_ratio = kv_cache_ratio + 0.1
-                compacted_length = int(compact_ratio * num_kv_blocks)
-                bitmap = self.scheduler.shrink_block_pool(compacted_length)
-                self._compact_kv_cache(compacted_length, bitmap)
     def metrics_thread(self):
         while True:
             metrics = self.metrics_queue.get()
