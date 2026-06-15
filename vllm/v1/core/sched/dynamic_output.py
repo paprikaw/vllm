@@ -1,7 +1,6 @@
 
 from dataclasses import dataclass
-from operator import is_
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import Any, Optional, Tuple
 from .output import NewRequestData, CachedRequestData
 import numpy as np
 import numpy.typing as npt
@@ -63,9 +62,6 @@ class DynamicSchedulerOutput():
     #   with different configurations.
     pp_layer_config: list[Tuple[int, int]]
     
-    # Whether the scheduling output is from before the migration was started.  
-    request_queue_id: int
-
     current_scheduler_output_version: int
 
     
