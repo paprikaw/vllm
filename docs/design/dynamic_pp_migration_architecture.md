@@ -1,8 +1,3 @@
----
-title: Dynamic Pipeline-Parallel Reconfiguration
----
-[](){ #dynamic-pp-migration-architecture }
-
 # Dynamic Pipeline-Parallel Reconfiguration
 
 This document describes an experimental extension to vLLM V1 that makes the
@@ -45,7 +40,7 @@ therefore distinguishes between the upstream component being extended, such as
 reconfiguration behavior, such as `DynamicScheduler`.
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph U["Existing vLLM V1 execution structure"]
         direction TB
         Engine["V1 EngineCore"]
