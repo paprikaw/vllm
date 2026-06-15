@@ -34,6 +34,7 @@ from vllm.vllm_flash_attn import (flash_attn_varlen_func,
                                   flash_attn_with_kvcache)
 from vllm.v1.attention.backends.flash_attn import (FlashAttentionBackend, FlashAttentionImpl,FlashAttentionMetadata)
 from vllm.vllm_flash_attn.flash_attn_interface import flexi_flash_attn_varlen_func, flexi_direct_flash_attn_varlen_func, prepare_flexi_kv_ptrs
+from vllm.kvcached_integration import use_flexi_kv_for_runtime
 if TYPE_CHECKING:
     from vllm.worker.model_runner import (ModelInputForGPUBuilder,
                                           ModelInputForGPUWithSamplingMetadata)
@@ -48,7 +49,7 @@ class FlexiFlashAttentionBackend(FlashAttentionBackend):
         vllm_config = get_current_vllm_config()
         # Both 'flexi' and 'direct' kernels use FlexiFlashAttentionImpl;
         # 'flash' uses the standard FlashAttentionImpl.
-        if vllm_config.dynamic_config.use_flexi_kv:
+        if use_flexi_kv_for_runtime(vllm_config):
             return FlexiFlashAttentionImpl
         return FlashAttentionImpl
 

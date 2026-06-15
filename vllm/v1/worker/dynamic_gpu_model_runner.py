@@ -41,6 +41,10 @@ from vllm.v1.utils import dynamic_bind_kv_cache, dynamic_bind_single_kv_tensor
 from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput, EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.kvcached_integration import (
+    use_direct_ptr_for_runtime,
+    use_flexi_kv_for_runtime,
+)
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.block_table import PtrTable
@@ -290,7 +294,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # This runs asynchronously on GPU using efficient index_select operations
         k_ptr_tables_tensor = None
         v_ptr_tables_tensor = None
-        if self.vllm_config.dynamic_config.use_direct_ptr:
+        if use_direct_ptr_for_runtime(self.vllm_config):
             num_reqs = self.input_batch.num_reqs
             
             # PtrTable should already be initialized via commit_ptr_tables()
@@ -1438,7 +1442,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         logger.info(f"[KV Alloc] block_token_num={block_token_num}, effective_block_token_num={effective_block_token_num}, "
                     f"VMM_MIN_TOKENS_PER_BLOCK={VMM_MIN_TOKENS_PER_BLOCK}, "
                     f"use_vmm_combined={use_vmm_combined}, layer_group_granularity={layer_group_granularity}")
-        
+
         # Track VMM handles for fine-grained 2MB release
         # For combined mode: one handle per KV pair (stored in key_handles, value_handles empty)
         # For combined_layers mode: handles are shared across layer groups
@@ -1539,7 +1543,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             self.page_meta,
             self.k_ptr_tensors,
             self.v_ptr_tensors,
-            use_direct_ptr=self.vllm_config.dynamic_config.use_direct_ptr,
+            use_direct_ptr=use_direct_ptr_for_runtime(self.vllm_config),
         )
         
         # Store VMM handles after binding (order matches self.key_caches/value_caches)
@@ -1564,7 +1568,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
             return
         
         # Initialize PtrTable stacked tensors after binding all KV caches (direct mode only)
-        if self.vllm_config.dynamic_config.use_direct_ptr:
+        if use_direct_ptr_for_runtime(self.vllm_config):
             self.commit_ptr_tables(self.k_ptr_tensors, self.v_ptr_tensors, is_first_time=True)
         
         del kv_caches
@@ -1890,7 +1894,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         def is_used(idx):
             return bitmap[idx]
         migrate_record: dict[int, int] = {}
-        if self.vllm_config.dynamic_config.use_flexi_kv:
+        if use_flexi_kv_for_runtime(self.vllm_config):
             compact_cache_with_record(self._migrate_block_by_swapping_ptrs, is_used, compacted_length, num_blocks, migrate_record)
             # After swapping tensor references in Python lists, we must update the GPU pointer arrays
             # because prepare_flexi_kv_ptrs caches the data_ptr() of each tensor on GPU.

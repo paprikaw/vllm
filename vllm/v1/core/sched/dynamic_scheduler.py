@@ -17,6 +17,7 @@ from bitarray import bitarray
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.kvcached_integration import use_flexi_kv_for_runtime
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.dynamic_config import PPLayerConfigs
 from vllm.distributed.kv_events import EventPublisherFactory
@@ -226,7 +227,7 @@ class DynamicScheduler(Scheduler):
             self.migration_in_process = True
             self.sender_list_during_migration = set(sender_list) 
             self.receiver_list_during_migration = set(receiver_list)
-            is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+            is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
             if should_increase_scheduler_output_version:
                 self.cur_scheduler_output_version += 1
             if is_flexi:

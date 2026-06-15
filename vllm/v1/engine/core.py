@@ -20,6 +20,7 @@ import zmq
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
+from vllm.kvcached_integration import maybe_apply_kvcached_vllm_patches
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
@@ -59,6 +60,7 @@ class EngineCore:
                  log_stats: bool,
                  executor_fail_callback: Optional[Callable] = None):
         assert vllm_config.model_config.runner_type != "pooling"
+        maybe_apply_kvcached_vllm_patches("EngineCore init")
 
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
