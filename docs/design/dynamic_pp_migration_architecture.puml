@@ -1,0 +1,172 @@
+@startuml DynamicPPMigrationArchitecture
+title vLLM V1 Dynamic Pipeline-Parallel Reconfiguration Architecture
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam wrapWidth 220
+skinparam maxMessageSize 180
+
+skinparam package {
+  BackgroundColor<<upstream>> #EEF3FF
+  BorderColor<<upstream>> #6B7FD7
+  BackgroundColor<<extension>> #FFF4E6
+  BorderColor<<extension>> #D9822B
+  BackgroundColor<<runtime>> #EAF7EA
+  BorderColor<<runtime>> #4E9A51
+}
+
+skinparam component {
+  BackgroundColor #FFFFFF
+  BorderColor #555555
+}
+
+legend right
+  |= Color |= Meaning |
+  | <back:#EEF3FF>    </back> | Existing vLLM V1 execution structure |
+  | <back:#FFF4E6>    </back> | Dynamic PP / migration extension |
+  | <back:#EAF7EA>    </back> | Runtime state transfer and execution |
+endlegend
+
+package "Existing vLLM V1 structure" <<upstream>> {
+  [V1 EngineCore] as UpstreamEngine
+  [V1 Scheduler] as UpstreamScheduler
+  [Ray Distributed Executor] as UpstreamExecutor
+  [GPU Worker / ModelRunner] as UpstreamWorker
+  [KV Cache] as KVCache
+
+  UpstreamEngine --> UpstreamScheduler : schedule requests
+  UpstreamEngine --> UpstreamExecutor : execute batches
+  UpstreamExecutor --> UpstreamWorker : run model
+  UpstreamWorker --> KVCache : read/write KV
+}
+
+package "Dynamic PP reconfiguration extension" <<extension>> {
+  [DynamicConfig\n- pp layout\n- migration steps\n- autoscaling flags] as DynamicConfig
+  [DynamicEngineCore\nRuntime layout manager] as DynamicEngine
+  [DynamicScheduler\nSingle active PP layout] as DynamicScheduler
+  [DynamicSchedulerOutput\nBatch-local PP layout\nMigration metadata] as DynamicOutput
+  [DynamicRayDistributedExecutor\nRuntime PP routing\nNo compiled DAG] as DynamicExecutor
+  [DynamicGPUWorker\nLayer assignment\nKV state transfer] as DynamicWorker
+}
+
+package "Runtime migration data plane" <<runtime>> {
+  [Dynamic Model\nLayer assignment] as DynamicModel
+  [KV Synchronizer\nKV patch send/apply] as KVSynchronizer
+  [Runtime PP topology\nPer-batch active ranks] as PPRouting
+}
+
+DynamicConfig --> DynamicEngine : initial layout,\ntarget layouts,\ntrigger policy
+
+DynamicEngine -up-|> UpstreamEngine
+DynamicScheduler -up-|> UpstreamScheduler
+DynamicExecutor -up-|> UpstreamExecutor
+DynamicWorker -up-|> UpstreamWorker
+
+DynamicEngine --> DynamicScheduler : current layout\npending target layout
+DynamicScheduler --> DynamicOutput : scheduled batch +\npp_layer_config
+DynamicOutput --> DynamicExecutor : execute with\nbatch-local layout
+DynamicExecutor --> DynamicWorker : add/remove layers\nstart/finalize migration\nresize KV
+DynamicWorker --> DynamicModel : change layer assignment
+DynamicWorker --> KVSynchronizer : send/apply KV patches
+KVSynchronizer --> KVCache : migrate KV state
+DynamicExecutor --> PPRouting : activate/deactivate ranks\nroute PP messages
+PPRouting --> DynamicWorker : forward batch through\nselected active ranks
+
+DynamicWorker --> DynamicExecutor : applied tokens,\nall_patch_applied,\nresize_done
+DynamicExecutor --> DynamicEngine : migration state
+DynamicEngine --> DynamicScheduler : switch active layout\nat sync boundary
+
+note right of DynamicEngine
+Main external abstraction:
+
+change_configuration(target_pp_layout)
+
+This may be implemented with sync,
+async, async_fast, or baseline strategy.
+end note
+
+note bottom of DynamicScheduler
+Important structural choice:
+
+The scheduler does not run two request queues.
+It keeps one active PP layout.
+The target layout is only a pending transition
+until the sync boundary batch is emitted.
+end note
+
+note bottom of DynamicOutput
+Each scheduled batch carries its own PP layout.
+Old-layout batches can finish naturally.
+New-layout batches start after the consistency boundary.
+end note
+
+note right of KVSynchronizer
+Migration correctness depends on coordinating:
+
+1. Layer assignment
+2. KV state transfer
+
+Changing layer assignment alone is not sufficient.
+The corresponding KV state must move as well.
+end note
+
+note right of DynamicExecutor
+This path intentionally does not use
+a compiled DAG for PP execution.
+
+The active PP stages and their
+connections are derived at runtime
+from the batch-local PP layout.
+end note
+
+note bottom of PPRouting
+Autoscaling is represented as PP reconfiguration
+where some ranks have empty layer ranges.
+Only non-empty ranks are active for new batches.
+end note
+
+@enduml
+
+@startuml DynamicPPMigrationSequence
+title Runtime PP Reconfiguration / Migration Flow
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 180
+
+actor "Control API / migration_thread" as Control
+participant "DynamicEngineCore" as Engine
+participant "DynamicScheduler" as Scheduler
+participant "DynamicRayDistributedExecutor" as Executor
+participant "DynamicGPUWorker" as Worker
+participant "KV Synchronizer" as KVSync
+
+Control -> Engine : change_configuration(target_pp_layout)
+Engine -> Engine : compare current and target layouts
+Engine -> Executor : prepare target layer assignment
+Executor -> Worker : load layers needed by target layout
+Engine -> Executor : start KV migration plan
+Executor -> Worker : install sender/receiver migration state
+
+loop old-layout batches continue
+  Engine -> Scheduler : schedule()
+  Scheduler --> Engine : batch with old pp_layer_config
+  Engine -> Executor : execute(batch)
+  Executor -> Worker : forward using batch-local PP layout
+  Worker -> KVSync : publish/apply KV patches
+end
+
+Engine -> Scheduler : request pending layout switch
+Engine -> Scheduler : schedule sync-boundary batch
+Scheduler --> Engine : batch with is_sync_after_migration
+Scheduler -> Scheduler : update active PP layout to target
+
+Engine -> Executor : execute sync-boundary batch
+Executor -> Worker : finalize migration boundary
+Worker -> KVSync : ensure all patches applied
+Worker -> Worker : cleanup old layers / resize KV if needed
+Executor --> Engine : migration finalized
+
+Engine -> Scheduler : resume scheduling with target layout
+
+@enduml
