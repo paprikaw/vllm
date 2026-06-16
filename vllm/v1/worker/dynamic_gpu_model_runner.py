@@ -42,8 +42,10 @@ from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput, EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.kvcached_integration import (
+    get_kvcached_layer_tensor_view,
     use_direct_ptr_for_runtime,
     use_flexi_kv_for_runtime,
+    use_kvcached_backend,
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -209,9 +211,18 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                 dtype = kv_cache_spec.dtype
                 logger.info(f"layer_name: {layer_name}, kv_cache_shape: {kv_cache_shape}, dtype: {dtype}")
-                kv_caches[layer_name] = torch.zeros(kv_cache_shape,
-                                                    dtype=dtype,
-                                                    device=self.device)
+                if (use_kvcached_backend()
+                        and getattr(self, "_kvcached_kv_tensors", None)):
+                    kv_caches[layer_name] = get_kvcached_layer_tensor_view(
+                        self, layer_name, num_blocks)
+                    layer_names = getattr(self, "_kvcached_layer_names", None)
+                    if layer_names is not None and layer_name not in layer_names:
+                        layer_names.append(layer_name)
+                        layer_names.sort(key=extract_layer_index)
+                else:
+                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
+                                                        dtype=dtype,
+                                                        device=self.device)
                 dynamic_bind_single_kv_tensor(
                     layer_index=layer_index,
                     start_layer=self.kv_cache_start_layer,
@@ -296,59 +307,66 @@ class DynamicGPUModelRunner(GPUModelRunner):
         v_ptr_tables_tensor = None
         if use_direct_ptr_for_runtime(self.vllm_config):
             num_reqs = self.input_batch.num_reqs
-            
-            # PtrTable should already be initialized via commit_ptr_tables()
-            # called during dynamic_initialize_kv_cache_flexi or finish_migration
-            if self.k_ptr_table is None or self.v_ptr_table is None:
-                if self.k_ptr_tensors and self.v_ptr_tensors:
-                    start_layer = getattr(
-                        self, "kv_cache_start_layer",
-                        getattr(self.model.model, "start_layer", 0))
-                    logger.info(
-                        "PtrTable missing before first active forward; "
-                        "committing %d layers with start_layer=%d",
-                        len(self.k_ptr_tensors), start_layer)
-                    self.commit_ptr_tables(
-                        self.k_ptr_tensors,
-                        self.v_ptr_tensors,
-                        target_start_layer=start_layer)
-                else:
-                    raise RuntimeError(
-                        f"PtrTable not initialized. "
-                        "Ensure commit_ptr_tables() is called after KV cache initialization."
-                    )
+            sched_start, sched_end = self.model.get_sched_layers()
+            has_scheduled_layers = sched_end > sched_start
+
+            if not has_scheduled_layers:
+                logger.debug(
+                    "Skipping PtrTable update for zero-layer rank "
+                    "with scheduled range [%d, %d)", sched_start, sched_end)
             else:
-                sched_start, sched_end = self.model.get_sched_layers()
-                ptr_start = self._ptr_table_start_layer
-                ptr_end = ptr_start + self.k_ptr_table.num_layers
-                if sched_start < ptr_start or sched_end > ptr_end:
-                    target_start = getattr(
-                        self, "kv_cache_start_layer",
-                        getattr(self.model.model, "start_layer", 0))
-                    logger.info(
-                        "PtrTable range [%d, %d) does not cover scheduled "
-                        "layers [%d, %d); recommitting %d layers with "
-                        "start_layer=%d",
-                        ptr_start, ptr_end, sched_start, sched_end,
-                        len(self.k_ptr_tensors), target_start)
-                    self.commit_ptr_tables(
-                        self.k_ptr_tensors,
-                        self.v_ptr_tensors,
-                        target_start_layer=target_start)
             
-            # Use the committed PtrTable's num_layers, NOT len(k_ptr_tensors)
-            # During migration, k_ptr_tensors may have been extended with new layer slots,
-            # but only the committed layers should participate in inference.
-            # The new layers will become active after commit_ptr_tables() is called
-            # at the end of migration (in finish_migration).
-            
-            # Get the block_table from input_batch (it's already on GPU after commit)
-            block_table = self.input_batch.block_table[0].get_device_tensor()
-            
-            # Update ptr_tables using efficient GPU operations
-            k_ptr_tables_tensor = self.k_ptr_table.update_from_block_table_and_ptr_tensors(
-                block_table, self.k_ptr_tensors, num_reqs)
-            v_ptr_tables_tensor = self.v_ptr_table.update_from_block_table_and_ptr_tensors(block_table, self.v_ptr_tensors, num_reqs)
+                # PtrTable should already be initialized via commit_ptr_tables()
+                # called during dynamic_initialize_kv_cache_flexi or finish_migration
+                if self.k_ptr_table is None or self.v_ptr_table is None:
+                    if self.k_ptr_tensors and self.v_ptr_tensors:
+                        start_layer = getattr(
+                            self, "kv_cache_start_layer",
+                            getattr(self.model.model, "start_layer", 0))
+                        logger.info(
+                            "PtrTable missing before first active forward; "
+                            "committing %d layers with start_layer=%d",
+                            len(self.k_ptr_tensors), start_layer)
+                        self.commit_ptr_tables(
+                            self.k_ptr_tensors,
+                            self.v_ptr_tensors,
+                            target_start_layer=start_layer)
+                    else:
+                        raise RuntimeError(
+                            f"PtrTable not initialized. "
+                            "Ensure commit_ptr_tables() is called after KV cache initialization."
+                        )
+                else:
+                    ptr_start = self._ptr_table_start_layer
+                    ptr_end = ptr_start + self.k_ptr_table.num_layers
+                    if sched_start < ptr_start or sched_end > ptr_end:
+                        target_start = getattr(
+                            self, "kv_cache_start_layer",
+                            getattr(self.model.model, "start_layer", 0))
+                        logger.info(
+                            "PtrTable range [%d, %d) does not cover scheduled "
+                            "layers [%d, %d); recommitting %d layers with "
+                            "start_layer=%d",
+                            ptr_start, ptr_end, sched_start, sched_end,
+                            len(self.k_ptr_tensors), target_start)
+                        self.commit_ptr_tables(
+                            self.k_ptr_tensors,
+                            self.v_ptr_tensors,
+                            target_start_layer=target_start)
+
+                # Use the committed PtrTable's num_layers, NOT len(k_ptr_tensors)
+                # During migration, k_ptr_tensors may have been extended with new layer slots,
+                # but only the committed layers should participate in inference.
+                # The new layers will become active after commit_ptr_tables() is called
+                # at the end of migration (in finish_migration).
+
+                # Get the block_table from input_batch (it's already on GPU after commit)
+                block_table = self.input_batch.block_table[0].get_device_tensor()
+
+                # Update ptr_tables using efficient GPU operations
+                k_ptr_tables_tensor = self.k_ptr_table.update_from_block_table_and_ptr_tensors(
+                    block_table, self.k_ptr_tensors, num_reqs)
+                v_ptr_tables_tensor = self.v_ptr_table.update_from_block_table_and_ptr_tensors(block_table, self.v_ptr_tensors, num_reqs)
         # Get the number of scheduled tokens for each request.
         req_ids = self.input_batch.req_ids
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]

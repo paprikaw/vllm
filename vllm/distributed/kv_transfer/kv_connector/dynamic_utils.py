@@ -124,6 +124,20 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
         trimmed_slot_mapping = slot_mapping.index_select(0, valid_indices)
         
         logger.info(f"debug-------------------- Original T: {slot_mapping.numel()}, Valid T: {num_valid}")
+        slot_min = int(trimmed_slot_mapping.min().item())
+        slot_max = int(trimmed_slot_mapping.max().item())
+        flat_capacity = int(k0.size(0))
+        logger.info(
+            "KV patch slot range: patch_id=%s layers=%s slots=[%s,%s] "
+            "flat_capacity=%s",
+            patch_id, list(map(int, layer_ids)), slot_min, slot_max,
+            flat_capacity)
+        if slot_min < 0 or slot_max >= flat_capacity:
+            raise IndexError(
+                "KV patch slot mapping is out of bounds: "
+                f"patch_id={patch_id}, layers={list(map(int, layer_ids))}, "
+                f"slot_min={slot_min}, slot_max={slot_max}, "
+                f"flat_capacity={flat_capacity}")
         
         # Preallocate KV tensor [2, L, T_valid, H, D] 只分配有效token的空间
         L = len(layer_ids)

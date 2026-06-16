@@ -437,6 +437,15 @@ class DynamicKVSynchronizer():
         self.key_cache_ptrs = []
         self.value_cache_ptrs = []
         self.kv_cache_start_layer = 0
+
+    def _sync_kvcached_stream(self, reason: str) -> None:
+        if not use_kvcached_backend():
+            return
+        sync_start = time.time()
+        current_stream().synchronize()
+        logger.info(
+            "KVCacheD synchronized CUDA stream after %s, took %.6fs",
+            reason, time.time() - sync_start)
     
     def get_nccl_lock(self) -> threading.Lock:
         """Return the NCCL lock for external use (e.g., Ray compiled_dag)."""
@@ -866,6 +875,7 @@ class DynamicKVSynchronizer():
                                 f"num_key_cache_ptrs={len(key_cache_ptrs)}")
                         # 填充到 kv_out[0][idx] (keys) 和 kv_out[1][idx] (values)
                         ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[0][idx], kv_out[1][idx], block_size)
+                self._sync_kvcached_stream("flexi KV patch gather")
             yield KVPatch(
                 KVPatchMeta(
                     type='kv_patch_meta' if not is_finished else "kv_patch_finished",
@@ -909,6 +919,7 @@ class DynamicKVSynchronizer():
                     slot_mapping=slot_mapping_dev,
                     is_finished=is_finished
                 )
+                self._sync_kvcached_stream("regular KV patch gather")
             kv_patch.meta.num_tokens = stored_tokens
             yield kv_patch
             self.last_patch_ids[rank] += 1
@@ -955,14 +966,23 @@ class DynamicKVSynchronizer():
                             ) -> Tuple[KVTensorMeta, torch.Tensor]:
         local_layer_id = layer_id - start_layer_id
         kv_cache = kv_caches[local_layer_id]
-        if (use_kvcached_backend() and logical_num_blocks is not None
-                and kv_cache.dim() == 5 and kv_cache.size(0) == 2
-                and 0 < logical_num_blocks < kv_cache.size(1)):
-            logger.info(
-                "KVCacheD migration sends logical KV window for layer %s: "
-                "blocks %s -> %s",
-                layer_id, kv_cache.size(1), logical_num_blocks)
-            kv_cache = kv_cache[:, :logical_num_blocks, ...].contiguous()
+        if (use_kvcached_backend() and kv_cache.dim() == 5
+                and kv_cache.size(0) == 2):
+            send_num_blocks = kv_cache.size(1)
+            if logical_num_blocks is not None:
+                send_num_blocks = min(logical_num_blocks, send_num_blocks)
+            if 0 < send_num_blocks <= kv_cache.size(1):
+                if send_num_blocks != kv_cache.size(1):
+                    logger.info(
+                        "KVCacheD migration sends logical KV window for layer "
+                        "%s: blocks %s -> %s",
+                        layer_id, kv_cache.size(1), send_num_blocks)
+                logger.info(
+                    "KVCacheD migration materializes sender snapshot for "
+                    "layer %s: shape=%s, send_blocks=%s",
+                    layer_id, tuple(kv_cache.shape), send_num_blocks)
+                kv_cache = kv_cache[:, :send_num_blocks, ...].contiguous()
+                self._sync_kvcached_stream("regular KV tensor snapshot")
         # 第一次访问时默认置为 False，避免 KeyError
         return KVTensorMeta(
             type='kv_tensor',
@@ -1596,4 +1616,5 @@ class DynamicKVSynchronizer():
                     kv_cache = self.kv_caches[local_layer_id]
                     # 使用裁剪后的 slot_mapping，从 0 到 num_tokens
                     self.kv_helper.put_kv_to_cache(self.model_executable, key, value, layer_id, kv_cache, slot_mapping, 0, slot_mapping.size(0))
+            self._sync_kvcached_stream("KV patch apply")
         return meta.id

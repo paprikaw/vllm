@@ -93,6 +93,21 @@ class model_aware_kv_ops_helper:
             # To avoid this, if the input dtype matches the kv cache storage
             # dtype, directly scatter-copy into the flattened cache.
             key_cache, value_cache = kv_cache[0], kv_cache[1]
+            tgt_slot = slot_mapping[start_pos:end_pos]
+            if tgt_slot.numel() > 0:
+                slot_min = int(tgt_slot.min().item())
+                slot_max = int(tgt_slot.max().item())
+                flat_capacity = int(key_cache.reshape(
+                    -1, key_cache.shape[-2], key_cache.shape[-1]).size(0))
+                logger.info(
+                    "KV patch apply slot range: layer=%s slots=[%s,%s] "
+                    "flat_capacity=%s",
+                    layer, slot_min, slot_max, flat_capacity)
+                if slot_min < 0 or slot_max >= flat_capacity:
+                    raise IndexError(
+                        "KV patch apply slot mapping is out of bounds: "
+                        f"layer={layer}, slot_min={slot_min}, "
+                        f"slot_max={slot_max}, flat_capacity={flat_capacity}")
             # tgt_slot = slot_mapping[start_pos:end_pos]
             # Fast path: direct copy when dtypes already match storage.
             # if keys.dtype == key_cache.dtype and values.dtype == value_cache.dtype:

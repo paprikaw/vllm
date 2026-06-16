@@ -22,9 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import FlexiKVTenso
 # from vllm.kv_allocator import allocate_with_cuda_async, free_cache, free_page_list, prepare_flexi_kv_ptrs
 from vllm.kv_allocator import kv_allocator
 from vllm.kvcached_integration import (
+    materialize_kvcached_received_kv_tensor,
     maybe_apply_kvcached_vllm_patches,
     use_direct_ptr_for_runtime,
     use_flexi_kv_for_runtime,
+    use_kvcached_backend,
 )
 from vllm.logger import init_logger
 from vllm.lora import layers
@@ -1376,6 +1378,18 @@ class DynamicGPUWorker(Worker):
                 kv_cache for idx, kv_cache in enumerate(self.dynamic_kv_synchronizer.kv_caches) 
                 if not any(idx in range(layers[0]-start_layer, layers[1]-start_layer+1) for layers in layers_list)
             ]
+            if use_kvcached_backend():
+                deleted_layers = {
+                    layer for layers in layers_list
+                    for layer in range(layers[0], layers[1] + 1)
+                }
+                layer_names = getattr(self.model_runner,
+                                      "_kvcached_layer_names", None)
+                if layer_names is not None:
+                    self.model_runner._kvcached_layer_names = [
+                        name for name in layer_names
+                        if extract_layer_index(name) not in deleted_layers
+                    ]
         new_start_layer = self._kv_cache_start_after_deleting_layers(
             start_layer, layers_list)
         self._set_kv_cache_start_layer(new_start_layer,
@@ -3439,6 +3453,16 @@ class DynamicGPUWorker(Worker):
                 else:
                     # dynamic_bind_single_kv_tensor内部不使用所，因此我们需要在外面加锁
                     with self.model_runner.forward_lock:
+                        bind_kv_tensor = kv_tensor
+                        if use_kvcached_backend():
+                            receiver_start_layer = self._kv_cache_start_layer()
+                            bind_kv_tensor = (
+                                materialize_kvcached_received_kv_tensor(
+                                    self.model_runner,
+                                    layer_id,
+                                    receiver_start_layer,
+                                    self.block_num,
+                                    kv_tensor))
                         dynamic_bind_single_kv_tensor(
                             layer_id,
                             self._kv_cache_start_layer(),
@@ -3446,7 +3470,7 @@ class DynamicGPUWorker(Worker):
                             self.compilation_config.static_forward_context,
                             self.dynamic_kv_synchronizer,
                             runner=self.model_runner,
-                            kv_tensor=kv_tensor
+                            kv_tensor=bind_kv_tensor
                         )
                 tmp_kv_tensors_dict.pop(layer_id)
             sync_start = time.time()

@@ -1,0 +1,169 @@
+// SPDX-FileCopyrightText: Copyright contributors to the kvcached project
+// SPDX-License-Identifier: Apache-2.0
+
+#include <fcntl.h>
+#include <cstring>
+#include <sys/mman.h>
+
+#include "constants.hpp"
+#include "cuda_utils.hpp"
+#include "ftensor.hpp"
+#include "page.hpp"
+
+namespace kvcached {
+
+static std::atomic<size_t> g_vaddr_allocated_offset = 0;
+
+static inline generic_ptr_t alloc_virtual_mem(const torch::Device &dev,
+                                              size_t size) {
+  size_t alignment_2mb = 2 * 1024 * 1024;
+  ASSERT(size % alignment_2mb == 0,
+         "alloc size not aligned."); // Ensure alignment.
+
+  generic_ptr_t vaddr;
+  size_t offset = g_vaddr_allocated_offset.fetch_add(size);
+  if (dev.is_cuda()) {
+    CHECK_DRV(cuMemAddressReserve(reinterpret_cast<CUdeviceptr *>(&vaddr), size,
+                                  alignment_2mb, kStartAddr + offset, 0ULL));
+  } else {
+    vaddr = mmap(reinterpret_cast<void *>(kStartAddr + offset), size,
+                 PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT(vaddr != MAP_FAILED, "mmap failed.");
+  }
+  // LOGE("Allocated virtual memory at %p", vaddr);
+  return vaddr;
+}
+
+static inline std::unique_ptr<Page> make_unique_page(const torch::Device &dev,
+                                                     page_id_t page_id,
+                                                     size_t page_size = 0) {
+  if (dev.is_cuda()) {
+    return std::make_unique<GPUPage>(page_id, dev.index(), page_size);
+  } else if (dev.is_cpu()) {
+    return std::make_unique<CPUPage>(page_id, page_size);
+  }
+  ASSERT(false, "Unsupported device type.");
+  return nullptr;
+}
+
+FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
+                 torch::Device dev, std::shared_ptr<Page> zero_page,
+                 size_t page_size)
+    : name_(name), vaddr_(nullptr), size_(size),
+      page_size_(page_size > 0 ? page_size : kPageSize), dtype_(dtype),
+      dev_(dev), zero_page_(zero_page) {
+  vaddr_ = alloc_virtual_mem(dev_, size_);
+  init_with_zero_();
+
+  auto num_elems = static_cast<int64_t>(size / torch::elementSize(dtype_));
+  auto options =
+      torch::TensorOptions().dtype(dtype_).device(dev_).requires_grad(false);
+  tensor_ =
+      torch::from_blob(reinterpret_cast<void *>(vaddr_), {num_elems}, options);
+}
+
+FTensor::~FTensor() {
+  if (vaddr_) {
+    CUresult res = cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr_), size_);
+    if (res != CUDA_SUCCESS) {
+      const char *err = nullptr;
+      (void)cuGetErrorString(res, &err);
+      LOGGER(ERROR, "cuMemUnmap during FTensor cleanup failed: %s",
+             err ? err : "unknown");
+    }
+    res = cuMemAddressFree(reinterpret_cast<CUdeviceptr>(vaddr_), size_);
+    if (res != CUDA_SUCCESS) {
+      const char *err = nullptr;
+      (void)cuGetErrorString(res, &err);
+      LOGGER(ERROR, "cuMemAddressFree during FTensor cleanup failed: %s",
+             err ? err : "unknown");
+    }
+  }
+  mapping_.clear(); // Free physical page handles after their mappings are gone.
+  zero_page_.reset();
+}
+
+bool FTensor::map(offset_t offset) {
+  assert(offset % page_size_ == 0); // Ensure alignment.
+
+  page_id_t page_id = offset / page_size_;
+  if (mapping_.find(page_id) != mapping_.end()) {
+    LOGGER(ERROR, "Page %ld is already mapped.", page_id);
+    return false;
+  }
+
+  auto vaddr = reinterpret_cast<generic_ptr_t>(
+      reinterpret_cast<uintptr_t>(vaddr_) + offset);
+  CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_));
+
+  mapping_[page_id] = make_unique_page(dev_, page_id, page_size_);
+  mapping_[page_id]->map(vaddr);
+  if (dev_.is_cuda()) {
+    CHECK_RT(cudaMemset(vaddr, 0, page_size_));
+  } else {
+    std::memset(vaddr, 0, page_size_);
+  }
+  return true;
+}
+
+bool FTensor::unmap(offset_t offset) {
+  assert(offset % page_size_ == 0); // Ensure alignment.
+
+  page_id_t page_id = offset / page_size_;
+  if (mapping_.find(page_id) == mapping_.end()) {
+    LOGGER(ERROR, "Page %ld is not mapped.", page_id);
+    return false;
+  }
+
+  auto vaddr = reinterpret_cast<generic_ptr_t>(
+      reinterpret_cast<uintptr_t>(vaddr_) + offset);
+  CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_));
+
+  // Map the zero page instead to ensure memory integrity.
+  map_(zero_page_.get(), offset);
+
+  mapping_.erase(page_id);
+  return true;
+}
+
+bool FTensor::map_(Page *page, offset_t offset, bool set_access) {
+  assert(offset % page_size_ == 0); // Ensure alignment.
+  assert(page);
+  auto vaddr =
+      reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(vaddr_) + offset);
+  return page->map(vaddr, set_access);
+}
+
+bool FTensor::set_access_(generic_ptr_t addr, size_t size) {
+  CUmemAccessDesc accessDesc_{
+      .location =
+          {
+              .type = CU_MEM_LOCATION_TYPE_DEVICE,
+              .id = dev_.index(),
+          },
+      .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+  };
+  CHECK_DRV(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(addr), size,
+                           &accessDesc_, 1));
+  return true;
+}
+
+bool FTensor::init_with_zero_() {
+  assert(reinterpret_cast<uintptr_t>(vaddr_) % page_size_ ==
+         0);                       // Ensure alignment.
+  assert(size_ % page_size_ == 0); // Ensure alignment.
+
+  bool succ = true;
+  for (size_t offset = 0; offset < size_; offset += page_size_) {
+    if (!map_(zero_page_.get(), offset, /* set_access = */ true)) {
+      succ = false;
+      break;
+    }
+  }
+  // if (succ)
+  //   set_access_(vaddr_, size_);
+
+  return succ;
+}
+
+} // namespace kvcached
