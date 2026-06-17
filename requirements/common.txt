@@ -3,6 +3,8 @@ cachetools
 psutil
 sentencepiece  # Required for LLaMA tokenizer.
 numpy
+posix_ipc>=1.0
+wrapt>=1.15
 requests >= 2.26.0
 tqdm
 blake3

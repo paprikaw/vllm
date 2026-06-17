@@ -25,6 +25,7 @@ from vllm.distributed.parallel_state import (
     get_pp_group, get_tp_group, graph_capture,
     prepare_communication_buffer_for_model)
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.kvcached_integration import use_direct_ptr_for_runtime
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model
@@ -521,9 +522,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # This runs asynchronously on GPU using efficient index_select operations
         k_ptr_tables_tensor = None
         v_ptr_tables_tensor = None
-        use_direct_ptr = (hasattr(self.vllm_config, 'dynamic_config') 
-                          and self.vllm_config.dynamic_config is not None
-                          and self.vllm_config.dynamic_config.use_direct_ptr)
+        use_direct_ptr = use_direct_ptr_for_runtime(self.vllm_config)
         if use_direct_ptr and self.k_ptr_tensors and self.v_ptr_tensors:
             num_reqs = self.input_batch.num_reqs
             

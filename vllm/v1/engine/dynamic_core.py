@@ -22,6 +22,12 @@ from bitarray import bitarray
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
+from vllm.kvcached_integration import (
+    commit_kvcached_physical_resize_if_needed,
+    maybe_apply_kvcached_vllm_patches,
+    use_kvcached_backend,
+    use_flexi_kv_for_runtime,
+)
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
@@ -75,6 +81,7 @@ class DynamicEngineCore(EngineCore):
                  migration_config: MigrationConfig,
                  executor_fail_callback: Optional[Callable] = None
                  ):
+        maybe_apply_kvcached_vllm_patches("DynamicEngineCore init")
 
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
@@ -442,6 +449,42 @@ class DynamicEngineCore(EngineCore):
             used_blocks)
         return True
 
+    def _verify_weight_memory_after_kv_resize(
+        self,
+        adding_per_rank: dict[int, list[Tuple[int, int]]],
+        context: str,
+    ) -> None:
+        """Temporarily verify worker-visible free memory before weight load."""
+        if not adding_per_rank:
+            return
+
+        mem_infos = self.model_executor.get_workers_mem_info()
+        failures: list[str] = []
+        for rank, layer_ranges in adding_per_rank.items():
+            adding_layers = sum(
+                hi - lo + 1 for lo, hi in layer_ranges)
+            if adding_layers <= 0:
+                continue
+            mem_info = mem_infos[rank]
+            required_weight_bytes = adding_layers * mem_info.layer_size
+            logger.info(
+                "[memory access] %s rank %s post-KV-resize free memory: "
+                "free=%.2f GiB, required_weight=%.2f GiB, "
+                "adding_layers=%s, layer_size=%.2f GiB",
+                context, rank, mem_info.free_mem / 1024**3,
+                required_weight_bytes / 1024**3, adding_layers,
+                mem_info.layer_size / 1024**3)
+            if required_weight_bytes > 0 and mem_info.free_mem < required_weight_bytes:
+                failures.append(
+                    f"rank {rank}: free={mem_info.free_mem} bytes, "
+                    f"required_weight={required_weight_bytes} bytes, "
+                    f"adding_layers={adding_layers}")
+
+        if failures:
+            raise RuntimeError(
+                f"{context}: KV resize did not free enough worker-visible "
+                "GPU memory for weight loading: " + "; ".join(failures))
+
     def _get_max_num_blocks(self, total_gpu_memory: int, weight_size_per_layer: int, page_size: int, num_layers: int, runtime_overhead: int = 0) -> int:
         """Calculate max number of KV blocks per layer.
         
@@ -769,6 +812,7 @@ class DynamicEngineCore(EngineCore):
         """
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
         assert isinstance(self.scheduler, DynamicScheduler)
+        is_kvcached = use_kvcached_backend()
         while True:
             time.sleep(0.3)
             resizing_done = self.model_executor.get_is_kv_resizing_done()
@@ -783,6 +827,15 @@ class DynamicEngineCore(EngineCore):
                         logger.info(
                             "[autoscaling async] scheduler block pool extended "
                             "from %s to %s after worker resize",
+                            current_blocks, resized_block_num)
+                    elif resized_block_num < current_blocks and is_kvcached:
+                        self.scheduler.shrink_block_pool(resized_block_num)
+                        commit_kvcached_physical_resize_if_needed(
+                            self.scheduler,
+                            "autoscaling async post-migration shrink")
+                        logger.info(
+                            "[autoscaling async] KVCacheD scheduler block "
+                            "pool shrunk from %s to %s after worker resize",
                             current_blocks, resized_block_num)
                     else:
                         logger.info(
@@ -1118,7 +1171,8 @@ class DynamicEngineCore(EngineCore):
         self.migration_status = MigrationStatus.MIGRATING
         self._migration_done_event.clear()  # signal that migration is in progress
         assert isinstance(self.scheduler, DynamicScheduler)
-        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+        is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
+        is_kvcached = use_kvcached_backend()
         fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
         enable_kv_resize = self.vllm_config.dynamic_config.enable_kv_resize
         # allow_resize is True only when both conditions are met:
@@ -1217,8 +1271,17 @@ class DynamicEngineCore(EngineCore):
 
             if allow_resize and need_compact:
                 time_start_compact_kv = time.time()
-                bitmap = self.scheduler.compact_kv_cache(compacted_length)
-                logger.info(f"[memory access] compacted_length for scheduler in {human_readable_duration(time.time() - time_start_compact_kv)}, compacted to: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
+                bitmap = None
+                if is_kvcached:
+                    logger.info(
+                        "[memory access] KVCacheD backend skips scheduler "
+                        "block compaction; physical pool target blocks=%s, "
+                        "maximum_kv_block_num_after_compact=%s",
+                        compacted_length,
+                        maximum_kv_block_num_after_compact)
+                else:
+                    bitmap = self.scheduler.compact_kv_cache(compacted_length)
+                    logger.info(f"[memory access] compacted_length for scheduler in {human_readable_duration(time.time() - time_start_compact_kv)}, compacted to: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
 
                 if compacted_length < original_length:
                     self.scheduler.shrink_block_pool(compacted_length)
@@ -1228,15 +1291,24 @@ class DynamicEngineCore(EngineCore):
         # with self.engine_lock:
         if allow_resize and need_compact:
             time_start_compact_kv = time.time()
-            self._compact_kv_cache(compacted_length, bitmap)
-            logger.info(f"[memory access] KV cache compacted to {compacted_length} blocks before adding layers")
-            logger.info(f"[timeline]: compact kv cache take: {human_readable_duration(time.time() - time_start_compact_kv)}")
+            if is_kvcached:
+                logger.info(
+                    "[memory access] KVCacheD backend skipped worker KV "
+                    "block compaction; trimming physical pool to %s blocks",
+                    compacted_length)
+            else:
+                assert bitmap is not None
+                self._compact_kv_cache(compacted_length, bitmap)
+                logger.info(f"[memory access] KV cache compacted to {compacted_length} blocks before adding layers")
+                logger.info(f"[timeline]: compact kv cache take: {human_readable_duration(time.time() - time_start_compact_kv)}")
 
             logger.info(f"important: when compacting kv cache, the kv cache size needs to be resized before migration")
 
             # 需要resize kv cache来进行migration，这里的resize一定是缩小
             # Only shrink when compacted_length < original_length (see sync path comment).
             if compacted_length < original_length:
+                commit_kvcached_physical_resize_if_needed(
+                    self.scheduler, "async pre-migration shrink")
                 self.model_executor.resize_kv_cache(
                     compacted_length,
                     ranks=pre_migration_resize_ranks)
@@ -1260,6 +1332,10 @@ class DynamicEngineCore(EngineCore):
             self._migration_done_event.set()
             return
 
+        commit_kvcached_physical_resize_if_needed(
+            self.scheduler, "async pre-weight trim")
+        self._verify_weight_memory_after_kv_resize(
+            adding_per_rank, "async migration")
         weight_loading_mode = self._dispatch_weight_loading(
             adding_per_rank, migration_kind="async")
         time_kv_compact_end = time.time()
@@ -1313,7 +1389,9 @@ class DynamicEngineCore(EngineCore):
         should_increase_version = allow_resize and need_compact
         slot_mapping = self.scheduler.start_migration(sender_list, receiver_list, should_increase_version)
         assert slot_mapping is not None if is_flexi else True
-        self.model_executor.start_kv_cache_migration_async(pp_layer_config, src_to_plan, slot_mapping)
+        logical_kv_blocks = compacted_length if allow_resize and need_compact else None
+        self.model_executor.start_kv_cache_migration_async(
+            pp_layer_config, src_to_plan, slot_mapping, logical_kv_blocks)
 
         time_kv_migration_end = time.time()
         logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
@@ -1503,7 +1581,8 @@ class DynamicEngineCore(EngineCore):
         self.migration_status = MigrationStatus.MIGRATING
         self._migration_done_event.clear()
         assert isinstance(self.scheduler, DynamicScheduler)
-        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+        is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
+        is_kvcached = use_kvcached_backend()
         fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
         enable_kv_resize = self.vllm_config.dynamic_config.enable_kv_resize
         allow_resize = (fixed_blocks <= 0) and enable_kv_resize
@@ -1574,8 +1653,15 @@ class DynamicEngineCore(EngineCore):
 
             if allow_resize and need_compact:
                 time_start_compact_kv = time.time()
-                bitmap = self.scheduler.compact_kv_cache(compacted_length)
-                logger.info(f"[async_fast] compacted to: {compacted_length} in {human_readable_duration(time.time() - time_start_compact_kv)}")
+                bitmap = None
+                if is_kvcached:
+                    logger.info(
+                        "[async_fast] KVCacheD backend skips scheduler block "
+                        "compaction; physical pool target blocks=%s",
+                        compacted_length)
+                else:
+                    bitmap = self.scheduler.compact_kv_cache(compacted_length)
+                    logger.info(f"[async_fast] compacted to: {compacted_length} in {human_readable_duration(time.time() - time_start_compact_kv)}")
 
             if allow_resize and compacted_length < original_length:
                 self.scheduler.shrink_block_pool(compacted_length)
@@ -1585,10 +1671,19 @@ class DynamicEngineCore(EngineCore):
         # Compact KV cache outside of engine lock
         if allow_resize and need_compact:
             time_start_compact_kv = time.time()
-            self._compact_kv_cache(compacted_length, bitmap)
-            logger.info(f"[async_fast] KV cache compacted to {compacted_length} blocks in {human_readable_duration(time.time() - time_start_compact_kv)}")
+            if is_kvcached:
+                logger.info(
+                    "[async_fast] KVCacheD backend skipped worker KV block "
+                    "compaction; trimming physical pool to %s blocks",
+                    compacted_length)
+            else:
+                assert bitmap is not None
+                self._compact_kv_cache(compacted_length, bitmap)
+                logger.info(f"[async_fast] KV cache compacted to {compacted_length} blocks in {human_readable_duration(time.time() - time_start_compact_kv)}")
 
         if allow_resize and compacted_length < original_length:
+            commit_kvcached_physical_resize_if_needed(
+                self.scheduler, "async_fast pre-migration shrink")
             self.model_executor.start_resize_kv_cache_async(compacted_length)
             logger.info(f"[async_fast timeline]: dispatched async resize kv cache: {human_readable_duration(time.time() - time_start)}")
 
@@ -1600,6 +1695,10 @@ class DynamicEngineCore(EngineCore):
             return engine_core_outputs
 
         # Phase 2: Start weight loading with configured mode
+        commit_kvcached_physical_resize_if_needed(
+            self.scheduler, "async_fast pre-weight trim")
+        self._verify_weight_memory_after_kv_resize(
+            adding_per_rank, "async_fast migration")
         weight_loading_mode = self._dispatch_weight_loading(
             adding_per_rank, migration_kind="async_fast")
 
@@ -1745,6 +1844,7 @@ class DynamicEngineCore(EngineCore):
         engine_core_outputs = []
         fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
         enable_kv_resize = self.vllm_config.dynamic_config.enable_kv_resize
+        is_kvcached = use_kvcached_backend()
         # allow_resize is True only when both conditions are met:
         # 1. fixed_num_gpu_blocks <= 0 (not fixed)
         # 2. enable_kv_resize is True (resize allowed during migration)
@@ -1833,11 +1933,17 @@ class DynamicEngineCore(EngineCore):
 
             if need_compact:
                 logger.info(f"[memory access] compacted_length: {compacted_length}, maximum_kv_block_num_after_compact: {maximum_kv_block_num_after_compact}")
-                # Get bitmap from scheduler before compacting
-                bitmap = self.scheduler.compact_kv_cache(compacted_length)
-                self._compact_kv_cache(compacted_length, bitmap)
-                logger.info(f"[memory access] KV cache compacted to {compacted_length} blocks before adding layers")
-                logger.info(f"[timeline]: after compact kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
+                if is_kvcached:
+                    logger.info(
+                        "[memory access] KVCacheD backend skips KV block "
+                        "compaction; physical pool target blocks=%s",
+                        compacted_length)
+                else:
+                    # Get bitmap from scheduler before compacting
+                    bitmap = self.scheduler.compact_kv_cache(compacted_length)
+                    self._compact_kv_cache(compacted_length, bitmap)
+                    logger.info(f"[memory access] KV cache compacted to {compacted_length} blocks before adding layers")
+                    logger.info(f"[timeline]: after compact kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
             else:
                 logger.info(f"[memory access] no need to compact kv cache")
             logger.info(f"[memory access] allow_resize: {allow_resize}, compacted_length: {compacted_length}, original_length: {original_length}") 
@@ -1851,8 +1957,14 @@ class DynamicEngineCore(EngineCore):
                 # 我理解这里只要shrink block pool在resize kv cache之前调用就行了
                 # TODO: 在resize之前，理论上需要保证没有shrink_kv_cache之前的in-flight request
                 # 这可能需要我实现一个scheduleroutput中的同步机制。
-                self.model_executor.resize_kv_cache(compacted_length)
-                self.scheduler.shrink_block_pool(compacted_length)
+                if is_kvcached:
+                    self.scheduler.shrink_block_pool(compacted_length)
+                    commit_kvcached_physical_resize_if_needed(
+                        self.scheduler, "sync pre-migration shrink")
+                    self.model_executor.resize_kv_cache(compacted_length)
+                else:
+                    self.model_executor.resize_kv_cache(compacted_length)
+                    self.scheduler.shrink_block_pool(compacted_length)
                 logger.info(f"[timeline]: after resize kv cache, time taken: {human_readable_duration(time.time() - time_start)}")
                 logger.info(f"[timeline]: after shrink block pool, time taken: {human_readable_duration(time.time() - time_start)}")
             # 对所有需要新增层的 rank 执行 add_layers
@@ -1863,6 +1975,10 @@ class DynamicEngineCore(EngineCore):
             # Save original config before updating - needed for find_src_rank_for_range
             original_pp_layer_config = deepcopy(self.cur_pp_layer_config)
             
+            commit_kvcached_physical_resize_if_needed(
+                self.scheduler, "sync pre-weight trim")
+            self._verify_weight_memory_after_kv_resize(
+                adding_per_rank, "sync migration")
             weight_loading_mode = self._dispatch_weight_loading(
                 adding_per_rank, migration_kind="sync")
             if weight_loading_mode == "async":
@@ -1940,6 +2056,8 @@ class DynamicEngineCore(EngineCore):
                     self.scheduler.extend_block_pool(resized_block_num)
                 else:
                     self.scheduler.shrink_block_pool(resized_block_num)
+                    commit_kvcached_physical_resize_if_needed(
+                        self.scheduler, "sync end-of-migration shrink")
             elif not allow_resize:
                 logger.info(f"[memory access] fixed_num_gpu_blocks={fixed_blocks}, skipping end-of-migration resize (would be {resized_block_num} blocks)")
             self.cur_pp_layer_config = pp_layer_config
@@ -2069,6 +2187,8 @@ class DynamicEngineCore(EngineCore):
                     self.scheduler.extend_block_pool(target_kv)
                 else:
                     self.scheduler.shrink_block_pool(target_kv)
+                    commit_kvcached_physical_resize_if_needed(
+                        self.scheduler, "set_pp_config same-config shrink")
             else:
                 logger.info(f"set_pp_config: KV cache already at {current_blocks} blocks, no resize needed")
         else:

@@ -64,6 +64,7 @@ class VllmCfg(BaseModel):
     gpu_memory_utilization: float = 0.9
     max_model_len: int = 8000
     max_num_batched_tokens: Optional[int] = None  # Max tokens per batch for chunked prefill (default: 2048 when chunked_prefill=True)
+    max_num_seqs: Optional[int] = None  # Max concurrent sequences; keep unset to use vLLM default.
     chunked_prefill: bool = True
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
@@ -737,6 +738,7 @@ class StaticVllmCfg(BaseModel):
     gpu_memory_utilization: float = 0.9
     max_model_len: int = 8000
     max_num_batched_tokens: Optional[int] = None  # Max tokens per batch for chunked prefill (default: 2048 when chunked_prefill=True)
+    max_num_seqs: Optional[int] = None  # Max concurrent sequences; keep unset to use vLLM default.
     chunked_prefill: bool = True
     enable_cuda_graph: bool = False
     enable_nsight: bool = False
@@ -1022,6 +1024,7 @@ class ExpVllmConfig:
     gpu_memory_utilization: float
     max_model_len: int
     max_num_batched_tokens: Optional[int]  # Max tokens per batch for chunked prefill
+    max_num_seqs: Optional[int]
     block_size: Optional[int]
     head_addr: str
     port: int
@@ -1382,6 +1385,7 @@ class ExperimentConfig:
             gpu_memory_utilization=static_cfg.vllm.gpu_memory_utilization,
             max_model_len=static_cfg.vllm.max_model_len,
             max_num_batched_tokens=static_cfg.vllm.max_num_batched_tokens,
+            max_num_seqs=static_cfg.vllm.max_num_seqs,
             block_size=blk_size,
             head_addr=static_cfg.vllm.head_addr,
             port=static_cfg.vllm.port,
@@ -1482,6 +1486,7 @@ class VllmServerSpec:
     gpu_memory_utilization: float
     max_model_len: int
     max_num_batched_tokens: Optional[int]
+    max_num_seqs: Optional[int]
     block_size: Optional[int]
     head_addr: str
     port: int

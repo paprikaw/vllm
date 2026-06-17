@@ -16,7 +16,9 @@ from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from setuptools_scm import get_version
-from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME, CUDAExtension, BuildExtension
+from torch.utils.cpp_extension import (CUDA_HOME, ROCM_HOME, BuildExtension,
+                                       CUDAExtension, include_paths,
+                                       library_paths)
 
 
 def load_module_from_path(module_name, path):
@@ -35,6 +37,8 @@ logger = logging.getLogger(__name__)
 envs = load_module_from_path('envs', os.path.join(ROOT_DIR, 'vllm', 'envs.py'))
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
+VLLM_BUILD_KVCACHED_ONLY = os.getenv("VLLM_BUILD_KVCACHED_ONLY",
+                                     "").upper() in ("1", "TRUE", "ON", "YES")
 
 if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
     logger.warning(
@@ -669,44 +673,77 @@ def get_requirements() -> list[str]:
     return requirements
 
 
+def get_kvcached_csrc_files() -> list[str]:
+    csrc_dir = ROOT_DIR / "kvcached" / "csrc"
+    if not csrc_dir.exists():
+        return []
+    return [
+        str(path.relative_to(ROOT_DIR)) for path in csrc_dir.rglob("*.cpp")
+        if not path.name.startswith("._")
+    ]
+
+
 ext_modules = []
 
-if _is_cuda() or _is_hip():
+if (_is_cuda() or _is_hip()) and not VLLM_BUILD_KVCACHED_ONLY:
     ext_modules.append(CMakeExtension(name="vllm._moe_C"))
 
-if _is_hip():
+if _is_hip() and not VLLM_BUILD_KVCACHED_ONLY:
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-    disable_fa3 = os.getenv("FLASH_ATTN_DISABLE_FA3", "").upper() in (
-        "1", "TRUE", "ON", "YES")
-    if (envs.VLLM_USE_PRECOMPILED
-            or get_nvcc_cuda_version() >= Version("12.3")) and not disable_fa3:
-        # FA3 requires CUDA 12.3 or later
+    if not VLLM_BUILD_KVCACHED_ONLY:
         ext_modules.append(
-            CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
-        # Optional since this doesn't get built (produce an .so file) when
-        # not targeting a hopper system
-        ext_modules.append(
-            CMakeExtension(name="vllm._flashmla_C", optional=True))
-    ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
-    
-    # kv_cache_allocator: Use CUDAExtension for Python 3.12 compatibility
-    # (torch.utils.cpp_extension handles pybind11 compatibility automatically)
-    kv_cache_ext = CUDAExtension(
-        name='vllm.kv_cache_allocator',
-        sources=['csrc/kv_cache_allocator_optimized.cpp'],
-        extra_compile_args={
-            'cxx': ['-O3', '-std=c++17'],
-        },
-        libraries=['cuda'],
-    )
-    # Mark this extension so we can identify it as a CUDA extension
-    kv_cache_ext._is_cuda_extension = True
-    ext_modules.append(kv_cache_ext)
+            CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+        disable_fa3 = os.getenv("FLASH_ATTN_DISABLE_FA3", "").upper() in (
+            "1", "TRUE", "ON", "YES")
+        if (envs.VLLM_USE_PRECOMPILED or get_nvcc_cuda_version() >= Version(
+                "12.3")) and not disable_fa3:
+            # FA3 requires CUDA 12.3 or later
+            ext_modules.append(
+                CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
+            # Optional since this doesn't get built (produce an .so file) when
+            # not targeting a hopper system
+            ext_modules.append(
+                CMakeExtension(name="vllm._flashmla_C", optional=True))
+        ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
 
-if _build_custom_ops():
+        # kv_cache_allocator: Use CUDAExtension for Python 3.12 compatibility
+        # (torch.utils.cpp_extension handles pybind11 compatibility automatically)
+        kv_cache_ext = CUDAExtension(
+            name='vllm.kv_cache_allocator',
+            sources=['csrc/kv_cache_allocator_optimized.cpp'],
+            extra_compile_args={
+                'cxx': ['-O3', '-std=c++17'],
+            },
+            libraries=['cuda'],
+        )
+        # Mark this extension so we can identify it as a CUDA extension
+        kv_cache_ext._is_cuda_extension = True
+        ext_modules.append(kv_cache_ext)
+
+    kvcached_csrc_files = get_kvcached_csrc_files()
+    if kvcached_csrc_files:
+        cxx_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
+        kvcached_compile_args = [
+            "-std=c++17", f"-D_GLIBCXX_USE_CXX11_ABI={cxx_abi}"
+        ]
+        kvcached_ext = CUDAExtension(
+            name="kvcached.vmm_ops",
+            sources=kvcached_csrc_files,
+            include_dirs=include_paths() +
+            [str(ROOT_DIR / "kvcached" / "csrc" / "inc")],
+            library_dirs=library_paths(),
+            libraries=["torch", "torch_cpu", "torch_python", "cuda"],
+            extra_compile_args={
+                "cxx": kvcached_compile_args,
+                "nvcc": kvcached_compile_args,
+            },
+        )
+        kvcached_ext._is_cuda_extension = True
+        ext_modules.append(kvcached_ext)
+
+if _build_custom_ops() and not VLLM_BUILD_KVCACHED_ONLY:
     ext_modules.append(CMakeExtension(name="vllm._C"))
 
 package_data = {
@@ -714,7 +751,8 @@ package_data = {
         "py.typed",
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
-    ]
+    ],
+    "kvcached": ["*.so", "*.pyi", "py.typed"],
 }
 
 if _no_device():

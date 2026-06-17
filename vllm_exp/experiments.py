@@ -155,6 +155,17 @@ def _phase_marker_line(phase_from: str, phase_to: str, boundary_ts: float) -> by
     return (f"{_PHASE_MARKER_TOKEN} from={phase_from} to={phase_to} boundary_ts={boundary_ts:.6f}\n").encode("utf-8")
 
 
+def _prepend_repo_to_pythonpath(env: Dict[str, str]) -> None:
+    repo_root = str(Path(__file__).resolve().parents[1])
+    pythonpath = env.get("PYTHONPATH")
+    if pythonpath:
+        if pythonpath.split(os.pathsep)[0] == repo_root:
+            return
+        env["PYTHONPATH"] = os.pathsep.join([repo_root, pythonpath])
+    else:
+        env["PYTHONPATH"] = repo_root
+
+
 class _ProcStdoutCapture:
     """Capture a subprocess stdout stream into a single raw log file.
 
@@ -746,6 +757,7 @@ def get_path_policy_from_var_keys(var_keys: list[str]) -> PathPolicy:
 ## Functions to start vllm and benchmark ##
 def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Optional[dict[str, Any]] = None) -> subprocess.Popen:
     env = os.environ.copy()
+    _prepend_repo_to_pythonpath(env)
     rank_to_ip, rank_to_node, pipeline_stage_to_rank = cfg.network.resolve_worker_placement(
         cfg.vllm.pipeline_parallel_size
     )
@@ -1315,6 +1327,7 @@ def generate_experiment_specs(
             gpu_memory_utilization=exp_cfg.vllm.gpu_memory_utilization,
             max_model_len=exp_cfg.vllm.max_model_len,
             max_num_batched_tokens=exp_cfg.vllm.max_num_batched_tokens,
+            max_num_seqs=exp_cfg.vllm.max_num_seqs,
             block_size=exp_cfg.vllm.block_size,
             head_addr=exp_cfg.vllm.head_addr,
             port=exp_cfg.vllm.port,
@@ -1415,6 +1428,7 @@ def start_vllm_for_sweep(
         raise ValueError("spec.server_raw_log_path must be set before calling start_vllm_for_sweep")
     
     env = os.environ.copy()
+    _prepend_repo_to_pythonpath(env)
     
     # Set weight chunk size environment variable
     env["VLLM_WEIGHT_CHUNK_SIZE_MB"] = str(spec.weight_chunk_size_mb)
@@ -1438,6 +1452,8 @@ def start_vllm_for_sweep(
         serve_args.append("--enable-chunked-prefill")
     if spec.max_num_batched_tokens is not None:
         serve_args.extend(["--max-num-batched-tokens", str(spec.max_num_batched_tokens)])
+    if spec.max_num_seqs is not None:
+        serve_args.extend(["--max-num-seqs", str(spec.max_num_seqs)])
     if not spec.enable_cuda_graph:
         serve_args.append("--enforce-eager")
     if spec.enable_nsight:
@@ -2307,6 +2323,7 @@ def start_vllm_single_instance(
         raise ValueError("spec.metrics_csv_path must be set before calling start_vllm_single_instance")
     
     env = os.environ.copy()
+    _prepend_repo_to_pythonpath(env)
     
     # Set weight chunk size environment variable
     env["VLLM_WEIGHT_CHUNK_SIZE_MB"] = str(spec.weight_chunk_size_mb)
@@ -2330,6 +2347,8 @@ def start_vllm_single_instance(
         serve_args.append("--enable-chunked-prefill")
     if spec.max_num_batched_tokens is not None:
         serve_args.extend(["--max-num-batched-tokens", str(spec.max_num_batched_tokens)])
+    if spec.max_num_seqs is not None:
+        serve_args.extend(["--max-num-seqs", str(spec.max_num_seqs)])
     if not spec.enable_cuda_graph:
         serve_args.append("--enforce-eager")
     if spec.enable_nsight:

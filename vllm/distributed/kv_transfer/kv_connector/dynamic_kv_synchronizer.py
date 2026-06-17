@@ -28,6 +28,10 @@ from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import (
     KVPatchMeta,
     KVTensorMeta,
 )
+from vllm.kvcached_integration import (
+    use_flexi_kv_for_runtime,
+    use_kvcached_backend,
+)
 from vllm.logger import init_logger
 from vllm.distributed.utils import StatelessProcessGroup
 import time
@@ -433,6 +437,15 @@ class DynamicKVSynchronizer():
         self.key_cache_ptrs = []
         self.value_cache_ptrs = []
         self.kv_cache_start_layer = 0
+
+    def _sync_kvcached_stream(self, reason: str) -> None:
+        if not use_kvcached_backend():
+            return
+        sync_start = time.time()
+        current_stream().synchronize()
+        logger.info(
+            "KVCacheD synchronized CUDA stream after %s, took %.6fs",
+            reason, time.time() - sync_start)
     
     def get_nccl_lock(self) -> threading.Lock:
         """Return the NCCL lock for external use (e.g., Ray compiled_dag)."""
@@ -674,7 +687,7 @@ class DynamicKVSynchronizer():
         assert all(transfer_in_process == False for transfer_in_process in self.kv_cache_transfer_in_process.values()), "In each of the migration process, this function should only be called once."
         assert all(patch_id == 0 for patch_id in self.last_patch_ids.values()), "The patch id of the rank should be 0."
         
-        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+        is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
         current_stream().synchronize()
         
         for rank, layer_ids in rank_to_layers_ids.items():
@@ -783,7 +796,7 @@ class DynamicKVSynchronizer():
             key_cache_ptrs: Optional[list[int]] = None,
             value_cache_ptrs: Optional[list[int]] = None,
     ) -> Generator[KVPatch, None, None]:
-        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+        is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
         if is_flexi:
             if key_cache_ptrs is None:
                 key_cache_ptrs = self.key_cache_ptrs
@@ -862,6 +875,7 @@ class DynamicKVSynchronizer():
                                 f"num_key_cache_ptrs={len(key_cache_ptrs)}")
                         # 填充到 kv_out[0][idx] (keys) 和 kv_out[1][idx] (values)
                         ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[0][idx], kv_out[1][idx], block_size)
+                self._sync_kvcached_stream("flexi KV patch gather")
             yield KVPatch(
                 KVPatchMeta(
                     type='kv_patch_meta' if not is_finished else "kv_patch_finished",
@@ -905,6 +919,7 @@ class DynamicKVSynchronizer():
                     slot_mapping=slot_mapping_dev,
                     is_finished=is_finished
                 )
+                self._sync_kvcached_stream("regular KV patch gather")
             kv_patch.meta.num_tokens = stored_tokens
             yield kv_patch
             self.last_patch_ids[rank] += 1
@@ -923,8 +938,9 @@ class DynamicKVSynchronizer():
             slot_mapping: Optional[torch.Tensor] = None,
             key_cache_ptrs: Optional[list[int]] = None,
             value_cache_ptrs: Optional[list[int]] = None,
+            logical_num_blocks: Optional[int] = None,
     ) -> Tuple[Union[KVTensorMeta, FlexiKVTensorMeta], torch.Tensor]:
-        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+        is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
         if is_flexi:
             assert slot_mapping is not None, "slot_mapping should be provided when using flexi flash attention"
             if key_cache_ptrs is None:
@@ -940,12 +956,33 @@ class DynamicKVSynchronizer():
                                         slot_mapping=slot_mapping,
                                         start_layer_id=start_layer_id)
         else:
-            return self._regular_get_kv_tensor(layer_id, layer_ids, self.kv_caches, start_layer_id)
+            return self._regular_get_kv_tensor(
+                layer_id, layer_ids, self.kv_caches, start_layer_id,
+                logical_num_blocks=logical_num_blocks)
 
     def _regular_get_kv_tensor(self, layer_id: int, layer_ids: list[int], kv_caches: list[torch.Tensor],
-                            start_layer_id: int) -> Tuple[KVTensorMeta, torch.Tensor]:
+                            start_layer_id: int,
+                            logical_num_blocks: Optional[int] = None
+                            ) -> Tuple[KVTensorMeta, torch.Tensor]:
         local_layer_id = layer_id - start_layer_id
         kv_cache = kv_caches[local_layer_id]
+        if (use_kvcached_backend() and kv_cache.dim() == 5
+                and kv_cache.size(0) == 2):
+            send_num_blocks = kv_cache.size(1)
+            if logical_num_blocks is not None:
+                send_num_blocks = min(logical_num_blocks, send_num_blocks)
+            if 0 < send_num_blocks <= kv_cache.size(1):
+                if send_num_blocks != kv_cache.size(1):
+                    logger.info(
+                        "KVCacheD migration sends logical KV window for layer "
+                        "%s: blocks %s -> %s",
+                        layer_id, kv_cache.size(1), send_num_blocks)
+                logger.info(
+                    "KVCacheD migration materializes sender snapshot for "
+                    "layer %s: shape=%s, send_blocks=%s",
+                    layer_id, tuple(kv_cache.shape), send_num_blocks)
+                kv_cache = kv_cache[:, :send_num_blocks, ...].contiguous()
+                self._sync_kvcached_stream("regular KV tensor snapshot")
         # 第一次访问时默认置为 False，避免 KeyError
         return KVTensorMeta(
             type='kv_tensor',
@@ -1324,7 +1361,7 @@ class DynamicKVSynchronizer():
         self.last_patch_ids[rank] += 1
 
     def finish_kv_cache_transfer(self) -> None:
-        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+        is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
         for rank in self.last_patch_ids:
             if is_flexi:
                 self.slot_mappings[rank].add_slot_mappings(
@@ -1449,7 +1486,7 @@ class DynamicKVSynchronizer():
            The same lock is used by PP NCCL, so this keeps KV and PP
            collectives mutually exclusive on the local GPU.
         """
-        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+        is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
         time_start = time.time()
         pipe = self._pair_pipes_recv[from_rank]
         nccl_lock = pipe._nccl_lock or self._nccl_lock
@@ -1531,7 +1568,7 @@ class DynamicKVSynchronizer():
         values = kv_payload[1]
         logger.info(f"apply one patch with id {meta.id}, num_tokens: {meta.num_tokens}")
         # slot_mapping 已经被裁剪过，只包含有效的 token
-        is_flexi = self.vllm_config.dynamic_config.use_flexi_kv
+        is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
         # assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
         if slot_mapping.size(0) != meta.num_tokens:
             logger.info(f"Warning: slot_mapping size {slot_mapping.size(0)} does not match num_tokens {meta.num_tokens}, proceed anyway.")
@@ -1579,4 +1616,5 @@ class DynamicKVSynchronizer():
                     kv_cache = self.kv_caches[local_layer_id]
                     # 使用裁剪后的 slot_mapping，从 0 到 num_tokens
                     self.kv_helper.put_kv_to_cache(self.model_executable, key, value, layer_id, kv_cache, slot_mapping, 0, slot_mapping.size(0))
+            self._sync_kvcached_stream("KV patch apply")
         return meta.id

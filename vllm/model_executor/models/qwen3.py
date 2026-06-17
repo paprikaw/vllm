@@ -34,6 +34,7 @@ from vllm.attention.dynamic_layer import FlexiAttention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.kvcached_integration import use_flexi_kv_for_runtime
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
@@ -118,7 +119,7 @@ class Qwen3Attention(nn.Module):
             rope_scaling=rope_scaling,
         )
         vllm_config = get_current_vllm_config()
-        is_flexi = vllm_config.dynamic_config.use_flexi_kv
+        is_flexi = use_flexi_kv_for_runtime(vllm_config)
         if is_flexi:
             logger.info("Using FlexiAttention in Qwen3Attention")
             self.attn = FlexiAttention(self.num_heads,

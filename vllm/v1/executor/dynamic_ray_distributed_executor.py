@@ -989,9 +989,17 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         """Wait for all async_add_layers to complete on all workers."""
         self.collective_rpc("wait_for_async_add_layers")
     
-    def start_kv_cache_migration_async(self, pp_layer_config: list[Tuple[int, int]], src_to_plan: dict[int, dict[int, list[int]]], slot_mapping: Optional[list[int]]):
+    def start_kv_cache_migration_async(
+            self,
+            pp_layer_config: list[Tuple[int, int]],
+            src_to_plan: dict[int, dict[int, list[int]]],
+            slot_mapping: Optional[list[int]],
+            logical_num_blocks: Optional[int] = None):
         # 调用 worker 侧的同名方法，仅在 source_rank 上发送，其余 rank 不做事
-        self.collective_rpc("start_kv_cache_migration_async", args=(pp_layer_config, src_to_plan,slot_mapping))
+        self.collective_rpc(
+            "start_kv_cache_migration_async",
+            args=(pp_layer_config, src_to_plan, slot_mapping,
+                  logical_num_blocks))
 
     def get_is_kv_resizing_done(self) -> list[bool]:
         return self.collective_rpc("get_is_kv_resizing_done")

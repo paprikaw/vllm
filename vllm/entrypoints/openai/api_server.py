@@ -39,6 +39,11 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine  # type: ignore
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.engine.multiprocessing.engine import run_mp_engine
 from vllm.engine.protocol import EngineClient
+from vllm.kvcached_integration import (
+    is_dynamic_migration_enabled,
+    maybe_apply_kvcached_vllm_patches,
+    use_kvcached_backend,
+)
 from vllm.entrypoints.chat_utils import (load_chat_template,
                                          resolve_hf_chat_template,
                                          resolve_mistral_chat_template)
@@ -172,6 +177,32 @@ async def build_async_engine_client_from_engine_args(
     # Create the EngineConfig (determines if we can use V1).
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+
+    if envs.VLLM_USE_V1 and not is_dynamic_migration_enabled(vllm_config):
+        if disable_frontend_multiprocessing:
+            logger.warning(
+                "V1 is enabled, but got --disable-frontend-multiprocessing. "
+                "To disable frontend multiprocessing, set VLLM_USE_V1=0.")
+
+        if use_kvcached_backend():
+            maybe_apply_kvcached_vllm_patches("OpenAI API server")
+        from vllm.v1.engine.async_llm import AsyncLLM
+        async_llm: Optional[AsyncLLM] = None
+        try:
+            async_llm = AsyncLLM.from_vllm_config(
+                vllm_config=vllm_config,
+                usage_context=usage_context,
+                disable_log_requests=engine_args.disable_log_requests,
+                disable_log_stats=engine_args.disable_log_stats)
+
+            # Don't keep the dummy data in memory
+            await async_llm.reset_mm_cache()
+
+            yield async_llm
+        finally:
+            if async_llm:
+                async_llm.shutdown()
+        return
     
     # Load migration config from dynamic_config fields or fallback to file
     dc = vllm_config.dynamic_config

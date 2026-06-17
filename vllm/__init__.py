@@ -9,6 +9,10 @@ from .version import __version__, __version_tuple__  # isort:skip
 # other modules are imported.
 import vllm.env_override  # isort:skip  # noqa: F401
 
+from vllm.kvcached_integration import maybe_apply_kvcached_vllm_patches
+
+maybe_apply_kvcached_vllm_patches("vllm import")
+
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.engine.llm_engine import LLMEngine
