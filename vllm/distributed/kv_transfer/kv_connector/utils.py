@@ -97,9 +97,14 @@ class model_aware_kv_ops_helper:
             if tgt_slot.numel() > 0:
                 slot_min = int(tgt_slot.min().item())
                 slot_max = int(tgt_slot.max().item())
-                flat_capacity = int(key_cache.reshape(
-                    -1, key_cache.shape[-2], key_cache.shape[-1]).size(0))
-                logger.info(
+                if key_cache.dim() >= 4:
+                    flat_capacity = int(key_cache.size(0) *
+                                        key_cache.size(1))
+                else:
+                    flat_capacity = int(key_cache.reshape(
+                        -1, key_cache.shape[-2],
+                        key_cache.shape[-1]).size(0))
+                logger.debug(
                     "KV patch apply slot range: layer=%s slots=[%s,%s] "
                     "flat_capacity=%s",
                     layer, slot_min, slot_max, flat_capacity)

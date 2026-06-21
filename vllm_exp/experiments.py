@@ -32,6 +32,40 @@ app = typer.Typer(no_args_is_help=True)
 C = Console()
 
 
+def _format_bytes(num_bytes: Optional[int]) -> str:
+    if num_bytes is None:
+        return "unset"
+    if num_bytes % (1024 * 1024) == 0:
+        return f"{num_bytes // (1024 * 1024)}MB"
+    if num_bytes % 1024 == 0:
+        return f"{num_bytes // 1024}KB"
+    return f"{num_bytes}B"
+
+
+def _log_page_attention_block_geometry(spec: "VllmServerSpec") -> None:
+    if spec.page_attention_block_size_bytes is None:
+        if spec.block_size:
+            C.print(
+                "[bold cyan]Using explicit vLLM token block_size: "
+                f"{spec.block_size}[/]")
+        return
+    C.print(
+        "[bold cyan]Derived PageAttention geometry: "
+        f"K+V page_attention_block_size="
+        f"{_format_bytes(spec.page_attention_block_size_bytes)}, "
+        f"vLLM token block_size={spec.block_size}[/]")
+
+
+def _apply_page_attention_block_env(env: dict[str, str],
+                                    spec: "VllmServerSpec") -> None:
+    if spec.page_attention_block_size_bytes is None:
+        return
+    env["VLLM_PAGE_ATTENTION_BLOCK_SIZE_BYTES"] = str(
+        spec.page_attention_block_size_bytes)
+    if spec.block_size is not None:
+        env["VLLM_DERIVED_TOKEN_BLOCK_SIZE"] = str(spec.block_size)
+
+
 def generate_analysis_report(logm: Union[LogManager, SweepLogManager], vars: Optional[dict[str, Any]] = None):
     """
     Automatically generate analysis files in the log directory after experiment completes.
@@ -963,6 +997,9 @@ def start_benchmark(
     if dataset_name == "sharegpt" and sharegpt_output_len is not None:
         bench_args.extend(["--sharegpt-output-len", str(sharegpt_output_len)])
     
+    if getattr(cfg.benchmark, "ignore_eos", False):
+        bench_args.append("--ignore-eos")
+
     C.print(f"start to run benchmark with args: {bench_args}")
 
     if cfg.benchmark.profile:
@@ -1329,6 +1366,7 @@ def generate_experiment_specs(
             max_num_batched_tokens=exp_cfg.vllm.max_num_batched_tokens,
             max_num_seqs=exp_cfg.vllm.max_num_seqs,
             block_size=exp_cfg.vllm.block_size,
+            page_attention_block_size_bytes=exp_cfg.vllm.page_attention_block_size_bytes,
             head_addr=exp_cfg.vllm.head_addr,
             port=exp_cfg.vllm.port,
             attention_kernel=exp_cfg.vllm.attention_kernel,
@@ -1376,6 +1414,7 @@ def generate_experiment_specs(
             restart_server_between_repetitions=exp_cfg.benchmark.restart_server_between_repetitions,
             print_outputs=exp_cfg.benchmark.print_outputs,
             profile=exp_cfg.benchmark.profile,
+            ignore_eos=exp_cfg.benchmark.ignore_eos,
             warmup=exp_cfg.benchmark.warmup,
             # Pipeline config for repetition reset
             initial_pp_config=exp_cfg.vllm.get_initial_pp_config(),
@@ -1432,6 +1471,7 @@ def start_vllm_for_sweep(
     
     # Set weight chunk size environment variable
     env["VLLM_WEIGHT_CHUNK_SIZE_MB"] = str(spec.weight_chunk_size_mb)
+    _apply_page_attention_block_env(env, spec)
     
     serve_args = [
         "vllm", "serve", spec.model_path,
@@ -1446,6 +1486,7 @@ def start_vllm_for_sweep(
         "--worker-cls", "vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker",
     ]
     
+    _log_page_attention_block_geometry(spec)
     if spec.block_size:
         serve_args.extend(["--block-size", str(spec.block_size)])
     if spec.chunked_prefill:
@@ -1550,6 +1591,8 @@ def start_benchmark_for_sweep(
         bench_args.append("--print-outputs")
     if spec.profile:
         bench_args.append("--profile")
+    if spec.ignore_eos:
+        bench_args.append("--ignore-eos")
     
     # Write benchmark config (includes metrics path) via spec helper
     spec.write_benchmark_config(
@@ -2327,6 +2370,7 @@ def start_vllm_single_instance(
     
     # Set weight chunk size environment variable
     env["VLLM_WEIGHT_CHUNK_SIZE_MB"] = str(spec.weight_chunk_size_mb)
+    _apply_page_attention_block_env(env, spec)
     
     serve_args = [
         "vllm", "serve", spec.model_path,
@@ -2341,6 +2385,7 @@ def start_vllm_single_instance(
         "--worker-cls", "vllm.v1.worker.dynamic_gpu_worker.DynamicGPUWorker",
     ]
     
+    _log_page_attention_block_geometry(spec)
     if spec.block_size:
         serve_args.extend(["--block-size", str(spec.block_size)])
     if spec.chunked_prefill:

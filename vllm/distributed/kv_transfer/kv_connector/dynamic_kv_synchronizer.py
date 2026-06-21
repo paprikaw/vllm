@@ -23,6 +23,7 @@ from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import (
     FlexiKVTensorMeta,
+    KVCachedSparseKVTensorMeta,
     kv_synchronizer_helper as kv_helper,
     KVPatch,
     KVPatchMeta,
@@ -213,12 +214,21 @@ class PairPipe:
         assert dtype is not None and shape is not None
         return torch.empty(shape, dtype=dtype, device=self.device)
 
-    def send_meta(self, obj: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]) -> None:
+    def send_meta(self, obj: Union[KVTensorMeta, KVPatchMeta,
+                                   FlexiKVTensorMeta,
+                                   KVCachedSparseKVTensorMeta]) -> None:
         self.meta_group.send_obj(obj, dst=self.peer_rank)
 
-    def recv_meta(self) -> Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]:
+    def recv_meta(self) -> Union[KVTensorMeta, KVPatchMeta,
+                                 FlexiKVTensorMeta,
+                                 KVCachedSparseKVTensorMeta]:
         obj = self.meta_group.recv_obj(src=self.peer_rank)
-        assert isinstance(obj, (KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta)), "The object should be a KVTensorMeta, KVPatchMeta, or FlexiKVTensorMeta"
+        assert isinstance(
+            obj,
+            (KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta,
+             KVCachedSparseKVTensorMeta)), (
+                 "The object should be a KVTensorMeta, KVPatchMeta, "
+                 "FlexiKVTensorMeta, or KVCachedSparseKVTensorMeta")
         return obj
 
     def wait_ready_for_kv_patch(self) -> None:
@@ -403,7 +413,8 @@ class DynamicKVSynchronizer():
         # Pydantic adapters for control metadata
         self._control_adapter = TypeAdapter(Union[KVTensorMeta,
                                                   KVPatchMeta,
-                                                  FlexiKVTensorMeta])
+                                                  FlexiKVTensorMeta,
+                                                  KVCachedSparseKVTensorMeta])
 
         pp_size = int(self.vllm_config.parallel_config.pipeline_parallel_size)
         # 目前这个是每一个synchronizer对应一个buffer，后续可能可以共享buffer
@@ -568,7 +579,10 @@ class DynamicKVSynchronizer():
                 self._pair_pipes_recv[peer_rank] = pipe
             return pipe
 
-    def _send_meta_to_rank(self, rank: int, meta: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]) -> None:
+    def _send_meta_to_rank(
+        self, rank: int,
+        meta: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta,
+                    KVCachedSparseKVTensorMeta]) -> None:
         pipe = self._ensure_pipe_and_buffer(rank, 'send')
         pipe = self._pair_pipes_send[rank]
         pipe.send_meta(meta)
@@ -624,7 +638,10 @@ class DynamicKVSynchronizer():
                     "shape=%s", rank, tuple(slot_mapping.shape))
         return slot_mapping
 
-    def _recv_metadata_from_rank(self, rank: int) -> Union[KVTensorMeta, KVPatchMeta]:
+    def _recv_metadata_from_rank(
+        self, rank: int
+    ) -> Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta,
+               KVCachedSparseKVTensorMeta]:
         """Block to receive one metadata entry from peer.
 
         Returns a dict with keys: "dtype", "shape", "layer_id".
@@ -939,7 +956,8 @@ class DynamicKVSynchronizer():
             key_cache_ptrs: Optional[list[int]] = None,
             value_cache_ptrs: Optional[list[int]] = None,
             logical_num_blocks: Optional[int] = None,
-    ) -> Tuple[Union[KVTensorMeta, FlexiKVTensorMeta], torch.Tensor]:
+    ) -> Tuple[Union[KVTensorMeta, FlexiKVTensorMeta,
+                     KVCachedSparseKVTensorMeta], torch.Tensor]:
         is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
         if is_flexi:
             assert slot_mapping is not None, "slot_mapping should be provided when using flexi flash attention"
@@ -958,14 +976,66 @@ class DynamicKVSynchronizer():
         else:
             return self._regular_get_kv_tensor(
                 layer_id, layer_ids, self.kv_caches, start_layer_id,
+                slot_mapping=slot_mapping,
                 logical_num_blocks=logical_num_blocks)
 
     def _regular_get_kv_tensor(self, layer_id: int, layer_ids: list[int], kv_caches: list[torch.Tensor],
                             start_layer_id: int,
+                            slot_mapping: Optional[torch.Tensor] = None,
                             logical_num_blocks: Optional[int] = None
-                            ) -> Tuple[KVTensorMeta, torch.Tensor]:
+                            ) -> Tuple[Union[KVTensorMeta,
+                                             KVCachedSparseKVTensorMeta],
+                                       torch.Tensor]:
         local_layer_id = layer_id - start_layer_id
         kv_cache = kv_caches[local_layer_id]
+        if (use_kvcached_backend() and kv_cache.dim() == 5
+                and kv_cache.size(0) == 2 and slot_mapping is not None):
+            valid_slots = slot_mapping[slot_mapping >= 0]
+            key_cache = kv_cache[0]
+            value_cache = kv_cache[1]
+            if valid_slots.device != key_cache.device:
+                valid_slots = valid_slots.to(key_cache.device,
+                                             non_blocking=True)
+            if valid_slots.numel() > 0:
+                slot_min = int(valid_slots.min().item())
+                slot_max = int(valid_slots.max().item())
+                flat_capacity = self.kv_helper._flat_capacity_for_cache(
+                    key_cache)
+                if slot_max >= flat_capacity:
+                    raise ValueError(
+                        "KVCacheD sparse migration slot mapping is out of "
+                        "bounds: "
+                        f"layer={layer_id}, slot_min={slot_min}, "
+                        f"slot_max={slot_max}, flat_capacity={flat_capacity}")
+                gathered_k = self.kv_helper._select_kv_slots(
+                    key_cache, valid_slots)
+                gathered_v = self.kv_helper._select_kv_slots(
+                    value_cache, valid_slots)
+                kv_payload = torch.stack((gathered_k, gathered_v),
+                                         dim=0).contiguous()
+            else:
+                kv_payload = torch.empty(
+                    2,
+                    0,
+                    int(kv_cache.size(-2)),
+                    int(kv_cache.size(-1)),
+                    dtype=kv_cache.dtype,
+                    device=kv_cache.device)
+            self._sync_kvcached_stream("KVCacheD sparse KV tensor snapshot")
+            logger.info(
+                "KVCacheD migration sends sparse live-slot tensor for "
+                "layer %s: live_tokens=%s cache_shape=%s payload_shape=%s",
+                layer_id, valid_slots.numel(), tuple(kv_cache.shape),
+                tuple(kv_payload.shape))
+            return KVCachedSparseKVTensorMeta(
+                type='kv_tensor_sparse',
+                layer_to_be_received=set(layer_ids),
+                layer_id=int(layer_id),
+                num_tokens=int(valid_slots.numel()),
+                slot_mapping_dtype=valid_slots.dtype,
+                slot_mapping_shape=valid_slots.shape,
+                kv_payload_dtype=kv_payload.dtype,
+                kv_payload_shape=kv_payload.shape), kv_payload
         if (use_kvcached_backend() and kv_cache.dim() == 5
                 and kv_cache.size(0) == 2):
             send_num_blocks = kv_cache.size(1)
@@ -1071,7 +1141,8 @@ class DynamicKVSynchronizer():
 
     def send_kv_tensor_to_rank(self,
             rank: int,
-            kv_tensor_meta: Union[KVTensorMeta, FlexiKVTensorMeta],
+            kv_tensor_meta: Union[KVTensorMeta, FlexiKVTensorMeta,
+                                  KVCachedSparseKVTensorMeta],
             kv_tensor: torch.Tensor,
             slot_mapping: Optional[torch.Tensor] = None,
             cuda_op_lock=None) -> None:
@@ -1096,7 +1167,7 @@ class DynamicKVSynchronizer():
         if not isinstance(kv_tensor_meta, KVTensorMeta):
             assert slot_mapping is not None, (
                 "slot_mapping should be provided when sending "
-                "FlexiKVTensorMeta")
+                "slot-mapped KV tensor metadata")
         
         retry_delay = 0.005  # 5ms fixed retry delay
         
@@ -1393,7 +1464,10 @@ class DynamicKVSynchronizer():
     def get_last_patch_id(self, rank: int) -> int:
         return self.last_patch_ids[rank]
 
-    def recv_controller(self, rank: int) -> Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta]:
+    def recv_controller(
+        self, rank: int
+    ) -> Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta,
+               KVCachedSparseKVTensorMeta]:
         pipe = self._ensure_pipe_and_buffer(rank, 'recv')
         pipe = self._pair_pipes_recv[rank]
         meta_obj = pipe.recv_meta()
@@ -1401,7 +1475,8 @@ class DynamicKVSynchronizer():
 
     def recv_kv_tensor(self,
             from_rank: int,
-            meta: Union[KVTensorMeta, FlexiKVTensorMeta],
+            meta: Union[KVTensorMeta, FlexiKVTensorMeta,
+                        KVCachedSparseKVTensorMeta],
             cuda_op_lock=None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Receive KV tensor from sender with deadlock-free protocol.
         
@@ -1418,7 +1493,8 @@ class DynamicKVSynchronizer():
         pipe = self._pair_pipes_recv[from_rank]
         nccl_lock = pipe._nccl_lock or self._nccl_lock
         
-        current_meta: Union[KVTensorMeta, FlexiKVTensorMeta] = meta
+        current_meta: Union[KVTensorMeta, FlexiKVTensorMeta,
+                            KVCachedSparseKVTensorMeta] = meta
         while True:
             # Step 2: Try to acquire lock (non-blocking)
             lock_acquired = nccl_lock.acquire(blocking=False)
@@ -1429,7 +1505,12 @@ class DynamicKVSynchronizer():
                 pipe.signal_group.send_obj("REJECT", dst=pipe.peer_rank)
                 # Sender will backoff and resend meta, we need to receive it
                 new_meta = self.recv_controller(from_rank)
-                assert isinstance(new_meta, (KVTensorMeta, FlexiKVTensorMeta)), f"Expected KVTensorMeta or FlexiKVTensorMeta, got {type(new_meta)}"
+                assert isinstance(
+                    new_meta,
+                    (KVTensorMeta, FlexiKVTensorMeta,
+                     KVCachedSparseKVTensorMeta)), (
+                         "Expected KVTensorMeta, FlexiKVTensorMeta, or "
+                         f"KVCachedSparseKVTensorMeta, got {type(new_meta)}")
                 current_meta = new_meta
                 continue
             
@@ -1442,7 +1523,8 @@ class DynamicKVSynchronizer():
                     "recv_kv_tensor: lock acquired in %ss, sent ACCEPT",
                     time_lock_acquired - time_start)
 
-                if isinstance(current_meta, FlexiKVTensorMeta):
+                if isinstance(current_meta, (FlexiKVTensorMeta,
+                                             KVCachedSparseKVTensorMeta)):
                     slot_mapping = self._recv_slot_mapping_from_rank(
                         from_rank, current_meta.slot_mapping_dtype,
                         current_meta.slot_mapping_shape)
@@ -1463,8 +1545,10 @@ class DynamicKVSynchronizer():
 
         logger.info(f"recv_kv_tensor completed: lock wait: {time_lock_acquired - time_start}, total: {time.time() - time_start}")
         
-        if isinstance(current_meta, FlexiKVTensorMeta):
-            assert slot_mapping is not None, "slot_mapping should not be None for FlexiKVTensorMeta"
+        if isinstance(current_meta, (FlexiKVTensorMeta,
+                                     KVCachedSparseKVTensorMeta)):
+            assert slot_mapping is not None, (
+                "slot_mapping should not be None for slot-mapped KV tensor")
             assert kv_payload.dim() == 4 and kv_payload.size(0) == 2
             return slot_mapping, kv_payload
         else:

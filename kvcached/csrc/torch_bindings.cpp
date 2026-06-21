@@ -31,6 +31,7 @@ std::vector<torch::Tensor>
 create_kv_tensors(size_t size, size_t dtype_size, const std::string &dev_str,
                   int64_t num_layers, int64_t num_kv_buffers = 2,
                   int64_t group_id = 0, bool unified_pool = false,
+                  bool layer_group_layout = false,
                   int64_t layer_group_granularity = 1,
                   size_t contiguous_page_size = 0,
                   size_t contiguous_total_size = 0) {
@@ -39,6 +40,7 @@ create_kv_tensors(size_t size, size_t dtype_size, const std::string &dev_str,
   auto dtype_ = torch_dtype_from_size(dtype_size);
   return allocator->create_kv_tensors(size, dtype_, dev_str, num_layers,
                                       num_kv_buffers, unified_pool,
+                                      layer_group_layout,
                                       layer_group_granularity,
                                       contiguous_page_size,
                                       contiguous_total_size);
@@ -68,16 +70,17 @@ bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
 std::shared_ptr<PageAllocator> create_page_allocator(
     int64_t num_layers, int64_t mem_size_per_layer, int64_t page_size,
     int64_t world_size = 1, int64_t pp_rank = 0, bool async_sched = false,
-    bool contiguous_layout = true, bool enable_page_prealloc = true,
-    int64_t num_kv_buffers = 2, int64_t group_id = 0,
-    const std::string &ipc_name = "",
+    bool contiguous_layout = true, bool layer_group_layout = false,
+    bool enable_page_prealloc = true, int64_t num_kv_buffers = 2,
+    int64_t group_id = 0, const std::string &ipc_name = "",
     int64_t layer_group_granularity = 1,
     int64_t map_page_size = 0) {
 
   return std::make_shared<PageAllocator>(
       num_layers, mem_size_per_layer, page_size, world_size, pp_rank,
-      async_sched, contiguous_layout, enable_page_prealloc, num_kv_buffers,
-      group_id, ipc_name, layer_group_granularity, map_page_size);
+      async_sched, contiguous_layout, layer_group_layout, enable_page_prealloc,
+      num_kv_buffers, group_id, ipc_name, layer_group_granularity,
+      map_page_size);
 }
 
 // PageAllocator method bindings
@@ -148,6 +151,21 @@ int64_t page_allocator_get_num_reserved_pages(
   return allocator->get_num_reserved_pages();
 }
 
+int64_t page_allocator_get_num_mapped_pages(
+    std::shared_ptr<PageAllocator> allocator) {
+  return allocator->get_num_mapped_pages();
+}
+
+int64_t page_allocator_get_num_budget_free_pages(
+    std::shared_ptr<PageAllocator> allocator) {
+  return allocator->get_num_budget_free_pages();
+}
+
+int64_t page_allocator_get_physical_page_limit(
+    std::shared_ptr<PageAllocator> allocator) {
+  return allocator->get_physical_page_limit();
+}
+
 int64_t page_allocator_get_avail_physical_pages(
     std::shared_ptr<PageAllocator> allocator) {
   return allocator->get_avail_physical_pages();
@@ -205,6 +223,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("size"), py::arg("dtype_size"), py::arg("dev_str"),
         py::arg("num_layers"), py::arg("num_kv_buffers") = 2,
         py::arg("group_id") = 0, py::arg("unified_pool") = false,
+        py::arg("layer_group_layout") = false,
         py::arg("layer_group_granularity") = 1,
         py::arg("contiguous_page_size") = 0,
         py::arg("contiguous_total_size") = 0);
@@ -222,6 +241,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("mem_size_per_layer"), py::arg("page_size"),
            py::arg("world_size") = 1, py::arg("pp_rank") = 0,
            py::arg("async_sched") = false, py::arg("contiguous_layout") = true,
+           py::arg("layer_group_layout") = false,
            py::arg("enable_page_prealloc") = true,
            py::arg("num_kv_buffers") = 2, py::arg("group_id") = 0,
            py::arg("ipc_name") = "",
@@ -243,6 +263,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_num_total_pages", &kvcached::page_allocator_get_num_total_pages)
       .def("get_num_reserved_pages",
            &kvcached::page_allocator_get_num_reserved_pages)
+      .def("get_num_mapped_pages",
+           &kvcached::page_allocator_get_num_mapped_pages)
+      .def("get_num_budget_free_pages",
+           &kvcached::page_allocator_get_num_budget_free_pages)
+      .def("get_physical_page_limit",
+           &kvcached::page_allocator_get_physical_page_limit)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
       .def("check_and_get_resize_target",

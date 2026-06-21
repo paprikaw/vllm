@@ -22,6 +22,7 @@ from kvcached.tp_ipc_util import broadcast_kv_tensors_created
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     DEFAULT_IPC_NAME,
+    LAYER_STACKING,
     PAGE_PREALLOC_ENABLED,
     PAGE_SIZE,
     SANITY_CHECK,
@@ -87,95 +88,134 @@ class KVCacheManager:
                 1 for MLA combined KV).
             group_id: KV cache group identifier for hybrid attention models.
                 Different groups have independent FTensors and page spaces.
-            physical_block_size: Per-layer physical block/slice size in bytes.
-                The stacking factor is PAGE_SIZE // physical_block_size.
+            physical_block_size: Layer-stacking K+V physical block size in
+                bytes. Only valid when KVCACHED_LAYER_STACKING=true.
         """
         self.num_blocks = num_blocks
-        self.page_attention_block_mem_size = block_size * cell_size
+        self.kv_tensor_block_mem_size = block_size * cell_size
         self.num_layers = num_layers
         self.num_kv_buffers = num_kv_buffers
+        self.layer_stacking_enabled = LAYER_STACKING
         env_physical_block_size = get_physical_block_size()
         if physical_block_size is None:
             physical_block_size = env_physical_block_size
-        if physical_block_size is None:
-            physical_block_size = PAGE_SIZE
-        physical_block_size = int(physical_block_size)
-        if physical_block_size <= 0:
-            raise ValueError(
-                "physical_block_size must be positive, got "
-                f"{physical_block_size}")
-        if physical_block_size > PAGE_SIZE:
-            raise ValueError(
-                "physical_block_size must be no larger than PAGE_SIZE "
-                f"({PAGE_SIZE}), got {physical_block_size}")
-        if PAGE_SIZE % physical_block_size != 0:
-            raise ValueError(
-                "PAGE_SIZE must be divisible by physical_block_size: "
-                f"PAGE_SIZE={PAGE_SIZE}, "
-                f"physical_block_size={physical_block_size}")
-        self.physical_block_size = physical_block_size
-        self.layer_group_granularity = PAGE_SIZE // physical_block_size
-        if self.num_layers % self.layer_group_granularity != 0:
-            raise ValueError(
-                f"num_layers ({self.num_layers}) must be divisible by "
-                f"layer_group_granularity ({self.layer_group_granularity})")
-        self.num_layer_groups = self.num_layers // self.layer_group_granularity
-        self.block_level_layer_groups = (
-            CONTIGUOUS_LAYOUT and self.layer_group_granularity > 1)
-        if self.layer_group_granularity > 1 and not CONTIGUOUS_LAYOUT:
-            raise ValueError(
-                "physical layer stacking requires "
-                "KVCACHED_CONTIGUOUS_LAYOUT=true")
-        if self.block_level_layer_groups:
-            if self.physical_block_size < self.page_attention_block_mem_size:
-                raise ValueError(
-                    "physical_block_size "
-                    f"({self.physical_block_size}) is smaller than "
-                    "one PageAttention block "
-                    f"({self.page_attention_block_mem_size})")
-            if (self.physical_block_size %
-                    self.page_attention_block_mem_size != 0):
-                raise ValueError(
-                    "physical_block_size "
-                    f"({self.physical_block_size}) must be divisible by "
-                    "PageAttention block size "
-                    f"({self.page_attention_block_mem_size})")
+        self.page_attention_block_mem_size = (
+            self.kv_tensor_block_mem_size * self.num_kv_buffers)
+        self.vrm_block_size = self.page_attention_block_mem_size
         self.reserve_null_block = reserve_null_block
         self.group_id = group_id
 
-        if self.block_level_layer_groups:
+        if self.layer_stacking_enabled:
+            if CONTIGUOUS_LAYOUT:
+                raise ValueError(
+                    "KVCACHED_LAYER_STACKING is independent of the original "
+                    "KVCacheD contiguous layout. Set "
+                    "KVCACHED_CONTIGUOUS_LAYOUT=false when enabling layer "
+                    "stacking.")
+            if physical_block_size is None:
+                physical_block_size = PAGE_SIZE
+            physical_block_size = int(physical_block_size)
+            if physical_block_size <= 0:
+                raise ValueError(
+                    "physical_block_size must be positive, got "
+                    f"{physical_block_size}")
+            if physical_block_size > PAGE_SIZE:
+                raise ValueError(
+                    "physical_block_size must be no larger than PAGE_SIZE "
+                    f"({PAGE_SIZE}), got {physical_block_size}")
+            if PAGE_SIZE % physical_block_size != 0:
+                raise ValueError(
+                    "PAGE_SIZE must be divisible by physical_block_size: "
+                    f"PAGE_SIZE={PAGE_SIZE}, "
+                    f"physical_block_size={physical_block_size}")
+            if physical_block_size % self.num_kv_buffers != 0:
+                raise ValueError(
+                    "physical_block_size must be divisible by num_kv_buffers: "
+                    f"physical_block_size={physical_block_size}, "
+                    f"num_kv_buffers={self.num_kv_buffers}")
+            self.physical_block_size = physical_block_size
+            self.physical_block_slice_size = (
+                physical_block_size // self.num_kv_buffers)
+            self.layer_group_granularity = PAGE_SIZE // physical_block_size
+            if self.num_layers % self.layer_group_granularity != 0:
+                raise ValueError(
+                    f"num_layers ({self.num_layers}) must be divisible by "
+                    "derived layer_group_granularity "
+                    f"({self.layer_group_granularity})")
+            if self.physical_block_size < self.vrm_block_size:
+                raise ValueError(
+                    "physical_block_size "
+                    f"({self.physical_block_size}) is smaller than "
+                    "one K+V PageAttention block "
+                    f"({self.vrm_block_size})")
+            if self.physical_block_size % self.vrm_block_size != 0:
+                raise ValueError(
+                    "physical_block_size "
+                    f"({self.physical_block_size}) must be divisible by "
+                    "K+V PageAttention block size "
+                    f"({self.vrm_block_size})")
+            self.num_layer_groups = (
+                self.num_layers // self.layer_group_granularity)
+            self.block_level_layer_groups = True
+            # Keep allocator accounting in the same unit as vLLM's
+            # PageAttention block: K+V bytes for one logical block in one
+            # layer. The per-K/per-V slice size is still tracked separately for
+            # tensor layout, but PageAllocator page ids and resize limits should
+            # not use the half-block K-only unit.
             self.block_mem_size = self.page_attention_block_mem_size
             self.page_size = self.physical_block_size
             self.physical_layer_slice_size = self.physical_block_size
             self.blocks_per_physical_page = (
-                self.physical_block_size // self.block_mem_size)
+                self.physical_block_size // self.vrm_block_size)
             self.layer_group_layout = (
                 "block_aligned" if self.blocks_per_physical_page == 1
                 else "slice_packed")
             self.physical_group_page_size = (
-                self.physical_block_size * self.layer_group_granularity *
-                self.num_kv_buffers)
+                self.physical_block_size * self.layer_group_granularity)
             self.packed_block_stride_bytes = (
-                self.page_attention_block_mem_size * self.num_kv_buffers *
+                self.page_attention_block_mem_size *
                 self.layer_group_granularity)
         else:
-            self.block_mem_size = self.page_attention_block_mem_size
-            # The physical page size used by kvcached page allocator.
-            self.page_size = PAGE_SIZE
-            self.physical_group_page_size = (
-                PAGE_SIZE * self.layer_group_granularity *
-                self.num_kv_buffers if CONTIGUOUS_LAYOUT else PAGE_SIZE)
+            if physical_block_size is not None:
+                raise ValueError(
+                    "KVCACHED_PHYSICAL_BLOCK_SIZE_* / dynamic_config."
+                    "physical_block_size is only valid when "
+                    "KVCACHED_LAYER_STACKING=true.")
+            self.physical_block_size = PAGE_SIZE
+            if self.physical_block_size % self.num_kv_buffers != 0:
+                raise ValueError(
+                    "physical_block_size must be divisible by num_kv_buffers: "
+                    f"physical_block_size={self.physical_block_size}, "
+                    f"num_kv_buffers={self.num_kv_buffers}")
+            self.physical_block_slice_size = (
+                self.physical_block_size // self.num_kv_buffers)
+            self.layer_group_granularity = 1
+            self.num_layer_groups = self.num_layers
+            self.block_level_layer_groups = False
+            if CONTIGUOUS_LAYOUT:
+                self.block_mem_size = self.kv_tensor_block_mem_size
+                self.page_size = self.physical_block_slice_size
+                self.page_allocator_num_kv_buffers = self.num_kv_buffers
+                self.physical_group_page_size = (
+                    self.physical_block_size * self.num_layers)
+            else:
+                # Non-contiguous default layout keeps one FTensor per layer,
+                # but maps a physical page as one K+V block-interleaved unit.
+                self.block_mem_size = self.page_attention_block_mem_size
+                self.page_size = self.physical_block_size
+                self.page_allocator_num_kv_buffers = 1
+                self.physical_group_page_size = self.physical_block_size
             self.packed_block_stride_bytes = (
-                self.block_mem_size * self.layer_group_granularity *
-                self.num_kv_buffers)
+                self.page_attention_block_mem_size)
             self.blocks_per_physical_page = (
-                self.page_size // self.block_mem_size)
+                self.physical_block_size // self.vrm_block_size)
             self.physical_layer_slice_size = self.page_size
-            self.layer_group_layout = "unstacked"
+            self.layer_group_layout = (
+                "upstream_contiguous" if CONTIGUOUS_LAYOUT else "per_layer")
 
-        # This is the logical allocator size. For slice_packed it remains the
-        # original per-layer K/V-buffer size; for block_aligned each public
-        # block is itself one packed physical page.
+        # This is the logical allocator size in vLLM PageAttention units:
+        # K+V bytes for one block in one layer. Per-buffer K/V slice sizes are
+        # only used for tensor layout.
         self.mem_size = self.num_blocks * self.block_mem_size
         self.world_size = world_size
         self.pp_rank = pp_rank
@@ -187,8 +227,10 @@ class KVCacheManager:
             pp_rank=self.pp_rank,
             async_sched=async_sched,
             contiguous_layout=CONTIGUOUS_LAYOUT,
+            layer_group_layout=self.block_level_layer_groups,
             enable_page_prealloc=PAGE_PREALLOC_ENABLED,
-            num_kv_buffers=self.num_kv_buffers,
+            num_kv_buffers=getattr(self, "page_allocator_num_kv_buffers",
+                                   self.num_kv_buffers),
             group_id=self.group_id,
             ipc_name=DEFAULT_IPC_NAME,
             layer_group_granularity=self.layer_group_granularity,
@@ -300,6 +342,9 @@ class KVCacheManager:
         reserved_pages = self.page_allocator.get_num_reserved_pages()
         inuse_pages = self.page_allocator.get_num_inuse_pages()
         free_pages = self.page_allocator.get_num_free_pages()
+        budget_free_pages = self.page_allocator.get_num_budget_free_pages()
+        mapped_pages = self.page_allocator.get_num_mapped_pages()
+        physical_page_limit = self.page_allocator.get_physical_page_limit()
         total_pages = self.page_allocator.get_num_total_pages()
         avail_physical_pages = self.page_allocator.get_avail_physical_pages()
         if self.block_level_layer_groups:
@@ -312,16 +357,20 @@ class KVCacheManager:
         else:
             prealloc_bytes = (
                 reserved_pages * self.num_layers * self.page_size *
-                self.num_kv_buffers)
+                getattr(self, "page_allocator_num_kv_buffers",
+                        self.num_kv_buffers))
             used_bytes = (
                 inuse_pages * self.num_layers * self.page_size *
-                self.num_kv_buffers)
+                getattr(self, "page_allocator_num_kv_buffers",
+                        self.num_kv_buffers))
         logger.info(
             "KVCacheD allocator state [%s]: reserved_pages=%d, "
-            "inuse_pages=%d, free_pages=%d, total_pages=%d, "
+            "inuse_pages=%d, free_pages=%d, budget_free_pages=%d, "
+            "mapped_pages=%d, physical_page_limit=%d, total_pages=%d, "
             "avail_physical_pages=%d, prealloc_bytes=%.2f GB, "
             "used_bytes=%.2f GB",
-            label, reserved_pages, inuse_pages, free_pages, total_pages,
+            label, reserved_pages, inuse_pages, free_pages,
+            budget_free_pages, mapped_pages, physical_page_limit, total_pages,
             avail_physical_pages, prealloc_bytes / (1024**3),
             used_bytes / (1024**3))
 
@@ -404,7 +453,16 @@ class KVCacheManager:
 
         while remaining_need > 0:  # Allocate the remaining blocks from pages
             if not self.avail_pages:
-                page = self.page_allocator.alloc_page()
+                try:
+                    page = self.page_allocator.alloc_page()
+                except RuntimeError as exc:
+                    logger.warning(
+                        "KVCacheD page allocation failed: %s. "
+                        "Rolling back %d partially allocated blocks.",
+                        exc, len(ret_index))
+                    if ret_index:
+                        self.free(ret_index)
+                    return None
                 page.init(self.block_mem_size)
                 if hasattr(page, "cap_blocks"):
                     page.cap_blocks(self.num_blocks)
@@ -562,10 +620,10 @@ class KVCacheManager:
         if self.in_shrink:
             blocks_from_free_pages = 0
         else:
-            virtual_free_pages = self.page_allocator.get_num_free_pages()
+            budget_free_pages = self.page_allocator.get_num_budget_free_pages()
             physical_free_pages = self.page_allocator.get_avail_physical_pages(
             ) + self.page_allocator.get_num_reserved_pages()
-            free_pages = min(virtual_free_pages, physical_free_pages)
+            free_pages = min(budget_free_pages, physical_free_pages)
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
         return avail_blocks + blocks_from_free_pages
@@ -573,7 +631,7 @@ class KVCacheManager:
     @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
-        if CONTIGUOUS_LAYOUT:
+        if self.block_level_layer_groups:
             memory_bytes = (self.page_allocator.get_num_inuse_pages() *
                             self.num_layer_groups *
                             self.physical_group_page_size)
@@ -581,7 +639,8 @@ class KVCacheManager:
             memory_bytes = (self.page_allocator.get_num_inuse_pages() *
                             self.num_layer_groups *
                             self.layer_group_granularity * self.page_size *
-                            self.num_kv_buffers)
+                            getattr(self, "page_allocator_num_kv_buffers",
+                                    self.num_kv_buffers))
 
         if unit == 'bytes':
             return memory_bytes
@@ -594,32 +653,163 @@ class KVCacheManager:
         else:
             raise ValueError(f"Unknown unit: {unit}")
 
-    @synchronized
-    def stats(self) -> dict[str, Any]:
-        """Return lightweight allocator statistics for debugging/tests."""
+    def _page_capacity_blocks(self, page_id: int, block_limit: int) -> int:
+        start, end = InternalPage.get_block_range(page_id, self.page_size,
+                                                  self.block_mem_size)
+        capped_start = max(start, 0)
+        capped_end = min(end, block_limit)
+        return max(capped_end - capped_start, 0)
+
+    def _page_free_blocks_below_limit(self, page: InternalPage,
+                                      block_limit: int) -> int:
+        return sum(1 for block_id in page.get_free_blocks()
+                   if 0 <= block_id < block_limit)
+
+    def _fragmentation_stats(
+        self,
+        target_blocks: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Compare logical PageAttention free blocks with whole free pages."""
+        block_limit = self.num_blocks if target_blocks is None else int(
+            target_blocks)
+        block_limit = max(block_limit, 0)
+        page_limit = (block_limit * self.block_mem_size + self.page_size -
+                      1) // self.page_size
+        page_limit = min(page_limit, self.page_allocator.get_num_total_pages())
+        bytes_per_logical_block = (
+            self.page_attention_block_mem_size * self.num_layers)
+
+        active_pages = set(self.full_pages) | set(self.avail_pages)
+        live_blocks = 0
+        partial_page_free_blocks = 0
+
+        for page_id, page in self.full_pages.items():
+            live_blocks += self._page_capacity_blocks(page_id, block_limit)
+
+        for page_id, page in self.avail_pages.items():
+            capacity = self._page_capacity_blocks(page_id, block_limit)
+            free_blocks = self._page_free_blocks_below_limit(page, block_limit)
+            live_blocks += max(capacity - free_blocks, 0)
+            partial_page_free_blocks += free_blocks
+
+        reserved_available_blocks = sum(
+            1 for block_id in self.reserved_blocks
+            if 0 <= block_id < block_limit)
+        logical_live_blocks = max(live_blocks - reserved_available_blocks, 0)
+        logical_available_blocks = max(block_limit - logical_live_blocks, 0)
+
+        physical_whole_available_blocks = 0
+        for page_id in range(page_limit):
+            if page_id in active_pages:
+                continue
+            physical_whole_available_blocks += self._page_capacity_blocks(
+                page_id, block_limit)
+        physical_whole_available_blocks = min(
+            physical_whole_available_blocks, logical_available_blocks)
+
+        internal_fragmentation_blocks = max(
+            logical_available_blocks - physical_whole_available_blocks, 0)
+        logical_available_bytes = (
+            logical_available_blocks * bytes_per_logical_block)
+        physical_whole_available_bytes = (
+            physical_whole_available_blocks * bytes_per_logical_block)
+        internal_fragmentation_bytes = (
+            internal_fragmentation_blocks * bytes_per_logical_block)
+        internal_fragmentation_ratio = (
+            internal_fragmentation_bytes / logical_available_bytes
+            if logical_available_bytes > 0 else 0.0)
+
         return {
+            "fragmentation_target_blocks": block_limit,
+            "fragmentation_target_pages": page_limit,
+            "fragmentation_bytes_per_logical_block":
+            bytes_per_logical_block,
+            "fragmentation_logical_live_blocks": logical_live_blocks,
+            "fragmentation_logical_available_blocks":
+            logical_available_blocks,
+            "fragmentation_logical_available_bytes":
+            logical_available_bytes,
+            "fragmentation_physical_whole_available_blocks":
+            physical_whole_available_blocks,
+            "fragmentation_physical_whole_available_bytes":
+            physical_whole_available_bytes,
+            "fragmentation_internal_blocks": internal_fragmentation_blocks,
+            "fragmentation_internal_bytes": internal_fragmentation_bytes,
+            "fragmentation_internal_ratio": internal_fragmentation_ratio,
+            "fragmentation_partial_page_free_blocks":
+            partial_page_free_blocks,
+            "fragmentation_reserved_available_blocks":
+            reserved_available_blocks,
+        }
+
+    @synchronized
+    def stats(self, target_blocks: Optional[int] = None) -> dict[str, Any]:
+        """Return lightweight allocator statistics for debugging/tests."""
+        blocks_per_allocator_page = InternalPage.get_num_blocks(
+            self.page_size, self.block_mem_size)
+        page_allocator_num_kv_buffers = getattr(
+            self, "page_allocator_num_kv_buffers", self.num_kv_buffers)
+        if self.block_level_layer_groups:
+            physical_maps_per_allocator_page = self.num_layer_groups
+            bytes_per_allocator_page = (
+                self.num_layer_groups * self.physical_group_page_size)
+        elif CONTIGUOUS_LAYOUT:
+            physical_maps_per_allocator_page = 1
+            bytes_per_allocator_page = self.physical_group_page_size
+        else:
+            physical_maps_per_allocator_page = (
+                self.num_layers * page_allocator_num_kv_buffers)
+            bytes_per_allocator_page = (
+                self.num_layers * page_allocator_num_kv_buffers *
+                self.page_size)
+        num_mapped_allocator_pages = self.page_allocator.get_num_mapped_pages()
+        stats = {
             "num_blocks": self.num_blocks,
             "block_mem_size": self.block_mem_size,
+            "kv_tensor_block_mem_size": self.kv_tensor_block_mem_size,
             "page_attention_block_mem_size": self.page_attention_block_mem_size,
             "num_layers": self.num_layers,
             "num_kv_buffers": self.num_kv_buffers,
+            "page_allocator_num_kv_buffers": page_allocator_num_kv_buffers,
+            "vrm_block_size": self.vrm_block_size,
+            "layer_stacking_enabled": self.layer_stacking_enabled,
+            "contiguous_layout": CONTIGUOUS_LAYOUT,
             "layer_group_granularity": self.layer_group_granularity,
             "layer_group_layout": self.layer_group_layout,
             "num_layer_groups": self.num_layer_groups,
             "block_level_layer_groups": self.block_level_layer_groups,
             "physical_block_size": self.physical_block_size,
+            "physical_block_slice_size": self.physical_block_slice_size,
             "page_size": self.page_size,
             "physical_group_page_size": self.physical_group_page_size,
             "physical_layer_slice_size": self.physical_layer_slice_size,
             "packed_block_stride_bytes": self.packed_block_stride_bytes,
             "blocks_per_physical_page": self.blocks_per_physical_page,
+            "blocks_per_allocator_page": blocks_per_allocator_page,
+            "physical_maps_per_allocator_page":
+            physical_maps_per_allocator_page,
+            "bytes_per_allocator_page": bytes_per_allocator_page,
             "available_size": self.available_size(),
             "mapped_memory_bytes": self.get_mapped_memory_size("bytes"),
+            "num_total_pages": self.page_allocator.get_num_total_pages(),
+            "physical_page_limit": self.page_allocator.get_physical_page_limit(),
+            "num_mapped_pages": num_mapped_allocator_pages,
+            "num_mapped_allocator_pages": num_mapped_allocator_pages,
+            "estimated_physical_map_ops": (
+                num_mapped_allocator_pages *
+                physical_maps_per_allocator_page),
+            "num_inuse_pages": self.page_allocator.get_num_inuse_pages(),
+            "num_free_pages": self.page_allocator.get_num_free_pages(),
+            "num_budget_free_pages":
+            self.page_allocator.get_num_budget_free_pages(),
+            "num_reserved_pages": self.page_allocator.get_num_reserved_pages(),
             "num_avail_blocks": self.num_avail_blocks,
             "num_full_pages": len(self.full_pages),
             "num_avail_pages": len(self.avail_pages),
             "num_reserved_blocks": len(self.reserved_blocks),
         }
+        stats.update(self._fragmentation_stats(target_blocks))
+        return stats
 
     @synchronized
     def clear(self):

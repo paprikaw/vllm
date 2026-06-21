@@ -41,6 +41,21 @@ const double GPU_UTILIZATION = []() {
   return env_val ? std::atof(env_val) : 0.95;
 }();
 
+static int64_t get_reserved_page_scale(bool layer_group_layout,
+                                       int64_t layer_group_granularity) {
+  if (!layer_group_layout) {
+    return 1;
+  }
+  return std::max<int64_t>(layer_group_granularity, 1);
+}
+
+static int64_t get_scaled_reserved_pages(int64_t reserved_pages,
+                                         bool layer_group_layout,
+                                         int64_t layer_group_granularity) {
+  return reserved_pages *
+         get_reserved_page_scale(layer_group_layout, layer_group_granularity);
+}
+
 // InternalPage implementation
 InternalPage::InternalPage(page_id_t id, int64_t size)
     : page_id(id), page_size(size), start_block(0), end_block(0),
@@ -122,8 +137,9 @@ int64_t InternalPage::get_num_blocks(int64_t page_size,
 PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
                              int64_t page_size, int64_t world_size,
                              int64_t pp_rank, bool async_sched,
-                             bool contiguous_layout, bool enable_page_prealloc,
-                             int64_t num_kv_buffers, int64_t group_id,
+                             bool contiguous_layout, bool layer_group_layout,
+                             bool enable_page_prealloc, int64_t num_kv_buffers,
+                             int64_t group_id,
                              const std::string &ipc_name,
                              int64_t layer_group_granularity,
                              int64_t map_page_size)
@@ -136,35 +152,51 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
                                               num_layers)),
       num_layer_groups_((num_layers + layer_group_granularity_ - 1) /
                         layer_group_granularity_),
-      block_level_layer_groups_(contiguous_layout &&
-                                layer_group_granularity_ > 1),
+      block_level_layer_groups_(layer_group_layout),
       group_id_(group_id),
       async_sched_(async_sched), contiguous_layout_(contiguous_layout),
+      layer_group_layout_(layer_group_layout),
       enable_page_prealloc_(enable_page_prealloc),
       gpu_utilization_(GPU_UTILIZATION),
       num_free_pages_(ceil_div(mem_size_per_layer, page_size)),
       num_total_pages_(ceil_div(mem_size_per_layer, page_size)),
-      min_reserved_pages_(std::min(num_free_pages_, MIN_RESERVED_PAGES)),
-      max_reserved_pages_(std::min(num_free_pages_, MAX_RESERVED_PAGES)),
+      physical_page_limit_(ceil_div(mem_size_per_layer, page_size)),
+      min_reserved_pages_(std::min(
+          num_free_pages_,
+          get_scaled_reserved_pages(MIN_RESERVED_PAGES, layer_group_layout,
+                                    layer_group_granularity_))),
+      max_reserved_pages_(std::min(
+          num_free_pages_,
+          get_scaled_reserved_pages(MAX_RESERVED_PAGES, layer_group_layout,
+                                    layer_group_granularity_))),
       prealloc_running_(false), prealloc_needed_(false),
       total_memory_size_(0) {
   virtual_pages_per_layer_ = num_total_pages_;
+  if (!layer_group_layout_) {
+    layer_group_granularity_ = 1;
+    num_layer_groups_ = num_layers_;
+    block_level_layer_groups_ = false;
+  }
   if (num_layers_ % layer_group_granularity_ != 0) {
     throw std::runtime_error(
         "num_layers must be divisible by layer_group_granularity");
   }
-  map_page_size_ =
-      map_page_size > 0
-          ? map_page_size
-          : (contiguous_layout_
-                 ? page_size_ * layer_group_granularity_ * num_kv_buffers_
-                 : page_size_);
+  if (layer_group_layout_) {
+    map_page_size_ = map_page_size > 0
+                         ? map_page_size
+                         : page_size_ * layer_group_granularity_ *
+                               num_kv_buffers_;
+  } else if (contiguous_layout_) {
+    map_page_size_ = page_size_ * num_layers_ * num_kv_buffers_;
+  } else {
+    map_page_size_ = page_size_;
+  }
   if (map_page_size_ % page_size_ != 0) {
     throw std::runtime_error(
         "map_page_size must be a multiple of allocator page_size");
   }
   total_memory_size_ =
-      contiguous_layout_
+      layer_group_layout_
           ? num_total_pages_ * num_layer_groups_ * map_page_size_
           : mem_size_per_layer * num_layers_ * num_kv_buffers_;
 
@@ -189,12 +221,18 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
             << "pp_rank=" << pp_rank << ", "
             << "async_sched=" << async_sched << ", "
             << "contiguous_layout=" << contiguous_layout << ", "
+            << "layer_group_layout=" << layer_group_layout_ << ", "
             << "enable_prealloc=" << enable_page_prealloc << ", "
             << "num_kv_buffers=" << num_kv_buffers << ", "
             << "layer_group_granularity=" << layer_group_granularity_ << ", "
             << "num_layer_groups=" << num_layer_groups_ << ", "
             << "block_level_layer_groups=" << block_level_layer_groups_ << ", "
             << "map_page_size=" << map_page_size_ / (1024 * 1024) << "MB, "
+            << "physical_page_limit=" << physical_page_limit_ << ", "
+            << "reserved_page_scale="
+            << get_reserved_page_scale(layer_group_layout_,
+                                       layer_group_granularity_)
+            << ", "
             << "group_id=" << group_id << ", "
             << "min_reserved_pages=" << min_reserved_pages_ << ", "
             << "max_reserved_pages=" << max_reserved_pages_ << std::endl;
@@ -243,6 +281,14 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 
     // Slow path: allocate from free pages
     if (!free_page_list_.empty()) {
+      if (get_budget_map_capacity_unlocked() <= 0) {
+        throw std::runtime_error(
+            "Physical page budget exhausted; no new page can be mapped");
+      }
+      if (get_avail_physical_pages() <= 0) {
+        throw std::runtime_error(
+            "No CUDA physical pages available for a new mapping");
+      }
       page_id = free_page_list_.front();
       free_page_list_.pop_front();
       num_free_pages_--;
@@ -270,6 +316,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     std::lock_guard<std::mutex> guard(lock_);
     free_page_list_.push_front(page_id);
     num_free_pages_++;
+    update_memory_usage();
     cond_.notify_all();
     throw std::runtime_error("Failed to map page " + std::to_string(page_id) +
                              ": " + e.what());
@@ -279,7 +326,10 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     trigger_preallocation();
   }
 
-  update_memory_usage();
+  {
+    std::lock_guard<std::mutex> guard(lock_);
+    update_memory_usage();
+  }
   auto end_time = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
       end_time - start_time);
@@ -293,7 +343,10 @@ void PageAllocator::free_page(page_id_t page_id) {
     std::lock_guard<std::mutex> lock(lock_);
     num_free_pages_++;
 
-    if (reserved_page_list_.size() < static_cast<size_t>(max_reserved_pages_)) {
+    bool can_keep_mapped =
+        get_num_mapped_pages_unlocked() + 1 <= physical_page_limit_;
+    if (can_keep_mapped &&
+        reserved_page_list_.size() < static_cast<size_t>(max_reserved_pages_)) {
       // Fast path: reserve page
       reserved_page_list_.push_back(page_id);
       update_memory_usage();
@@ -322,6 +375,10 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
     std::lock_guard<std::mutex> lock(lock_);
     num_free_pages_ += page_ids.size();
     int64_t num_to_reserve = max_reserved_pages_ - reserved_page_list_.size();
+    int64_t budget_reserve_capacity =
+        physical_page_limit_ - get_num_mapped_pages_unlocked();
+    num_to_reserve =
+        std::min(num_to_reserve, std::max<int64_t>(budget_reserve_capacity, 0));
 
     if (num_to_reserve > 0) {
       // Fast path: reserve pages
@@ -369,87 +426,44 @@ bool PageAllocator::resize(int64_t new_mem_size) {
   {
     std::lock_guard<std::mutex> lock(lock_);
 
-    if (new_num_pages < get_num_inuse_pages()) {
-      return false;
+    if (new_num_pages > num_total_pages_) {
+      LOGGER(WARNING,
+             "Requested physical page limit %ld exceeds virtual page "
+             "capacity %ld; clamping to virtual capacity.",
+             new_num_pages, num_total_pages_);
+      new_num_pages = num_total_pages_;
     }
 
-    if (new_num_pages == num_total_pages_) {
-      return true;
-    } else if (new_num_pages > num_total_pages_) {
-      int64_t num_to_expand = new_num_pages - num_total_pages_;
+    physical_page_limit_ = new_num_pages;
 
-      // Reuse previously reclaimed pages first
-      int64_t num_to_reuse = std::min(
-          static_cast<int64_t>(reclaimed_page_list_.size()), num_to_expand);
-      if (num_to_reuse > 0) {
-        for (int64_t i = 0; i < num_to_reuse; ++i) {
-          free_page_list_.push_back(reclaimed_page_list_.front());
-          reclaimed_page_list_.pop_front();
-        }
-        num_to_expand -= num_to_reuse;
-        num_free_pages_ += num_to_reuse;
-      }
+    int64_t mapped_pages = get_num_mapped_pages_unlocked();
+    int64_t excess_pages = mapped_pages - physical_page_limit_;
+    int64_t reserved_to_unmap = std::min<int64_t>(
+        std::max<int64_t>(excess_pages, 0),
+        static_cast<int64_t>(reserved_page_list_.size()));
+    for (int64_t i = 0; i < reserved_to_unmap; ++i) {
+      pages_to_unmap.push_back(reserved_page_list_.front());
+      reserved_page_list_.pop_front();
+    }
 
-      // Allocate new pages if needed
-      if (num_to_expand > 0) {
-        for (int64_t i = num_total_pages_; i < num_total_pages_ + num_to_expand;
-             ++i) {
-          free_page_list_.push_back(i);
-        }
-        num_free_pages_ += num_to_expand;
-      }
-      num_total_pages_ = new_num_pages;
+    if (pages_to_unmap.empty()) {
       update_memory_usage();
-      return true;
-    } else {
-      // Shrink path
-      int64_t num_to_reclaim = num_total_pages_ - new_num_pages;
-
-      if (free_page_list_.size() < static_cast<size_t>(num_to_reclaim)) {
-        // Need to trim reserved pages first
-        if (!reserved_page_list_.empty()) {
-          pages_to_unmap.assign(reserved_page_list_.begin(),
-                                reserved_page_list_.end());
-          reserved_page_list_.clear();
-        } else {
-          return false;
-        }
-      } else {
-        // Enough free pages, reclaim directly
-        for (int64_t i = 0; i < num_to_reclaim; ++i) {
-          reclaimed_page_list_.push_back(free_page_list_.back());
-          free_page_list_.pop_back();
-        }
-        num_free_pages_ -= num_to_reclaim;
-        num_total_pages_ = new_num_pages;
-        return true;
-      }
+      return get_num_mapped_pages_unlocked() <= physical_page_limit_;
     }
   }
 
-  // Unmap pages outside the lock (exception-safe)
+  // Unmap reserved pages outside the lock (exception-safe). These pages remain
+  // valid virtual pages and can be mapped again later if the physical budget
+  // expands.
   unmap_pages(pages_to_unmap);
 
   {
     std::lock_guard<std::mutex> lock(lock_);
-    int64_t num_to_reclaim = num_total_pages_ - new_num_pages;
-
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
     update_memory_usage();
-
-    if (free_page_list_.size() < static_cast<size_t>(num_to_reclaim)) {
-      return false;
-    }
-
-    for (int64_t i = 0; i < num_to_reclaim; ++i) {
-      reclaimed_page_list_.push_back(free_page_list_.back());
-      free_page_list_.pop_back();
-    }
-    num_free_pages_ -= num_to_reclaim;
-    num_total_pages_ = new_num_pages;
+    return get_num_mapped_pages_unlocked() <= physical_page_limit_;
   }
-  return true;
 }
 
 void PageAllocator::trim() {
@@ -478,10 +492,35 @@ void PageAllocator::trim() {
   }
 }
 
+int64_t PageAllocator::get_num_inuse_pages_unlocked() const {
+  return num_total_pages_ - num_free_pages_;
+}
+
+int64_t PageAllocator::get_num_mapped_pages_unlocked() const {
+  return get_num_inuse_pages_unlocked() +
+         static_cast<int64_t>(reserved_page_list_.size());
+}
+
+int64_t PageAllocator::get_num_budget_free_pages_unlocked() const {
+  int64_t budget_free =
+      physical_page_limit_ - get_num_inuse_pages_unlocked();
+  if (budget_free < 0) {
+    budget_free = 0;
+  }
+  return std::min(num_free_pages_, budget_free);
+}
+
+int64_t PageAllocator::get_budget_map_capacity_unlocked() const {
+  int64_t capacity =
+      physical_page_limit_ - get_num_mapped_pages_unlocked();
+  return std::max<int64_t>(capacity, 0);
+}
+
 int64_t PageAllocator::get_num_free_pages() const { return num_free_pages_; }
 
 int64_t PageAllocator::get_num_inuse_pages() const {
-  return num_total_pages_ - num_free_pages_;
+  std::lock_guard<std::mutex> lock(lock_);
+  return get_num_inuse_pages_unlocked();
 }
 
 int64_t PageAllocator::get_num_total_pages() const { return num_total_pages_; }
@@ -489,6 +528,21 @@ int64_t PageAllocator::get_num_total_pages() const { return num_total_pages_; }
 int64_t PageAllocator::get_num_reserved_pages() const {
   std::lock_guard<std::mutex> lock(lock_);
   return reserved_page_list_.size();
+}
+
+int64_t PageAllocator::get_num_mapped_pages() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return get_num_mapped_pages_unlocked();
+}
+
+int64_t PageAllocator::get_num_budget_free_pages() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return get_num_budget_free_pages_unlocked();
+}
+
+int64_t PageAllocator::get_physical_page_limit() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return physical_page_limit_;
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
@@ -500,8 +554,8 @@ int64_t PageAllocator::get_avail_physical_pages() const {
       std::max(avail_phy_mem_size - headroom, static_cast<size_t>(0));
 
   int64_t physical_bytes_per_logical_page =
-      contiguous_layout_ ? num_layer_groups_ * map_page_size_
-                         : num_layers_ * num_kv_buffers_ * page_size_;
+      layer_group_layout_ ? num_layer_groups_ * map_page_size_
+                          : num_layers_ * num_kv_buffers_ * page_size_;
   return avail_phy_mem_size / physical_bytes_per_logical_page;
 }
 
@@ -516,8 +570,8 @@ PageAllocator::check_and_get_resize_target(int64_t current_mem_size) const {
     return -1;
   }
   int64_t physical_to_logical_factor =
-      contiguous_layout_ ? (num_layer_groups_ * map_page_size_) / page_size_
-                         : num_layers_ * num_kv_buffers_;
+      layer_group_layout_ ? (num_layer_groups_ * map_page_size_) / page_size_
+                          : num_layers_ * num_kv_buffers_;
   return mem_info_tracker_->check_and_get_resize_target(
       current_mem_size, physical_to_logical_factor, 1);
 }
@@ -611,7 +665,8 @@ void PageAllocator::prealloc_worker() {
     // Only try to reserve up to the available free pages and physical memory
     to_reserve =
         std::min({to_reserve, static_cast<int64_t>(free_page_list_.size()),
-                  get_avail_physical_pages()});
+                  get_avail_physical_pages(),
+                  get_budget_map_capacity_unlocked()});
 
     LOGGER(INFO,
            "max_reserved_pages: %ld, min_reserved_pages: %ld, "
@@ -636,6 +691,7 @@ void PageAllocator::prealloc_worker() {
     for (int64_t i = 0; i < to_reserve && !free_page_list_.empty(); ++i) {
       pages_to_reserve.push_back(free_page_list_.front());
       free_page_list_.pop_front();
+      num_free_pages_--;
     }
 
     lock.unlock();
@@ -647,6 +703,7 @@ void PageAllocator::prealloc_worker() {
         reserved_page_list_.insert(reserved_page_list_.end(),
                                    pages_to_reserve.begin(),
                                    pages_to_reserve.end());
+        num_free_pages_ += pages_to_reserve.size();
         update_memory_usage();
         cond_.notify_all();
         LOGGER(INFO, "Preallocated %ld pages, reserved=%ld",
@@ -656,6 +713,7 @@ void PageAllocator::prealloc_worker() {
         free_page_list_.insert(free_page_list_.begin(),
                                pages_to_reserve.begin(),
                                pages_to_reserve.end());
+        num_free_pages_ += pages_to_reserve.size();
         cond_.notify_all();
         LOGGER(ERROR, "Failed to preallocate %ld pages: %s",
                pages_to_reserve.size(), e.what());
@@ -672,16 +730,20 @@ void PageAllocator::prealloc_worker() {
 
 void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
   std::vector<offset_t> offsets;
-  offsets.reserve(contiguous_layout_ ? page_ids.size() * num_layer_groups_
-                                     : page_ids.size());
+  offsets.reserve(layer_group_layout_ ? page_ids.size() * num_layer_groups_
+                                      : page_ids.size());
 
-  if (contiguous_layout_) {
+  if (layer_group_layout_) {
     const offset_t group_total_span = virtual_pages_per_layer_ * map_page_size_;
     for (page_id_t pid : page_ids) {
       for (int64_t group_idx = 0; group_idx < num_layer_groups_; ++group_idx) {
         offsets.push_back(group_idx * group_total_span +
                           pid * map_page_size_);
       }
+    }
+  } else if (contiguous_layout_) {
+    for (page_id_t pid : page_ids) {
+      offsets.push_back(pid * map_page_size_);
     }
   } else {
     for (page_id_t pid : page_ids) {
@@ -708,16 +770,20 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
   auto start_time = std::chrono::steady_clock::now();
 
   std::vector<offset_t> offsets;
-  offsets.reserve(contiguous_layout_ ? page_ids.size() * num_layer_groups_
-                                     : page_ids.size());
+  offsets.reserve(layer_group_layout_ ? page_ids.size() * num_layer_groups_
+                                      : page_ids.size());
 
-  if (contiguous_layout_) {
+  if (layer_group_layout_) {
     const offset_t group_total_span = virtual_pages_per_layer_ * map_page_size_;
     for (page_id_t pid : page_ids) {
       for (int64_t group_idx = 0; group_idx < num_layer_groups_; ++group_idx) {
         offsets.push_back(group_idx * group_total_span +
                           pid * map_page_size_);
       }
+    }
+  } else if (contiguous_layout_) {
+    for (page_id_t pid : page_ids) {
+      offsets.push_back(pid * map_page_size_);
     }
   } else {
     for (page_id_t pid : page_ids) {
@@ -750,15 +816,16 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
 }
 
 void PageAllocator::update_memory_usage() {
+  int64_t inuse_pages = get_num_inuse_pages_unlocked();
+
   // Calculate currently used physical memory (excluding preallocated pages)
   int64_t used_phy_mem_size =
-      contiguous_layout_
-          ? get_num_inuse_pages() * num_layer_groups_ * map_page_size_
-          : get_num_inuse_pages() * num_layers_ * page_size_ *
-                num_kv_buffers_;
+      layer_group_layout_
+          ? inuse_pages * num_layer_groups_ * map_page_size_
+          : inuse_pages * num_layers_ * page_size_ * num_kv_buffers_;
   // Calculate physical memory occupied by preallocated pages
   int64_t prealloc_phy_mem_size =
-      contiguous_layout_
+      layer_group_layout_
           ? static_cast<int64_t>(reserved_page_list_.size()) *
                 num_layer_groups_ * map_page_size_
           : static_cast<int64_t>(reserved_page_list_.size()) * num_layers_ *
@@ -840,8 +907,9 @@ void PageAllocator::resize_watcher() {
     }
     if (mem_info_tracker_) {
       int64_t physical_to_logical_factor =
-          contiguous_layout_ ? (num_layer_groups_ * map_page_size_) / page_size_
-                             : num_layers_ * num_kv_buffers_;
+          layer_group_layout_
+              ? (num_layer_groups_ * map_page_size_) / page_size_
+              : num_layers_ * num_kv_buffers_;
       int64_t target = mem_info_tracker_->check_and_get_resize_target(
           mem_size_per_layer_, physical_to_logical_factor, 1);
       resize_target_.store(target, std::memory_order_relaxed);

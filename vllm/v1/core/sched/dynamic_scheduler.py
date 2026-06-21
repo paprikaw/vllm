@@ -14,7 +14,8 @@ from bitarray import bitarray
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.kvcached_integration import use_flexi_kv_for_runtime
+from vllm.kvcached_integration import (use_flexi_kv_for_runtime,
+                                       use_kvcached_backend)
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.distributed.kv_events import EventPublisherFactory
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
@@ -197,7 +198,7 @@ class DynamicScheduler(Scheduler):
             is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
             if should_increase_scheduler_output_version:
                 self.cur_scheduler_output_version += 1
-            if is_flexi:
+            if is_flexi or use_kvcached_backend():
                 slot_mapping = self.get_slot_mapping_from_reqs(self.running)
                 logger.info(f"[num tokens]: slot_mapping length:{len(slot_mapping)} ")
                 logger.info(f"[num tokens]: scheduler side num_tokens:{self.kv_cache_manager} ")

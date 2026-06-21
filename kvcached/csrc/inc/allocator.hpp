@@ -30,6 +30,7 @@ public:
                                                int64_t num_layers,
                                                int64_t num_kv_buffers = 2,
                                                bool unified_pool = false,
+                                               bool layer_group_layout = false,
                                                int64_t layer_group_granularity = 1,
                                                size_t contiguous_page_size = 0,
                                                size_t contiguous_total_size = 0);
@@ -53,14 +54,15 @@ private:
   std::vector<torch::Tensor>
   create_kv_tensors_per_layer_(std::string_view prefix, size_t size,
                                torch::Dtype dtype, const std::string &dev_str,
-                               int64_t num_layers);
+                               int64_t num_layers, size_t page_size);
   std::vector<torch::Tensor>
   create_kv_tensors_contiguous_(size_t total_size, torch::Dtype dtype,
                                 const std::string &dev_str,
                                 size_t page_size);
   torch::Tensor create_ftensor_(size_t size, torch::Dtype dtype,
                                 const std::string &dev_str,
-                                std::string name = "");
+                                std::string name = "",
+                                size_t page_size = 0);
   void free_ftensor_(torch::Tensor &ftensor);
 
   // CUDA util functions.
@@ -79,6 +81,7 @@ private:
   int64_t num_layers_;
   int64_t layer_group_granularity_;
   bool contiguous_layout_;
+  bool layer_group_layout_;
   bool unified_pool_;
   size_t kv_tensor_size_per_layer_;
 

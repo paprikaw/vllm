@@ -46,8 +46,8 @@ static inline size_t get_v_base_offset(const torch::Tensor &tensor) {
 FTensorAllocator::FTensorAllocator(const torch::Device &device,
                                    bool contiguous_layout)
     : dev_(device), num_layers_(0), layer_group_granularity_(1),
-      contiguous_layout_(contiguous_layout), unified_pool_(false),
-      kv_tensor_size_per_layer_(0) {
+      contiguous_layout_(contiguous_layout), layer_group_layout_(false),
+      unified_pool_(false), kv_tensor_size_per_layer_(0) {
   if (dev_.is_cuda()) {
     init_cuda_();
   }
@@ -114,21 +114,26 @@ void FTensorAllocator::shutdown() {
 std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
     size_t size, torch::Dtype dtype, const std::string &dev_str,
     int64_t num_layers, int64_t num_kv_buffers, bool unified_pool,
-    int64_t layer_group_granularity, size_t contiguous_page_size,
-    size_t contiguous_total_size) {
+    bool layer_group_layout, int64_t layer_group_granularity,
+    size_t contiguous_page_size, size_t contiguous_total_size) {
   std::lock_guard<std::mutex> lock(mtx_);
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
-  if (layer_group_granularity <= 0) {
+  layer_group_layout_ = layer_group_layout;
+  if (layer_group_layout_) {
+    if (layer_group_granularity <= 0) {
+      layer_group_granularity = 1;
+    }
+    if (layer_group_granularity > num_layers) {
+      layer_group_granularity = num_layers;
+    }
+    ASSERT(num_layers % layer_group_granularity == 0,
+           "num_layers (%ld) must be divisible by layer_group_granularity (%ld)",
+           num_layers, layer_group_granularity);
+  } else {
     layer_group_granularity = 1;
   }
-  if (layer_group_granularity > num_layers) {
-    layer_group_granularity = num_layers;
-  }
-  ASSERT(num_layers % layer_group_granularity == 0,
-         "num_layers (%ld) must be divisible by layer_group_granularity (%ld)",
-         num_layers, layer_group_granularity);
   layer_group_granularity_ = layer_group_granularity;
   unified_pool_ = unified_pool;
   // Ensure size is aligned to page size.
@@ -140,11 +145,30 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
   }
   kv_tensor_size_per_layer_ = aligned_size;
 
-  if (contiguous_layout_) {
+  if (contiguous_layout_ && !layer_group_layout_) {
+    // Upstream contiguous layout: one FTensor and one compound page covers
+    // every layer for the same page id. kPageSize is the user-facing K+V
+    // total physical block size; split K/V layouts derive per-buffer slices
+    // internally instead of exposing separate physical-block units.
+    ASSERT(num_kv_buffers > 0, "num_kv_buffers must be positive.");
+    ASSERT(kPageSize % static_cast<size_t>(num_kv_buffers) == 0,
+           "K+V physical block size %zu must be divisible by num_kv_buffers "
+           "%ld",
+           kPageSize, num_kv_buffers);
+    size_t per_buffer_page_size =
+        kPageSize / static_cast<size_t>(num_kv_buffers);
+    size_t compound_page_size =
+        per_buffer_page_size * num_layers * num_kv_buffers;
+    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
+    return create_kv_tensors_contiguous_(aligned_size * num_layers, dtype,
+                                         dev_str, compound_page_size);
+  } else if (layer_group_layout_) {
+    // Layer-stacked layout: one FTensor with groups of layers packed into
+    // smaller compound pages. This is intentionally distinct from the
+    // upstream contiguous-layout meaning above.
     size_t page_size = contiguous_page_size > 0
                            ? contiguous_page_size
-                           : kPageSize * layer_group_granularity_ *
-                                 num_kv_buffers;
+                           : kPageSize * layer_group_granularity_;
     size_t total_size =
         contiguous_total_size > 0 ? contiguous_total_size : aligned_size * num_layers;
     ASSERT(page_size % kPageSize == 0,
@@ -156,9 +180,17 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, page_size);
     return create_kv_tensors_contiguous_(total_size, dtype, dev_str, page_size);
   } else {
-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+    ASSERT(num_kv_buffers > 0, "num_kv_buffers must be positive.");
+    ASSERT(kPageSize % static_cast<size_t>(num_kv_buffers) == 0,
+           "K+V physical block size %zu must be divisible by num_kv_buffers "
+           "%ld",
+           kPageSize, num_kv_buffers);
+    size_t per_buffer_page_size =
+        unified_pool ? kPageSize
+                     : kPageSize / static_cast<size_t>(num_kv_buffers);
+    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, per_buffer_page_size);
     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
-                                        num_layers);
+                                        num_layers, per_buffer_page_size);
   }
 }
 
@@ -174,7 +206,7 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
     return false;
   }
 
-  if (contiguous_layout_) {
+  if (contiguous_layout_ || layer_group_layout_) {
     // In contiguous layout, use the single contiguous tensor for mapping
     // Each offset maps a block that contains all layers
     auto ftensor = contiguous_kv_tensor_.get();
@@ -226,7 +258,7 @@ bool FTensorAllocator::unmap_from_kv_tensors(
     return false;
   }
 
-  if (contiguous_layout_) {
+  if (contiguous_layout_ || layer_group_layout_) {
     // In contiguous layout, unmap using the single contiguous tensor
     auto ftensor = contiguous_kv_tensor_.get();
     auto tensor = ftensor->get_tensor();
@@ -273,11 +305,11 @@ std::string FTensorAllocator::get_anon_tensor_name_() {
 
 std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
     std::string_view prefix, size_t size, torch::Dtype dtype,
-    const std::string &dev_str, int64_t num_layers) {
+    const std::string &dev_str, int64_t num_layers, size_t page_size) {
   std::vector<torch::Tensor> ftensors;
   for (int64_t i = 0; i < num_layers; i++) {
     auto name = std::string(prefix) + std::to_string(i);
-    auto tensor = create_ftensor_(size, dtype, dev_str, name);
+    auto tensor = create_ftensor_(size, dtype, dev_str, name, page_size);
     ftensors.push_back(tensor);
   }
   return ftensors;
@@ -300,7 +332,8 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
 /** this function is not thread-safe */
 torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
                                                 const std::string &dev_str,
-                                                std::string name) {
+                                                std::string name,
+                                                size_t page_size) {
   if (name.empty())
     name = get_anon_tensor_name_();
 
@@ -313,7 +346,7 @@ torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
 
   // Create a new FTensor
   ftensors_[name] =
-      std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_);
+      std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_, page_size);
   return ftensors_[name]->get_tensor();
 }
 

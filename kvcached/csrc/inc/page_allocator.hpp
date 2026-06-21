@@ -64,6 +64,7 @@ public:
   PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
                 int64_t page_size, int64_t world_size = 1, int64_t pp_rank = 0,
                 bool async_sched = false, bool contiguous_layout = true,
+                bool layer_group_layout = false,
                 bool enable_page_prealloc = true, int64_t num_kv_buffers = 2,
                 int64_t group_id = 0, const std::string &ipc_name = "",
                 int64_t layer_group_granularity = 1,
@@ -85,6 +86,9 @@ public:
   int64_t get_num_inuse_pages() const;
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
+  int64_t get_num_mapped_pages() const;
+  int64_t get_num_budget_free_pages() const;
+  int64_t get_physical_page_limit() const;
   int64_t get_avail_physical_pages() const;
 
   // Poll the shared-memory MemInfoStruct to see if an external controller
@@ -131,6 +135,10 @@ private:
   void start_prealloc_thread_internal();
   void stop_prealloc_thread_internal();
   bool should_use_worker_ipc() const;
+  int64_t get_num_inuse_pages_unlocked() const;
+  int64_t get_num_mapped_pages_unlocked() const;
+  int64_t get_num_budget_free_pages_unlocked() const;
+  int64_t get_budget_map_capacity_unlocked() const;
 
   // Configuration
   int64_t num_layers_;
@@ -147,12 +155,14 @@ private:
   int64_t group_id_;
   bool async_sched_;
   bool contiguous_layout_;
+  bool layer_group_layout_;
   bool enable_page_prealloc_;
   double gpu_utilization_;
 
   // Memory tracking
   int64_t num_free_pages_;
   int64_t num_total_pages_;
+  int64_t physical_page_limit_;
 
   // Page lists
   std::deque<page_id_t> free_page_list_;

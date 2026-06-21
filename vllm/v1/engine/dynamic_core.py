@@ -1414,7 +1414,15 @@ class DynamicEngineCore(EngineCore):
             return should_sync
 
         def sync_by_checking_leftover_tokens() -> bool:
-            token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 500))
+            threshold_override = os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD")
+            if threshold_override is not None:
+                token_to_send_threshold = int(threshold_override)
+            else:
+                max_num_batched_tokens = int(getattr(
+                    self.vllm_config.scheduler_config,
+                    "max_num_batched_tokens", 0) or 0)
+                token_to_send_threshold = max(500,
+                                              2 * max_num_batched_tokens)
             assert isinstance(self.model_executor, DynamicRayDistributedExecutor) 
             assert isinstance(self.scheduler, DynamicScheduler)
             receiver_list = list(adding_per_rank.keys())
@@ -1455,8 +1463,12 @@ class DynamicEngineCore(EngineCore):
                 self.scheduler.num_tokens_for_migration - applied
                 for applied in relevant_applied_tokens
             ]
-            logger.info(f"lag between sent and applied tokens: {lag}")
-            return min_applied_token > 0 and max(lag) < token_to_send_threshold
+            logger.info(
+                "lag between sent and applied tokens: %s "
+                "(sync_threshold=%s)",
+                lag, token_to_send_threshold)
+            return (min_applied_token > 0
+                    and max(lag) <= token_to_send_threshold)
 
         '''
         Following checks the patch sending process and synchronize the kv cache when all tokens in the sender to be sent are less than the threshold

@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Iterator
-from pathlib import Path
 import json
+import os
+from pathlib import Path
 import typer
 from pydantic import BaseModel, Field, model_validator, field_validator, ValidationInfo
 from rich.console import Console
@@ -12,6 +13,116 @@ from rich.console import Console
 
 app = typer.Typer(no_args_is_help=True)
 C = Console()
+
+
+def _parse_size_env(name: str, scale: int) -> Optional[int]:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {name}: {raw}. Must be an integer.") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got: {value}")
+    return value * scale
+
+
+def get_page_attention_block_size_bytes_from_env() -> Optional[int]:
+    """Return the requested K+V PageAttention block size in bytes.
+
+    This is a semantic experiment knob. It is converted to vLLM's token
+    block_size at launch time using the selected model's KV-cache shape.
+    """
+    for prefix in ("VLLM_PAGE_ATTENTION_BLOCK_SIZE",
+                   "KVCACHED_PAGE_ATTENTION_BLOCK_SIZE"):
+        for suffix, scale in (("BYTES", 1), ("KB", 1024),
+                              ("MB", 1024 * 1024)):
+            parsed = _parse_size_env(f"{prefix}_{suffix}", scale)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _dtype_size_bytes(dtype_name: Optional[str]) -> int:
+    if not dtype_name:
+        return 2
+    normalized = dtype_name.lower().replace("torch.", "")
+    if normalized in ("float16", "fp16", "half", "bfloat16", "bf16"):
+        return 2
+    if normalized in ("float32", "fp32"):
+        return 4
+    if normalized in ("float8", "fp8", "float8_e4m3fn", "float8_e5m2"):
+        return 1
+    raise ValueError(
+        f"Unsupported torch_dtype for PageAttention block derivation: {dtype_name}"
+    )
+
+
+def _load_model_config(model_path: str) -> Dict[str, Any]:
+    config_path = Path(model_path).expanduser() / "config.json"
+    if not config_path.exists():
+        raise ValueError(
+            "Cannot derive vLLM token block_size from PageAttention block "
+            f"size because model config is missing: {config_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"Model config is not a JSON object: {config_path}")
+    return data
+
+
+def derive_token_block_size_from_page_attention_block(
+    *,
+    model_path: str,
+    explicit_block_size: Optional[int],
+) -> tuple[Optional[int], Optional[int]]:
+    """Resolve vLLM token block_size from a K+V PageAttention byte target."""
+    page_attention_block_size = get_page_attention_block_size_bytes_from_env()
+    if page_attention_block_size is None:
+        return explicit_block_size, None
+
+    model_cfg = _load_model_config(model_path)
+    num_attention_heads = model_cfg.get("num_attention_heads")
+    num_kv_heads = model_cfg.get("num_key_value_heads", num_attention_heads)
+    head_dim = model_cfg.get("head_dim")
+    if head_dim is None:
+        hidden_size = model_cfg.get("hidden_size")
+        if hidden_size is None or num_attention_heads is None:
+            raise ValueError(
+                "Cannot derive head_dim from model config; expected head_dim "
+                "or hidden_size + num_attention_heads.")
+        head_dim = int(hidden_size) // int(num_attention_heads)
+    if num_kv_heads is None:
+        raise ValueError(
+            "Cannot derive PageAttention block size: model config lacks "
+            "num_key_value_heads and num_attention_heads.")
+
+    dtype_size = _dtype_size_bytes(model_cfg.get("torch_dtype"))
+    bytes_per_token = 2 * int(num_kv_heads) * int(head_dim) * dtype_size
+    if page_attention_block_size % bytes_per_token != 0:
+        raise ValueError(
+            "Requested K+V PageAttention block size is not an integer number "
+            "of tokens: "
+            f"page_attention_block_size={page_attention_block_size} bytes, "
+            f"bytes_per_token={bytes_per_token}")
+    derived_block_size = page_attention_block_size // bytes_per_token
+    if derived_block_size <= 0:
+        raise ValueError(
+            "Derived token block_size must be positive, got "
+            f"{derived_block_size}")
+    if derived_block_size % 16 != 0:
+        raise ValueError(
+            "Derived token block_size must be divisible by 16 for the "
+            f"FlashAttention backend, got {derived_block_size}.")
+    if explicit_block_size is not None and explicit_block_size != derived_block_size:
+        raise ValueError(
+            "Do not set token block_size together with "
+            "VLLM_PAGE_ATTENTION_BLOCK_SIZE_* unless they match. "
+            f"explicit block_size={explicit_block_size}, derived "
+            f"block_size={derived_block_size} from "
+            f"{page_attention_block_size} bytes.")
+    return int(derived_block_size), int(page_attention_block_size)
 
 # =========================
 # Config models
@@ -744,6 +855,7 @@ class StaticVllmCfg(BaseModel):
     enable_nsight: bool = False
     attention_kernel: str = "direct"  # "flash", "flexi", or "direct"
     block_size: Optional[int] = None
+    """Legacy token block size. Prefer VLLM_PAGE_ATTENTION_BLOCK_SIZE_* for new experiments."""
     head_addr: str = "head"
     port: int = 8000
     weight_chunk_size_mb: float = 10.0
@@ -812,6 +924,7 @@ class StaticBenchCfg(BaseModel):
     pattern_batch_size: int = 150
     profile: bool = False
     print_outputs: bool = False
+    ignore_eos: bool = False
     benchmark_script_path: str = "/root/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     burstiness: float = 100.0
     warmup: Optional[WarmupBenchCfg] = None
@@ -1026,6 +1139,7 @@ class ExpVllmConfig:
     max_num_batched_tokens: Optional[int]  # Max tokens per batch for chunked prefill
     max_num_seqs: Optional[int]
     block_size: Optional[int]
+    page_attention_block_size_bytes: Optional[int]
     head_addr: str
     port: int
     attention_kernel: str  # "flash", "flexi", or "direct"
@@ -1152,6 +1266,7 @@ class ExpBenchmarkConfig:
     restart_server_between_repetitions: bool = False
     print_outputs: bool = False
     profile: bool = False
+    ignore_eos: bool = False
     benchmark_script_path: str = ""
     warmup: Optional[WarmupBenchCfg] = None
     # Dataset configuration
@@ -1214,7 +1329,9 @@ class ExperimentConfig:
         vars_dict["chunk"] = self.vllm.weight_chunk_size_mb
         vars_dict["mig_mode"] = self.vllm.migration_approach
         vars_dict["wl"] = self.vllm.weight_loading_mode
-        if self.vllm.block_size is not None:
+        if self.vllm.page_attention_block_size_bytes is not None:
+            vars_dict["pab_kb"] = self.vllm.page_attention_block_size_bytes // 1024
+        elif self.vllm.block_size is not None:
             vars_dict["blk"] = self.vllm.block_size
         if self.vllm.fixed_num_gpu_blocks != -1:
             vars_dict["fixed_blocks"] = self.vllm.fixed_num_gpu_blocks
@@ -1350,7 +1467,12 @@ class ExperimentConfig:
         mig_approach = migration_approach if migration_approach is not None else static_cfg.vllm.migration_approach
         weight_loading = weight_loading_mode if weight_loading_mode is not None else static_cfg.vllm.weight_loading_mode
         fixed_blocks = fixed_num_gpu_blocks if fixed_num_gpu_blocks is not None else static_cfg.vllm.fixed_num_gpu_blocks
-        blk_size = block_size if block_size is not None else static_cfg.vllm.block_size
+        raw_blk_size = block_size if block_size is not None else static_cfg.vllm.block_size
+        blk_size, page_attention_block_size_bytes = (
+            derive_token_block_size_from_page_attention_block(
+                model_path=static_cfg.model.path,
+                explicit_block_size=raw_blk_size,
+            ))
         vmm = use_vmm if use_vmm is not None else static_cfg.vllm.use_vmm
         kv_resize = enable_kv_resize if enable_kv_resize is not None else static_cfg.vllm.enable_kv_resize
         cpu_cache = enable_cpu_weight_cache if enable_cpu_weight_cache is not None else static_cfg.vllm.enable_cpu_weight_cache
@@ -1387,6 +1509,7 @@ class ExperimentConfig:
             max_num_batched_tokens=static_cfg.vllm.max_num_batched_tokens,
             max_num_seqs=static_cfg.vllm.max_num_seqs,
             block_size=blk_size,
+            page_attention_block_size_bytes=page_attention_block_size_bytes,
             head_addr=static_cfg.vllm.head_addr,
             port=static_cfg.vllm.port,
             attention_kernel=kernel,
@@ -1422,6 +1545,7 @@ class ExperimentConfig:
             restart_server_between_repetitions=static_cfg.benchmark.restart_server_between_repetitions,
             print_outputs=static_cfg.benchmark.print_outputs,
             profile=static_cfg.benchmark.profile,
+            ignore_eos=static_cfg.benchmark.ignore_eos,
             benchmark_script_path=static_cfg.benchmark.benchmark_script_path,
             warmup=static_cfg.benchmark.warmup,
             dataset_name=static_cfg.benchmark.dataset_name,
@@ -1488,6 +1612,7 @@ class VllmServerSpec:
     max_num_batched_tokens: Optional[int]
     max_num_seqs: Optional[int]
     block_size: Optional[int]
+    page_attention_block_size_bytes: Optional[int]
     head_addr: str
     port: int
     
@@ -1622,6 +1747,7 @@ class BenchmarkSpec:
     # Features
     print_outputs: bool = False
     profile: bool = False
+    ignore_eos: bool = False
     
     # Optional warmup
     warmup: Optional[WarmupBenchCfg] = None
@@ -1677,6 +1803,7 @@ class BenchmarkSpec:
             "pattern_batch_size": self.pattern_batch_size,
             "profile": self.profile,
             "print_outputs": self.print_outputs,
+            "ignore_eos": self.ignore_eos,
             "burstiness": self.burstiness,
             "warmup": self.warmup.model_dump() if self.warmup else None,
             "metrics_file_name": metrics_file_path,

@@ -1,4 +1,5 @@
 from collections import defaultdict
+from contextlib import nullcontext
 from concurrent.futures import thread
 from copy import deepcopy
 import gc
@@ -18,11 +19,15 @@ from torch.cuda import Stream
 from vllm._custom_ops import flexi_reshape_and_cache_flash
 from vllm.attention import layer
 from vllm.attention.dynamic_layer import FlexiAttention
-from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import FlexiKVTensorMeta
+from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import (
+    FlexiKVTensorMeta,
+    KVCachedSparseKVTensorMeta,
+)
 # from vllm.kv_allocator import allocate_with_cuda_async, free_cache, free_page_list, prepare_flexi_kv_ptrs
 from vllm.kv_allocator import kv_allocator
 from vllm.kvcached_integration import (
     materialize_kvcached_received_kv_tensor,
+    materialize_kvcached_sparse_received_kv_tensor,
     maybe_apply_kvcached_vllm_patches,
     use_direct_ptr_for_runtime,
     use_flexi_kv_for_runtime,
@@ -133,6 +138,7 @@ class DynamicGPUWorker(Worker):
         # Debug assertions for KV binding/shape
         self._debug_assert_kv: bool = str(os.getenv("VLLM_DEBUG_ASSERT_KV", "1")).lower() not in ("0", "", "false", "no")
         self._listen_kv_cache_threads: list[threading.Thread] = []
+        self._kv_patch_recv_apply_lock = threading.Lock()
         self.rank_to_layers_ids: dict[int, list[int]] = {}
         self._pending_deleted_model_layers: list[list[object]] = []
         self._pending_deleted_model_layers_events: list[threading.Event] = []
@@ -3057,16 +3063,20 @@ class DynamicGPUWorker(Worker):
                 # Sender KV indexing must stay tied to the old layout captured
                 # when migration starts. Autoscaling updates the target layout
                 # asynchronously, while old-config batches are still running.
+                nccl_lock = getattr(self, "_nccl_lock", None)
+                nccl_lock_context = (nccl_lock if nccl_lock is not None
+                                     else nullcontext())
                 with self.model_runner.forward_lock:
-                    kv_tensor_meta, kv_tensor_data = self.dynamic_kv_synchronizer.get_kv_tensor_from_cache(
-                        layer_ids,
-                        layer_id,
-                        sender_start_layer_id,
-                        self.model_runner.page_meta,
-                        slot_mapping_dev,
-                        key_cache_ptrs=sender_key_cache_ptrs,
-                        value_cache_ptrs=sender_value_cache_ptrs,
-                        logical_num_blocks=logical_num_blocks)
+                    with nccl_lock_context:
+                        kv_tensor_meta, kv_tensor_data = self.dynamic_kv_synchronizer.get_kv_tensor_from_cache(
+                            layer_ids,
+                            layer_id,
+                            sender_start_layer_id,
+                            self.model_runner.page_meta,
+                            slot_mapping_dev,
+                            key_cache_ptrs=sender_key_cache_ptrs,
+                            value_cache_ptrs=sender_value_cache_ptrs,
+                            logical_num_blocks=logical_num_blocks)
                 logger.info(f"start to send kv tensor for layer {layer_id} to rank {rank}, kv_tensor_meta: {kv_tensor_meta}, kv_tensor_data shape: {kv_tensor_data.shape}, time taken to get kv tensor: {human_readable_duration(time.time() - time_start)} seconds")
                 send_gate = (self.model_runner.fbgate.foreground
                              if self.vllm_config.dynamic_config.
@@ -3342,14 +3352,15 @@ class DynamicGPUWorker(Worker):
                 meta = self.dynamic_kv_synchronizer.recv_controller(from_rank)
                 logger.info("received kv tensor meta")
                 if first_time:
-                    assert isinstance(meta, KVTensorMeta) or isinstance(meta, FlexiKVTensorMeta)
+                    assert isinstance(meta, (KVTensorMeta, FlexiKVTensorMeta,
+                                             KVCachedSparseKVTensorMeta))
                     layers_to_be_received = set(meta.layer_to_be_received)
                     time_start = time.time()
                     first_time = False
                     self.receiver_num_applied_token_dict[from_rank] = 0
                     self.is_all_patch_applied[from_rank] = False # 第一次接受到kv tensor时，需要将is_all_patch_applied设置为False，表示需要等待所有patch都应用完毕后才能进行配置的转换
                     tmp_slot_token_num = meta.num_tokens
-                if meta.type != "kv_tensor":
+                if meta.type not in ("kv_tensor", "kv_tensor_sparse"):
                     assert layers_to_be_received == received_layer, "The layers to be received should be the same as the received layers"
                     break
 
@@ -3365,8 +3376,8 @@ class DynamicGPUWorker(Worker):
                 # communicator and writes to newly allocated buffers, so it is
                 # safe to run concurrently with compiled DAG foreground tasks.
                 with self.model_runner.fbgate.foreground():
-                    if is_flexi:
-                        assert isinstance(meta, FlexiKVTensorMeta)
+                    if isinstance(meta, (FlexiKVTensorMeta,
+                                         KVCachedSparseKVTensorMeta)):
                         slot_mapping, kv_tensor = (
                             self.dynamic_kv_synchronizer.recv_kv_tensor(
                                 from_rank,
@@ -3427,35 +3438,28 @@ class DynamicGPUWorker(Worker):
                 logger.info(f"[timeline]: pre-allocation done, free memory after: {free_after / 1024**3:.2f} GB, allocated: {(free_before - free_after) / 1024**3:.2f} GB")
                 logger.info(f"[timeline]: pre-allocation done in {human_readable_duration(time.time() - time_start_bind_kv_cache)}")
 
-            for layer_id in layer_ids:
-                logger.info(f"current memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB, start to bind kv cache for layer {layer_id}")
-                kv_tensor = tmp_kv_tensors_dict[layer_id]
-                if is_flexi:
-                    slot_mapping = tmp_slot_mapping_dict[layer_id]
-                    assert self.device is not None
-                    logger.info(f"[timeline]: binding layer {layer_id} on migration stream {self.migration_stream}")
-                    # Use pre-allocated memory
-                    preallocated = preallocated_caches.get(layer_id)
-                    dynamic_flexi_bind_single_kv_tensor(
-                        self._kv_cache_start_layer(),
-                        self._kv_cache_start_layer() + len(self.model_runner.key_caches),
-                        layer_id,
-                        slot_mapping,
-                        self.block_num,
-                        kv_tensor,
-                        self.vllm_config.compilation_config.static_forward_context,
-                        self.dynamic_kv_synchronizer,
-                        self.model_runner,
-                        self.device,
-                        stream=self.migration_stream,
-                        preallocated=preallocated,
-                    )
-                else:
-                    # dynamic_bind_single_kv_tensor内部不使用所，因此我们需要在外面加锁
-                    with self.model_runner.forward_lock:
-                        bind_kv_tensor = kv_tensor
-                        if use_kvcached_backend():
-                            receiver_start_layer = self._kv_cache_start_layer()
+            if not is_flexi and use_kvcached_backend():
+                # KVCacheD materialization can trigger lazy page mapping and an
+                # async copy into the backing FTensor. Keep the whole bind phase
+                # serialized with forward until the stream is synchronized.
+                receiver_start_layer = self._kv_cache_start_layer()
+                receiver_end_layer = (
+                    receiver_start_layer + len(self.model_runner.kv_caches))
+                with self.model_runner.forward_lock:
+                    for layer_id in layer_ids:
+                        logger.info(f"current memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB, start to bind kv cache for layer {layer_id}")
+                        kv_tensor = tmp_kv_tensors_dict[layer_id]
+                        if layer_id in tmp_slot_mapping_dict:
+                            bind_kv_tensor = (
+                                materialize_kvcached_sparse_received_kv_tensor(
+                                    self.model_runner,
+                                    layer_id,
+                                    receiver_start_layer,
+                                    self.block_num,
+                                    kv_tensor,
+                                    tmp_slot_mapping_dict[layer_id]))
+                            tmp_slot_mapping_dict.pop(layer_id)
+                        else:
                             bind_kv_tensor = (
                                 materialize_kvcached_received_kv_tensor(
                                     self.model_runner,
@@ -3465,25 +3469,72 @@ class DynamicGPUWorker(Worker):
                                     kv_tensor))
                         dynamic_bind_single_kv_tensor(
                             layer_id,
-                            self._kv_cache_start_layer(),
-                            self._kv_cache_start_layer() + len(self.model_runner.kv_caches),
+                            receiver_start_layer,
+                            receiver_end_layer,
                             self.compilation_config.static_forward_context,
                             self.dynamic_kv_synchronizer,
                             runner=self.model_runner,
-                            kv_tensor=bind_kv_tensor
+                            kv_tensor=bind_kv_tensor)
+                        tmp_kv_tensors_dict.pop(layer_id)
+                    sync_start = time.time()
+                    if self.migration_stream is not None:
+                        self.migration_stream.synchronize()
+                        logger.info(
+                            f"[timeline]: migration stream synchronize after bind took {human_readable_duration(time.time() - sync_start)}"
                         )
-                tmp_kv_tensors_dict.pop(layer_id)
-            sync_start = time.time()
-            if self.migration_stream is not None:
-                self.migration_stream.synchronize()
-                logger.info(
-                    f"[timeline]: migration stream synchronize after bind took {human_readable_duration(time.time() - sync_start)}"
-                )
+                    else:
+                        _sync_current_cuda_stream(self.device)
+                        logger.info(
+                            f"[timeline]: current stream synchronize after bind took {human_readable_duration(time.time() - sync_start)}"
+                        )
             else:
-                _sync_current_cuda_stream(self.device)
-                logger.info(
-                    f"[timeline]: current stream synchronize after bind took {human_readable_duration(time.time() - sync_start)}"
-                )
+                for layer_id in layer_ids:
+                    logger.info(f"current memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB, start to bind kv cache for layer {layer_id}")
+                    kv_tensor = tmp_kv_tensors_dict[layer_id]
+                    if is_flexi:
+                        slot_mapping = tmp_slot_mapping_dict[layer_id]
+                        assert self.device is not None
+                        logger.info(f"[timeline]: binding layer {layer_id} on migration stream {self.migration_stream}")
+                        # Use pre-allocated memory
+                        preallocated = preallocated_caches.get(layer_id)
+                        dynamic_flexi_bind_single_kv_tensor(
+                            self._kv_cache_start_layer(),
+                            self._kv_cache_start_layer() + len(self.model_runner.key_caches),
+                            layer_id,
+                            slot_mapping,
+                            self.block_num,
+                            kv_tensor,
+                            self.vllm_config.compilation_config.static_forward_context,
+                            self.dynamic_kv_synchronizer,
+                            self.model_runner,
+                            self.device,
+                            stream=self.migration_stream,
+                            preallocated=preallocated,
+                        )
+                    else:
+                        # dynamic_bind_single_kv_tensor内部不使用所，因此我们需要在外面加锁
+                        with self.model_runner.forward_lock:
+                            dynamic_bind_single_kv_tensor(
+                                layer_id,
+                                self._kv_cache_start_layer(),
+                                self._kv_cache_start_layer() + len(self.model_runner.kv_caches),
+                                self.compilation_config.static_forward_context,
+                                self.dynamic_kv_synchronizer,
+                                runner=self.model_runner,
+                                kv_tensor=kv_tensor
+                            )
+                    tmp_kv_tensors_dict.pop(layer_id)
+                sync_start = time.time()
+                if self.migration_stream is not None:
+                    self.migration_stream.synchronize()
+                    logger.info(
+                        f"[timeline]: migration stream synchronize after bind took {human_readable_duration(time.time() - sync_start)}"
+                    )
+                else:
+                    _sync_current_cuda_stream(self.device)
+                    logger.info(
+                        f"[timeline]: current stream synchronize after bind took {human_readable_duration(time.time() - sync_start)}"
+                    )
             # memory_snapshot(f"rank{self.rank}_after_bind_all_kv_caches_from_rank{from_rank}", self.device)
             logger.info(f"[timeline]: bind kv cache time taken: {human_readable_duration(time.time() - time_start_bind_kv_cache)}")
             
@@ -3531,46 +3582,47 @@ class DynamicGPUWorker(Worker):
                 # Ensure the order of the patch
                 assert meta.id == cur_patch_id, f"The patch id should be the next id of the last patch, meta id: {meta.id} vs cur patch id{cur_patch_id}"
                 cur_patch_id += 1
-                slot_mapping, kv_payload = self.dynamic_kv_synchronizer.recv_kv_patch(
-                    from_rank,
-                    meta)
-                logger.info(f"[listen loop]: Received Meta: {meta}")
-                logger.info(f"[listen loop]: slot mapping device: {slot_mapping.device}, kv payload device: {kv_payload.device}, kv payload shape: {kv_payload.shape}, slot mapping shape: {slot_mapping.shape}")
-                
-                # Only apply patch if there's actual data (skip for empty kv_patch_finished)
-                if kv_payload.numel() > 0:
-                    with self._layer_loaded_cv:
-                        receiver_start_layer_id = self._kv_patch_apply_start_layer()
-                        receiver_key_cache_ptrs = None
-                        receiver_value_cache_ptrs = None
-                        if use_flexi_kv_for_runtime(self.vllm_config):
-                            receiver_key_cache_ptrs = list(
-                                self.dynamic_kv_synchronizer.key_cache_ptrs)
-                            receiver_value_cache_ptrs = list(
-                                self.dynamic_kv_synchronizer.value_cache_ptrs)
-                            if not self._kv_ptr_view_covers_layers(
-                                    receiver_start_layer_id,
-                                    receiver_key_cache_ptrs,
-                                    receiver_value_cache_ptrs,
-                                    list(meta.layer_ids)):
-                                raise RuntimeError(
-                                    "KV migration receiver could not capture "
-                                    "a pointer view covering patch layers: "
-                                    f"rank={self.rank}, from_rank={from_rank}, "
-                                    f"start_layer={receiver_start_layer_id}, "
-                                    f"num_key_cache_ptrs={len(receiver_key_cache_ptrs)}, "
-                                    f"layers={meta.layer_ids}")
-                    with self.model_runner.forward_lock:
-                        self.dynamic_kv_synchronizer.apply_one_patch_to_kv_cache(
-                            receiver_start_layer_id, meta,
-                            kv_payload, slot_mapping,
-                            self.model_runner.page_meta,
-                            key_cache_ptrs=receiver_key_cache_ptrs,
-                            value_cache_ptrs=receiver_value_cache_ptrs)
-                    self.receiver_num_applied_token_dict[from_rank] += meta.num_tokens
-                    logger.info(f"[num tokens]: receiver side: rank {from_rank} applied token: {meta.num_tokens}, total applied token: {self.receiver_num_applied_token_dict[from_rank]}")
-                else:
-                    logger.info(f"[listen loop]: skipping apply for empty patch (type={meta.type})")
+                with self._kv_patch_recv_apply_lock:
+                    slot_mapping, kv_payload = (
+                        self.dynamic_kv_synchronizer.recv_kv_patch(
+                            from_rank, meta))
+                    logger.info(f"[listen loop]: Received Meta: {meta}")
+                    logger.info(f"[listen loop]: slot mapping device: {slot_mapping.device}, kv payload device: {kv_payload.device}, kv payload shape: {kv_payload.shape}, slot mapping shape: {slot_mapping.shape}")
+
+                    # Only apply patch if there's actual data (skip for empty kv_patch_finished)
+                    if kv_payload.numel() > 0:
+                        with self._layer_loaded_cv:
+                            receiver_start_layer_id = self._kv_patch_apply_start_layer()
+                            receiver_key_cache_ptrs = None
+                            receiver_value_cache_ptrs = None
+                            if use_flexi_kv_for_runtime(self.vllm_config):
+                                receiver_key_cache_ptrs = list(
+                                    self.dynamic_kv_synchronizer.key_cache_ptrs)
+                                receiver_value_cache_ptrs = list(
+                                    self.dynamic_kv_synchronizer.value_cache_ptrs)
+                                if not self._kv_ptr_view_covers_layers(
+                                        receiver_start_layer_id,
+                                        receiver_key_cache_ptrs,
+                                        receiver_value_cache_ptrs,
+                                        list(meta.layer_ids)):
+                                    raise RuntimeError(
+                                        "KV migration receiver could not capture "
+                                        "a pointer view covering patch layers: "
+                                        f"rank={self.rank}, from_rank={from_rank}, "
+                                        f"start_layer={receiver_start_layer_id}, "
+                                        f"num_key_cache_ptrs={len(receiver_key_cache_ptrs)}, "
+                                        f"layers={meta.layer_ids}")
+                        with self.model_runner.forward_lock:
+                            self.dynamic_kv_synchronizer.apply_one_patch_to_kv_cache(
+                                receiver_start_layer_id, meta,
+                                kv_payload, slot_mapping,
+                                self.model_runner.page_meta,
+                                key_cache_ptrs=receiver_key_cache_ptrs,
+                                value_cache_ptrs=receiver_value_cache_ptrs)
+                        self.receiver_num_applied_token_dict[from_rank] += meta.num_tokens
+                        logger.info(f"[num tokens]: receiver side: rank {from_rank} applied token: {meta.num_tokens}, total applied token: {self.receiver_num_applied_token_dict[from_rank]}")
+                    else:
+                        logger.info(f"[listen loop]: skipping apply for empty patch (type={meta.type})")
                     
                 if meta.type == "kv_patch_meta":
                     logger.info(f"debug: ------------ Worker {self.rank} received kv patch meta from rank {from_rank}, kv payload shape: {kv_payload.shape}, slot mapping shape: {slot_mapping.shape}, num tokens: {meta.num_tokens}, patch id: {meta.id}")

@@ -141,6 +141,8 @@ SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
 MAX_CACHED_TOKENS = int(os.getenv("KVCACHED_MAX_CACHED_TOKENS", "16000"))
 CONTIGUOUS_LAYOUT = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT",
                               "true").lower() == "true"
+LAYER_STACKING = os.getenv("KVCACHED_LAYER_STACKING",
+                           "false").lower() == "true"
 
 
 def _parse_size_env(name: str, scale: int) -> int | None:
@@ -157,12 +159,14 @@ def _parse_size_env(name: str, scale: int) -> int | None:
 
 
 def get_physical_block_size(default: int | None = None) -> int | None:
-    """Return the per-layer physical block/slice size in bytes.
+    """Return the layer-stacking K+V physical block size in bytes.
 
-    This is the user-facing layer-stacking interface.  When set, the stacking
-    factor is derived as ``PAGE_SIZE // physical_block_size``.  For example,
-    with the default 2MB base page, 1MB means stacking 2 layers and 512KB means
-    stacking 4 layers.
+    This value is only meaningful when ``KVCACHED_LAYER_STACKING=true``.  The
+    stacking factor is derived as ``PAGE_SIZE // physical_block_size``.  For
+    example, with the default 2MB base page, 1MB means stacking 2 layers and
+    512KB means stacking 4 layers.  For attention layouts with separate K and
+    V tensors, KVCacheD derives the internal per-tensor slice size from this
+    K+V total.
     """
     for name, scale in (
         ("KVCACHED_PHYSICAL_BLOCK_SIZE_BYTES", 1),

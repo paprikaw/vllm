@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import torch
+
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -82,6 +84,36 @@ def use_direct_ptr_for_runtime(vllm_config: Any) -> bool:
     dynamic_config = getattr(vllm_config, "dynamic_config", None)
     return (use_flexi_kv_for_runtime(vllm_config)
             and bool(getattr(dynamic_config, "use_direct_ptr", False)))
+
+
+def _log_kvcached_fragmentation_stats(
+    reason: str,
+    target: int,
+    before_stats: dict[str, Any],
+    after_stats: dict[str, Any],
+) -> None:
+    prefix = f" ({reason})" if reason else ""
+    logger.info(
+        "KVCacheD fragmentation%s: target_blocks=%s "
+        "before_logical_available_bytes=%s "
+        "before_physical_whole_available_bytes=%s "
+        "before_internal_fragmentation_bytes=%s "
+        "before_internal_fragmentation_ratio=%.6f "
+        "after_logical_available_bytes=%s "
+        "after_physical_whole_available_bytes=%s "
+        "after_internal_fragmentation_bytes=%s "
+        "after_internal_fragmentation_ratio=%.6f",
+        prefix,
+        target,
+        before_stats.get("fragmentation_logical_available_bytes"),
+        before_stats.get("fragmentation_physical_whole_available_bytes"),
+        before_stats.get("fragmentation_internal_bytes"),
+        float(before_stats.get("fragmentation_internal_ratio", 0.0)),
+        after_stats.get("fragmentation_logical_available_bytes"),
+        after_stats.get("fragmentation_physical_whole_available_bytes"),
+        after_stats.get("fragmentation_internal_bytes"),
+        float(after_stats.get("fragmentation_internal_ratio", 0.0)),
+    )
 
 
 def is_dynamic_migration_enabled(vllm_config: Any) -> bool:
@@ -591,9 +623,10 @@ def _enhance_elastic_block_pool_for_dynamic_resize(
             raise RuntimeError(
                 f"KVCacheD physical extend failed: target_blocks={new_block_num}")
         _ensure_block_metadata(self, new_block_num)
-        self.kv_cache_manager.num_blocks = new_block_num
-        self.kv_cache_manager.mem_size = (
-            new_block_num * self.kv_cache_manager.block_mem_size)
+        if new_block_num > self.kv_cache_manager.num_blocks:
+            self.kv_cache_manager.num_blocks = new_block_num
+            self.kv_cache_manager.mem_size = (
+                new_block_num * self.kv_cache_manager.block_mem_size)
         self.num_gpu_blocks = new_block_num
         self._pending_physical_num_gpu_blocks = new_block_num
 
@@ -601,38 +634,57 @@ def _enhance_elastic_block_pool_for_dynamic_resize(
         num_moves = _commit_pending_block_moves(self)
         target = getattr(self, "_pending_physical_num_gpu_blocks",
                          self.num_gpu_blocks)
-        if target == getattr(self.kv_cache_manager, "num_blocks", target):
-            before_stats = self.kv_cache_manager.stats()
+        current_virtual_blocks = getattr(self.kv_cache_manager, "num_blocks",
+                                         target)
+        current_physical_limit = None
+        try:
+            current_physical_limit = (
+                self.kv_cache_manager.page_allocator.get_physical_page_limit())
+        except Exception:
+            logger.debug("Could not read KVCacheD physical page limit",
+                         exc_info=True)
+        block_mem_size = getattr(self.kv_cache_manager, "block_mem_size")
+        target_physical_pages = (
+            target * block_mem_size + self.kv_cache_manager.page_size - 1
+        ) // self.kv_cache_manager.page_size
+        if (target == current_virtual_blocks
+                and current_physical_limit == target_physical_pages):
+            before_stats = self.kv_cache_manager.stats(target_blocks=target)
             try:
                 self.kv_cache_manager.trim()
             except Exception:
                 logger.exception("KVCacheD trim failed during %s", reason)
                 raise
-            after_stats = self.kv_cache_manager.stats()
+            after_stats = self.kv_cache_manager.stats(target_blocks=target)
             logger.info(
                 "KVCacheD physical trim committed%s: target_blocks=%s "
                 "stats_before=%s stats_after=%s pending_moves=%s",
                 f" ({reason})" if reason else "", target, before_stats,
                 after_stats, num_moves)
+            _log_kvcached_fragmentation_stats(reason, target, before_stats,
+                                              after_stats)
             return True
 
-        before_stats = self.kv_cache_manager.stats()
+        before_stats = self.kv_cache_manager.stats(target_blocks=target)
         ok = _resize_kvcached_pool(self, target)
         if not ok:
             raise RuntimeError(
                 "KVCacheD physical resize failed after worker compaction: "
                 f"target_blocks={target}, reason={reason}, "
                 f"stats_before={before_stats}")
-        self.kv_cache_manager.num_blocks = target
-        self.kv_cache_manager.mem_size = (
-            target * self.kv_cache_manager.block_mem_size)
+        if target > self.kv_cache_manager.num_blocks:
+            self.kv_cache_manager.num_blocks = target
+            self.kv_cache_manager.mem_size = (
+                target * self.kv_cache_manager.block_mem_size)
         self.kv_cache_manager.trim()
-        after_stats = self.kv_cache_manager.stats()
+        after_stats = self.kv_cache_manager.stats(target_blocks=target)
         logger.info(
             "KVCacheD physical resize committed%s: target_blocks=%s "
             "stats_before=%s stats_after=%s",
             f" ({reason})" if reason else "", target, before_stats,
             after_stats)
+        _log_kvcached_fragmentation_stats(reason, target, before_stats,
+                                          after_stats)
         return True
 
     def migrate_block(
@@ -745,7 +797,10 @@ def materialize_kvcached_received_kv_tensor(
     local_idx = _kvcached_tensor_index(
         runner, layer_id, fallback_start_layer=start_layer)
 
-    dst = _slice_kvcached_tensor(kv_tensors[local_idx], int(num_blocks))
+    # KVCacheD shrink changes the physical page budget only. The backing
+    # FTensor keeps the original virtual block space, and migrated slot
+    # mappings may legally target high virtual slots after shrink.
+    dst = kv_tensors[local_idx]
     if getattr(kv_payload, "dim", lambda: 0)() < 2:
         raise RuntimeError(
             "KVCacheD receiver expected a KV payload with a block dimension, "
@@ -769,6 +824,82 @@ def materialize_kvcached_received_kv_tensor(
         getattr(runner, "_kvcached_tensor_start_layer", start_layer),
         local_idx, payload_blocks, int(dst.shape[1]), tuple(kv_payload.shape),
         tuple(dst.shape))
+    return dst
+
+
+def materialize_kvcached_sparse_received_kv_tensor(
+    runner: Any,
+    layer_id: int,
+    start_layer: int,
+    num_blocks: int,
+    kv_payload: Any,
+    slot_mapping: Any,
+) -> Any:
+    """Scatter a migrated live-slot KV payload into a KVCacheD backing view."""
+    kv_tensors = getattr(runner, "_kvcached_kv_tensors", None)
+    if not kv_tensors:
+        raise RuntimeError(
+            "KVCacheD receiver has no backing KV tensors for migrated layer "
+            f"{layer_id}")
+
+    local_idx = _kvcached_tensor_index(
+        runner, layer_id, fallback_start_layer=start_layer)
+    # Keep the full virtual FTensor view. `num_blocks` is the current physical
+    # resize target for KVCacheD and must not cap sparse migration slot ids.
+    dst = kv_tensors[local_idx]
+    if getattr(kv_payload, "dim", lambda: 0)() != 4:
+        raise RuntimeError(
+            "KVCacheD sparse receiver expected payload [2, T, H, D], "
+            f"got shape={getattr(kv_payload, 'shape', None)}")
+    if int(kv_payload.shape[0]) != 2:
+        raise RuntimeError(
+            "KVCacheD sparse receiver expected payload first dim to be 2, "
+            f"got shape={tuple(kv_payload.shape)}")
+    if slot_mapping.device != dst.device:
+        slot_mapping = slot_mapping.to(dst.device, non_blocking=True)
+    if kv_payload.device != dst.device or kv_payload.dtype != dst.dtype:
+        kv_payload = kv_payload.to(device=dst.device,
+                                   dtype=dst.dtype,
+                                   non_blocking=True)
+
+    if int(slot_mapping.numel()) != int(kv_payload.shape[1]):
+        raise RuntimeError(
+            "KVCacheD sparse receiver slot count does not match payload: "
+            f"slot_mapping={tuple(slot_mapping.shape)}, "
+            f"payload_shape={tuple(kv_payload.shape)}")
+
+    if slot_mapping.numel() > 0:
+        key_cache = dst[0]
+        value_cache = dst[1]
+        block_size = int(key_cache.size(1))
+        block_indices = torch.div(slot_mapping,
+                                  block_size,
+                                  rounding_mode="floor")
+        block_offsets = slot_mapping.remainder(block_size)
+        flat_capacity = int(key_cache.size(0) * key_cache.size(1))
+        slot_min = int(slot_mapping.min().item())
+        slot_max = int(slot_mapping.max().item())
+        if slot_min < 0 or slot_max >= flat_capacity:
+            raise RuntimeError(
+                "KVCacheD sparse receiver slot mapping is out of bounds: "
+                f"layer={layer_id}, slot_min={slot_min}, "
+                f"slot_max={slot_max}, flat_capacity={flat_capacity}")
+        key_cache.index_put_((block_indices, block_offsets),
+                             kv_payload[0],
+                             accumulate=False)
+        value_cache.index_put_((block_indices, block_offsets),
+                               kv_payload[1],
+                               accumulate=False)
+
+    _remember_kvcached_layer_name(runner, int(layer_id))
+    logger.info(
+        "KVCacheD receiver materialized sparse migrated KV: layer=%s "
+        "start_layer=%s tensor_start=%s tensor_idx=%s live_tokens=%s "
+        "bound_blocks=%s payload_shape=%s dst_shape=%s",
+        layer_id, start_layer,
+        getattr(runner, "_kvcached_tensor_start_layer", start_layer),
+        local_idx, int(slot_mapping.numel()), int(dst.shape[1]),
+        tuple(kv_payload.shape), tuple(dst.shape))
     return dst
 
 

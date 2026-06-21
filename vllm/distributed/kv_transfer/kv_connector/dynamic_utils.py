@@ -60,6 +60,17 @@ class FlexiKVTensorMeta(BaseModel):
     kv_payload_dtype: torch.dtype
     kv_payload_shape: torch.Size
 
+class KVCachedSparseKVTensorMeta(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    type: Literal['kv_tensor_sparse']
+    layer_to_be_received: set[int]
+    layer_id: int
+    num_tokens: int
+    slot_mapping_dtype: torch.dtype
+    slot_mapping_shape: torch.Size
+    kv_payload_dtype: torch.dtype
+    kv_payload_shape: torch.Size
+
 class KVPatch:
     def __init__(self, meta: KVPatchMeta, kv_payload: torch.Tensor, slot_mapping: torch.Tensor):
         self.meta = meta
@@ -80,6 +91,24 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
 
     def make_metadata_for_stage_batch(self, batch_id: int, layer_ids: list[int], num_tokens: int, tensor: torch.Tensor) -> KVSynchronizerMetadata:
         return {"type": "kv_stage_batch", "dtype": tensor.dtype, "shape": tensor.shape, "batch_id": batch_id, "layer_ids": layer_ids, "num_tokens": num_tokens}
+
+    @staticmethod
+    def _flat_capacity_for_cache(cache: torch.Tensor) -> int:
+        if cache.dim() >= 4:
+            return int(cache.size(0) * cache.size(1))
+        return int(cache.size(0))
+
+    @staticmethod
+    def _select_kv_slots(cache: torch.Tensor,
+                         slot_mapping: torch.Tensor) -> torch.Tensor:
+        if cache.dim() >= 4:
+            block_size = int(cache.size(1))
+            block_indices = torch.div(slot_mapping,
+                                      block_size,
+                                      rounding_mode='floor')
+            block_offsets = slot_mapping.remainder(block_size)
+            return cache[block_indices, block_offsets, ...]
+        return torch.index_select(cache, 0, slot_mapping)
 
     def extract_kv_patch_from_kv_cache(self, patch_id: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor, is_finished: bool) -> KVPatch:
         """Aggregate multiple layers' KV for this stage and send in one shot.. . 
@@ -105,9 +134,14 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
         # Derive shapes using model config and helper flags.
         assert self.model_executable is not None, "The model_executable should be set"
         num_heads, head_size = self.get_model_args(self.model_executable)
-        # Peek the first cache to get dtype/device.
-        k0, v0 = self.get_kv_from_cache(kv_caches[0], num_heads,
-                                                  head_size)
+        # Peek the first cache to get dtype/device.  For normal FlashAttention
+        # caches this keeps the native block layout instead of flattening the
+        # whole layer; layer-stacked KVCacheD views are intentionally strided.
+        if self.is_deepseek_mla and self.use_mla_opt:
+            k0, v0 = self.get_kv_from_cache(kv_caches[0], num_heads,
+                                            head_size)
+        else:
+            k0, v0 = kv_caches[0][0], kv_caches[0][1]
 
         # Ensure index lives on same device for fast gather.
         if slot_mapping.device != k0.device:
@@ -126,7 +160,7 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
         logger.info(f"debug-------------------- Original T: {slot_mapping.numel()}, Valid T: {num_valid}")
         slot_min = int(trimmed_slot_mapping.min().item())
         slot_max = int(trimmed_slot_mapping.max().item())
-        flat_capacity = int(k0.size(0))
+        flat_capacity = self._flat_capacity_for_cache(k0)
         logger.info(
             "KV patch slot range: patch_id=%s layers=%s slots=[%s,%s] "
             "flat_capacity=%s",
@@ -148,14 +182,17 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
         for idx, layer_id in enumerate(layer_ids):
             local_layer_id = int(layer_id - start_layer_id)
             kv_cache = kv_caches[local_layer_id]
-            key_cache, value_cache = self.get_kv_from_cache(
-                kv_cache, num_heads, head_size)
+            if self.is_deepseek_mla and self.use_mla_opt:
+                key_cache, value_cache = self.get_kv_from_cache(
+                    kv_cache, num_heads, head_size)
+            else:
+                key_cache, value_cache = kv_cache[0], kv_cache[1]
 
             assert trimmed_slot_mapping.device == key_cache.device
 
             # 直接用裁剪后的 slot_mapping 提取 KV
-            gathered_k = torch.index_select(key_cache, 0, trimmed_slot_mapping)
-            gathered_v = torch.index_select(value_cache, 0, trimmed_slot_mapping)
+            gathered_k = self._select_kv_slots(key_cache, trimmed_slot_mapping)
+            gathered_v = self._select_kv_slots(value_cache, trimmed_slot_mapping)
 
             assert gathered_k.device == KV_all.device and gathered_k.dtype == KV_all.dtype
             assert gathered_v.device == KV_all.device and gathered_v.dtype == KV_all.dtype

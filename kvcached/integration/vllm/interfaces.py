@@ -10,6 +10,7 @@ from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.tp_ipc_util import start_worker_listener_thread
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
+    LAYER_STACKING,
     PAGE_SIZE,
     get_physical_block_size,
     get_kvcached_logger,
@@ -41,10 +42,11 @@ def should_use_worker_ipc() -> bool:
 
 def _resolve_physical_layer_block_size(
     num_layers: int,
-    block_mem_bytes: int,
+    kv_tensor_block_bytes: int,
+    num_kv_buffers: int,
     physical_block_size: Optional[int],
-) -> Tuple[int, int]:
-    """Resolve per-layer physical block size and stacking factor."""
+) -> Tuple[int, int, int]:
+    """Resolve K+V physical block size, per-tensor slice, and stacking."""
     env_physical_block_size = get_physical_block_size()
     if physical_block_size is None:
         physical_block_size = env_physical_block_size
@@ -64,23 +66,30 @@ def _resolve_physical_layer_block_size(
             "PAGE_SIZE must be divisible by physical_block_size: "
             f"PAGE_SIZE={PAGE_SIZE}, "
             f"physical_block_size={physical_block_size}")
+    if physical_block_size % num_kv_buffers != 0:
+        raise ValueError(
+            "physical_block_size must be divisible by num_kv_buffers: "
+            f"physical_block_size={physical_block_size}, "
+            f"num_kv_buffers={num_kv_buffers}")
+    physical_block_slice_size = physical_block_size // num_kv_buffers
+    vrm_block_bytes = kv_tensor_block_bytes * num_kv_buffers
     layer_group_granularity = PAGE_SIZE // physical_block_size
     if layer_group_granularity > 1 and num_layers % layer_group_granularity != 0:
         raise ValueError(
             f"num_layers ({num_layers}) must be divisible by derived "
             f"layer_group_granularity ({layer_group_granularity})")
-    if layer_group_granularity > 1:
-        if physical_block_size < block_mem_bytes:
-            raise ValueError(
-                "physical_block_size "
-                f"({physical_block_size}) is smaller than one "
-                f"PageAttention block ({block_mem_bytes})")
-        if physical_block_size % block_mem_bytes != 0:
-            raise ValueError(
-                "physical_block_size "
-                f"({physical_block_size}) must be divisible by "
-                f"PageAttention block size ({block_mem_bytes})")
-    return int(layer_group_granularity), int(physical_block_size)
+    if physical_block_size < vrm_block_bytes:
+        raise ValueError(
+            "physical_block_size "
+            f"({physical_block_size}) is smaller than one "
+            f"K+V PageAttention block ({vrm_block_bytes})")
+    if physical_block_size % vrm_block_bytes != 0:
+        raise ValueError(
+            "physical_block_size "
+            f"({physical_block_size}) must be divisible by "
+            f"K+V PageAttention block size ({vrm_block_bytes})")
+    return (int(layer_group_granularity), int(physical_block_size),
+            int(physical_block_slice_size))
 
 def init_kvcached(
     tp_rank: int = 0,
@@ -188,6 +197,8 @@ def alloc_kv_cache(
     is_mla = attention_type == "MLA"
     is_hybrid_linear = attention_type == "HYBRID_LINEAR"
     unified_pool = is_hybrid_linear
+    allocator_unified_pool = unified_pool
+    block_interleaved_kv = False
 
     if is_hybrid_linear and _contiguous_layout:
         raise ValueError(
@@ -249,26 +260,69 @@ def alloc_kv_cache(
 
     assert torch.cuda.is_available(), "CUDA is not available."
 
-    layer_group_granularity, physical_block_size = (
-        _resolve_physical_layer_block_size(
-            int(num_layers), int(block_mem_bytes), physical_block_size))
-    if layer_group_granularity > 1 and not _contiguous_layout:
-        raise ValueError(
-            "physical layer stacking is currently supported only with "
-            "KVCACHED_CONTIGUOUS_LAYOUT=true")
-    block_level_layer_groups = _contiguous_layout and layer_group_granularity > 1
-
     # --- Compute virtual tensor budget and number of blocks ---
     # The vLLM KVCacheManager already decided the logical block capacity.
     requested_bytes_per_layer_k_or_v = requested_num_blocks * block_mem_bytes
     contiguous_page_size = 0
     contiguous_total_size = 0
-    packed_block_stride_bytes = block_mem_bytes * num_k_or_v
-    blocks_per_physical_page = 0
+    page_attention_block_bytes = block_mem_bytes * num_k_or_v
+    packed_block_stride_bytes = page_attention_block_bytes
+    layer_stacking_enabled = LAYER_STACKING
+    if layer_stacking_enabled and _contiguous_layout:
+        raise ValueError(
+            "KVCACHED_LAYER_STACKING is independent of the original KVCacheD "
+            "contiguous layout. Set KVCACHED_CONTIGUOUS_LAYOUT=false when "
+            "enabling layer stacking.")
+    if layer_stacking_enabled and unified_pool:
+        raise ValueError(
+            "KVCACHED_LAYER_STACKING is not implemented for the hybrid "
+            "unified-pool KV layout.")
+
+    if not layer_stacking_enabled:
+        env_physical_block_size = get_physical_block_size()
+        if physical_block_size is None:
+            physical_block_size = env_physical_block_size
+        if physical_block_size is not None:
+            raise ValueError(
+                "KVCACHED_PHYSICAL_BLOCK_SIZE_* / dynamic_config."
+                "physical_block_size is only valid when "
+                "KVCACHED_LAYER_STACKING=true.")
+        layer_group_granularity = 1
+        physical_block_size = PAGE_SIZE
+        if physical_block_size % num_k_or_v != 0:
+            raise ValueError(
+                "physical_block_size must be divisible by num_kv_buffers: "
+                f"physical_block_size={physical_block_size}, "
+                f"num_kv_buffers={num_k_or_v}")
+        physical_block_slice_size = physical_block_size // num_k_or_v
+        if not _contiguous_layout and not is_mla:
+            # Per-layer default layout maps one K+V physical page and exposes
+            # K/V as a block-interleaved tensor view. This keeps the public
+            # physical_block_size as K+V total while satisfying CUDA VMM's
+            # physical allocation granularity.
+            allocator_unified_pool = True
+            block_interleaved_kv = True
+        blocks_per_physical_page = (
+            physical_block_size // page_attention_block_bytes)
+        block_level_layer_groups = False
+        layer_group_layout = (
+            "upstream_contiguous" if _contiguous_layout else "per_layer")
+        alignment = physical_block_slice_size
+        gpu_mem_bytes_per_layer_k_or_v = _align_up(
+            requested_bytes_per_layer_k_or_v, alignment)
+        num_blocks_per_layer = (
+            gpu_mem_bytes_per_layer_k_or_v // block_mem_bytes)
+    else:
+        layer_group_granularity, physical_block_size, physical_block_slice_size = (
+            _resolve_physical_layer_block_size(
+                int(num_layers), int(block_mem_bytes), int(num_k_or_v),
+                physical_block_size))
+        block_level_layer_groups = True
+
     if block_level_layer_groups:
-        group_block_bytes = (
-            block_mem_bytes * num_k_or_v * layer_group_granularity)
-        blocks_per_physical_page = physical_block_size // block_mem_bytes
+        group_block_bytes = page_attention_block_bytes * layer_group_granularity
+        blocks_per_physical_page = (
+            physical_block_size // page_attention_block_bytes)
         layer_group_layout = (
             "block_aligned" if blocks_per_physical_page == 1
             else "slice_packed")
@@ -287,23 +341,29 @@ def alloc_kv_cache(
         logger.info(
             "KVCacheD layer-group layout enabled: "
             "derived_layout=%s, physical_block_size=%d, "
+            "physical_block_slice_size=%d, "
             "granularity=%d, num_layer_groups=%d, "
             "logical_group_block=%d, packed_block_stride=%d, "
             "blocks_per_physical_page=%d, packed_page_size=%d, "
             "total_virtual_bytes=%d",
             layer_group_layout, physical_block_size,
+            physical_block_slice_size,
             layer_group_granularity, num_layer_groups, group_block_bytes,
             packed_block_stride_bytes,
             blocks_per_physical_page, contiguous_page_size,
             contiguous_total_size)
-    else:
-        # Allocate the virtual tensor to that capacity, rounded up to the VMM
-        # page boundary, so Python tensor strides and PageAllocator map offsets
-        # agree.
-        alignment = 2 * PAGE_SIZE if is_mla else PAGE_SIZE
-        gpu_mem_bytes_per_layer_k_or_v = _align_up(
-            requested_bytes_per_layer_k_or_v, alignment)
-        num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_bytes
+
+    logger.info(
+        "KVCacheD PageAttention geometry: token_block_size=%d, "
+        "page_attention_block_size=%d, block_mem_size_per_k_or_v=%d, "
+        "num_kv_buffers=%d, physical_block_size=%d, "
+        "physical_block_slice_size=%d, layer_group_granularity=%d, "
+        "contiguous_layout=%s, layer_stacking_enabled=%s, "
+        "layout=%s, blocks_per_physical_page=%d",
+        block_size, page_attention_block_bytes, block_mem_bytes,
+        num_k_or_v, physical_block_size, physical_block_slice_size,
+        layer_group_granularity, _contiguous_layout, layer_stacking_enabled,
+        layer_group_layout, blocks_per_physical_page)
 
     gpu_capacity_bytes = torch.cuda.get_device_properties(device).total_memory
     if block_level_layer_groups:
@@ -323,7 +383,8 @@ def alloc_kv_cache(
     raw_kv_tensors = create_kv_tensors(
         ftensor_bytes_per_layer, dtype.itemsize, device, num_layers,
         num_kv_buffers=num_k_or_v, group_id=group_id,
-        unified_pool=unified_pool,
+        unified_pool=allocator_unified_pool,
+        layer_group_layout=block_level_layer_groups,
         layer_group_granularity=layer_group_granularity,
         contiguous_page_size=contiguous_page_size,
         contiguous_total_size=contiguous_total_size,
@@ -348,8 +409,60 @@ def alloc_kv_cache(
         kernel_kvcache_shape[token_dim_idx] = kernel_block_size
 
     # --- Reshape raw tensors into per-layer KV cache views ---
-    if not _contiguous_layout:
+    if block_level_layer_groups:
+        packed_block_elems = packed_block_stride_bytes // dtype.itemsize
+        one_kv_block_elems = block_mem_bytes // dtype.itemsize
+        num_layer_groups = num_layers // layer_group_granularity
+        group_stride = (
+            (num_blocks_per_layer // blocks_per_physical_page) *
+            (contiguous_page_size // dtype.itemsize))
+        flat = raw_kv_tensors[0].view(dtype=dtype)[
+            :contiguous_total_size // dtype.itemsize]
         kv_tensors: List[torch.Tensor] = []
+        if is_mla:
+            shape = list(actual_kvcache_shape)
+            strides = [packed_block_elems]
+            inner = 1
+            for dim in reversed(shape[1:]):
+                strides.insert(1, inner)
+                inner *= dim
+            for i in range(num_layers):
+                group_idx = i // layer_group_granularity
+                layer_in_group = i % layer_group_granularity
+                offset = (group_idx * group_stride +
+                          layer_in_group * one_kv_block_elems)
+                kv_tensors.append(torch.as_strided(
+                    flat, shape, strides, storage_offset=offset))
+        else:
+            shape = list(actual_kvcache_shape)
+            token_dim_idx = 2
+            token_block_elems = math.prod(shape[token_dim_idx:])
+            if blocks_dim_idx == 1:
+                strides = [
+                    one_kv_block_elems,
+                    packed_block_elems,
+                    token_block_elems // shape[token_dim_idx],
+                ]
+                for dim in shape[token_dim_idx + 1:]:
+                    strides.append(strides[-1] // dim)
+            else:
+                strides = [
+                    packed_block_elems,
+                    one_kv_block_elems,
+                    token_block_elems // shape[token_dim_idx],
+                ]
+                for dim in shape[token_dim_idx + 1:]:
+                    strides.append(strides[-1] // dim)
+            for i in range(num_layers):
+                group_idx = i // layer_group_granularity
+                layer_in_group = i % layer_group_granularity
+                offset = (
+                    group_idx * group_stride +
+                    layer_in_group * num_k_or_v * one_kv_block_elems)
+                kv_tensors.append(torch.as_strided(
+                    flat, shape, strides, storage_offset=offset))
+    elif not _contiguous_layout:
+        kv_tensors = []
         if is_mla:
             num_eles = math.prod(kernel_kvcache_shape)
             kv_tensors = [
@@ -373,7 +486,7 @@ def alloc_kv_cache(
                 strides[i] = strides[i + 1] * shape[i + 1]
             # hidden_size_eles uses kernel_block_size (shape[2]), not block_size.
             hidden_size_eles = strides[2] * shape[2]  # = kernel_bs * h * d
-            if unified_pool:
+            if unified_pool or block_interleaved_kv:
                 # Block-interleaved at kernel granularity: inter-(kernel-)block
                 # stride = 2*hidden_size; K/V dim stride = hidden_size.
                 if blocks_dim_idx == 1:          # FlashAttn (2, N*ratio, ...)
@@ -394,78 +507,20 @@ def alloc_kv_cache(
                 kv_tensors.append(
                     torch.as_strided(t.view(dtype=dtype), shape, strides))
     else:
-        if block_level_layer_groups:
-            packed_block_elems = packed_block_stride_bytes // dtype.itemsize
-            one_kv_block_elems = block_mem_bytes // dtype.itemsize
-            num_layer_groups = num_layers // layer_group_granularity
-            group_stride = (
-                (num_blocks_per_layer // blocks_per_physical_page) *
-                (contiguous_page_size // dtype.itemsize))
-            flat = raw_kv_tensors[0].view(dtype=dtype)[
-                :contiguous_total_size // dtype.itemsize]
-            kv_tensors = []
-            if is_mla:
-                shape = list(actual_kvcache_shape)
-                strides = [packed_block_elems]
-                inner = 1
-                for dim in reversed(shape[1:]):
-                    strides.insert(1, inner)
-                    inner *= dim
-                for i in range(num_layers):
-                    group_idx = i // layer_group_granularity
-                    layer_in_group = i % layer_group_granularity
-                    offset = (
-                        group_idx * group_stride +
-                        layer_in_group * one_kv_block_elems)
-                    kv_tensors.append(torch.as_strided(
-                        flat, shape, strides, storage_offset=offset))
-            else:
-                shape = list(actual_kvcache_shape)
-                token_dim_idx = 2
-                token_block_elems = math.prod(shape[token_dim_idx:])
-                if blocks_dim_idx == 1:
-                    strides = [
-                        one_kv_block_elems,
-                        packed_block_elems,
-                        token_block_elems // shape[token_dim_idx],
-                    ]
-                    for dim in shape[token_dim_idx + 1:]:
-                        strides.append(strides[-1] // dim)
-                else:
-                    strides = [
-                        packed_block_elems,
-                        one_kv_block_elems,
-                        token_block_elems // shape[token_dim_idx],
-                    ]
-                    for dim in shape[token_dim_idx + 1:]:
-                        strides.append(strides[-1] // dim)
-                for i in range(num_layers):
-                    group_idx = i // layer_group_granularity
-                    layer_in_group = i % layer_group_granularity
-                    offset = (
-                        group_idx * group_stride +
-                        layer_in_group * num_k_or_v * one_kv_block_elems)
-                    kv_tensors.append(torch.as_strided(
-                        flat, shape, strides, storage_offset=offset))
-        else:
-            layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
-            num_layer_groups = num_layers // layer_group_granularity
-            contiguous_shape = [
-                num_layer_groups,
-                num_blocks_per_layer,
-                layer_group_granularity,
-            ] + layer_elem_shape
-            num_eles = math.prod(contiguous_shape)
-            contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
-            kv_tensors = [
-                contiguous_tensor[
-                    i // layer_group_granularity,
-                    :,
-                    i % layer_group_granularity,
-                ].permute(*permute_order) for i in range(num_layers)
-            ]
+        layer_elem_shape = (
+            actual_kvcache_shape[:blocks_dim_idx] +
+            actual_kvcache_shape[blocks_dim_idx + 1:])
+        contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
+        num_eles = math.prod(contiguous_shape)
+        contiguous_tensor = (
+            raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(
+                contiguous_shape))
+        kv_tensors = [
+            contiguous_tensor[:, i].permute(*permute_order)
+            for i in range(num_layers)
+        ]
 
-    if not unified_pool:
+    if not is_hybrid_linear:
         return kv_tensors
 
     # --- Build raw int8 buffers for hybrid model (mamba) support ---

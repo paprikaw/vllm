@@ -293,8 +293,17 @@ class KVCacheManager:
         self.single_type_manager.save_new_computed_blocks(
             request.request_id, new_computed_block_list)
 
-        new_blocks = self.single_type_manager.allocate_new_blocks(
-            request.request_id, num_tokens_need_slot)
+        try:
+            new_blocks = self.single_type_manager.allocate_new_blocks(
+                request.request_id, num_tokens_need_slot)
+        except ValueError as e:
+            if "Unable to allocate KV cache blocks from physical pool" in str(e):
+                logger.warning(
+                    "KV cache physical pool exhausted while allocating slots "
+                    "for request %s; deferring to scheduler preemption/retry: %s",
+                    request.request_id, e)
+                return None
+            raise
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.

@@ -3,6 +3,9 @@
 
 #include <cuda_runtime.h>
 
+#include <stdexcept>
+#include <string>
+
 #include "constants.hpp"
 #include "cuda_utils.hpp"
 #include "page.hpp"
@@ -20,9 +23,19 @@ GPUPage::GPUPage(page_id_t page_id, int dev_idx, size_t page_size)
           {
               .type = CU_MEM_LOCATION_TYPE_DEVICE,
               .id = dev_,
-          },
+      },
   };
-  CHECK_DRV(cuMemCreate(&handle_, page_size_, &prop, 0));
+  CUresult res = cuMemCreate(&handle_, page_size_, &prop, 0);
+  if (res != CUDA_SUCCESS) {
+    const char *err = nullptr;
+    (void)cuGetErrorString(res, &err);
+    throw std::runtime_error("cuMemCreate failed for GPUPage page_id=" +
+                             std::to_string(page_id_) +
+                             " page_size=" +
+                             std::to_string(page_size_) +
+                             " cuda_error=" +
+                             (err ? err : "unknown"));
+  }
 }
 
 GPUPage::~GPUPage() {
