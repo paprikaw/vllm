@@ -647,42 +647,69 @@ def _enhance_elastic_block_pool_for_dynamic_resize(
         target_physical_pages = (
             target * block_mem_size + self.kv_cache_manager.page_size - 1
         ) // self.kv_cache_manager.page_size
+        page_allocator = self.kv_cache_manager.page_allocator
+        prealloc_paused = False
+        before_stats = self.kv_cache_manager.stats(target_blocks=target)
+
+        try:
+            page_allocator.stop_prealloc_thread()
+            prealloc_paused = True
+            self.kv_cache_manager.trim()
+            after_trim_stats = self.kv_cache_manager.stats(
+                target_blocks=target)
+        except Exception:
+            if prealloc_paused and not getattr(self.kv_cache_manager,
+                                               "_closed", False):
+                page_allocator.start_prealloc_thread()
+            logger.exception("KVCacheD pre-resize trim failed during %s",
+                             reason)
+            raise
+
         if (target == current_virtual_blocks
                 and current_physical_limit == target_physical_pages):
-            before_stats = self.kv_cache_manager.stats(target_blocks=target)
             try:
-                self.kv_cache_manager.trim()
+                after_stats = self.kv_cache_manager.stats(
+                    target_blocks=target)
             except Exception:
-                logger.exception("KVCacheD trim failed during %s", reason)
+                logger.exception("KVCacheD stats failed during %s", reason)
                 raise
-            after_stats = self.kv_cache_manager.stats(target_blocks=target)
+            finally:
+                if prealloc_paused and not getattr(self.kv_cache_manager,
+                                                   "_closed", False):
+                    page_allocator.start_prealloc_thread()
             logger.info(
                 "KVCacheD physical trim committed%s: target_blocks=%s "
-                "stats_before=%s stats_after=%s pending_moves=%s",
+                "stats_before=%s stats_after_trim=%s stats_after=%s "
+                "pending_moves=%s",
                 f" ({reason})" if reason else "", target, before_stats,
-                after_stats, num_moves)
+                after_trim_stats, after_stats, num_moves)
             _log_kvcached_fragmentation_stats(reason, target, before_stats,
                                               after_stats)
             return True
 
-        before_stats = self.kv_cache_manager.stats(target_blocks=target)
-        ok = _resize_kvcached_pool(self, target)
-        if not ok:
-            raise RuntimeError(
-                "KVCacheD physical resize failed after worker compaction: "
-                f"target_blocks={target}, reason={reason}, "
-                f"stats_before={before_stats}")
-        if target > self.kv_cache_manager.num_blocks:
-            self.kv_cache_manager.num_blocks = target
-            self.kv_cache_manager.mem_size = (
-                target * self.kv_cache_manager.block_mem_size)
-        self.kv_cache_manager.trim()
-        after_stats = self.kv_cache_manager.stats(target_blocks=target)
+        try:
+            ok = _resize_kvcached_pool(self, target)
+            if not ok:
+                raise RuntimeError(
+                    "KVCacheD physical resize failed after worker compaction: "
+                    f"target_blocks={target}, reason={reason}, "
+                    f"stats_before={before_stats}, "
+                    f"stats_after_trim={after_trim_stats}")
+            if target > self.kv_cache_manager.num_blocks:
+                self.kv_cache_manager.num_blocks = target
+                self.kv_cache_manager.mem_size = (
+                    target * self.kv_cache_manager.block_mem_size)
+            self.kv_cache_manager.trim()
+            after_stats = self.kv_cache_manager.stats(target_blocks=target)
+        finally:
+            if prealloc_paused and not getattr(self.kv_cache_manager,
+                                               "_closed", False):
+                page_allocator.start_prealloc_thread()
         logger.info(
             "KVCacheD physical resize committed%s: target_blocks=%s "
-            "stats_before=%s stats_after=%s",
+            "stats_before=%s stats_after_trim=%s stats_after=%s",
             f" ({reason})" if reason else "", target, before_stats,
-            after_stats)
+            after_trim_stats, after_stats)
         _log_kvcached_fragmentation_stats(reason, target, before_stats,
                                           after_stats)
         return True

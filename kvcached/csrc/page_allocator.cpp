@@ -661,7 +661,10 @@ void PageAllocator::prealloc_worker() {
     prealloc_needed_ = false;
 
     int64_t current_reserved = reserved_page_list_.size();
-    int64_t to_reserve = std::max(0L, min_reserved_pages_ - current_reserved);
+    int64_t to_reserve = 0;
+    if (current_reserved < min_reserved_pages_) {
+      to_reserve = std::max<int64_t>(0, max_reserved_pages_ - current_reserved);
+    }
     // Only try to reserve up to the available free pages and physical memory
     to_reserve =
         std::min({to_reserve, static_cast<int64_t>(free_page_list_.size()),
