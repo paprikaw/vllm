@@ -1776,6 +1776,40 @@ class DynamicGPUWorker(Worker):
                 self.after_migration_applied_token_num),
         }
 
+    def finish_idle_async_kv_cache_transfer(
+        self,
+        sender_list: list[int],
+    ) -> None:
+        """Finish async KV transfer when no sync batch can be scheduled.
+
+        The normal autoscaling path sends the final ``kv_patch_finished`` marker
+        from ``async_migration_after_execute_callback`` on a scheduler output
+        with ``is_sync_after_migration=True``. If the workload has already
+        drained, there is no next scheduler output. In that idle case, the full
+        KV tensor snapshot is the last data transfer, so enqueue an empty
+        finished patch for each active sender destination.
+        """
+        if self.rank not in set(sender_list):
+            return
+
+        target_ranks = list(self.rank_to_layers_ids.keys())
+        if not target_ranks:
+            logger.info(
+                "[autoscaling sync] rank %s has no active async KV senders "
+                "to finish in idle path", self.rank)
+            return
+
+        for dst_rank in target_ranks:
+            self.dynamic_kv_synchronizer.add_new_tokens_to_kv_synchronizer(
+                dst_rank,
+                [],
+                is_finished=True,
+                num_total_new_tokens=0,
+            )
+        logger.info(
+            "[autoscaling sync] rank %s enqueued idle async KV transfer "
+            "finish markers for destinations %s", self.rank, target_ranks)
+
     def get_kv_cache_spec_for_layers(self, rank: int, layer_range: Tuple[int, int]) -> dict[str, KVCacheSpec]:
         if self.rank != rank:
             logger.debug(f"Worker {self.rank} is not the target rank {rank}, skip getting kv cache spec for layers")

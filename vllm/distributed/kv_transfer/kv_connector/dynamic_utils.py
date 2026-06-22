@@ -150,14 +150,31 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
         # 首先裁剪 slot_mapping，只保留有效部分（>= 0）
         valid_mask = (slot_mapping >= 0)
         num_valid = int(valid_mask.sum().item())
-        
-        assert num_valid != 0, "No valid slots in slot_mapping, skipping patch creation"
-        
+
         # 只保留有效的 slot_mapping
         valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
         trimmed_slot_mapping = slot_mapping.index_select(0, valid_indices)
-        
+
         logger.info(f"debug-------------------- Original T: {slot_mapping.numel()}, Valid T: {num_valid}")
+        if num_valid == 0:
+            if not is_finished:
+                raise AssertionError(
+                    "No valid slots in slot_mapping for non-final KV patch")
+            L = len(layer_ids)
+            KV_shape = (2, int(L), 0, int(num_heads), int(head_size))
+            KV_all = torch.empty(KV_shape, dtype=k0.dtype, device=k0.device)
+            meta = KVPatchMeta(
+                type='kv_patch_finished',
+                id=int(patch_id),
+                layer_ids=list(map(int, layer_ids)),
+                num_tokens=0,
+                slot_mapping_dtype=trimmed_slot_mapping.dtype,
+                slot_mapping_shape=trimmed_slot_mapping.shape,
+                kv_payload_dtype=KV_all.dtype,
+                kv_payload_shape=KV_all.shape,
+            )
+            return KVPatch(meta, KV_all, trimmed_slot_mapping)
+
         slot_min = int(trimmed_slot_mapping.min().item())
         slot_max = int(trimmed_slot_mapping.max().item())
         flat_capacity = self._flat_capacity_for_cache(k0)

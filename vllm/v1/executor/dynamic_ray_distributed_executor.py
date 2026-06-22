@@ -1029,6 +1029,19 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             time.time() - start, sender_list, receiver_list,
             total_migration_tokens, new_kv_cache_block_num)
 
+    def finish_idle_async_kv_cache_transfer(
+        self,
+        sender_list: list[int],
+    ) -> None:
+        start = time.time()
+        self.collective_rpc(
+            "finish_idle_async_kv_cache_transfer",
+            args=(sender_list,))
+        logger.info(
+            "[autoscaling rpc timing] finish_idle_async_kv_cache_transfer "
+            "took %.3fs, senders=%s",
+            time.time() - start, sender_list)
+
     def get_applied_token_num(self, receiver_list: list[int]) -> list[list[int]]:
         """Return KV patch buffer status per rank.
         """

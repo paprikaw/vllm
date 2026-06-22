@@ -923,6 +923,39 @@ class DynamicKVSynchronizer():
             patch_id = self.last_patch_ids[rank]
             logger.info(f"start to get slot mapping for rank {rank}")
             slot_mapping, is_finished, stored_tokens = self.slot_mappings[rank].get_all_slot_mappings()
+            if is_finished and not slot_mapping:
+                dtype = torch.bfloat16
+                if kv_cache:
+                    dtype = kv_cache[0][0].dtype
+                slot_mapping_dev = torch.empty(0,
+                                               device=self.device,
+                                               dtype=torch.int64)
+                kv_out = torch.empty(
+                    2,
+                    len(layer_ids),
+                    0,
+                    self.num_heads,
+                    self.head_size,
+                    dtype=dtype,
+                    device=self.device)
+                yield KVPatch(
+                    KVPatchMeta(
+                        type='kv_patch_finished',
+                        id=patch_id,
+                        layer_ids=layer_ids,
+                        num_tokens=0,
+                        slot_mapping_dtype=torch.int64,
+                        slot_mapping_shape=slot_mapping_dev.shape,
+                        kv_payload_dtype=kv_out.dtype,
+                        kv_payload_shape=kv_out.shape,
+                    ),
+                    kv_out,
+                    slot_mapping_dev,
+                )
+                self.kv_cache_transfer_in_process[rank] = False
+                self.kv_patch_sending = False
+                self.last_patch_ids[rank] = 0
+                break
             lock_context = cuda_op_lock if cuda_op_lock is not None else nullcontext()
             with lock_context:
                 slot_mapping_dev = torch.tensor(slot_mapping,

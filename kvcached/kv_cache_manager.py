@@ -282,6 +282,9 @@ class KVCacheManager:
 
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
+        self.defer_physical_free_pages: bool = False
+        self.deferred_free_page_ids: List[int] = []
+        self.deferred_free_page_id_set: set[int] = set()
         self._closed: bool = False
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
@@ -534,7 +537,18 @@ class KVCacheManager:
             else:
                 self.avail_pages[page_id] = page
 
-        if pages_to_free:
+        if pages_to_free and self.defer_physical_free_pages:
+            new_pages = [
+                page_id for page_id in pages_to_free
+                if page_id not in self.deferred_free_page_id_set
+            ]
+            self.deferred_free_page_ids.extend(new_pages)
+            self.deferred_free_page_id_set.update(new_pages)
+            logger.info(
+                "KVCacheD deferred physical free of %d pages during "
+                "migration (total_deferred=%d)",
+                len(new_pages), len(self.deferred_free_page_ids))
+        elif pages_to_free:
             self.page_allocator.free_pages(pages_to_free)
 
         if self.in_shrink:
@@ -592,7 +606,33 @@ class KVCacheManager:
         Trim the reserved pages to free up physical memory.
         """
         self._wait_post_init()
+        if self.defer_physical_free_pages:
+            logger.info(
+                "KVCacheD skipping trim while migration physical frees are "
+                "deferred")
+            return
         self.page_allocator.trim()
+
+    @synchronized
+    def begin_defer_physical_free(self) -> None:
+        self._wait_post_init()
+        self.defer_physical_free_pages = True
+        logger.info("KVCacheD began deferring physical page frees")
+
+    @synchronized
+    def end_defer_physical_free(self) -> None:
+        self._wait_post_init()
+        pages_to_free = list(self.deferred_free_page_ids)
+        self.deferred_free_page_ids.clear()
+        self.deferred_free_page_id_set.clear()
+        self.defer_physical_free_pages = False
+        if not pages_to_free:
+            logger.info("KVCacheD ended physical free deferral: no pages")
+            return
+        logger.info(
+            "KVCacheD ending physical free deferral: freeing %d pages",
+            len(pages_to_free))
+        self.page_allocator.free_pages(pages_to_free)
 
     def shutdown(self) -> None:
         """Stop background allocator activity before KV tensors are destroyed."""

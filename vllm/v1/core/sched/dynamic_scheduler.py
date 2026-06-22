@@ -199,6 +199,13 @@ class DynamicScheduler(Scheduler):
             if should_increase_scheduler_output_version:
                 self.cur_scheduler_output_version += 1
             if is_flexi or use_kvcached_backend():
+                if use_kvcached_backend():
+                    begin_defer = getattr(
+                        self.kv_cache_manager,
+                        "begin_defer_physical_free",
+                        None)
+                    if begin_defer is not None:
+                        begin_defer()
                 slot_mapping = self.get_slot_mapping_from_reqs(self.running)
                 logger.info(f"[num tokens]: slot_mapping length:{len(slot_mapping)} ")
                 logger.info(f"[num tokens]: scheduler side num_tokens:{self.kv_cache_manager} ")

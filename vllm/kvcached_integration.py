@@ -41,6 +41,10 @@ _VMM_BACKENDS = {
 }
 
 
+class KVCacheDPhysicalResizePending(RuntimeError):
+    """Raised when KVCacheD cannot shrink the physical pool yet."""
+
+
 def get_kv_cache_backend() -> str:
     """Return the selected KV cache backend for this workspace."""
     backend = os.getenv("VLLM_KVCACHE_BACKEND")
@@ -690,7 +694,7 @@ def _enhance_elastic_block_pool_for_dynamic_resize(
         try:
             ok = _resize_kvcached_pool(self, target)
             if not ok:
-                raise RuntimeError(
+                raise KVCacheDPhysicalResizePending(
                     "KVCacheD physical resize failed after worker compaction: "
                     f"target_blocks={target}, reason={reason}, "
                     f"stats_before={before_stats}, "
@@ -968,6 +972,20 @@ def _rebind_kvcached_tensor_views(
     kv_synchronizer.kv_caches.clear()
     dynamic_bind_kv_cache(kv_views, forward_context, runner.kv_caches,
                           kv_synchronizer)
+
+
+def _kvcached_virtual_slot_capacity(runner: Any, block_size: int) -> int:
+    """Return the full virtual token-slot capacity of KVCacheD tensors."""
+    kv_tensors = getattr(runner, "_kvcached_kv_tensors", None)
+    if not kv_tensors:
+        return 0
+    kv_tensor = kv_tensors[0]
+    shape = tuple(kv_tensor.shape)
+    if len(shape) >= 3 and shape[0] == 2:
+        return int(shape[1]) * int(block_size)
+    if len(shape) >= 3 and shape[1] == 2:
+        return int(shape[0]) * int(block_size)
+    return 0
 
 
 def _rebind_kvcached_flexi_ptrs(runner: Any, num_blocks: int) -> None:
@@ -1350,7 +1368,8 @@ def _apply_dynamic_migration_kvcached_patches(
                                    None)):
                 return original_tensor_resize(self, new_length)
             assert new_length > 0
-            self.block_num = new_length
+            with self.model_runner.forward_lock:
+                self.block_num = new_length
             logger.info(
                 "KVCacheD dynamic tensor KV resize recorded physical target "
                 "%s blocks without shrinking virtual tensor views",
@@ -1366,8 +1385,6 @@ def _apply_dynamic_migration_kvcached_patches(
 
         def _patched_resize_impl(self, new_length: int) -> None:
             if (not use_kvcached_backend()
-                    or not use_flexi_kv_for_runtime(
-                        getattr(self, "vllm_config", None))
                     or not getattr(self.model_runner, "_kvcached_kv_tensors",
                                    None)):
                 return original_resize_impl(self, new_length)
@@ -1379,8 +1396,35 @@ def _apply_dynamic_migration_kvcached_patches(
             if new_length == old_length:
                 logger.info("KVCacheD KV cache length already %s", new_length)
                 return
-            self.block_num = new_length
+            is_flexi = use_flexi_kv_for_runtime(getattr(self, "vllm_config",
+                                                        None))
             with self.model_runner.forward_lock:
+                self.block_num = new_length
+                slot_capacity = new_length * self.block_size
+                if not is_flexi:
+                    # Normal attention reads KVCacheD through full virtual
+                    # FTensor views. A physical shrink must not shorten the
+                    # migration slot bitmap, because in-flight scheduler
+                    # outputs and sparse KV patches may still reference high
+                    # virtual block ids until the autoscaling sync point.
+                    slot_capacity = max(
+                        slot_capacity,
+                        _kvcached_virtual_slot_capacity(
+                            self.model_runner, self.block_size))
+                    logger.info(
+                        "KVCacheD dynamic tensor KV resize recorded physical "
+                        "target %s blocks while keeping virtual slot capacity "
+                        "%s tokens",
+                        new_length, slot_capacity)
+                    self.dynamic_kv_synchronizer.create_slot_mappings(
+                        slot_capacity)
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        "KVCacheD dynamic tensor KV resize recorded target "
+                        "from %s to %s blocks in %.3fs",
+                        old_length, new_length, elapsed)
+                    return
+
                 _rebind_kvcached_flexi_ptrs(self.model_runner, new_length)
                 if (use_direct_ptr_for_runtime(self.vllm_config)
                         and self.model_runner.k_ptr_tensors
@@ -1389,8 +1433,8 @@ def _apply_dynamic_migration_kvcached_patches(
                         self.model_runner.k_ptr_tensors,
                         self.model_runner.v_ptr_tensors,
                         target_start_layer=self._kv_cache_start_layer())
-            self.dynamic_kv_synchronizer.create_slot_mappings(
-                new_length * self.block_size)
+                self.dynamic_kv_synchronizer.create_slot_mappings(
+                    slot_capacity)
             elapsed = time.time() - start_time
             logger.info(
                 "KVCacheD dynamic KV resize rebound flexi pointers "

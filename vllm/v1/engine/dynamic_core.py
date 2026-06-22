@@ -23,6 +23,7 @@ from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.kvcached_integration import (
+    KVCacheDPhysicalResizePending,
     commit_kvcached_physical_resize_if_needed,
     maybe_apply_kvcached_vllm_patches,
     use_kvcached_backend,
@@ -71,6 +72,11 @@ def _safe_queue_size(q: Any) -> int:
         return q.qsize()
     except (AttributeError, NotImplementedError):
         return 0
+
+
+class MigrationRetryLater(RuntimeError):
+    """Raised when a migration is valid but current live KV blocks are too high."""
+
 
 class DynamicEngineCore(EngineCore):
 
@@ -361,7 +367,7 @@ class DynamicEngineCore(EngineCore):
 
         Returns AssessResult with:
           - enough_without_compact: free_mem >= required_mem
-          - can_fit_after_compact: free_mem + freed_estimate > required_mem
+          - can_fit_after_compact: free_mem + freed_estimate >= required_mem
           - required_mem: bytes needed by new layers' weights + their KV
             cache (estimated) with safety margin
         注意，这里的所有memory都是对于整体的memory而言，而不是对于单个kv cache tensor而言的。
@@ -400,7 +406,7 @@ class DynamicEngineCore(EngineCore):
         used_blocks =  block_num - free_blocks
 
         # 或许需要compact, 此时我们计算在加入当前layer之后，kv cache的最大block数量
-        if max_blocks_per_layer > used_blocks:
+        if max_blocks_per_layer >= used_blocks:
             logger.info(f"[memory access] assessed memory for adding layers: {num_changed_layers}, memory can fit after compact, max_blocks_per_layer: {max_blocks_per_layer}")
             return LayerAddingAssessResult(False, True, max_blocks_per_layer)
 
@@ -436,8 +442,8 @@ class DynamicEngineCore(EngineCore):
         used_blocks = (
             current_blocks -
             self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
-        if assess.max_blocks_per_layer <= used_blocks:
-            raise RuntimeError(
+        if assess.max_blocks_per_layer < used_blocks:
+            raise MigrationRetryLater(
                 f"{context}: rank {rank} temporary PP config can hold only "
                 f"{assess.max_blocks_per_layer} KV blocks, but current used "
                 f"blocks is {used_blocks} (current total={current_blocks})")
@@ -821,6 +827,13 @@ class DynamicEngineCore(EngineCore):
                 resizing_done)
             if all(resizing_done):
                 with self.scheduler.lock:
+                    if is_kvcached:
+                        end_defer = getattr(
+                            self.scheduler.kv_cache_manager,
+                            "end_defer_physical_free",
+                            None)
+                        if end_defer is not None:
+                            end_defer()
                     current_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
                     if resized_block_num > current_blocks:
                         self.scheduler.extend_block_pool(resized_block_num)
@@ -1431,6 +1444,13 @@ class DynamicEngineCore(EngineCore):
             if not receiver_list:
                 logger.info("No receivers in migration, can sync immediately")
                 return True
+
+            if (self.scheduler.num_tokens_for_migration == 0
+                    and self.scheduler.get_num_unfinished_requests() == 0):
+                logger.info(
+                    "No migration tokens and no unfinished requests; "
+                    "can sync immediately")
+                return True
             
             applied_token_list = self.model_executor.get_applied_token_num(receiver_list)
             logger.info(f"applied_token_list: {applied_token_list}")
@@ -1476,6 +1496,8 @@ class DynamicEngineCore(EngineCore):
         assert isinstance(self.scheduler, DynamicScheduler)
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
         resized_block_num = 0
+        idle_autoscaling_sync = False
+        idle_autoscaling_total_tokens = 0
         while True:
             time.sleep(0.3)
 
@@ -1517,11 +1539,31 @@ class DynamicEngineCore(EngineCore):
                         assert resized_block_num > self.scheduler.kv_cache_manager.num_gpu_blocks, f"resized_block_num: {resized_block_num} is less than the current kv cache size: {self.scheduler.kv_cache_manager.num_gpu_blocks}"
                         logger.info(f"[memory access] start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
 
+                idle_autoscaling_sync = (
+                    self.vllm_config.dynamic_config.pipeline_autoscaling_enabled
+                    and self.scheduler.get_num_unfinished_requests() == 0)
+                idle_autoscaling_total_tokens = (
+                    self.scheduler.num_tokens_for_migration)
+
                 with self.engine_lock:
-                    self.scheduler.async_change_configuration(
-                        pp_layer_config, resized_block_num)
+                    if idle_autoscaling_sync:
+                        self.scheduler.update_layer_config(pp_layer_config)
+                        self.scheduler.migration_in_process = False
+                        self.scheduler.sender_list_during_migration = None
+                        self.scheduler.receiver_list_during_migration = None
+                        self.scheduler.num_tokens_for_migration = 0
+                        logger.info(
+                            "[autoscaling async] applied idle no-request PP "
+                            "config switch directly "
+                            "(total_migration_tokens=%s)",
+                            idle_autoscaling_total_tokens)
+                    else:
+                        self.scheduler.async_change_configuration(
+                            pp_layer_config, resized_block_num)
                     self.cur_pp_layer_config = pp_layer_config
                     if not self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+                        self._apply_active_pp_ranks_for_config(pp_layer_config)
+                    elif idle_autoscaling_sync:
                         self._apply_active_pp_ranks_for_config(pp_layer_config)
                     else:
                         logger.info(
@@ -1534,6 +1576,25 @@ class DynamicEngineCore(EngineCore):
 
         assert resized_block_num != 0
         if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+            if idle_autoscaling_sync:
+                logger.info(
+                    "[autoscaling async] finalizing idle no-request migration "
+                    "on workers (total_migration_tokens=%s)",
+                    idle_autoscaling_total_tokens)
+                self.model_executor.finish_idle_async_kv_cache_transfer(
+                    sender_list)
+                self.model_executor.finalize_async_migration_after_sync(
+                    sender_list, receiver_list,
+                    idle_autoscaling_total_tokens, resized_block_num)
+                self._wait_for_worker_resize_cleanup_after_patch_done(
+                    resized_block_num, time.time())
+                self.migration_status = MigrationStatus.NOT_MIGRATING
+                self._migration_done_event.set()
+                logger.info(
+                    "[timeline]: migration process time taken: %s",
+                    human_readable_duration(time.time() - time_start))
+                self._migration_timeline_start = None
+                return
             timeout_s = float(os.environ.get(
                 "VLLM_AUTOSCALING_SYNC_WAIT_TIMEOUT_S", "300"))
             if not self._migration_done_event.wait(timeout=timeout_s):
@@ -2644,16 +2705,28 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         # Start from 0: alternative_configs now represents migration targets only
         # (initial config is from VLLM_PP_LAYER_PARTITION, not from alternative_configs)
         cur_config = 0
+        pending_config: Optional[int] = None
+        pending_retry_count = 0
         while True:
             # Check if reset was requested (between benchmark repetitions or experiments)
             if self._migration_reset_event.is_set():
                 logger.info(f"migration_thread: resetting request counter from {num_of_requests} to 0, cur_config from {cur_config} to 0")
                 num_of_requests = 0
                 cur_config = 0
+                pending_config = None
+                pending_retry_count = 0
                 self._migration_reset_event.clear()
             
-            num_of_requests += self.request_num_queue.get()
-            logger.info("num_of_requests: " + str(num_of_requests))
+            if pending_config is None:
+                request_delta = self.request_num_queue.get()
+            else:
+                try:
+                    request_delta = self.request_num_queue.get(timeout=0.5)
+                except queue.Empty:
+                    request_delta = 0
+            num_of_requests += request_delta
+            if request_delta:
+                logger.info("num_of_requests: " + str(num_of_requests))
             
             # Read current migration config under lock
             with self._migration_config_lock:
@@ -2664,50 +2737,73 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             if num_of_requests % 100 == 0:
                 logger.info(f"migration_thread: current alternative_configs={alternative_configs}, migration_steps={migration_steps}")
             
-            if num_of_requests in migration_steps:
-                # First increment cur_config to get the target configuration
-                # (cur_config=0 is initial config, cur_config=1 is first migration target, etc.)
-                cur_config += 1
-                if cur_config in alternative_configs:
-                    logger.info(f"change model configuration to config index {cur_config}")
+            target_config = pending_config
+            if target_config is None and num_of_requests in migration_steps:
+                # cur_config=0 is initial config, cur_config=1 is first
+                # migration target, etc. Only advance cur_config after a
+                # migration succeeds; a retryable shrink precondition should
+                # keep targeting the same config instead of losing the event.
+                target_config = cur_config + 1
+
+            if target_config is not None:
+                if target_config in alternative_configs:
+                    logger.info(
+                        f"change model configuration to config index {target_config}")
                     # Use migration_mode to determine which method to call
                     migration_mode = self.migration_config.migration_mode
-                    if migration_mode == "sync":
-                        logger.info(f"Using sync migration mode")
-                        # Do NOT temporarily disable fixed_num_gpu_blocks here.
-                        # The engine core and workers have separate vllm_config
-                        # copies. Disabling here only affects the engine core,
-                        # causing it to expand the scheduler block pool while
-                        # workers keep their KV tensors at the fixed size —
-                        # leading to CUDA illegal memory access when the
-                        # scheduler allocates blocks beyond that size.
-                        # The sync/async migration code already handles
-                        # fixed_num_gpu_blocks correctly (skipping resize and
-                        # keeping the current block count).
-                        engine_core_outputs = self.change_model_configuration_by_kv_transfer_sync(alternative_configs[cur_config])
-                        # Drain outputs must be sent to output_queue so the
-                        # client receives responses for requests that finished
-                        # during the drain; otherwise the client hangs forever
-                        # waiting for the missing responses.
-                        for output in engine_core_outputs:
-                            if output is not None:
-                                self.output_queue.put_nowait(output)
-                        logger.info(f"migration_thread: flushed {len(engine_core_outputs)} drain outputs to output_queue")
-                    elif migration_mode == "async":
-                        logger.info(f"Using async migration mode")
-                        self.change_model_configuration_by_kv_transfer_async(alternative_configs[cur_config])
-                    elif migration_mode == "async_fast":
-                        logger.info(f"Using async_fast migration mode")
-                        engine_core_outputs = self.change_model_configuration_by_kv_transfer_async_fast(alternative_configs[cur_config])
-                        for output in engine_core_outputs:
-                            if output is not None:
-                                self.output_queue.put_nowait(output)
-                        logger.info(f"migration_thread: flushed {len(engine_core_outputs)} async_fast drain outputs to output_queue")
+                    try:
+                        if migration_mode == "sync":
+                            logger.info(f"Using sync migration mode")
+                            # Do NOT temporarily disable fixed_num_gpu_blocks here.
+                            # The engine core and workers have separate vllm_config
+                            # copies. Disabling here only affects the engine core,
+                            # causing it to expand the scheduler block pool while
+                            # workers keep their KV tensors at the fixed size —
+                            # leading to CUDA illegal memory access when the
+                            # scheduler allocates blocks beyond that size.
+                            # The sync/async migration code already handles
+                            # fixed_num_gpu_blocks correctly (skipping resize and
+                            # keeping the current block count).
+                            engine_core_outputs = self.change_model_configuration_by_kv_transfer_sync(alternative_configs[target_config])
+                            # Drain outputs must be sent to output_queue so the
+                            # client receives responses for requests that finished
+                            # during the drain; otherwise the client hangs forever
+                            # waiting for the missing responses.
+                            for output in engine_core_outputs:
+                                if output is not None:
+                                    self.output_queue.put_nowait(output)
+                            logger.info(f"migration_thread: flushed {len(engine_core_outputs)} drain outputs to output_queue")
+                        elif migration_mode == "async":
+                            logger.info(f"Using async migration mode")
+                            self.change_model_configuration_by_kv_transfer_async(alternative_configs[target_config])
+                        elif migration_mode == "async_fast":
+                            logger.info(f"Using async_fast migration mode")
+                            engine_core_outputs = self.change_model_configuration_by_kv_transfer_async_fast(alternative_configs[target_config])
+                            for output in engine_core_outputs:
+                                if output is not None:
+                                    self.output_queue.put_nowait(output)
+                            logger.info(f"migration_thread: flushed {len(engine_core_outputs)} async_fast drain outputs to output_queue")
+                        else:
+                            raise ValueError(f"Invalid migration_mode: {migration_mode}. Must be 'sync', 'async', or 'async_fast'.")
+                    except (MigrationRetryLater,
+                            KVCacheDPhysicalResizePending) as exc:
+                        pending_config = target_config
+                        pending_retry_count += 1
+                        if pending_retry_count == 1 or pending_retry_count % 20 == 0:
+                            logger.info(
+                                "migration_thread: deferring config index %s "
+                                "until live KV blocks fit target "
+                                "(retry=%s): %s",
+                                target_config, pending_retry_count, exc)
                     else:
-                        raise ValueError(f"Invalid migration_mode: {migration_mode}. Must be 'sync', 'async', or 'async_fast'.")
+                        cur_config = target_config
+                        pending_config = None
+                        pending_retry_count = 0
 
                 else:
-                    logger.warning(f"migration_thread: cur_config {cur_config} not found in alternative_configs, skipping migration")
+                    logger.warning(f"migration_thread: cur_config {target_config} not found in alternative_configs, skipping migration")
+                    pending_config = None
+                    pending_retry_count = 0
 
     def metrics_thread(self):
         while True:

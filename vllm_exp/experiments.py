@@ -1060,11 +1060,15 @@ def start_benchmark(
 
 def stop_tree(proc: subprocess.Popen):
     if proc and proc.poll() is None:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.terminate()
         try:
-            proc.wait(timeout=15)
+            proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
 def start_tc(spec: TcRunSpec):
     # 配置tc所需的DELAY
@@ -1648,8 +1652,20 @@ def start_benchmark_for_sweep(
         else:
             C.print("[yellow]WARNING[/] Could not parse successful requests count from benchmark log")
             
-        # Check for fatal errors in log
-        if "Cannot connect to host" in log_content or "Connection refused" in log_content:
+        # Check for fatal benchmark errors without scanning generated text.
+        # With --print-outputs, model output can legitimately contain phrases
+        # like "Connection refused"; only explicit benchmark error lines count.
+        fatal_connection_error = any(
+            (
+                line.startswith("ERROR")
+                or ": ERROR:" in line
+                or "aiohttp.client_exceptions" in line
+                or line.startswith("Traceback")
+            )
+            and ("Cannot connect to host" in line or "Connection refused" in line)
+            for line in log_content.splitlines()
+        )
+        if fatal_connection_error:
             C.print("[red]ERROR[/] Benchmark failed to connect to server")
             return False
             
@@ -1657,6 +1673,25 @@ def start_benchmark_for_sweep(
         C.print(f"[yellow]WARNING[/] Could not validate benchmark log: {e}")
     
     return True
+
+
+def _wait_after_benchmark_if_requested() -> None:
+    """Keep the server alive briefly after benchmark completion if requested."""
+    raw_wait_s = os.environ.get("VLLM_EXP_POST_BENCHMARK_WAIT_S", "").strip()
+    if not raw_wait_s:
+        return
+
+    try:
+        wait_s = float(raw_wait_s)
+    except ValueError:
+        C.print(f"[yellow]WARNING:[/] Ignoring invalid VLLM_EXP_POST_BENCHMARK_WAIT_S={raw_wait_s!r}")
+        return
+
+    if wait_s <= 0:
+        return
+
+    C.print(f"[bold cyan]Waiting {wait_s:.1f}s after benchmark before stopping server[/]")
+    time.sleep(wait_s)
 
 
 def _append_text_file(src: Path, dst: Path, banner: Optional[str] = None) -> None:
@@ -2124,6 +2159,8 @@ def _run_single_sweep_experiment(
         if not ok:
             C.print("[yellow]WARNING:[/] Benchmark failed, but will process logs")
         
+        _wait_after_benchmark_if_requested()
+
         stop_tree(proc)
         capture.close()
         
@@ -2534,6 +2571,8 @@ def _run_single_experiment_on_running_server(
         if not ok:
             C.print("[yellow]WARNING:[/] Benchmark failed")
         
+        _wait_after_benchmark_if_requested()
+
         # Process logs - copy raw to main
         server_main_path = logm.get_path_with_log_type("server", "log", vars_mapping)
         if server_main_path.exists():

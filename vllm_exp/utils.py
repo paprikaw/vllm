@@ -179,11 +179,15 @@ def start_benchmark(cfg: Config, spec: BenchmarkRunSpec, log_dir: Path, log_file
 
 def stop_tree(proc: subprocess.Popen):
     if proc and proc.poll() is None:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.terminate()
         try:
-            proc.wait(timeout=15)
+            proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
 def start_tc(spec: TcRunSpec):
     # 配置tc所需的DELAY

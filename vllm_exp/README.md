@@ -221,6 +221,41 @@ is_log_cover: true
 - 访问 `http://head:8000` 失败
   - 确保 `head` 解析到本机（容器加 `--add-host head:127.0.0.1`，或本机 `/etc/hosts` 配置）。
 
+### KVCacheD Layer Stacking Shrink 对照配置
+
+这组配置用于复现 layer stacking 在 shrink 前高碎片压力下的优势：
+
+- `vllm_exp/configs/kvcached_layerstack_advantage_default_l40s.yaml`
+  - default KVCacheD：`VLLM_PAGE_ATTENTION_BLOCK_SIZE_KB=128`，`KVCACHED_PAGE_SIZE_MB=2`，`KVCACHED_LAYER_STACKING=false`。
+  - 含义是 PageAttention 的 K+V block 为 128KB，但 KVCacheD 可回收 physical page 仍是 2MB。
+- `vllm_exp/configs/kvcached_layerstack_advantage_stack_l40s.yaml`
+  - layer stacking：`VLLM_PAGE_ATTENTION_BLOCK_SIZE_KB=128`，`KVCACHED_PHYSICAL_BLOCK_SIZE_KB=128`，`KVCACHED_LAYER_STACKING=true`。
+  - 含义是 PageAttention block 和 layer-stacked physical block 都按 K+V 128KB 对齐。
+
+两个配置都在单台 L40S 上使用 Qwen3-32B-FP8，从 `16,16,16,16` shrink 到 `64,0,0,0`。负载先交替发送短 decode 与长 decode 请求，让 default 2MB physical page 内部形成 partial live blocks；第 60 个请求触发 shrink。`requests` 字段里的重复 `request_rate: 8.0` 是分段负载的 stage marker，用于在保持到达速率不变时交替请求长度。
+
+运行示例：
+
+```bash
+python -m vllm_exp.run sweep-test \
+  --config vllm_exp/configs/kvcached_layerstack_advantage_default_l40s.yaml \
+  --log-dir tmp/kvcached_layerstack_advantage_logs \
+  --single-server
+
+python -m vllm_exp.run sweep-test \
+  --config vllm_exp/configs/kvcached_layerstack_advantage_stack_l40s.yaml \
+  --log-dir tmp/kvcached_layerstack_advantage_logs \
+  --single-server
+```
+
+这组实验的关键统计口径是 migration trigger-to-completion latency：
+
+- 开始：server log 中第一次出现 `change model configuration to config index 1`。
+- 结束：server log 中出现 `[autoscaling sync] scheduler pause released after KV patches applied`。
+- 注意：`[timeline]: migration process time taken` 只覆盖最后一次成功 migration attempt；如果 shrink 因 physical fragmentation 被反复 defer，它会低估用户实际看到的 migration 时间。
+
+在已验证的 L40S rerun 中，default 的 trigger-to-release 约为 77s，layer stacking 约为 4s；default 最高 internal fragmentation ratio 记到 1.0，layer stacking 为 0.0。这个结果说明优势主要来自 shrink 时减少 partial physical page 导致的可回收性损失，而不是普通 steady-state prealloc 命中路径。
+
 ### 最小可用示例（快速起跑）
 
 ```yaml
@@ -249,4 +284,3 @@ is_log_cover: true
 
 - 所有日志与指标写入 `--log-dir` 下按 `path_policy.variables` 组成的层级目录。
 - 框架会在 `constants.json` 中写入“常量参数指纹”，便于区分不同实验。
-
