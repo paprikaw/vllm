@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import (
 # from vllm.kv_allocator import allocate_with_cuda_async, free_cache, free_page_list, prepare_flexi_kv_ptrs
 from vllm.kv_allocator import kv_allocator
 from vllm.kvcached_integration import (
+    filter_kvcached_vmm_mapped_slots,
     materialize_kvcached_received_kv_tensor,
     materialize_kvcached_sparse_received_kv_tensor,
     maybe_apply_kvcached_vllm_patches,
@@ -133,6 +134,7 @@ class DynamicGPUWorker(Worker):
         self._autoscale_sender_key_cache_ptrs: Optional[list[int]] = None
         self._autoscale_sender_value_cache_ptrs: Optional[list[int]] = None
         self._autoscale_sender_start_layer: Optional[int] = None
+        self._migration_logical_num_blocks: Optional[int] = None
         # Debug flag: when enabled, re-raise exceptions for easier debugging
         self._debug_raise: bool = str(os.getenv("VLLM_DEBUG_RAISE", "0")).lower() not in ("0", "", "false", "no")
         # Debug assertions for KV binding/shape
@@ -404,6 +406,18 @@ class DynamicGPUWorker(Worker):
                 "for KV from rank %s: layers=%s wait=%s",
                 self.rank, from_rank, sorted(layer_ids),
                 human_readable_duration(waited))
+
+    def _clear_autoscale_sender_pointer_view(self, reason: str) -> None:
+        if (self._autoscale_sender_key_cache_ptrs is not None
+                or self._autoscale_sender_value_cache_ptrs is not None
+                or self._autoscale_sender_start_layer is not None):
+            logger.info(
+                "[autoscaling async] rank %s cleared captured sender KV "
+                "pointer view after %s",
+                self.rank, reason)
+        self._autoscale_sender_key_cache_ptrs = None
+        self._autoscale_sender_value_cache_ptrs = None
+        self._autoscale_sender_start_layer = None
 
     def _add_layers(self, layer_list: list[Tuple[int, int]]) -> None:
         """添加新的模型层
@@ -939,17 +953,61 @@ class DynamicGPUWorker(Worker):
 
         request_states = getattr(scheduler_output,
                                  "autoscaling_request_states", None)
-        if request_states is None:
-            request_states = self._export_autoscaling_request_states_for_batch(
+        if request_states:
+            request_states = {
+                req_id: self._normalize_autoscaling_request_state(req_id,
+                                                                  req_state)
+                for req_id, req_state in request_states.items()
+            }
+            scheduler_output.autoscaling_request_states = request_states
+
+        refresh_ranks = set(
+            getattr(scheduler_output,
+                    "autoscaling_request_state_refresh_ranks", ()) or ())
+        should_refresh_local_states = self.rank in refresh_ranks
+        if should_refresh_local_states:
+            if not request_states:
+                raise RuntimeError(
+                    "Autoscaling request-state sync asked rank "
+                    f"{self.rank} to refresh, but the target batch carried "
+                    "no request states")
+            start = time.time()
+            for req_id, req_state in request_states.items():
+                self.model_runner.requests[req_id] = deepcopy(req_state)
+            logger.info(
+                "[autoscaling request states] rank %s refreshed %d local "
+                "request states from sync batch source_rank=%s in %s",
+                self.rank, len(request_states),
+                scheduler_output.autoscaling_request_state_source_rank,
+                human_readable_duration(time.time() - start))
+        else:
+            exported_states = self._export_autoscaling_request_states_for_batch(
                 scheduler_output)
-            if request_states:
+            if exported_states:
+                if request_states is None:
+                    request_states = exported_states
+                    scheduler_output.autoscaling_request_state_source_rank = (
+                        self.rank)
+                    added_states = len(exported_states)
+                    skipped_states = 0
+                else:
+                    added_states = 0
+                    skipped_states = 0
+                    for req_id, req_state in exported_states.items():
+                        if req_id in request_states:
+                            skipped_states += 1
+                            continue
+                        request_states[req_id] = req_state
+                        added_states += 1
                 scheduler_output.autoscaling_request_states = request_states
-                scheduler_output.autoscaling_request_state_source_rank = (
-                    self.rank)
                 logger.info(
-                    "[autoscaling request states] rank %s attached %d "
-                    "request states to target PP batch",
-                    self.rank, len(request_states))
+                    "[autoscaling request states] rank %s attached %d worker "
+                    "request states to target PP batch; added=%d skipped=%d "
+                    "total_states=%d source_rank=%s refresh_ranks=%s",
+                    self.rank, len(exported_states), added_states,
+                    skipped_states, len(request_states),
+                    scheduler_output.autoscaling_request_state_source_rank,
+                    sorted(refresh_ranks))
 
         request_states = getattr(scheduler_output,
                                  "autoscaling_request_states", None)
@@ -965,22 +1023,54 @@ class DynamicGPUWorker(Worker):
 
         start = time.time()
         imported = 0
-        for req_id in missing:
-            req_state = request_states.get(req_id)
-            if req_state is None:
-                continue
-            self.model_runner.requests[req_id] = deepcopy(req_state)
-            imported += 1
+        request_states = request_states or {}
+        for req_id, req_state in request_states.items():
+            if req_id not in self.model_runner.requests:
+                self.model_runner.requests[req_id] = deepcopy(
+                    self._normalize_autoscaling_request_state(req_id,
+                                                             req_state))
+                imported += 1
+
+        unresolved = [
+            req_id for req_id in missing
+            if req_id not in self.model_runner.requests
+        ]
+        if unresolved:
+            raise RuntimeError(
+                "Autoscaling target batch did not receive request states for "
+                f"rank {self.rank}: missing={unresolved} "
+                f"available_states={list(request_states.keys())[:16]}")
 
         if imported:
             logger.info(
-                "[autoscaling request states] rank %s imported %d/%d "
+                "[autoscaling request states] rank %s imported %d "
                 "missing request states from sync batch source_rank=%s in %s",
-                self.rank, imported, len(missing),
+                self.rank, imported,
                 scheduler_output.autoscaling_request_state_source_rank,
                 human_readable_duration(time.time() - start))
 
         self._reset_input_batch_for_autoscaling_sync_batch(scheduler_output)
+
+    def _normalize_autoscaling_request_state(
+        self,
+        req_id: str,
+        req_state: Any,
+    ) -> Any:
+        normalized = deepcopy(req_state)
+        kv_cache_config = getattr(self.model_runner, "kv_cache_config", None)
+        kv_cache_groups = getattr(kv_cache_config, "kv_cache_groups", None)
+        expected_groups = len(kv_cache_groups or ()) or 1
+        block_ids = getattr(normalized, "block_ids", None)
+        if not block_ids:
+            normalized.block_ids = [[] for _ in range(expected_groups)]
+            return normalized
+        if len(block_ids) != expected_groups:
+            raise RuntimeError(
+                "Autoscaling request-state sync received malformed "
+                f"block_ids for request {req_id} on rank {self.rank}: "
+                f"groups={len(block_ids)} expected={expected_groups}")
+        normalized.block_ids = [list(group) for group in block_ids]
+        return normalized
 
     def _reset_input_batch_for_autoscaling_sync_batch(
         self,
@@ -1010,11 +1100,38 @@ class DynamicGPUWorker(Worker):
         scheduler_output: DynamicSchedulerOutput,
     ) -> dict[str, Any]:
         request_states: dict[str, Any] = {}
+        req_ids = getattr(scheduler_output,
+                          "autoscaling_request_state_req_ids", None)
+        if req_ids is not None:
+            for req_id in req_ids:
+                req_state = self.model_runner.requests.get(req_id)
+                if req_state is not None:
+                    request_states[req_id] = (
+                        self._normalize_autoscaling_request_state(
+                            req_id, req_state))
+            return request_states
+
         for req in scheduler_output.scheduled_cached_reqs:
             req_state = self.model_runner.requests.get(req.req_id)
             if req_state is not None:
-                request_states[req.req_id] = deepcopy(req_state)
+                request_states[req.req_id] = (
+                    self._normalize_autoscaling_request_state(
+                        req.req_id, req_state))
         return request_states
+
+    def _autoscaling_live_request_block_ids(self) -> set[int]:
+        """Return blocks for requests that still need KV after migration."""
+        live_block_ids: set[int] = set()
+        requests = getattr(self.model_runner, "requests", {})
+        for req_state in list(requests.values()):
+            block_groups = getattr(req_state, "block_ids", None)
+            if not block_groups:
+                continue
+            for block_id in block_groups[0]:
+                block_id = int(block_id)
+                if block_id >= 0:
+                    live_block_ids.add(block_id)
+        return live_block_ids
 
     @torch.inference_mode()
     def execute_model(
@@ -1682,37 +1799,56 @@ class DynamicGPUWorker(Worker):
         - runtime_overhead_bytes: overhead measured by profile_run (activations,
           CUDA context, NCCL buffers, etc.)
         """
-        _sync_current_cuda_stream(self.device)
-        gc.collect()  # Trigger Python GC to free any unreferenced memory
-        if hasattr(self.model_runner.model, 'get_layer_weight_size'):
-            layer_size = int(self.model_runner.model.get_layer_weight_size())
-        else:
-            # Fallback for models without get_layer_weight_size
-            layer_size = 0
-            logger.warning("get_mem_info: Model has no get_layer_weight_size method, layer_size set to 0")
+        def collect_mem_info() -> WorkerMemInfo:
+            _sync_current_cuda_stream(self.device)
+            gc.collect()  # Trigger Python GC to free any unreferenced memory
+            if hasattr(self.model_runner.model, 'get_layer_weight_size'):
+                layer_size = int(
+                    self.model_runner.model.get_layer_weight_size())
+            else:
+                # Fallback for models without get_layer_weight_size
+                layer_size = 0
+                logger.warning(
+                    "get_mem_info: Model has no get_layer_weight_size "
+                    "method, layer_size set to 0")
 
-        is_kv_cache_initialized = len(self.model_runner.kv_caches) != 0 and self.model_runner.kv_caches[0].numel() != 0
+            is_kv_cache_initialized = (
+                len(self.model_runner.kv_caches) != 0
+                and self.model_runner.kv_caches[0].numel() != 0)
 
-        # Free memory from driver
-        free_memory, _ = torch.cuda.mem_get_info()
+            # Free memory from driver
+            free_memory, _ = torch.cuda.mem_get_info()
 
-        # Size of a single KV cache tensor (for one layer) from model runner
-        kv_tensor_size = 0
-        assert isinstance(self.model_runner, DynamicGPUModelRunner)
-        if is_kv_cache_initialized:
-            kv_tensor_size = int(self.model_runner.get_single_kv_tensor_size())
+            # Size of a single KV cache tensor (for one layer) from model runner
+            kv_tensor_size = 0
+            assert isinstance(self.model_runner, DynamicGPUModelRunner)
+            if is_kv_cache_initialized:
+                kv_tensor_size = int(
+                    self.model_runner.get_single_kv_tensor_size())
 
-        # get the size of total gpu memory
-        total_gpu_memory = get_total_gpu_memory(self.rank)
-        
-        # Get runtime overhead from MemoryOverheadMonitor baseline
-        # This was measured during determine_available_memory() via profile_run
-        overhead_monitor = get_memory_overhead_monitor()
-        runtime_overhead = 0
-        if overhead_monitor is not None and overhead_monitor.baseline_overhead_bytes is not None:
-            runtime_overhead = overhead_monitor.baseline_overhead_bytes
-        
-        return WorkerMemInfo(layer_size, kv_tensor_size, int(free_memory), int(total_gpu_memory), int(runtime_overhead))
+            # get the size of total gpu memory
+            total_gpu_memory = get_total_gpu_memory(self.rank)
+
+            # Get runtime overhead from MemoryOverheadMonitor baseline
+            # This was measured during determine_available_memory() via profile_run
+            overhead_monitor = get_memory_overhead_monitor()
+            runtime_overhead = 0
+            if (overhead_monitor is not None
+                    and overhead_monitor.baseline_overhead_bytes is not None):
+                runtime_overhead = overhead_monitor.baseline_overhead_bytes
+
+            return WorkerMemInfo(layer_size, kv_tensor_size,
+                                 int(free_memory), int(total_gpu_memory),
+                                 int(runtime_overhead))
+
+        autoscaling_enabled = (
+            self.vllm_config.dynamic_config.pipeline_autoscaling_enabled)
+        fbgate = getattr(getattr(self, "model_runner", None), "fbgate", None)
+        if autoscaling_enabled and fbgate is not None:
+            gate = getattr(fbgate, "exclusive_background", fbgate.background)
+            with gate():
+                return collect_mem_info()
+        return collect_mem_info()
 
     def get_kv_buffer_status(self) -> KVBufferStatus:
         """Return KV patch buffer status per rank.
@@ -1849,9 +1985,17 @@ class DynamicGPUWorker(Worker):
                         self.rank)
             return
         if is_flexi:
-            assert num_blocks == len(runner.key_caches[0]), f"bitmap length mismatch: num_blocks: {num_blocks} != kv_cache_tensor_length: {len(runner.key_caches)}"
+            local_num_blocks = len(runner.key_caches[0])
+            assert num_blocks == local_num_blocks, (
+                "bitmap length mismatch: "
+                f"num_blocks: {num_blocks} != "
+                f"kv_cache_tensor_length: {local_num_blocks}")
         else:
-            assert num_blocks == runner.kv_caches[0].size(1), f"bitmap length mismatch: num_blocks: {num_blocks} != kv_cache_tensor_length: {len(runner.kv_caches[0])}"
+            local_num_blocks = runner.kv_caches[0].size(1)
+            assert num_blocks == local_num_blocks, (
+                "bitmap length mismatch: "
+                f"num_blocks: {num_blocks} != "
+                f"kv_cache_tensor_length: {local_num_blocks}")
 
         def is_used(idx):
             return bitmap[idx]
@@ -2882,7 +3026,9 @@ class DynamicGPUWorker(Worker):
         
         _sync_current_cuda_stream(self.device)
         
-        logger.info(f"[forward]: resized kv cache, available gpu memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB")
+        logger.debug(
+            "[forward]: resized kv cache, available gpu memory: %.2f GB",
+            torch.cuda.mem_get_info()[0] / 1024**3)
         logger.info(f"[timeline]: time before in lock: {time_after_in_lock - time_before_in_lock:.4f} seconds")
         logger.info(f"[timeline]: time after free: {time_after_free - time_after_in_lock:.4f} seconds")
         logger.info(f"[timeline]: total resize kv cache time taken: {human_readable_duration(time.time() - time_start)}")
@@ -2932,6 +3078,12 @@ class DynamicGPUWorker(Worker):
         # scheduler to read stale True value from receivers and prematurely extend
         # block pool during VMM allocation.
         self.kv_resizing_done = False
+        self._migration_logical_num_blocks = logical_num_blocks
+        if logical_num_blocks is not None:
+            logger.info(
+                "[autoscaling async] rank %s using migration logical block "
+                "count %s for receiver KV binding",
+                self.rank, logical_num_blocks)
 
         receiver_sources: list[int] = []
         for src_rank, rank_to_layers_ids in src_to_plan.items():
@@ -2975,6 +3127,7 @@ class DynamicGPUWorker(Worker):
         with self._layer_loaded_cv:
             sender_key_cache_ptrs = None
             sender_value_cache_ptrs = None
+            sender_kv_caches = None
             if (use_direct_ptr_for_runtime(self.vllm_config)
                     and self.vllm_config.dynamic_config.
                     pipeline_autoscaling_enabled):
@@ -3022,11 +3175,17 @@ class DynamicGPUWorker(Worker):
                         f"layers={sender_layer_ids}")
             else:
                 sender_start_layer_id = self._kv_cache_start_layer()
+                sender_kv_caches = list(self.dynamic_kv_synchronizer.kv_caches)
+                logger.info(
+                    "[autoscaling async] rank %s captured sender KV tensor "
+                    "view at migration start: start_layer=%s, num_layers=%s",
+                    self.rank, sender_start_layer_id, len(sender_kv_caches))
 
         def migration_thread(rank: int, layer_ids: list[int],
                              start_layer_id: int,
                              key_cache_ptrs: Optional[list[int]],
-                             value_cache_ptrs: Optional[list[int]]):
+                             value_cache_ptrs: Optional[list[int]],
+                             kv_caches: Optional[list[torch.Tensor]]):
             try:
                 # Set CUDA device for this thread - threads don't inherit CUDA context
                 torch.cuda.set_device(self.device)
@@ -3038,7 +3197,8 @@ class DynamicGPUWorker(Worker):
                 # self.dynamic_kv_synchronizer.start_kv_tensor_transfer_async(rank_to_layers_ids, self.model_runner.kv_caches, self.model_runner.model.model.start_layer)
                 self._sender_loop(rank, layer_ids, slot_mapping,
                                   start_layer_id, key_cache_ptrs,
-                                  value_cache_ptrs, logical_num_blocks)
+                                  value_cache_ptrs, logical_num_blocks,
+                                  kv_caches)
                 logger.info(f"[timeline]: after start kv cache tensor, time taken: {human_readable_duration(time.time() - time_start)}")
             finally:
                 # 通知 do_resize 此 sender 线程已完成
@@ -3051,7 +3211,8 @@ class DynamicGPUWorker(Worker):
                              args=(rank, layer_ids,
                                    sender_start_layer_id,
                                    sender_key_cache_ptrs,
-                                   sender_value_cache_ptrs),
+                                   sender_value_cache_ptrs,
+                                   sender_kv_caches),
                              daemon=True).start()
         logger.info("finished starting kv cache migration async")
         return None
@@ -3064,6 +3225,7 @@ class DynamicGPUWorker(Worker):
                                 sender_key_cache_ptrs: Optional[list[int]] = None,
                                 sender_value_cache_ptrs: Optional[list[int]] = None,
                                 logical_num_blocks: Optional[int] = None,
+                                sender_kv_caches: Optional[list[torch.Tensor]] = None,
                                 ) -> None:
         """Send layers' KV cache to a peer rank.
             In each of the migration process, this function should only be called once.
@@ -3087,11 +3249,66 @@ class DynamicGPUWorker(Worker):
         assert self.migration_stream is not None
         with torch.cuda.stream(self.migration_stream):
             slot_mapping_dev = None
+            slot_mapping_host = None
+            slot_mapping_already_valid = False
             if slot_mapping is not None:
-                with self.model_runner.forward_lock:
-                    slot_mapping_dev = torch.tensor(slot_mapping,
+                slot_mapping_host = (
+                    slot_mapping.detach().cpu().tolist()
+                    if isinstance(slot_mapping, torch.Tensor)
+                    else slot_mapping)
+                if use_kvcached_backend():
+                    slot_mapping_host = [
+                        int(slot) for slot in slot_mapping_host
+                        if int(slot) >= 0
+                    ]
+                    slot_mapping_already_valid = True
+                    if os.environ.get(
+                            "VLLM_AUTOSCALING_KVCACHED_DEBUG",
+                            "").lower() in {"1", "true", "yes", "on"}:
+                        trace_blocks = sorted({
+                            int(slot) // int(self.block_size)
+                            for slot in slot_mapping_host
+                            if int(slot) >= 0
+                        })
+                        if os.environ.get(
+                                "VLLM_AUTOSCALING_KVCACHED_DEBUG_VERBOSE",
+                                "").lower() in {"1", "true", "yes", "on"}:
+                            logger.warning(
+                                "[KVCACHED_MIGRATION_SLOT_TRACE] "
+                                "sender_rank=%s target_rank=%s "
+                                "phase=initial_snapshot slot_count=%s "
+                                "block_size=%s blocks=%s slots_min=%s "
+                                "slots_max=%s",
+                                self.rank, rank, len(slot_mapping_host),
+                                self.block_size, trace_blocks,
+                                min(slot_mapping_host)
+                                if slot_mapping_host else None,
+                                max(slot_mapping_host)
+                                if slot_mapping_host else None)
+                        else:
+                            logger.warning(
+                                "[KVCACHED_MIGRATION_SLOT_TRACE] "
+                                "sender_rank=%s target_rank=%s "
+                                "phase=initial_snapshot slot_count=%s "
+                                "block_size=%s blocks_count=%s "
+                                "sample_blocks=%s slots_min=%s slots_max=%s",
+                                self.rank, rank, len(slot_mapping_host),
+                                self.block_size, len(trace_blocks),
+                                trace_blocks[:64],
+                                min(slot_mapping_host)
+                                if slot_mapping_host else None,
+                                max(slot_mapping_host)
+                                if slot_mapping_host else None)
+                    slot_mapping_dev = None
+                else:
+                    slot_mapping_dev = torch.tensor(slot_mapping_host,
                                                     dtype=torch.int64,
                                                     device=self.device)
+                    _sync_current_cuda_stream(self.device)
+            autoscaling_enabled = (
+                self.vllm_config.dynamic_config.
+                pipeline_autoscaling_enabled)
+            send_gate = self.model_runner.fbgate.background
             for layer_id in layer_ids:
                 time_start = time.time()
                 # Sender KV indexing must stay tied to the old layout captured
@@ -3100,28 +3317,96 @@ class DynamicGPUWorker(Worker):
                 nccl_lock = getattr(self, "_nccl_lock", None)
                 nccl_lock_context = (nccl_lock if nccl_lock is not None
                                      else nullcontext())
-                with self.model_runner.forward_lock:
-                    with nccl_lock_context:
-                        kv_tensor_meta, kv_tensor_data = self.dynamic_kv_synchronizer.get_kv_tensor_from_cache(
-                            layer_ids,
-                            layer_id,
-                            sender_start_layer_id,
-                            self.model_runner.page_meta,
-                            slot_mapping_dev,
-                            key_cache_ptrs=sender_key_cache_ptrs,
-                            value_cache_ptrs=sender_value_cache_ptrs,
-                            logical_num_blocks=logical_num_blocks)
+                autoscale_snapshot_context = (
+                    nullcontext() if autoscaling_enabled else send_gate())
+                with autoscale_snapshot_context:
+                    # The live KV cache is still writable by the foreground
+                    # model execution stream. Serialize only the snapshot
+                    # gather itself; the subsequent NCCL send uses the gathered
+                    # payload and can overlap with inference.
+                    with self.model_runner.forward_lock:
+                        inference_sync_start = time.time()
+                        if self.inference_stream is not None:
+                            self.inference_stream.synchronize()
+                        inference_sync_duration = time.time() - inference_sync_start
+                        layer_slot_mapping_dev = slot_mapping_dev
+                        layer_slot_mapping_already_valid = (
+                            slot_mapping_already_valid)
+                        if (use_kvcached_backend()
+                                and slot_mapping_host is not None):
+                            original_slot_count = len(slot_mapping_host)
+                            filtered_slot_mapping_host = (
+                                filter_kvcached_vmm_mapped_slots(
+                                    "migration_initial_snapshot_prefilter:"
+                                    f"layer={layer_id}:target={rank}",
+                                    self.dynamic_kv_synchronizer,
+                                    slot_mapping_host,
+                                    int(self.block_size),
+                                    layer_ids=[
+                                        int(candidate_layer_id)
+                                        for candidate_layer_id in layer_ids
+                                    ],
+                                    rank=self.rank,
+                                    sync_before_check=True,
+                                ))
+                            if (len(filtered_slot_mapping_host) !=
+                                    original_slot_count):
+                                logger.warning(
+                                    "[KVCACHED_MIGRATION_SLOT_TRACE] "
+                                    "sender_rank=%s target_rank=%s "
+                                    "phase=initial_snapshot_prefilter_layer "
+                                    "layer=%s original_slots=%s kept_slots=%s "
+                                    "dropped_slots=%s block_size=%s layer_ids=%s",
+                                    self.rank, rank, layer_id,
+                                    original_slot_count,
+                                    len(filtered_slot_mapping_host),
+                                    original_slot_count -
+                                    len(filtered_slot_mapping_host),
+                                    self.block_size, layer_ids)
+                            layer_slot_mapping_dev = torch.tensor(
+                                filtered_slot_mapping_host,
+                                dtype=torch.int64,
+                                device=self.device)
+                            layer_slot_mapping_already_valid = True
+                            _sync_current_cuda_stream(self.device)
+                        with nccl_lock_context:
+                            kv_tensor_meta, kv_tensor_data = self.dynamic_kv_synchronizer.get_kv_tensor_from_cache(
+                                layer_ids,
+                                layer_id,
+                                sender_start_layer_id,
+                                self.model_runner.page_meta,
+                                layer_slot_mapping_dev,
+                                key_cache_ptrs=sender_key_cache_ptrs,
+                                value_cache_ptrs=sender_value_cache_ptrs,
+                                logical_num_blocks=logical_num_blocks,
+                                kv_caches=sender_kv_caches,
+                                slot_mapping_already_valid=layer_slot_mapping_already_valid)
+                        # Keep the KV snapshot read ordered before the next
+                        # foreground forward can overwrite the same cache pages.
+                        migration_sync_start = time.time()
+                        self.migration_stream.synchronize()
+                        logger.debug(
+                            "[autoscaling async] rank %s synchronized streams "
+                            "while snapshotting KV layer %s for rank %s: "
+                            "inference_wait=%s migration_wait=%s",
+                            self.rank, layer_id, rank,
+                            human_readable_duration(inference_sync_duration),
+                            human_readable_duration(time.time() -
+                                                    migration_sync_start))
                 logger.info(f"start to send kv tensor for layer {layer_id} to rank {rank}, kv_tensor_meta: {kv_tensor_meta}, kv_tensor_data shape: {kv_tensor_data.shape}, time taken to get kv tensor: {human_readable_duration(time.time() - time_start)} seconds")
-                send_gate = (self.model_runner.fbgate.foreground
-                             if self.vllm_config.dynamic_config.
-                             pipeline_autoscaling_enabled else
-                             self.model_runner.fbgate.background)
-                with send_gate():
+                if autoscaling_enabled:
                     self.dynamic_kv_synchronizer.send_kv_tensor_to_rank(
                         rank,
                         kv_tensor_meta,
                         kv_tensor_data,
-                        slot_mapping_dev)
+                        layer_slot_mapping_dev)
+                if not autoscaling_enabled:
+                    with send_gate():
+                        self.dynamic_kv_synchronizer.send_kv_tensor_to_rank(
+                            rank,
+                            kv_tensor_meta,
+                            kv_tensor_data,
+                            layer_slot_mapping_dev)
                 logger.info(f"[debug]: sent kv tensor for layer {layer_id} to rank {rank}")
 
                 # 将layer_ids中的第一个layer id对应的原生key cache list保存为一个文件
@@ -3150,11 +3435,21 @@ class DynamicGPUWorker(Worker):
                     self.model_runner.page_meta,
                     cuda_op_lock=self.model_runner.forward_lock,
                     key_cache_ptrs=sender_key_cache_ptrs,
-                    value_cache_ptrs=sender_value_cache_ptrs):
+                    value_cache_ptrs=sender_value_cache_ptrs,
+                    kv_caches=sender_kv_caches,
+                    live_block_ids_getter=(
+                        self._autoscaling_live_request_block_ids
+                        if self.vllm_config.dynamic_config.
+                        pipeline_autoscaling_enabled else None),
+                    block_size=self.block_size):
                 time_start = time.time()
                 patch_payload_size = kv_patch.kv_payload.numel() * kv_patch.kv_payload.element_size()
                 patch_slot_mapping_size = kv_patch.slot_mapping.numel() * kv_patch.slot_mapping.element_size()
-                with self.model_runner.fbgate.foreground():
+                patch_send_context = (
+                    nullcontext() if self.vllm_config.dynamic_config.
+                    pipeline_autoscaling_enabled else
+                    self.model_runner.fbgate.background())
+                with patch_send_context:
                     self.dynamic_kv_synchronizer.send_kv_patch_to_rank(
                         rank,
                         kv_patch)
@@ -3374,8 +3669,9 @@ class DynamicGPUWorker(Worker):
             received_layer = set()
             layers_to_be_received  = set()
             logger.info(f"[operation]: start to listen to kv cache tensor and patches")
-            for i in range(len(self.model_runner.kv_caches)):
-                logger.info(f"[debug]: kv_caches[{i}] shape: {self.model_runner.kv_caches[i].shape}")
+            kv_cache_snapshot = list(self.model_runner.kv_caches)
+            for i, kv_cache in enumerate(kv_cache_snapshot):
+                logger.info(f"[debug]: kv_caches[{i}] shape: {kv_cache.shape}")
             first_time = True
             tmp_kv_tensors_dict: dict[int, torch.Tensor] = {}
             tmp_slot_mapping_dict: dict[int, torch.Tensor] = {}
@@ -3399,29 +3695,52 @@ class DynamicGPUWorker(Worker):
                     break
 
                 assert meta.layer_id not in received_layer, "The layer should not be received twice"
-                assert meta.num_tokens == tmp_slot_token_num, "The num tokens should be the same for all kv tensor metas"
+                if meta.num_tokens != tmp_slot_token_num:
+                    logger.warning(
+                        "[KVCACHED_MIGRATION_SLOT_TRACE] receiver_rank=%s "
+                        "from_rank=%s phase=initial_snapshot_recv "
+                        "layer=%s first_num_tokens=%s layer_num_tokens=%s "
+                        "using_max_for_progress=%s",
+                        self.rank, from_rank, meta.layer_id,
+                        tmp_slot_token_num, meta.num_tokens,
+                        max(tmp_slot_token_num, meta.num_tokens))
+                    tmp_slot_token_num = max(tmp_slot_token_num,
+                                             meta.num_tokens)
                 received_layer.add(meta.layer_id)
                 logger.info(f"[debug]: rank {self.rank} receive kv tensor meta {meta}")
 
-                # NOTE: Use foreground() instead of background() here.
-                # background() waits for ALL foreground tasks to finish, which
-                # deadlocks with compiled DAG (which uses foreground() for its
-                # NCCL recv and execute_model). KV migration NCCL uses a separate
-                # communicator and writes to newly allocated buffers, so it is
-                # safe to run concurrently with compiled DAG foreground tasks.
-                with self.model_runner.fbgate.foreground():
+                # Bulk KV receives share the local NCCL lock with PP transfer.
+                # Autoscaling receivers must not wait for the migration
+                # foreground gate here: a middle PP rank may already have a
+                # foreground task queued behind the sender's forward_lock while
+                # this listener needs to ACCEPT another rank's transfer.
+                recv_gate = nullcontext
+                autoscaling_enabled = (
+                    self.vllm_config.dynamic_config.
+                    pipeline_autoscaling_enabled)
+                # Bulk receives land in temporary tensors. Holding the local
+                # forward lock here can deadlock a middle autoscaling rank that
+                # is concurrently sending downstream patches while receiving
+                # upstream snapshots. Binding/applying into the local KV cache
+                # remains serialized below.
+                recv_cuda_op_lock = (None if autoscaling_enabled
+                                     else self.model_runner.forward_lock)
+                with recv_gate():
                     if isinstance(meta, (FlexiKVTensorMeta,
                                          KVCachedSparseKVTensorMeta)):
                         slot_mapping, kv_tensor = (
                             self.dynamic_kv_synchronizer.recv_kv_tensor(
                                 from_rank,
-                                meta))
-                        tmp_slot_mapping_dict[meta.layer_id] = slot_mapping 
+                                meta,
+                                cuda_op_lock=recv_cuda_op_lock))
+                        tmp_slot_mapping_dict[meta.layer_id] = slot_mapping
                     else:
                         assert isinstance(meta, KVTensorMeta)
-                        kv_tensor = self.dynamic_kv_synchronizer.recv_kv_tensor(
-                            from_rank,
-                            meta)
+                        kv_tensor = (
+                            self.dynamic_kv_synchronizer.recv_kv_tensor(
+                                from_rank,
+                                meta,
+                                cuda_op_lock=recv_cuda_op_lock))
                         assert isinstance(kv_tensor, torch.Tensor)
                 tmp_kv_tensors_dict[meta.layer_id] = kv_tensor
 
@@ -3449,6 +3768,18 @@ class DynamicGPUWorker(Worker):
             # with main forward thread. Otherwise both threads may try to allocate
             # memory simultaneously, causing OOM even when total memory would suffice.
             preallocated_caches: dict[int, tuple] = {}
+            receiver_block_num = (
+                self._migration_logical_num_blocks
+                if self._migration_logical_num_blocks is not None
+                else self.block_num)
+            if receiver_block_num != self.block_num:
+                logger.info(
+                    "[autoscaling async] rank %s receiver block count "
+                    "switching from %s to migration logical blocks %s "
+                    "before binding layers %s",
+                    self.rank, self.block_num, receiver_block_num,
+                    layer_ids)
+                self.block_num = receiver_block_num
             if is_flexi:
                 _sync_current_cuda_stream(self.device)
                 gc.collect()
@@ -3466,7 +3797,7 @@ class DynamicGPUWorker(Worker):
                 free_before, _ = torch.cuda.mem_get_info()
                 logger.info(f"[timeline]: free memory before preallocate: {free_before / 1024**3:.2f} GB")
                 preallocated_caches = self.model_runner.preallocate_flexi_kv_caches_for_migration(
-                    layer_ids, self.block_num
+                    layer_ids, receiver_block_num
                 )
                 free_after, _ = torch.cuda.mem_get_info()
                 logger.info(f"[timeline]: pre-allocation done, free memory after: {free_after / 1024**3:.2f} GB, allocated: {(free_before - free_after) / 1024**3:.2f} GB")
@@ -3489,7 +3820,7 @@ class DynamicGPUWorker(Worker):
                                     self.model_runner,
                                     layer_id,
                                     receiver_start_layer,
-                                    self.block_num,
+                                    receiver_block_num,
                                     kv_tensor,
                                     tmp_slot_mapping_dict[layer_id]))
                             tmp_slot_mapping_dict.pop(layer_id)
@@ -3499,7 +3830,7 @@ class DynamicGPUWorker(Worker):
                                     self.model_runner,
                                     layer_id,
                                     receiver_start_layer,
-                                    self.block_num,
+                                    receiver_block_num,
                                     kv_tensor))
                         dynamic_bind_single_kv_tensor(
                             layer_id,
@@ -3510,6 +3841,12 @@ class DynamicGPUWorker(Worker):
                             runner=self.model_runner,
                             kv_tensor=bind_kv_tensor)
                         tmp_kv_tensors_dict.pop(layer_id)
+                    sync_start = time.time()
+                    _sync_current_cuda_stream(self.device)
+                    logger.info(
+                        "[timeline]: current stream synchronize after "
+                        "KVCacheD bind took %s",
+                        human_readable_duration(time.time() - sync_start))
                     sync_start = time.time()
                     if self.migration_stream is not None:
                         self.migration_stream.synchronize()
@@ -3536,7 +3873,7 @@ class DynamicGPUWorker(Worker):
                             self._kv_cache_start_layer() + len(self.model_runner.key_caches),
                             layer_id,
                             slot_mapping,
-                            self.block_num,
+                            receiver_block_num,
                             kv_tensor,
                             self.vllm_config.compilation_config.static_forward_context,
                             self.dynamic_kv_synchronizer,
@@ -3617,9 +3954,13 @@ class DynamicGPUWorker(Worker):
                 assert meta.id == cur_patch_id, f"The patch id should be the next id of the last patch, meta id: {meta.id} vs cur patch id{cur_patch_id}"
                 cur_patch_id += 1
                 with self._kv_patch_recv_apply_lock:
-                    slot_mapping, kv_payload = (
-                        self.dynamic_kv_synchronizer.recv_kv_patch(
-                            from_rank, meta))
+                    recv_patch_gate = nullcontext
+                    recv_patch_cuda_op_lock = self.model_runner.forward_lock
+                    with recv_patch_gate():
+                        slot_mapping, kv_payload = (
+                            self.dynamic_kv_synchronizer.recv_kv_patch(
+                                from_rank, meta,
+                                cuda_op_lock=recv_patch_cuda_op_lock))
                     logger.info(f"[listen loop]: Received Meta: {meta}")
                     logger.info(f"[listen loop]: slot mapping device: {slot_mapping.device}, kv payload device: {kv_payload.device}, kv payload shape: {kv_payload.shape}, slot mapping shape: {slot_mapping.shape}")
 
@@ -3653,10 +3994,10 @@ class DynamicGPUWorker(Worker):
                                 self.model_runner.page_meta,
                                 key_cache_ptrs=receiver_key_cache_ptrs,
                                 value_cache_ptrs=receiver_value_cache_ptrs)
-                        self.receiver_num_applied_token_dict[from_rank] += meta.num_tokens
-                        logger.info(f"[num tokens]: receiver side: rank {from_rank} applied token: {meta.num_tokens}, total applied token: {self.receiver_num_applied_token_dict[from_rank]}")
                     else:
                         logger.info(f"[listen loop]: skipping apply for empty patch (type={meta.type})")
+                    self.receiver_num_applied_token_dict[from_rank] += meta.num_tokens
+                    logger.info(f"[num tokens]: receiver side: rank {from_rank} applied token: {meta.num_tokens}, total applied token: {self.receiver_num_applied_token_dict[from_rank]}")
                     
                 if meta.type == "kv_patch_meta":
                     logger.info(f"debug: ------------ Worker {self.rank} received kv patch meta from rank {from_rank}, kv payload shape: {kv_payload.shape}, slot mapping shape: {slot_mapping.shape}, num tokens: {meta.num_tokens}, patch id: {meta.id}")
@@ -3734,7 +4075,10 @@ class DynamicGPUWorker(Worker):
         # 处于迁移中时，或这是同步批（用于发送 finished 信号），直接放行。
         if scheduler_output.migration_in_process:
             assert self.after_migration_total_token == 0, "If in migration process, the total after migration token num should be zero"
-            logger.info(f"debug: rank {self.rank} is in migration or is sync after migration, skip kv synchronize before execute callback")
+            logger.debug(
+                "rank %s is in migration or sync after migration; skip KV "
+                "synchronize before execute callback",
+                self.rank)
             return
 
         if self.after_migration_total_token != 0:
@@ -3766,6 +4110,16 @@ class DynamicGPUWorker(Worker):
         is_sync = scheduler_output.is_sync_after_migration
         num_total_new_tokens = scheduler_output.total_num_scheduled_tokens
         num_total_migration_tokens = scheduler_output.total_migration_tokens
+        trace_info = {
+            "scheduler_step_id":
+            getattr(scheduler_output, "scheduler_step_id", -1),
+            "scheduler_output_version":
+            getattr(scheduler_output, "current_scheduler_output_version", -1),
+            "scheduler_request_free_epoch":
+            getattr(scheduler_output, "scheduler_request_free_epoch", -1),
+            "scheduler_block_free_epoch":
+            getattr(scheduler_output, "scheduler_block_free_epoch", -1),
+        }
 
         if scheduler_output.migration_in_process:
             assert scheduler_output.sender_list is not None and scheduler_output.receiver_list is not None, "If in migration process, the sender list should not be None"
@@ -3784,9 +4138,13 @@ class DynamicGPUWorker(Worker):
                         rank,
                         slot_mapping,
                         is_sync,
-                        num_total_new_tokens
+                        num_total_new_tokens,
+                        trace_info=trace_info,
                     )
-                logger.info(f"Sender added kv patch to synchronizer, is finished: {is_sync}, num total new tokens: {num_total_new_tokens}")
+                logger.info(
+                    "Sender added kv patch to synchronizer, is finished: %s, "
+                    "num total new tokens: %s, trace_info=%s",
+                    is_sync, num_total_new_tokens, trace_info)
 
             if is_sync:
                 logger.info(
@@ -3842,9 +4200,30 @@ class DynamicGPUWorker(Worker):
         is_receiver = self.rank in receiver_set
 
         if not is_sender and not is_receiver:
+            fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
+            if fixed_blocks <= 0:
+                if self.block_num != new_kv_cache_block_num:
+                    logger.info(
+                        "[autoscaling sync] rank %s has no sender/receiver "
+                        "work; resizing local KV cache from %s to %s to match "
+                        "the global block pool",
+                        self.rank, self.block_num, new_kv_cache_block_num)
+                    self.resize_kv_cache(new_kv_cache_block_num)
+                else:
+                    logger.info(
+                        "[autoscaling sync] rank %s has no sender/receiver "
+                        "work and KV cache already matches %s blocks",
+                        self.rank, new_kv_cache_block_num)
+            else:
+                logger.info(
+                    "fixed_num_gpu_blocks=%s, skipping no-op rank "
+                    "worker-side resize (would be %s blocks)",
+                    fixed_blocks, new_kv_cache_block_num)
             self.after_migration_total_token = 0
             self.after_migration_applied_token_num = 0
             self.kv_resizing_done = True
+            self._clear_autoscale_sender_pointer_view(
+                "no-op migration finalize")
             with self.resizing_done_cv:
                 self.resizing_done = True
                 self.resizing_done_cv.notify_all()
@@ -3858,6 +4237,8 @@ class DynamicGPUWorker(Worker):
                 "[autoscaling sync] rank %s migration already finalized; "
                 "sender=%s receiver=%s", self.rank, is_sender, is_receiver)
             self.kv_resizing_done = True
+            self._clear_autoscale_sender_pointer_view(
+                "already-finalized migration")
             with self.resizing_done_cv:
                 self.resizing_done = True
                 self.resizing_done_cv.notify_all()
@@ -3893,6 +4274,13 @@ class DynamicGPUWorker(Worker):
         handles_to_free_key: list[list[int]] = []
         handles_to_free_value: list[list[int]] = []
         grouped_handles_to_free: list[tuple[list[int], list[int]]] = []  # (handles, base_k_ptrs) tuples
+        if is_receiver:
+            # A rank can be both sender and receiver during autoscaling
+            # shrink. Drain incoming patches before mutating kv_cache_start_layer
+            # or the local KV cache list, otherwise the listener may index the
+            # old patch layer ids against the new target-local view.
+            self.wait_for_all_patch_applied(
+                "pre-shelve autoscaling KV cache cleanup")
         if layer_ranges:
             with self.model_runner.forward_lock:
                 caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free = self.atomic_shelve_kv_cache(self.rank, layer_ranges)
@@ -3932,7 +4320,10 @@ class DynamicGPUWorker(Worker):
                             logger.info(f"[do_resize] Waiting for {self._num_active_sender_threads} sender threads...")
                             self._sender_threads_cv.wait(timeout=5.0)
 
-                    release_weights_immediately = target_num_layers <= 0
+                    release_weights_immediately = (
+                        target_num_layers <= 0
+                        or self.vllm_config.dynamic_config.
+                        pipeline_autoscaling_enabled)
                     detached_layers = self.remove_layers(
                         self.rank,
                         layer_ranges,
@@ -3940,9 +4331,12 @@ class DynamicGPUWorker(Worker):
                     deleted_layers_released = None
                     if release_weights_immediately:
                         logger.info(
-                            "[delete_layers] rank %s target PP range is empty; "
-                            "released sender weights immediately after sync",
-                            self.rank)
+                            "[delete_layers] rank %s released sender weights "
+                            "immediately after sync; target_num_layers=%s "
+                            "autoscaling=%s",
+                            self.rank, target_num_layers,
+                            self.vllm_config.dynamic_config.
+                            pipeline_autoscaling_enabled)
                     else:
                         deleted_layers_released = (
                             self._queue_deleted_model_layers_after_inference(
@@ -3995,6 +4389,7 @@ class DynamicGPUWorker(Worker):
 
     def finish_migration(self):
         self.rank_to_layers_ids = {}
+        self._clear_autoscale_sender_pointer_view("finish_migration")
         
         # Atomically rebuild and commit PtrTable stacked tensors after migration
         # This ensures all ptr_tensors changes are reflected in a single atomic switch

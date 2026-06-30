@@ -357,7 +357,8 @@ class Qwen2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        logger.info(f"Forwarding with layers:{self.start_layer} to {self.end_layer}")
+        logger.debug("Forwarding with layers:%s to %s", self.start_layer,
+                     self.end_layer)
         forwarding_start_time = time.time()
         for layer in self.layers[self.start_layer:self.end_layer]:
             layer_start_time = time.time()
@@ -367,7 +368,9 @@ class Qwen2Model(nn.Module):
                 residual,
             )
             logger.debug(f"after Layer forwarding took {human_readable_duration(time.time() - layer_start_time)}")
-        logger.info(f"after forwarding took {human_readable_duration(time.time() - forwarding_start_time)}")
+        logger.debug(
+            "after forwarding took %s",
+            human_readable_duration(time.time() - forwarding_start_time))
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,

@@ -24,7 +24,9 @@ from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.kvcached_integration import (
     KVCacheDPhysicalResizePending,
+    begin_kvcached_physical_free_deferral_if_needed,
     commit_kvcached_physical_resize_if_needed,
+    end_kvcached_physical_free_deferral_if_needed,
     maybe_apply_kvcached_vllm_patches,
     use_kvcached_backend,
     use_flexi_kv_for_runtime,
@@ -53,6 +55,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.core.sched.dynamic_scheduler import DynamicScheduler
 from vllm.v1.core.sched.dynamic_scheduler import MigrationStatus
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.version import __version__ as VLLM_VERSION
 from vllm.v1.utils import WorkerMemInfo, LayerAddingAssessResult, human_readable_duration
 from dataclasses import dataclass
@@ -144,11 +147,19 @@ class DynamicEngineCore(EngineCore):
         self._migration_alternative_configs: Dict[int, Any] = {}
         self._migration_steps: set = set()
         self._migration_config_lock = threading.Lock()
+        self._autoscaling_policy: Dict[str, Any] = {}
+        self._autoscaling_last_scale_request = -1
+
+        if (vllm_config.dynamic_config
+                and vllm_config.dynamic_config.autoscaling_policy):
+            self._autoscaling_policy = dict(
+                vllm_config.dynamic_config.autoscaling_policy)
+            logger.info("autoscaling policy enabled: %s",
+                        self._autoscaling_policy)
         
         # Initialize from dynamic_config if available
         if (vllm_config.dynamic_config and
-                (vllm_config.dynamic_config.is_migration
-                 or vllm_config.dynamic_config.autoscaling_sequence)):
+                vllm_config.dynamic_config.is_migration):
             if vllm_config.dynamic_config.autoscaling_sequence:
                 sequence_configs: dict[int, list[Tuple[int, int]]] = {}
                 sequence_steps: list[int] = []
@@ -259,6 +270,8 @@ class DynamicEngineCore(EngineCore):
         self._migration_done_event.set()  # initially no migration in progress
         self._migration_timeline_start: Optional[float] = None
         self._autoscaling_schedule_paused = False
+        self._autoscaling_schedule_pause_start: Optional[float] = None
+        self._last_kvcached_quiescent_release_check = 0.0
 
         self.scheduler_kv_cache_config: Optional[KVCacheConfig]
 
@@ -425,6 +438,23 @@ class DynamicEngineCore(EngineCore):
                 rank, 0, mem_infos[rank], pp_layer_config)
             max_blocks_per_rank.append(assess.max_blocks_per_layer)
         return min(max_blocks_per_rank)
+
+    def _project_kv_pressure_for_pp_config(
+        self,
+        pp_layer_config: list[Tuple[int, int]],
+    ) -> tuple[float, int, int]:
+        """Return used-block pressure if the scheduler moved to pp config."""
+        assert isinstance(self.scheduler, DynamicScheduler)
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        current_blocks = block_pool.num_gpu_blocks
+        used_blocks = current_blocks - block_pool.get_num_free_blocks()
+        mem_infos = self.model_executor.get_workers_mem_info()
+        target_blocks = self._calculate_max_blocks_for_pp_config(
+            pp_layer_config, mem_infos)
+        if target_blocks <= 0:
+            return float("inf"), used_blocks, target_blocks
+        return used_blocks / target_blocks, used_blocks, target_blocks
 
     def _needs_pre_migration_kv_resize(
         self,
@@ -735,6 +765,13 @@ class DynamicEngineCore(EngineCore):
                     self.batch_queue.task_done()
                     engine_core_outputs.append(self.scheduler.update_from_output(
                         scheduler_output, model_output))
+                    if self.batch_queue.empty():
+                        flush_delayed = getattr(
+                            self.scheduler,
+                            "flush_pipeline_delayed_frees",
+                            None)
+                        if flush_delayed is not None:
+                            flush_delayed("sync drain batch queue empty")
                     continue
 
                 if not finish_waiting:
@@ -757,6 +794,12 @@ class DynamicEngineCore(EngineCore):
                 model_output = future.result()
                 engine_core_outputs.append(self.scheduler.update_from_output(
                     scheduler_output, model_output))
+                flush_delayed = getattr(
+                    self.scheduler,
+                    "flush_pipeline_delayed_frees",
+                    None)
+                if flush_delayed is not None:
+                    flush_delayed("sync drain direct execution")
         finally:
             if finish_waiting:
                 self.scheduler.finish_sync_drain()
@@ -805,6 +848,113 @@ class DynamicEngineCore(EngineCore):
                 last_log = now
             time.sleep(poll_s)
 
+    def _should_keep_kvcached_physical_free_deferred(self) -> bool:
+        if not use_kvcached_backend():
+            return False
+        dynamic_config = getattr(self.vllm_config, "dynamic_config", None)
+        if not getattr(dynamic_config, "pipeline_autoscaling_enabled", False):
+            return False
+        value = os.environ.get(
+            "VLLM_AUTOSCALING_DEFER_KVCACHED_PHYSICAL_FREE", "0")
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+
+    def _end_kvcached_physical_free_deferral_if_safe(
+        self,
+        reason: str,
+    ) -> bool:
+        force_cleanup_release = (
+            os.environ.get(
+                "VLLM_AUTOSCALING_FORCE_KVCACHED_CLEANUP_FREE_RELEASE", "")
+            .strip().lower() in {"1", "true", "yes", "on"}
+            and "autoscaling async worker cleanup" in reason)
+        if (self._should_keep_kvcached_physical_free_deferred()
+                and not force_cleanup_release):
+            logger.info(
+                "KVCacheD physical free deferral remains active during %s; "
+                "serving-time page unmap is deferred for async autoscaling",
+                reason)
+            return False
+        if force_cleanup_release:
+            logger.warning(
+                "KVCacheD debug forcing physical free deferral release during "
+                "%s", reason)
+        log_deferred = getattr(self.scheduler,
+                               "log_kvcached_deferred_release_invariant",
+                               None)
+        if log_deferred is not None:
+            log_deferred(reason)
+        return end_kvcached_physical_free_deferral_if_needed(
+            self.scheduler, reason)
+
+    def _release_kvcached_physical_free_deferral_at_quiescent_point(
+        self,
+        reason: str,
+    ) -> bool:
+        """Physically reclaim deferred KVCacheD pages only when no batch runs.
+
+        KVCacheD can pack multiple PageAttention blocks into one backing page.
+        During async autoscaling, unmapping those pages while any PP batch is
+        still executing can invalidate memory another worker stream may read.
+        We therefore keep physical frees deferred during serving, and briefly
+        release/re-arm that deferral only at a pipeline quiescent point.
+        """
+        if not self._should_keep_kvcached_physical_free_deferred():
+            return False
+        if self.migration_status is not MigrationStatus.NOT_MIGRATING:
+            return False
+        if self._autoscaling_schedule_paused:
+            return False
+        if self.batch_queue is not None and not self.batch_queue.empty():
+            return False
+        if getattr(self.scheduler, "running", None):
+            return False
+        if getattr(self.scheduler, "waiting", None):
+            return False
+        if getattr(self.scheduler, "requests", None):
+            return False
+        if getattr(self.scheduler, "_pipeline_pending_free_requests", None):
+            return False
+
+        now = time.time()
+        if now - self._last_kvcached_quiescent_release_check < 0.5:
+            return False
+        self._last_kvcached_quiescent_release_check = now
+
+        if isinstance(self.model_executor, DynamicRayDistributedExecutor):
+            try:
+                resizing_done = self.model_executor.get_is_kv_resizing_done()
+            except Exception:
+                logger.exception(
+                    "Failed to query KV resize state before KVCacheD "
+                    "quiescent physical free release")
+                return False
+            if not all(resizing_done):
+                logger.debug(
+                    "Skipping KVCacheD quiescent physical free release during "
+                    "%s because worker cleanup/resize is still active: %s",
+                    reason, resizing_done)
+                return False
+
+        flush_delayed = getattr(self.scheduler,
+                                "flush_pipeline_delayed_frees", None)
+        if flush_delayed is not None:
+            flush_delayed(f"{reason} before quiescent physical free release")
+
+        log_deferred = getattr(self.scheduler,
+                               "log_kvcached_deferred_release_invariant",
+                               None)
+        if log_deferred is not None:
+            log_deferred(reason)
+        released = end_kvcached_physical_free_deferral_if_needed(
+            self.scheduler, reason)
+        if released:
+            begin_kvcached_physical_free_deferral_if_needed(
+                self.scheduler, f"{reason} re-arm")
+            logger.info(
+                "KVCacheD physical free deferral released and re-armed at "
+                "pipeline quiescent point during %s", reason)
+        return released
+
     def _wait_for_worker_resize_cleanup_after_patch_done(
         self,
         resized_block_num: int,
@@ -828,12 +978,8 @@ class DynamicEngineCore(EngineCore):
             if all(resizing_done):
                 with self.scheduler.lock:
                     if is_kvcached:
-                        end_defer = getattr(
-                            self.scheduler.kv_cache_manager,
-                            "end_defer_physical_free",
-                            None)
-                        if end_defer is not None:
-                            end_defer()
+                        self._end_kvcached_physical_free_deferral_if_safe(
+                            "autoscaling async worker cleanup")
                     current_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
                     if resized_block_num > current_blocks:
                         self.scheduler.extend_block_pool(resized_block_num)
@@ -892,9 +1038,64 @@ class DynamicEngineCore(EngineCore):
     ) -> None:
         if self._is_autoscaling_sync_batch(scheduler_output):
             self._autoscaling_schedule_paused = True
+            self._autoscaling_schedule_pause_start = time.time()
             logger.info(
                 "[autoscaling sync] submitted sync batch; pausing scheduler "
                 "until all workers report KV patch application")
+
+    def _build_autoscaling_request_states_from_scheduler(
+        self,
+    ) -> dict[str, CachedRequestState]:
+        """Build a full live-request state snapshot for autoscaling handoff.
+
+        Some live requests can be waiting or preempted when the sync batch is
+        emitted. Those requests may no longer exist in the source worker's
+        model_runner.requests cache, but newly activated PP ranks still need
+        their metadata before a later cached/resumed schedule references them.
+        """
+        assert isinstance(self.scheduler, DynamicScheduler)
+        request_states: dict[str, CachedRequestState] = {}
+        missing_blocks = 0
+        num_kv_cache_groups = len(
+            self.scheduler.kv_cache_config.kv_cache_groups)
+        for req_id, req in self.scheduler.requests.items():
+            if req.is_finished():
+                continue
+            try:
+                block_ids = self.scheduler.kv_cache_manager.get_block_ids(
+                    req_id)
+            except AssertionError:
+                # Preempted or never-scheduled waiting requests may not own KV
+                # blocks at sync time. Their next schedule will provide fresh
+                # new_block_ids before the worker adds them to the input batch.
+                block_ids = [[] for _ in range(num_kv_cache_groups)]
+                missing_blocks += 1
+            else:
+                if len(block_ids) != num_kv_cache_groups:
+                    raise RuntimeError(
+                        "Scheduler produced malformed autoscaling request "
+                        f"state for {req_id}: block_groups={len(block_ids)} "
+                        f"expected={num_kv_cache_groups}")
+
+            request_states[req_id] = CachedRequestState(
+                req_id=req_id,
+                prompt_token_ids=list(req.prompt_token_ids),
+                mm_inputs=list(req.mm_inputs),
+                mm_positions=list(req.mm_positions),
+                sampling_params=req.sampling_params,
+                generator=None,
+                block_ids=block_ids,
+                num_computed_tokens=req.num_computed_tokens,
+                output_token_ids=list(req.output_token_ids),
+                lora_request=req.lora_request,
+            )
+
+        if missing_blocks:
+            logger.info(
+                "[autoscaling request states] scheduler snapshot included "
+                "%d live requests without current KV blocks",
+                missing_blocks)
+        return request_states
 
     def _mark_autoscaling_active_pp_ranks_if_needed(
         self,
@@ -908,11 +1109,19 @@ class DynamicEngineCore(EngineCore):
         scheduler_output.autoscaling_activate_pp_ranks = active_ranks
         scheduler_output.autoscaling_activate_pp_ranks_generation = (
             self._placement_generation + 1)
+        scheduler_output.autoscaling_request_state_req_ids = tuple(
+            self.scheduler.requests.keys())
+        scheduler_output.autoscaling_request_states = (
+            self._build_autoscaling_request_states_from_scheduler())
+        scheduler_output.autoscaling_request_state_source_rank = -2
         logger.info(
             "[autoscaling active ranks] marked sync batch for actor-chain "
-            "activation, generation=%s active_ranks=%s",
+            "activation, generation=%s active_ranks=%s live_reqs=%s "
+            "snapshot_states=%s",
             scheduler_output.autoscaling_activate_pp_ranks_generation,
-            active_ranks)
+            active_ranks,
+            len(scheduler_output.autoscaling_request_state_req_ids),
+            len(scheduler_output.autoscaling_request_states or {}))
 
     def _finish_autoscaling_schedule_pause_if_needed(
         self,
@@ -949,6 +1158,12 @@ class DynamicEngineCore(EngineCore):
             self.scheduler.pp_layer_config,
             update_workers=(activation_generation < 0))
         self._autoscaling_schedule_paused = False
+        if self._autoscaling_schedule_pause_start is not None:
+            logger.info(
+                "[timeline]: autoscaling scheduler pause time taken: %s",
+                human_readable_duration(time.time() -
+                                        self._autoscaling_schedule_pause_start))
+            self._autoscaling_schedule_pause_start = None
         self.migration_status = MigrationStatus.NOT_MIGRATING
         self._migration_done_event.set()
         if waited_cleanup:
@@ -1038,10 +1253,24 @@ class DynamicEngineCore(EngineCore):
                 assert isinstance(scheduler_output, DynamicSchedulerOutput)
                 self._finish_autoscaling_schedule_pause_if_needed(
                     scheduler_output)
+                if self.batch_queue.empty():
+                    flush_delayed = getattr(
+                        self.scheduler,
+                        "flush_pipeline_delayed_frees",
+                        None)
+                    if flush_delayed is not None:
+                        flush_delayed("batch queue empty")
+                    self._release_kvcached_physical_free_deferral_at_quiescent_point(
+                        "batch queue empty")
                 if (getattr(self, "_pending_batch_queue_size", None)
                         is not None and self.batch_queue.empty()):
                     self._refresh_batch_queue_for_active_pp_ranks()
-            logger.info(f"[forward]: step with batch queue in {time.time() - time_start:.2f} seconds")
+            elif not scheduled_batch and self.batch_queue.empty():
+                self._release_kvcached_physical_free_deferral_at_quiescent_point(
+                    "idle scheduler step")
+            logger.debug(
+                "[forward]: step with batch queue in %.2f seconds",
+                time.time() - time_start)
 
             return engine_core_outputs
 
@@ -1054,6 +1283,8 @@ class DynamicEngineCore(EngineCore):
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
         with self.engine_lock:
             if not self.scheduler.has_requests():
+                self._release_kvcached_physical_free_deferral_at_quiescent_point(
+                    "idle single batch step")
                 return EngineCoreOutputs(
                     outputs=[],
                     scheduler_stats=self.scheduler.make_stats(),
@@ -1078,6 +1309,14 @@ class DynamicEngineCore(EngineCore):
                 scheduler_output, model_output)
             self._finish_autoscaling_schedule_pause_if_needed(
                 scheduler_output)
+            flush_delayed = getattr(
+                self.scheduler,
+                "flush_pipeline_delayed_frees",
+                None)
+            if flush_delayed is not None:
+                flush_delayed("single batch execution")
+            self._release_kvcached_physical_free_deferral_at_quiescent_point(
+                "single batch execution")
             return engine_core_outputs
 
     def change_model_configuration_by_reinitialize_kv_cache(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
@@ -1254,6 +1493,43 @@ class DynamicEngineCore(EngineCore):
                 # 同时，如果当前的GPU available memory已经足够，则需要评估是否需要resize kv cache
                 adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
                 assess = self._assess_memory_for_layer_reconfiguration(rank, adding_layer_num, mem_infos[rank], self.cur_pp_layer_config)
+                if (self.vllm_config.dynamic_config.
+                        pipeline_autoscaling_enabled and is_flexi
+                        and adding_layer_num > 0):
+                    deleting_layer_num = 0
+                    if start_layer <= end_layer:
+                        if layers[0] > start_layer:
+                            deleting_layer_num += layers[0] - start_layer
+                        if layers[1] < end_layer:
+                            deleting_layer_num += end_layer - layers[1]
+                    if deleting_layer_num > 0:
+                        current_blocks = (
+                            self.scheduler.kv_cache_manager.block_pool.
+                            num_gpu_blocks)
+                        used_blocks = (
+                            current_blocks - self.scheduler.kv_cache_manager.
+                            block_pool.get_num_free_blocks())
+                        extra_blocks = max(0, int(os.environ.get(
+                            "VLLM_AUTOSCALING_MIDDLE_RANK_EXTRA_BLOCKS",
+                            "512")))
+                        middle_rank_max_blocks = min(
+                            assess.max_blocks_per_layer,
+                            used_blocks + extra_blocks)
+                        if middle_rank_max_blocks < current_blocks:
+                            logger.info(
+                                "[memory access] autoscaling middle rank %s "
+                                "adds %s and deletes %s layers; capping "
+                                "temporary KV blocks from %s to %s "
+                                "(used=%s, extra=%s) so incoming KV can bind "
+                                "before outgoing layers are finalized",
+                                rank, adding_layer_num, deleting_layer_num,
+                                assess.max_blocks_per_layer,
+                                middle_rank_max_blocks, used_blocks,
+                                extra_blocks)
+                            assess = LayerAddingAssessResult(
+                                False,
+                                middle_rank_max_blocks >= used_blocks,
+                                middle_rank_max_blocks)
                 maximum_kv_block_num_after_compact.append(assess.max_blocks_per_layer)
                 if self._needs_pre_migration_kv_resize(
                         rank, assess, "async migration"):
@@ -1500,7 +1776,6 @@ class DynamicEngineCore(EngineCore):
         idle_autoscaling_total_tokens = 0
         while True:
             time.sleep(0.3)
-
             should_sync = sync_by_checking_leftover_tokens()
 
             final_pp_layer_config = deepcopy(tmp_pp_layer_config)
@@ -1611,6 +1886,9 @@ class DynamicEngineCore(EngineCore):
             return
 
         if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
+            if is_kvcached:
+                self._end_kvcached_physical_free_deferral_if_safe(
+                    "async migration no-resize completion")
             logger.info(f"no need to resize kv cache during migration, directly synchronize the kv cache, sleep for 4 seconds")
             time.sleep(4)
             logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
@@ -1625,6 +1903,9 @@ class DynamicEngineCore(EngineCore):
             logger.info(f"resizing_done status: {resizing_done}")
             if all(resizing_done):
                 with self.scheduler.lock:
+                    if is_kvcached:
+                        self._end_kvcached_physical_free_deferral_if_safe(
+                            "async migration resize completion")
                     self.scheduler.extend_block_pool(resized_block_num)
                 break
 
@@ -1872,6 +2153,9 @@ class DynamicEngineCore(EngineCore):
 
         assert resized_block_num != 0
         if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
+            if is_kvcached:
+                self._end_kvcached_physical_free_deferral_if_safe(
+                    "async_fast migration no-resize completion")
             logger.info(f"[async_fast] no need to resize kv cache, migration setup complete in {human_readable_duration(time.time() - time_start)}")
             self.migration_status = MigrationStatus.NOT_MIGRATING
             self._migration_done_event.set()
@@ -1885,6 +2169,9 @@ class DynamicEngineCore(EngineCore):
             logger.info(f"resizing_done status: {resizing_done}")
             if all(resizing_done):
                 with self.scheduler.lock:
+                    if is_kvcached:
+                        self._end_kvcached_physical_free_deferral_if_safe(
+                            "async_fast migration resize completion")
                     self.scheduler.extend_block_pool(resized_block_num)
                 break
 
@@ -2516,7 +2803,8 @@ class DynamicEngineCoreProc(DynamicEngineCore):
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
             self._process_engine_step()
-            logger.info(f"debug: ---------------------process the engine step, time: {time.time() - time_start:.2f} seconds")
+            logger.debug("process the engine step, time: %.2f seconds",
+                         time.time() - time_start)
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
@@ -2707,6 +2995,7 @@ class DynamicEngineCoreProc(DynamicEngineCore):
         cur_config = 0
         pending_config: Optional[int] = None
         pending_retry_count = 0
+        low_pressure_checks = 0
         while True:
             # Check if reset was requested (between benchmark repetitions or experiments)
             if self._migration_reset_event.is_set():
@@ -2715,10 +3004,26 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                 cur_config = 0
                 pending_config = None
                 pending_retry_count = 0
+                low_pressure_checks = 0
                 self._migration_reset_event.clear()
             
             if pending_config is None:
-                request_delta = self.request_num_queue.get()
+                scale_down_poll_s = 0.0
+                if self._autoscaling_policy:
+                    try:
+                        scale_down_poll_s = float(
+                            self._autoscaling_policy.get(
+                                "scale_down_poll_interval_s", 0.0))
+                    except (TypeError, ValueError):
+                        scale_down_poll_s = 0.0
+                if scale_down_poll_s > 0:
+                    try:
+                        request_delta = self.request_num_queue.get(
+                            timeout=scale_down_poll_s)
+                    except queue.Empty:
+                        request_delta = 0
+                else:
+                    request_delta = self.request_num_queue.get()
             else:
                 try:
                     request_delta = self.request_num_queue.get(timeout=0.5)
@@ -2744,6 +3049,204 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                 # migration succeeds; a retryable shrink precondition should
                 # keep targeting the same config instead of losing the event.
                 target_config = cur_config + 1
+
+            if target_config is None and self._autoscaling_policy:
+                policy_type = self._autoscaling_policy.get("type")
+                if policy_type == "kv_pressure_incremental":
+                    scale_up_threshold = float(self._autoscaling_policy.get(
+                        "scale_up_threshold", 0.8))
+                    if scale_up_threshold > 1:
+                        scale_up_threshold /= 100.0
+                    scale_down_threshold = self._autoscaling_policy.get(
+                        "scale_down_threshold")
+                    if scale_down_threshold is not None:
+                        scale_down_threshold = float(scale_down_threshold)
+                        if scale_down_threshold > 1:
+                            scale_down_threshold /= 100.0
+                    scale_down_target_threshold = (
+                        self._autoscaling_policy.get(
+                            "scale_down_target_threshold",
+                            scale_down_threshold))
+                    if scale_down_target_threshold is not None:
+                        scale_down_target_threshold = float(
+                            scale_down_target_threshold)
+                        if scale_down_target_threshold > 1:
+                            scale_down_target_threshold /= 100.0
+                    min_interval = int(self._autoscaling_policy.get(
+                        "min_request_interval", 1))
+                    min_request = int(self._autoscaling_policy.get(
+                        "min_requests_before_scale", 1))
+                    scale_down_min_interval = int(
+                        self._autoscaling_policy.get(
+                            "scale_down_min_request_interval", min_interval))
+                    scale_down_stable_checks = int(
+                        self._autoscaling_policy.get(
+                            "scale_down_stable_checks", 1))
+                    max_config_index = int(self._autoscaling_policy.get(
+                        "max_config_index",
+                        max(alternative_configs) if alternative_configs
+                        else cur_config))
+                    min_config_index = int(self._autoscaling_policy.get(
+                        "min_config_index", 0))
+                    scale_up_mode = str(self._autoscaling_policy.get(
+                        "scale_up_mode", "incremental"))
+                    scale_down_waiting_threshold = (
+                        self._autoscaling_policy.get(
+                            "scale_down_waiting_threshold"))
+                    if scale_down_waiting_threshold is not None:
+                        scale_down_waiting_threshold = int(
+                            scale_down_waiting_threshold)
+                    scale_down_running_threshold = (
+                        self._autoscaling_policy.get(
+                            "scale_down_running_threshold"))
+                    if scale_down_running_threshold is not None:
+                        scale_down_running_threshold = int(
+                            scale_down_running_threshold)
+                    enough_up_interval = (
+                        self._autoscaling_last_scale_request < 0
+                        or num_of_requests - self._autoscaling_last_scale_request
+                        >= min_interval)
+                    enough_down_interval = (
+                        self._autoscaling_last_scale_request < 0
+                        or num_of_requests - self._autoscaling_last_scale_request
+                        >= scale_down_min_interval)
+                    should_check_scale = request_delta or (
+                        scale_down_threshold is not None
+                        and scale_down_poll_s > 0)
+                    if not should_check_scale:
+                        continue
+                    kv_pressure = self.scheduler.get_kv_cache_utilization()
+                    if scale_up_mode == "direct_to_max":
+                        available_up_configs = [
+                            idx for idx in alternative_configs
+                            if cur_config < idx <= max_config_index
+                        ]
+                        next_config = (max(available_up_configs)
+                                       if available_up_configs else
+                                       cur_config + 1)
+                    else:
+                        next_config = cur_config + 1
+                    if (request_delta and num_of_requests >= min_request
+                            and enough_up_interval
+                            and next_config <= max_config_index
+                            and next_config in alternative_configs):
+                        logger.info(
+                            "autoscaling policy: request=%s "
+                            "kv_pressure=%.4f threshold=%.4f cur_config=%s "
+                            "next_config=%s",
+                            num_of_requests, kv_pressure, scale_up_threshold,
+                            cur_config, next_config)
+                        if kv_pressure >= scale_up_threshold:
+                            target_config = next_config
+                            low_pressure_checks = 0
+                            self._autoscaling_last_scale_request = (
+                                num_of_requests)
+                            logger.info(
+                                "autoscaling policy: KV pressure %.4f >= %.4f, "
+                                "scaling up to config index %s",
+                                kv_pressure, scale_up_threshold, target_config)
+                    if (target_config is None
+                            and scale_down_threshold is not None
+                            and cur_config > min_config_index
+                            and enough_down_interval):
+                        prev_config = cur_config - 1
+                        waiting_reqs = len(self.scheduler.waiting)
+                        running_reqs = len(self.scheduler.running)
+                        waiting_allows_scale_down = (
+                            scale_down_waiting_threshold is None
+                            or waiting_reqs <= scale_down_waiting_threshold)
+                        running_allows_scale_down = (
+                            scale_down_running_threshold is None
+                            or running_reqs <= scale_down_running_threshold)
+                        projected_pressure = float("inf")
+                        used_blocks = -1
+                        target_blocks = -1
+                        if prev_config in alternative_configs:
+                            try:
+                                (projected_pressure, used_blocks,
+                                 target_blocks) = (
+                                     self._project_kv_pressure_for_pp_config(
+                                         alternative_configs[prev_config]))
+                            except Exception:
+                                logger.exception(
+                                    "autoscaling policy: failed to estimate "
+                                    "target KV pressure for config index %s; "
+                                    "skipping scale-down check", prev_config)
+                        logger.info(
+                            "autoscaling policy: request=%s "
+                            "kv_pressure=%.4f scale_down_threshold=%.4f "
+                            "projected_prev_pressure=%.4f "
+                            "scale_down_target_threshold=%s used_blocks=%s "
+                            "target_blocks=%s cur_config=%s prev_config=%s "
+                            "waiting_reqs=%s scale_down_waiting_threshold=%s "
+                            "running_reqs=%s scale_down_running_threshold=%s "
+                            "low_pressure_checks=%s/%s",
+                            num_of_requests, kv_pressure,
+                            scale_down_threshold, projected_pressure,
+                            ("None" if scale_down_target_threshold is None else
+                             f"{scale_down_target_threshold:.4f}"),
+                            used_blocks, target_blocks, cur_config,
+                            prev_config, waiting_reqs,
+                            ("None" if scale_down_waiting_threshold is None else
+                             str(scale_down_waiting_threshold)),
+                            running_reqs,
+                            ("None" if scale_down_running_threshold is None else
+                             str(scale_down_running_threshold)),
+                            low_pressure_checks, scale_down_stable_checks)
+                        target_has_headroom = (
+                            scale_down_target_threshold is None
+                            or projected_pressure <=
+                            scale_down_target_threshold)
+                        if (kv_pressure <= scale_down_threshold
+                                and not waiting_allows_scale_down):
+                            low_pressure_checks = 0
+                            logger.info(
+                                "autoscaling policy: skip scale-down to config "
+                                "index %s because waiting_reqs=%s exceeds "
+                                "threshold %s",
+                                prev_config, waiting_reqs,
+                                scale_down_waiting_threshold)
+                        elif (kv_pressure <= scale_down_threshold
+                                and not running_allows_scale_down):
+                            low_pressure_checks = 0
+                            logger.info(
+                                "autoscaling policy: skip scale-down to config "
+                                "index %s because running_reqs=%s exceeds "
+                                "threshold %s",
+                                prev_config, running_reqs,
+                                scale_down_running_threshold)
+                        elif (kv_pressure <= scale_down_threshold
+                                and target_has_headroom):
+                            low_pressure_checks += 1
+                            if (low_pressure_checks >= scale_down_stable_checks
+                                    and prev_config in alternative_configs):
+                                target_config = prev_config
+                                low_pressure_checks = 0
+                                self._autoscaling_last_scale_request = (
+                                    num_of_requests)
+                                logger.info(
+                                    "autoscaling policy: KV pressure %.4f <= "
+                                    "%.4f and projected target pressure %.4f "
+                                    "allows scale-down for %s checks, "
+                                    "decrementing to config index %s",
+                                    kv_pressure, scale_down_threshold,
+                                    projected_pressure,
+                                    scale_down_stable_checks, target_config)
+                        elif kv_pressure <= scale_down_threshold:
+                            low_pressure_checks = 0
+                            logger.info(
+                                "autoscaling policy: skip scale-down to config "
+                                "index %s because projected target pressure "
+                                "%.4f exceeds threshold %s",
+                                prev_config, projected_pressure,
+                                ("None" if scale_down_target_threshold is None
+                                 else f"{scale_down_target_threshold:.4f}"))
+                        else:
+                            low_pressure_checks = 0
+                else:
+                    logger.warning(
+                        "autoscaling policy: unsupported policy type %r",
+                        policy_type)
 
             if target_config is not None:
                 if target_config in alternative_configs:
@@ -2799,11 +3302,13 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                         cur_config = target_config
                         pending_config = None
                         pending_retry_count = 0
+                        low_pressure_checks = 0
 
                 else:
                     logger.warning(f"migration_thread: cur_config {target_config} not found in alternative_configs, skipping migration")
                     pending_config = None
                     pending_retry_count = 0
+                    low_pressure_checks = 0
 
     def metrics_thread(self):
         while True:

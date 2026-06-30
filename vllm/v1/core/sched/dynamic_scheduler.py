@@ -2,10 +2,12 @@
 
 from vllm.v1.core.dynamic_kv_cache_manager import DynamicKVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
-from typing import List, Tuple, Optional, Union
+from typing import Any, List, Tuple, Optional, Union
 from threading import Lock
 import vllm.envs as envs
 from enum import Enum
+import os
+import time
 import torch
 import gc
 from collections import defaultdict, deque
@@ -14,8 +16,10 @@ from bitarray import bitarray
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.kvcached_integration import (use_flexi_kv_for_runtime,
-                                       use_kvcached_backend)
+from vllm.kvcached_integration import (
+    use_flexi_kv_for_runtime,
+    use_kvcached_backend,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.distributed.kv_events import EventPublisherFactory
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
@@ -35,6 +39,17 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 
 logger = init_logger(__name__)
+
+
+def _autoscaling_kvcached_debug_enabled() -> bool:
+    return os.environ.get("VLLM_AUTOSCALING_KVCACHED_DEBUG",
+                          "").lower() in {"1", "true", "yes", "on"}
+
+
+def _short_req_id(req_id: str) -> str:
+    return req_id[-8:] if isinstance(req_id, str) else str(req_id)
+
+
 class DynamicScheduler(Scheduler):
     def __init__(
         self,
@@ -179,6 +194,20 @@ class DynamicScheduler(Scheduler):
         self.num_tokens_for_migration = 0 # 记录已经发送的slot数量，用来和worker端已处理的slot数量进行对比
 
         self.cur_scheduler_output_version = 0
+        self._debug_scheduler_step_id = 0
+        self._debug_request_free_epoch = 0
+        self._debug_block_free_epoch = 0
+        self._debug_request_free_epochs: dict[str, int] = {}
+        self._delay_pipeline_request_free = (
+            self.vllm_config.parallel_config.pipeline_parallel_size > 1)
+        if os.environ.get(
+                "VLLM_AUTOSCALING_DISABLE_PIPELINE_FINISHED_ID_FREE_DELAY",
+                "").strip().lower() in {"1", "true", "yes", "on"}:
+            logger.warning(
+                "KVCacheD debug disabled pipeline finished-id KV free delay")
+            self._delay_pipeline_request_free = False
+        self._pipeline_pending_free_requests: dict[str, Request] = {}
+        self._pipeline_delivered_free_request_ids: set[str] = set()
 
         # 用以记录在迁移过程中，哪些rank是sender，哪些rank是receiver
         self.sender_list_during_migration: Optional[set[int]] = None 
@@ -199,13 +228,6 @@ class DynamicScheduler(Scheduler):
             if should_increase_scheduler_output_version:
                 self.cur_scheduler_output_version += 1
             if is_flexi or use_kvcached_backend():
-                if use_kvcached_backend():
-                    begin_defer = getattr(
-                        self.kv_cache_manager,
-                        "begin_defer_physical_free",
-                        None)
-                    if begin_defer is not None:
-                        begin_defer()
                 slot_mapping = self.get_slot_mapping_from_reqs(self.running)
                 logger.info(f"[num tokens]: slot_mapping length:{len(slot_mapping)} ")
                 logger.info(f"[num tokens]: scheduler side num_tokens:{self.kv_cache_manager} ")
@@ -269,6 +291,8 @@ class DynamicScheduler(Scheduler):
         """
         pp_layer_config = self.pp_layer_config
         scheduler_output = super().schedule()
+        self._debug_scheduler_step_id += 1
+        scheduler_step_id = self._debug_scheduler_step_id
         is_sync_after_migration = self._pending_pp_layer_config is not None
 
         # When inject_sync_msg is True, it means we need to sync the kv cache between layers belongs to old and new configuration
@@ -293,6 +317,9 @@ class DynamicScheduler(Scheduler):
                 kv_connector_metadata=scheduler_output.kv_connector_metadata,
                 pp_layer_config=pp_layer_config,
                 current_scheduler_output_version=self.cur_scheduler_output_version,
+                scheduler_step_id=scheduler_step_id,
+                scheduler_request_free_epoch=self._debug_request_free_epoch,
+                scheduler_block_free_epoch=self._debug_block_free_epoch,
                 is_sync_after_migration=is_sync_after_migration,
                 total_migration_tokens=self.num_tokens_for_migration + scheduler_output.total_num_scheduled_tokens,
                 # total_migration_tokens=self.num_tokens_for_migration,
@@ -302,6 +329,19 @@ class DynamicScheduler(Scheduler):
                 receiver_list= self.receiver_list_during_migration,
                 # slot_mapping = self.get_slot_mapping_from_reqs(scheduler_output.scheduled_new_reqs) if self.sending_slot_mapping else None,
             )
+        if _autoscaling_kvcached_debug_enabled():
+            logger.warning(
+                "[KVCACHED_SCHED_OUTPUT_TRACE] phase=create step_id=%s "
+                "sched_ver=%s request_free_epoch=%s block_free_epoch=%s "
+                "total_tokens=%s scheduled_req_ids=%s finished_req_ids=%s "
+                "migration_in_process=%s is_sync_after_migration=%s",
+                scheduler_step_id, self.cur_scheduler_output_version,
+                self._debug_request_free_epoch, self._debug_block_free_epoch,
+                output.total_num_scheduled_tokens,
+                [_short_req_id(req_id)
+                 for req_id in output.num_scheduled_tokens.keys()],
+                [_short_req_id(req_id) for req_id in output.finished_req_ids],
+                output.migration_in_process, output.is_sync_after_migration)
         # scheduled token为0的请求不应该发送给worker，因此在这里我们跳过后续的asynchronise处理
         if output.total_num_scheduled_tokens == 0:
             return output
@@ -357,6 +397,221 @@ class DynamicScheduler(Scheduler):
     def dynamic_schedule(self) -> DynamicSchedulerOutput:
         with self.lock:
             return self._schedule()
+
+    def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
+        assert request.is_finished()
+        self._debug_request_free_epoch += 1
+        request_free_epoch = self._debug_request_free_epoch
+        self._debug_request_free_epochs[
+            request.request_id] = request_free_epoch
+        if _autoscaling_kvcached_debug_enabled():
+            logger.warning(
+                "[KVCACHED_REQUEST_FREE_TRACE] phase=request_free_enter "
+                "trace_ns=%s request_free_epoch=%s block_free_epoch=%s "
+                "req_id=%s status=%s",
+                time.time_ns(), request_free_epoch,
+                self._debug_block_free_epoch,
+                _short_req_id(request.request_id), request.status)
+
+        delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        self.encoder_cache_manager.free(request)
+        self._cached_reqs_data.pop(request.request_id, None)
+        self.finished_req_ids.add(request.request_id)
+
+        if not delay_free_blocks:
+            if self._delay_pipeline_request_free:
+                self._pipeline_pending_free_requests[
+                    request.request_id] = request
+                self._pipeline_delivered_free_request_ids.discard(
+                    request.request_id)
+                logger.debug(
+                    "Delayed KV block free for finished request %s until "
+                    "workers consume finished_req_ids",
+                    request.request_id)
+            else:
+                self._free_blocks(request)
+
+        return kv_xfer_params
+
+    def _free_blocks(self, request: Request):
+        if not _autoscaling_kvcached_debug_enabled():
+            return super()._free_blocks(request)
+
+        self._debug_block_free_epoch += 1
+        block_free_epoch = self._debug_block_free_epoch
+        request_free_epoch = self._debug_request_free_epochs.get(
+            request.request_id, -1)
+        self._log_kvcached_free_invariant(request, "before_free")
+        block_ids = getattr(request, "block_ids", None)
+        block_ids_trace = [
+            [int(block_id) for block_id in block_group]
+            for block_group in (block_ids or [])
+        ]
+        logger.warning(
+            "[KVCACHED_REQUEST_FREE_TRACE] phase=before_free trace_ns=%s "
+            "request_free_epoch=%s block_free_epoch=%s req_id=%s "
+            "block_ids=%s",
+            time.time_ns(), request_free_epoch, block_free_epoch,
+            request.request_id, block_ids_trace)
+        try:
+            return super()._free_blocks(request)
+        finally:
+            logger.warning(
+                "[KVCACHED_REQUEST_FREE_TRACE] phase=after_free trace_ns=%s "
+                "request_free_epoch=%s block_free_epoch=%s req_id=%s "
+                "block_ids=%s",
+                time.time_ns(), request_free_epoch, block_free_epoch,
+                request.request_id, block_ids_trace)
+            self._log_kvcached_free_invariant(request, "after_free")
+
+    def _live_kvcached_block_refs(
+        self,
+        exclude_req_id: Optional[str] = None,
+    ) -> dict[int, list[str]]:
+        manager = getattr(self.kv_cache_manager, "single_type_manager", None)
+        req_to_blocks = getattr(manager, "req_to_blocks", {})
+        live_refs: dict[int, list[str]] = defaultdict(list)
+        for req_id, blocks in req_to_blocks.items():
+            if req_id == exclude_req_id:
+                continue
+            req = self.requests.get(req_id)
+            if req is None or req.is_finished():
+                continue
+            for block in blocks:
+                live_refs[int(block.block_id)].append(_short_req_id(req_id))
+        return live_refs
+
+    def _log_kvcached_free_invariant(
+        self,
+        request: Request,
+        phase: str,
+    ) -> None:
+        manager = getattr(self.kv_cache_manager, "single_type_manager", None)
+        req_to_blocks = getattr(manager, "req_to_blocks", {})
+        req_blocks = list(req_to_blocks.get(request.request_id, []))
+        req_block_ids = [int(block.block_id) for block in req_blocks]
+        physical_candidates = [
+            int(block.block_id)
+            for block in req_blocks
+            if int(getattr(block, "ref_cnt", 0)) == 1
+        ]
+        live_refs = self._live_kvcached_block_refs(
+            exclude_req_id=request.request_id)
+        overlap = {
+            block_id: live_refs[block_id]
+            for block_id in physical_candidates
+            if block_id in live_refs
+        }
+        if overlap:
+            logger.error(
+                "[KVCACHED_SCHED_FREE_OVERLAP] phase=%s trace_ns=%s "
+                "req_id=%s status=%s candidate_blocks=%s overlap=%s",
+                phase, time.time_ns(), _short_req_id(request.request_id),
+                request.status, physical_candidates[:128], overlap)
+        logger.warning(
+            "[KVCACHED_SCHED_FREE_INVARIANT] phase=%s trace_ns=%s req_id=%s "
+            "status=%s req_blocks=%d physical_candidates=%d "
+            "scheduler_live_blocks=%d overlap_count=%d "
+            "sample_req_blocks=%s sample_candidates=%s sample_overlap=%s",
+            phase, time.time_ns(), _short_req_id(request.request_id),
+            request.status, len(req_block_ids), len(physical_candidates),
+            len(live_refs), len(overlap), req_block_ids[:64],
+            physical_candidates[:64], {
+                block_id: overlap[block_id]
+                for block_id in list(overlap)[:16]
+            })
+
+    def log_kvcached_deferred_release_invariant(self, reason: str) -> None:
+        if not _autoscaling_kvcached_debug_enabled():
+            return
+        block_pool = getattr(self.kv_cache_manager, "block_pool", None)
+        physical_manager = getattr(block_pool, "kv_cache_manager", None)
+        if physical_manager is None:
+            return
+        pages = list(getattr(physical_manager, "deferred_free_page_ids", []))
+        if not pages:
+            logger.warning(
+                "[KVCACHED_DEFERRED_RELEASE_INVARIANT] reason=%s "
+                "trace_ns=%s deferred_pages=0 scheduler_live_blocks=%d",
+                reason, time.time_ns(),
+                len(self._live_kvcached_block_refs()))
+            return
+        blocks_per_page = int(
+            getattr(physical_manager, "blocks_per_physical_page", 1) or 1)
+        deferred_blocks: set[int] = set()
+        for page_id in pages:
+            start_block = int(page_id) * blocks_per_page
+            deferred_blocks.update(
+                range(start_block, start_block + blocks_per_page))
+        live_refs = self._live_kvcached_block_refs()
+        overlap = {
+            block_id: live_refs[block_id]
+            for block_id in sorted(deferred_blocks & set(live_refs))
+        }
+        if overlap:
+            logger.error(
+                "[KVCACHED_DEFERRED_RELEASE_OVERLAP] reason=%s trace_ns=%s "
+                "blocks_per_page=%s deferred_pages=%s overlap=%s",
+                reason, time.time_ns(), blocks_per_page, pages[:128], {
+                    block_id: overlap[block_id]
+                    for block_id in list(overlap)[:64]
+                })
+        logger.warning(
+            "[KVCACHED_DEFERRED_RELEASE_INVARIANT] reason=%s trace_ns=%s "
+            "deferred_pages=%d deferred_blocks=%d blocks_per_page=%d "
+            "scheduler_live_blocks=%d overlap_count=%d sample_pages=%s "
+            "sample_overlap=%s",
+            reason, time.time_ns(), len(pages), len(deferred_blocks),
+            blocks_per_page, len(live_refs), len(overlap), pages[:64], {
+                block_id: overlap[block_id]
+                for block_id in list(overlap)[:16]
+            })
+
+    def flush_pipeline_delayed_frees(self, reason: str) -> int:
+        if not self._delay_pipeline_request_free:
+            return 0
+        with self.lock:
+            if not self._pipeline_pending_free_requests:
+                return 0
+            requests = [
+                (req_id, request)
+                for req_id, request in
+                self._pipeline_pending_free_requests.items()
+                if req_id in self._pipeline_delivered_free_request_ids
+            ]
+            if not requests:
+                return 0
+            if _autoscaling_kvcached_debug_enabled():
+                logger.warning(
+                    "[KVCACHED_PIPELINE_FREE_TRACE] phase=flush_enter "
+                    "trace_ns=%s reason=%s pending=%s delivered=%s "
+                    "flush_req_ids=%s",
+                    time.time_ns(), reason,
+                    [_short_req_id(req_id)
+                     for req_id in self._pipeline_pending_free_requests],
+                    [_short_req_id(req_id)
+                     for req_id in self._pipeline_delivered_free_request_ids],
+                    [_short_req_id(req_id) for req_id, _ in requests])
+            freed = 0
+            for req_id, request in requests:
+                if _autoscaling_kvcached_debug_enabled():
+                    logger.warning(
+                        "[KVCACHED_PIPELINE_FREE_TRACE] phase=flush_free_one "
+                        "trace_ns=%s reason=%s req_id=%s status=%s",
+                        time.time_ns(), reason, _short_req_id(req_id),
+                        request.status)
+                self._pipeline_pending_free_requests.pop(req_id, None)
+                self._pipeline_delivered_free_request_ids.discard(req_id)
+                self._cached_reqs_data.pop(req_id, None)
+                if req_id not in self.requests:
+                    continue
+                self._free_blocks(request)
+                freed += 1
+            if freed:
+                logger.info(
+                    "Freed KV blocks for %d finished requests after pipeline "
+                    "finished-id delivery (%s)", freed, reason)
+            return freed
 
     def add_request(self, request: Request) -> None:
         if self._sync_drain_pending_waiting is not None:
@@ -436,9 +691,31 @@ class DynamicScheduler(Scheduler):
         assert isinstance(scheduler_output, DynamicSchedulerOutput), \
             "Expected DynamicSchedulerOutput"
         with self.lock:
-            return super().update_from_output(
+            outputs = super().update_from_output(
                 create_from_dynamic_scheduler_output(scheduler_output),
                 model_runner_output)
+            for req_id in scheduler_output.finished_req_ids:
+                if req_id in self._pipeline_pending_free_requests:
+                    self._pipeline_delivered_free_request_ids.add(req_id)
+            if (_autoscaling_kvcached_debug_enabled()
+                    and scheduler_output.finished_req_ids):
+                logger.warning(
+                    "[KVCACHED_PIPELINE_FREE_TRACE] phase=mark_delivered "
+                    "trace_ns=%s step_id=%s sched_ver=%s finished_req_ids=%s "
+                    "pending=%s delivered=%s",
+                    time.time_ns(),
+                    getattr(scheduler_output, "scheduler_step_id", -1),
+                    getattr(scheduler_output,
+                            "current_scheduler_output_version", -1),
+                    [_short_req_id(req_id)
+                     for req_id in scheduler_output.finished_req_ids],
+                    [_short_req_id(req_id)
+                     for req_id in self._pipeline_pending_free_requests],
+                    [_short_req_id(req_id)
+                     for req_id in self._pipeline_delivered_free_request_ids])
+            for req_id in self._pipeline_pending_free_requests:
+                self._cached_reqs_data.pop(req_id, None)
+            return outputs
 
     def make_stats(
         self,
@@ -456,8 +733,13 @@ class DynamicScheduler(Scheduler):
             page_size_bytes = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
             num_layers = self.vllm_config.model_config.hf_text_config.num_hidden_layers
             # Use self.requests dict to ensure consistency with req_to_blocks
+            active_requests = {
+                req_id: req
+                for req_id, req in self.requests.items()
+                if not req.is_finished()
+            }
             actual_kv_mem, allocated_kv_mem = self.kv_cache_manager.get_kv_memory_stats(
-                self.requests, page_size_bytes, num_layers)
+                active_requests, page_size_bytes, num_layers)
         
         return SchedulerStats(
             num_running_reqs=len(self.running),

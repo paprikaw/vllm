@@ -328,8 +328,8 @@ class DynamicLlamaModel(LlamaModel):
 
         t0 = time.time()
         with self.model_lock:
-            logger.info("getting model lock taking %s",
-                        human_readable_duration(time.time() - t0))
+            logger.debug("getting model lock taking %s",
+                         human_readable_duration(time.time() - t0))
             with set_current_vllm_config(self.vllm_config):
                 if get_pp_group().is_first_rank:
                     if inputs_embeds is not None:
@@ -390,7 +390,7 @@ class DynamicLlamaModel(LlamaModel):
                     _total_layer_time += layer_elapsed
                     
                     if layer_idx % 10 == 0 or layer_elapsed > 0.1:
-                        logger.info(
+                        logger.debug(
                             "[LAYER_TIMING] layer %d took %s (cumulative: %s)",
                             layer_idx, human_readable_duration(layer_elapsed),
                             human_readable_duration(_total_layer_time))
@@ -400,13 +400,13 @@ class DynamicLlamaModel(LlamaModel):
                     avg_time = sum(_layer_times) / len(_layer_times)
                     max_time = max(_layer_times)
                     max_layer = _layer_times.index(max_time) + self.sched_start_layer
-                    logger.info(
+                    logger.debug(
                         "[LAYER_SUMMARY] %d layers: total=%s, avg=%s, max=%s (layer %d)",
                         len(_layer_times), human_readable_duration(_total_layer_time),
                         human_readable_duration(avg_time), human_readable_duration(max_time), max_layer)
                 
-                logger.info("after forwarding took %s",
-                            human_readable_duration(time.time() - fwd_t0))
+                logger.debug("after forwarding took %s",
+                             human_readable_duration(time.time() - fwd_t0))
 
                 if not get_pp_group().is_last_rank:
                     return IntermediateTensors({

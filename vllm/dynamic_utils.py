@@ -19,6 +19,7 @@ class ForegroundBackgroundGate:
         self._cond = threading.Condition()
         self._active_foreground = 0
         self._background_running = False
+        self._exclusive_background_running = False
 
     @contextmanager
     def foreground(self):
@@ -36,6 +37,22 @@ class ForegroundBackgroundGate:
                     self._cond.notify_all()
 
     @contextmanager
+    def migration_foreground(self):
+        """Foreground section that yields to an active migration transfer."""
+        with self._cond:
+            while self._exclusive_background_running:
+                self._cond.wait()
+            self._active_foreground += 1
+
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._active_foreground -= 1
+                if self._active_foreground == 0:
+                    self._cond.notify_all()
+
+    @contextmanager
     def background(self):
         """后台任务：仅在系统空闲时运行"""
         with self._cond:
@@ -47,5 +64,22 @@ class ForegroundBackgroundGate:
             yield
         finally:
             with self._cond:
+                self._background_running = False
+                self._cond.notify_all()
+
+    @contextmanager
+    def exclusive_background(self):
+        """Background section that also blocks migration-aware foreground."""
+        with self._cond:
+            while self._active_foreground > 0 or self._background_running:
+                self._cond.wait()
+            self._background_running = True
+            self._exclusive_background_running = True
+
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._exclusive_background_running = False
                 self._background_running = False
                 self._cond.notify_all()

@@ -9,8 +9,8 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from typing import Dict, Optional, Union, TypedDict, List, Literal
-from pydantic import BaseModel, ConfigDict
+from typing import Any, Dict, Optional, Union, TypedDict, List, Literal
+from pydantic import BaseModel, ConfigDict, Field
 
 # Avoid circular import by defining metadata type locally instead of importing
 # from dynamic_layer_kv_connector
@@ -39,6 +39,7 @@ class KVPatchMeta(BaseModel):
     slot_mapping_shape: torch.Size
     kv_payload_dtype: torch.dtype
     kv_payload_shape: torch.Size
+    scheduler_trace: Dict[str, Any] = Field(default_factory=dict)
 
 class KVTensorMeta(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -110,7 +111,15 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
             return cache[block_indices, block_offsets, ...]
         return torch.index_select(cache, 0, slot_mapping)
 
-    def extract_kv_patch_from_kv_cache(self, patch_id: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor, is_finished: bool) -> KVPatch:
+    def extract_kv_patch_from_kv_cache(
+            self,
+            patch_id: int,
+            kv_caches: list[torch.Tensor],
+            layer_ids: list[int],
+            start_layer_id: int,
+            slot_mapping: torch.Tensor,
+            is_finished: bool,
+            slot_mapping_already_valid: bool = False) -> KVPatch:
         """Aggregate multiple layers' KV for this stage and send in one shot.. . 
 
         Prefer passing `kv_caches` and `dest_slot_mapping` only; this method
@@ -134,26 +143,51 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
         # Derive shapes using model config and helper flags.
         assert self.model_executable is not None, "The model_executable should be set"
         num_heads, head_size = self.get_model_args(self.model_executable)
-        # Peek the first cache to get dtype/device.  For normal FlashAttention
-        # caches this keeps the native block layout instead of flattening the
-        # whole layer; layer-stacked KVCacheD views are intentionally strided.
+        first_local_layer_id = int(layer_ids[0] - start_layer_id)
+        if first_local_layer_id < 0 or first_local_layer_id >= len(kv_caches):
+            raise IndexError(
+                "KV patch sender layer index out of range while selecting "
+                "dtype/device sample: "
+                f"first_layer_id={layer_ids[0]}, "
+                f"start_layer_id={start_layer_id}, "
+                f"first_local_layer_id={first_local_layer_id}, "
+                f"num_kv_caches={len(kv_caches)}")
+        first_kv_cache = kv_caches[first_local_layer_id]
+        # Peek the first layer actually being sent to get dtype/device.  In
+        # autoscaling a captured KV view may contain zero-size placeholders for
+        # layers outside the sender's migration plan.
         if self.is_deepseek_mla and self.use_mla_opt:
-            k0, v0 = self.get_kv_from_cache(kv_caches[0], num_heads,
+            k0, v0 = self.get_kv_from_cache(first_kv_cache, num_heads,
                                             head_size)
         else:
-            k0, v0 = kv_caches[0][0], kv_caches[0][1]
+            k0, v0 = first_kv_cache[0], first_kv_cache[1]
 
-        # Ensure index lives on same device for fast gather.
-        if slot_mapping.device != k0.device:
-            slot_mapping = slot_mapping.to(k0.device, non_blocking=True)
-        
-        # 首先裁剪 slot_mapping，只保留有效部分（>= 0）
-        valid_mask = (slot_mapping >= 0)
-        num_valid = int(valid_mask.sum().item())
+        slot_min: Optional[int] = None
+        slot_max: Optional[int] = None
+        if slot_mapping_already_valid:
+            trimmed_slot_mapping = slot_mapping
+            num_valid = int(trimmed_slot_mapping.numel())
+            if num_valid > 0 and not trimmed_slot_mapping.is_cuda:
+                slot_min = int(trimmed_slot_mapping.min().item())
+                slot_max = int(trimmed_slot_mapping.max().item())
+        else:
+            # Ensure index lives on same device for fast gather/filtering.
+            if slot_mapping.device != k0.device:
+                slot_mapping = slot_mapping.to(k0.device, non_blocking=True)
+            # 首先裁剪 slot_mapping，只保留有效部分（>= 0）
+            valid_mask = (slot_mapping >= 0)
+            num_valid = int(valid_mask.sum().item())
 
-        # 只保留有效的 slot_mapping
-        valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
-        trimmed_slot_mapping = slot_mapping.index_select(0, valid_indices)
+            # 只保留有效的 slot_mapping
+            valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
+            trimmed_slot_mapping = slot_mapping.index_select(0, valid_indices)
+
+        # Move the final index tensor only after CPU-side range checks had a
+        # chance to run. This avoids a needless CUDA scalar sync on the hot
+        # autoscaling patch path where the slot list is already CPU-filtered.
+        if trimmed_slot_mapping.device != k0.device:
+            trimmed_slot_mapping = trimmed_slot_mapping.to(k0.device,
+                                                           non_blocking=True)
 
         logger.info(f"debug-------------------- Original T: {slot_mapping.numel()}, Valid T: {num_valid}")
         if num_valid == 0:
@@ -175,8 +209,9 @@ class kv_synchronizer_helper(model_aware_kv_ops_helper):
             )
             return KVPatch(meta, KV_all, trimmed_slot_mapping)
 
-        slot_min = int(trimmed_slot_mapping.min().item())
-        slot_max = int(trimmed_slot_mapping.max().item())
+        if slot_min is None or slot_max is None:
+            slot_min = int(trimmed_slot_mapping.min().item())
+            slot_max = int(trimmed_slot_mapping.max().item())
         flat_capacity = self._flat_capacity_for_cache(k0)
         logger.info(
             "KV patch slot range: patch_id=%s layers=%s slots=[%s,%s] "

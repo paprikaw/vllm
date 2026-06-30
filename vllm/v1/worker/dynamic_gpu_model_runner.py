@@ -3,6 +3,7 @@ from hmac import new
 import threading
 import copy
 import gc
+import os
 import time
 import weakref
 from typing import TYPE_CHECKING, Optional, Union, Tuple
@@ -43,6 +44,7 @@ from vllm.v1.outputs import ModelRunnerOutput, EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.kvcached_integration import (
     get_kvcached_layer_tensor_view,
+    guard_kvcached_vmm_slots_mapped,
     use_direct_ptr_for_runtime,
     use_flexi_kv_for_runtime,
     use_kvcached_backend,
@@ -70,6 +72,39 @@ else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 from vllm.logger import init_logger
 logger = init_logger(__name__)
+
+
+def _autoscaling_kvcached_debug_enabled() -> bool:
+    return os.environ.get("VLLM_AUTOSCALING_KVCACHED_DEBUG",
+                          "").lower() in {"1", "true", "yes", "on"}
+
+
+def _autoscaling_kvcached_debug_verbose() -> bool:
+    return os.environ.get("VLLM_AUTOSCALING_KVCACHED_DEBUG_VERBOSE",
+                          "").lower() in {"1", "true", "yes", "on"}
+
+
+def _autoscaling_kvcached_sync_attribution_enabled() -> bool:
+    return os.environ.get("VLLM_AUTOSCALING_KVCACHED_SYNC_ATTRIBUTION",
+                          "").lower() in {"1", "true", "yes", "on"}
+
+
+def _autoscaling_kvcached_live_block_guard_enabled() -> bool:
+    return os.environ.get("VLLM_AUTOSCALING_KVCACHED_LIVE_BLOCK_GUARD",
+                          "").lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_for_autoscaling_kvcached_attribution(source: str) -> None:
+    if not _autoscaling_kvcached_sync_attribution_enabled():
+        return
+    if not use_kvcached_backend() or not torch.cuda.is_available():
+        return
+    sync_start = time.time()
+    torch.cuda.current_stream().synchronize()
+    logger.warning(
+        "[KVCACHED_SYNC_ATTRIBUTION] source=%s synchronized current stream "
+        "in %.6fs trace_ns=%s",
+        source, time.time() - sync_start, time.time_ns())
 
 
 class DynamicGPUModelRunner(GPUModelRunner):
@@ -112,6 +147,125 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self.inference_stream: Optional[torch.cuda.Stream] = None
         self._pending_k_ptr_table: Optional["PtrTable"] = None
         self._pending_v_ptr_table: Optional["PtrTable"] = None
+
+    def _log_autoscaling_live_blocks_debug(
+        self,
+        scheduler_output: "SchedulerOutput",
+        stage: str,
+    ) -> None:
+        if not _autoscaling_kvcached_debug_enabled():
+            return
+        autoscaling_sync = getattr(scheduler_output,
+                                   "autoscaling_request_state_sync", False)
+        finished_req_ids = getattr(scheduler_output, "finished_req_ids", ())
+        scheduler_step_id = getattr(scheduler_output, "scheduler_step_id", -1)
+        sched_ver = getattr(scheduler_output,
+                            "current_scheduler_output_version", -1)
+        request_free_epoch = getattr(
+            scheduler_output, "scheduler_request_free_epoch", -1)
+        block_free_epoch = getattr(
+            scheduler_output, "scheduler_block_free_epoch", -1)
+        scheduler_trace = {
+            "scheduler_step_id": scheduler_step_id,
+            "scheduler_output_version": sched_ver,
+            "scheduler_request_free_epoch": request_free_epoch,
+            "scheduler_block_free_epoch": block_free_epoch,
+        }
+        verbose = _autoscaling_kvcached_debug_verbose()
+        live_block_guard = _autoscaling_kvcached_live_block_guard_enabled()
+        if (not verbose and not autoscaling_sync and not finished_req_ids
+                and not live_block_guard):
+            return
+
+        try:
+            pp_rank = get_pp_group().rank
+        except Exception:
+            pp_rank = -1
+
+        block_table = self.input_batch.block_table[0]
+        num_reqs = self.input_batch.num_reqs
+        live_blocks: set[int] = set()
+        counts_sample: list[int] = []
+        req_blocks_trace: dict[str, list[int]] = {}
+        live_finished_req_ids: list[str] = []
+        live_finished_counts: list[int] = []
+        live_finished_blocks: dict[str, list[int]] = {}
+        finished_req_id_set = set(finished_req_ids)
+        for row_idx in range(num_reqs):
+            req_id = (self.input_batch.req_ids[row_idx]
+                      if row_idx < len(self.input_batch.req_ids) else None)
+            num_blocks = int(block_table.num_blocks_per_row[row_idx])
+            if row_idx < 16:
+                counts_sample.append(num_blocks)
+            if num_blocks <= 0:
+                continue
+            row_blocks = [
+                int(block_id)
+                for block_id in block_table.block_table_np[row_idx, :num_blocks]
+                if int(block_id) >= 0
+            ]
+            live_blocks.update(row_blocks)
+            if req_id is not None and req_id in finished_req_id_set:
+                live_finished_req_ids.append(req_id)
+                live_finished_counts.append(num_blocks)
+                live_finished_blocks[req_id] = row_blocks[:64]
+            if verbose and req_id is not None:
+                req_blocks_trace[req_id] = row_blocks
+
+        if live_block_guard and live_blocks and use_kvcached_backend():
+            kv_group_spec = self.kv_cache_config.kv_cache_groups[0]
+            block_size = int(kv_group_spec.kv_cache_spec.block_size)
+            live_slots = [
+                int(block_id) * block_size
+                for block_id in sorted(live_blocks)
+            ]
+            try:
+                sched_start, sched_end = self.model.get_sched_layers()
+                layer_ids = list(range(int(sched_start), int(sched_end)))
+            except Exception:
+                layer_ids = None
+            if layer_ids is None or layer_ids:
+                guard_kvcached_vmm_slots_mapped(
+                    f"worker_live_blocks:{stage}",
+                    self,
+                    live_slots,
+                    block_size,
+                    layer_ids=layer_ids,
+                    rank=pp_rank,
+                    group_id=0,
+                )
+
+        req_ids = list(self.input_batch.req_ids)
+        scheduled_req_ids = sorted(scheduler_output.num_scheduled_tokens.keys())
+        logger.warning(
+            "[AUTOSCALE_LIVE_BLOCKS_DEBUG] rank=%s stage=%s trace_ns=%s "
+            "step_id=%s sched_ver=%s request_free_epoch=%s "
+            "block_free_epoch=%s "
+            "autoscaling_sync=%s num_reqs=%d scheduled_reqs=%d "
+            "finished_reqs=%d live_blocks=%d sample_live_blocks=%s "
+            "sample_req_ids=%s sample_counts=%s live_finished_req_ids=%s "
+            "live_finished_counts=%s live_finished_blocks=%s",
+            pp_rank, stage, time.time_ns(), scheduler_step_id, sched_ver,
+            request_free_epoch, block_free_epoch, autoscaling_sync, num_reqs,
+            len(scheduled_req_ids), len(finished_req_ids),
+            len(live_blocks), sorted(live_blocks)[:64],
+            [req_id[-8:] for req_id in req_ids[:16]], counts_sample,
+            [req_id[-8:] for req_id in live_finished_req_ids],
+            live_finished_counts, {
+                req_id[-8:]: blocks
+                for req_id, blocks in live_finished_blocks.items()
+            })
+        if verbose:
+            logger.warning(
+                "[KVCACHED_LIVE_BLOCKS_TRACE] rank=%s stage=%s "
+                "step_id=%s sched_ver=%s request_free_epoch=%s "
+                "block_free_epoch=%s "
+                "autoscaling_sync=%s finished_req_ids=%s scheduled_req_ids=%s "
+                "live_blocks=%s req_blocks=%s",
+                pp_rank, stage, scheduler_step_id, sched_ver,
+                request_free_epoch, block_free_epoch, autoscaling_sync,
+                list(finished_req_ids), scheduled_req_ids,
+                sorted(live_blocks), req_blocks_trace)
 
     def set_kv_cache_start_layer(self, start_layer: int, reason: str = "") -> None:
         old_start_layer = self.kv_cache_start_layer
@@ -266,7 +420,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
             return super().execute_model(scheduler_output, intermediate_tensors)
         
         time_start = time.time()
-        logger.info(f"getting forward lock taking {human_readable_duration(time.time() - time_start)}")
+        logger.debug("getting forward lock taking %s",
+                     human_readable_duration(time.time() - time_start))
         with self.fbgate.foreground():
             self.model.set_sched_layers(layer_config[0], layer_config[1])
             try:
@@ -297,6 +452,19 @@ class DynamicGPUModelRunner(GPUModelRunner):
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        scheduler_step_id = getattr(scheduler_output, "scheduler_step_id", -1)
+        sched_ver = getattr(scheduler_output,
+                            "current_scheduler_output_version", -1)
+        request_free_epoch = getattr(
+            scheduler_output, "scheduler_request_free_epoch", -1)
+        block_free_epoch = getattr(
+            scheduler_output, "scheduler_block_free_epoch", -1)
+        scheduler_trace = {
+            "scheduler_step_id": scheduler_step_id,
+            "scheduler_output_version": sched_ver,
+            "scheduler_request_free_epoch": request_free_epoch,
+            "scheduler_block_free_epoch": block_free_epoch,
+        }
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -440,6 +608,82 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 block_numbers * block_size,
                 block_offsets,
                 out=block_table.slot_mapping_np[:total_num_scheduled_tokens])
+            if use_kvcached_backend():
+                try:
+                    pp_rank_for_guard = get_pp_group().rank
+                except Exception:
+                    pp_rank_for_guard = -1
+                try:
+                    sched_start, sched_end = self.model.get_sched_layers()
+                    guard_layer_ids = list(range(int(sched_start),
+                                                 int(sched_end)))
+                except Exception:
+                    guard_layer_ids = None
+                guard_kvcached_vmm_slots_mapped(
+                    "inference_prepare:"
+                    f"step={scheduler_step_id}:sched_ver={sched_ver}:"
+                    f"request_free_epoch={request_free_epoch}:"
+                    f"block_free_epoch={block_free_epoch}",
+                    self,
+                    block_table.slot_mapping_np[:total_num_scheduled_tokens],
+                    int(block_size),
+                    layer_ids=guard_layer_ids,
+                    rank=pp_rank_for_guard,
+                    group_id=int(kv_cache_group_id),
+                    trace_info=scheduler_trace,
+                )
+            if _autoscaling_kvcached_debug_enabled():
+                try:
+                    pp_rank = get_pp_group().rank
+                except Exception:
+                    pp_rank = -1
+                valid_blocks = sorted({
+                    int(block_id)
+                    for block_id in block_numbers
+                    if int(block_id) >= 0
+                })
+                slot_slice = block_table.slot_mapping_np[
+                    :total_num_scheduled_tokens]
+                req_blocks_trace: dict[str, list[int]] = {}
+                if _autoscaling_kvcached_debug_verbose():
+                    offset = 0
+                    for req_idx, req_id in enumerate(req_ids):
+                        count = int(num_scheduled_tokens[req_idx])
+                        req_block_numbers = block_numbers[offset:offset + count]
+                        req_blocks_trace[req_id] = sorted({
+                            int(block_id)
+                            for block_id in req_block_numbers
+                            if int(block_id) >= 0
+                        })
+                        offset += count
+                    logger.warning(
+                        "[KVCACHED_INFER_USE_TRACE] rank=%s kv_group=%s "
+                        "trace_ns=%s step_id=%s sched_ver=%s "
+                        "request_free_epoch=%s block_free_epoch=%s "
+                        "num_reqs=%s total_tokens=%s block_size=%s "
+                        "blocks=%s req_blocks=%s slots_min=%s slots_max=%s",
+                        pp_rank, kv_cache_group_id, time.time_ns(),
+                        scheduler_step_id, sched_ver, request_free_epoch,
+                        block_free_epoch, num_reqs,
+                        total_num_scheduled_tokens, block_size, valid_blocks,
+                        req_blocks_trace,
+                        int(slot_slice.min()) if slot_slice.size else None,
+                        int(slot_slice.max()) if slot_slice.size else None)
+                else:
+                    logger.warning(
+                        "[KVCACHED_INFER_USE_TRACE] rank=%s kv_group=%s "
+                        "trace_ns=%s step_id=%s sched_ver=%s "
+                        "request_free_epoch=%s block_free_epoch=%s "
+                        "num_reqs=%s total_tokens=%s block_size=%s "
+                        "blocks_count=%s sample_blocks=%s slots_min=%s "
+                        "slots_max=%s",
+                        pp_rank, kv_cache_group_id, time.time_ns(),
+                        scheduler_step_id, sched_ver, request_free_epoch,
+                        block_free_epoch, num_reqs,
+                        total_num_scheduled_tokens, block_size,
+                        len(valid_blocks), valid_blocks[:64],
+                        int(slot_slice.min()) if slot_slice.size else None,
+                        int(slot_slice.max()) if slot_slice.size else None)
             # logger.info(f"block_table_indices: {block_table_indices}")
             # logger.info(f"block_table_cpu: {block_table_cpu.flatten()}")
             # logger.info(f"block_numbers: {block_numbers}")
@@ -546,6 +790,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
         self._update_states(scheduler_output)
+        self._log_autoscaling_live_blocks_debug(scheduler_output,
+                                                "post_update_states")
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
                 # Return empty ModelRunnerOutput if there's no work to do.
@@ -555,6 +801,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
         # Prepare the decoder inputs.
         attn_metadata, logits_indices, spec_decode_metadata, k_ptr_tables_tensor, v_ptr_tables_tensor = (
             self._dynamic_prepare_inputs(scheduler_output))
+        self._log_autoscaling_live_blocks_debug(scheduler_output,
+                                                "post_prepare_inputs")
         
         # DEBUG: Log critical batch state for cross-node synchronization debugging
         pp_rank = get_pp_group().rank
@@ -669,6 +917,8 @@ class DynamicGPUModelRunner(GPUModelRunner):
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
                 )
+                _sync_for_autoscaling_kvcached_attribution(
+                    "inference_forward")
             except Exception as e:
                 time.sleep(2)
                 logger.info(f"Exception during model forward: {e}")
@@ -696,6 +946,39 @@ class DynamicGPUModelRunner(GPUModelRunner):
                                             all_gather_group=get_tp_group())
             logits = None
         else:
+            if spec_decode_metadata is None:
+                # Keep this tiny per-batch index tensor out of the long model
+                # forward window. It only depends on CPU batch metadata.
+                logits_indices = (
+                    self.query_start_loc_cpu[1:self.input_batch.num_reqs + 1].
+                    to(device=self.device, non_blocking=False) - 1)
+            if os.getenv("VLLM_DYNAMIC_PP_VALIDATE_LOGITS_INDICES",
+                         "0") == "1":
+                hidden_len = int(hidden_states.shape[0])
+                min_logit_index = (int(logits_indices.min().item())
+                                   if logits_indices.numel() else 0)
+                max_logit_index = (int(logits_indices.max().item())
+                                   if logits_indices.numel() else -1)
+                if min_logit_index < 0 or max_logit_index >= hidden_len:
+                    batch_req_ids = list(self.input_batch.req_ids)
+                    scheduled_tokens = [
+                        scheduler_output.num_scheduled_tokens.get(req_id)
+                        for req_id in batch_req_ids[:16]
+                    ]
+                    raise RuntimeError(
+                        "PP last-rank logits index out of bounds before "
+                        "sampling: "
+                        f"rank={get_pp_group().rank} "
+                        f"hidden_len={hidden_len} "
+                        f"min_logit_index={min_logit_index} "
+                        f"max_logit_index={max_logit_index} "
+                        f"num_reqs={self.input_batch.num_reqs} "
+                        f"total_num_scheduled_tokens="
+                        f"{scheduler_output.total_num_scheduled_tokens} "
+                        f"query_start_loc="
+                        f"{self.query_start_loc_cpu[:self.input_batch.num_reqs + 1].tolist()} "
+                        f"req_ids_first16={batch_req_ids[:16]} "
+                        f"scheduled_tokens_first16={scheduled_tokens}")
             sample_hidden_states = hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
             #  After compute_logits
@@ -2162,7 +2445,12 @@ class DynamicGPUModelRunner(GPUModelRunner):
         time_start = time.time()
         allocations: dict[int, Tuple[list[int], list[int], int, int, list[int], bool]] = {}
         granularity = getattr(self, 'layer_group_granularity', 1)
-        use_vmm_combined = getattr(self, 'vmm_combined_mode', False)
+        use_vmm_config = getattr(self.vllm_config.dynamic_config, 'use_vmm',
+                                 True)
+        use_vmm_combined = (
+            granularity > 1
+            and (use_vmm_config
+                 or getattr(self, 'vmm_combined_mode', False)))
         logger.info(f"preallocate_flexi_kv_caches_for_migration: layer_ids={layer_ids}, block_num={block_num}, granularity={granularity}, use_vmm_combined={use_vmm_combined}") 
         if use_vmm_combined and granularity > 1:
             # Use grouped allocation to match initialization pattern
@@ -2216,9 +2504,13 @@ class DynamicGPUModelRunner(GPUModelRunner):
                 v_ptrs_per_layer = vmm_result[1]
                 k_ptrs_dev_per_layer = vmm_result[2]  # [granularity]
                 v_ptrs_dev_per_layer = vmm_result[3]
-                # aligned_combined_bytes = vmm_result[4]
-                # bytes_per_kv = vmm_result[5]
+                aligned_combined_bytes = vmm_result[4]
+                bytes_per_kv = vmm_result[5]
                 kv_handles = vmm_result[6]  # [num_blocks] shared handles
+                self.vmm_aligned_bytes = aligned_combined_bytes
+                self.vmm_bytes_per_kv = bytes_per_kv
+                self.vmm_combined_mode = True
+                self.vmm_bytes_per_tensor = bytes_per_kv
                 
                 # Store grouped handles for proper release later
                 new_grouped_handles.append(list(kv_handles))

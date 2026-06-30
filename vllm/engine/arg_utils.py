@@ -367,6 +367,8 @@ class EngineArgs:
         DynamicConfig.autoscaling_candidate_ranks
     autoscaling_sequence: Optional[list[dict[str, Any]]] = \
         DynamicConfig.autoscaling_sequence
+    autoscaling_policy: Optional[dict[str, Any]] = \
+        DynamicConfig.autoscaling_policy
     num_gpu_blocks_override: Optional[
         int] = CacheConfig.num_gpu_blocks_override
     num_lookahead_slots: int = SchedulerConfig.num_lookahead_slots
@@ -449,6 +451,8 @@ class EngineArgs:
                 self.autoscaling_candidate_ranks)
         if self.autoscaling_sequence is not None:
             self.dynamic_config.autoscaling_sequence = self.autoscaling_sequence
+        if self.autoscaling_policy is not None:
+            self.dynamic_config.autoscaling_policy = self.autoscaling_policy
         if self.qlora_adapter_name_or_path is not None:
             warnings.warn(
                 "The `qlora_adapter_name_or_path` is deprecated "
@@ -677,6 +681,11 @@ class EngineArgs:
             type=json.loads,
             default=None,
             help="JSON autoscaling sequence used by dynamic PP experiments.")
+        parallel_group.add_argument(
+            "--autoscaling-policy",
+            type=json.loads,
+            default=None,
+            help="JSON runtime autoscaling policy used by dynamic PP experiments.")
         parallel_group.add_argument(
             "--disable-custom-all-reduce",
             **parallel_kwargs["disable_custom_all_reduce"])

@@ -69,6 +69,13 @@ class DynamicSchedulerOutput():
     # the bitmask for the whole batch
     grammar_bitmask: Optional[npt.NDArray[np.int32]]
 
+    # Debug correlation ids for scheduler/free/worker/migration lifetime
+    # tracing. These are intentionally carried in the scheduler output so
+    # worker-side logs can be compared against scheduler-side free events.
+    scheduler_step_id: int = -1
+    scheduler_request_free_epoch: int = -1
+    scheduler_block_free_epoch: int = -1
+
     total_migration_tokens: int = 0
 
     # KV Cache Connector metadata.
@@ -104,5 +111,7 @@ class DynamicSchedulerOutput():
     # this scheduler output, and newly activated ranks import them before
     # running the batch.
     autoscaling_request_state_sync: bool = False
+    autoscaling_request_state_refresh_ranks: Optional[tuple[int, ...]] = None
+    autoscaling_request_state_req_ids: Optional[tuple[str, ...]] = None
     autoscaling_request_states: Optional[dict[str, Any]] = None
     autoscaling_request_state_source_rank: int = -1

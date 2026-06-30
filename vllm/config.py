@@ -4279,6 +4279,15 @@ class DynamicConfig:
     alternative_configs.
     """
 
+    autoscaling_policy: Optional[dict[str, Any]] = None
+    """Optional runtime autoscaling policy.
+
+    Experimental policies are evaluated by the dynamic engine at runtime. For
+    example, {"type": "kv_pressure_incremental", "scale_up_threshold": 0.8,
+    "scale_down_threshold": 0.45} increments or decrements one PP config when
+    KV cache pressure crosses the configured thresholds.
+    """
+
     fixed_num_gpu_blocks: int = -1
     """Fixed number of GPU KV cache blocks per layer. Default -1 (auto).
     When set to a positive value, initializes the KV cache with exactly this
@@ -4328,7 +4337,8 @@ class DynamicConfig:
     @property
     def is_migration(self) -> bool:
         """Whether migration is enabled (derived from migration_steps)."""
-        return bool(self.migration_steps or self.autoscaling_sequence)
+        return bool(self.migration_steps or self.autoscaling_sequence
+                    or self.autoscaling_policy)
 
     @property
     def use_flexi_kv(self) -> bool:

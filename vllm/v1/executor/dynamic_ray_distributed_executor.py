@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 from concurrent.futures import Future as StdFuture
+import threading
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 from vllm.v1.kv_cache_interface import KVCacheSpec, KVCacheConfig
 import msgspec
@@ -40,6 +41,91 @@ from vllm.v1.worker.utils import KVBufferStatus
 logger = init_logger(__name__)
 
 
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _falsy_env(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() in {
+        "0", "false", "no", "off"
+    }
+
+
+def _dynamic_pp_wait_all_rank_refs() -> bool:
+    return not _falsy_env("VLLM_DYNAMIC_PP_WAIT_ALL_RANK_REFS", "1")
+
+
+def _dynamic_pp_strict_actor_chain() -> bool:
+    return _truthy_env("VLLM_DYNAMIC_PP_STRICT_ACTOR_CHAIN")
+
+
+def _dynamic_pp_ref_trace_enabled() -> bool:
+    return (_truthy_env("VLLM_DYNAMIC_PP_REF_TRACE")
+            or _truthy_env("VLLM_AUTOSCALING_KVCACHED_DEBUG"))
+
+
+def _short_req_ids(req_ids) -> list[str]:
+    return [req_id[-8:] if isinstance(req_id, str) else str(req_id)
+            for req_id in (req_ids or ())]
+
+
+def _scheduler_ref_trace_info(scheduler_output, active_ranks, transport: str):
+    return {
+        "transport": transport,
+        "step_id": getattr(scheduler_output, "scheduler_step_id", -1),
+        "sched_ver": getattr(scheduler_output,
+                             "current_scheduler_output_version", -1),
+        "pp_seq": getattr(scheduler_output, "pp_nccl_seq", -1),
+        "active_ranks": tuple(active_ranks or ()),
+        "req_ids": tuple(getattr(scheduler_output, "num_scheduled_tokens", {})
+                         .keys()),
+        "finished_req_ids": tuple(getattr(scheduler_output,
+                                          "finished_req_ids", ()) or ()),
+        "migration": getattr(scheduler_output, "migration_in_process", False),
+        "sync": getattr(scheduler_output, "is_sync_after_migration", False),
+    }
+
+
+def _log_pp_ref_trace(phase: str, info: Optional[dict[str, Any]], **extra):
+    if not _dynamic_pp_ref_trace_enabled():
+        return
+    info = info or {}
+    logger.warning(
+        "[PP_REF_TRACE] phase=%s trace_ns=%s transport=%s step_id=%s "
+        "sched_ver=%s pp_seq=%s active_ranks=%s req_ids=%s "
+        "finished_req_ids=%s migration=%s sync=%s extra=%s",
+        phase, time.time_ns(), info.get("transport"),
+        info.get("step_id"), info.get("sched_ver"), info.get("pp_seq"),
+        info.get("active_ranks"), _short_req_ids(info.get("req_ids")),
+        _short_req_ids(info.get("finished_req_ids")), info.get("migration"),
+        info.get("sync"), extra)
+
+
+def _watch_rank_refs_async(refs, active_ranks, trace_info, label: str) -> None:
+    if not _dynamic_pp_ref_trace_enabled():
+        return
+
+    def watch_one(rank, ref):
+        _log_pp_ref_trace(f"{label}:rank_ref_wait_enter", trace_info,
+                          rank=rank)
+        try:
+            ray.get(ref)
+        except Exception as exc:
+            _log_pp_ref_trace(f"{label}:rank_ref_error", trace_info,
+                              rank=rank, error=repr(exc))
+            return
+        _log_pp_ref_trace(f"{label}:rank_ref_returned", trace_info,
+                          rank=rank)
+
+    for rank, ref in zip(active_ranks or (), refs or ()):
+        thread = threading.Thread(target=watch_one,
+                                  args=(rank, ref),
+                                  daemon=True)
+        thread.start()
+
+
 def _dynamic_pp_rdt_transport() -> str:
     transport = os.getenv("VLLM_DYNAMIC_PP_RDT_TRANSPORT", "").lower()
     if transport in ("1", "true"):
@@ -65,15 +151,27 @@ class RayObjectRefFuture(StdFuture):
     consumed with `ray.get()`. The v1 engine only needs `result()`.
     """
 
-    def __init__(self, ref, refs=None):
+    def __init__(self, ref, refs=None, active_ranks=None, trace_info=None):
         super().__init__()
         self.ref = ref
         self.refs = list(refs) if refs is not None else [ref]
+        self.active_ranks = list(active_ranks or range(len(self.refs)))
+        self.trace_info = trace_info
 
     def result(self, timeout=None):
         if timeout is not None:
             raise NotImplementedError("timeout is not supported")
-        return ray.get(self.ref)
+        if _dynamic_pp_wait_all_rank_refs():
+            _log_pp_ref_trace("future_wait_all_enter", self.trace_info)
+            result = ray.get(self.refs)[-1]
+            _log_pp_ref_trace("future_wait_all_returned", self.trace_info)
+            return result
+        _log_pp_ref_trace("future_final_only_enter", self.trace_info)
+        result = ray.get(self.ref)
+        _log_pp_ref_trace("future_final_only_returned", self.trace_info)
+        _watch_rank_refs_async(self.refs, self.active_ranks, self.trace_info,
+                               "future_final_only_tail")
+        return result
 
 
 class DynamicRayDistributedExecutor(RayDistributedExecutor):
@@ -110,6 +208,13 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         self._autoscaling_active_pp_ranks_generation: int = -1
         self._autoscaling_active_pp_ranks_ref = None
         self._autoscaling_request_state_sync_pending: Optional[
+            tuple[int, ...]] = None
+        self._autoscaling_request_state_refresh_ranks_pending: Optional[
+            tuple[int, ...]] = None
+        self._autoscaling_request_states_pending: Optional[dict[str, Any]] = None
+        self._autoscaling_request_state_req_ids_pending: Optional[
+            tuple[str, ...]] = None
+        self._autoscaling_request_state_sync_key: Optional[
             tuple[int, ...]] = None
 
         if self.parallel_config.ray_workers_use_nsight:
@@ -502,15 +607,26 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
     ) -> None:
         """Commit the driver-side PP actor chain after worker routing is ready."""
         start = time.time()
+        previous_tuple = tuple(self.active_pp_ranks or ())
+        next_tuple = tuple(active_ranks or ())
+        if next_tuple != previous_tuple:
+            # A later scale-up can return to the same active-rank tuple after a
+            # scale-down. Treat every committed topology change as a new
+            # request-state handoff generation.
+            self._autoscaling_request_state_sync_key = None
         previous_active = set(self.active_pp_ranks or [])
         next_active = set(active_ranks or [])
-        if next_active - previous_active:
+        newly_active = tuple(sorted(next_active - previous_active))
+        if newly_active:
             self._autoscaling_request_state_sync_pending = tuple(
                 active_ranks or [])
+            self._autoscaling_request_state_refresh_ranks_pending = (
+                newly_active)
             logger.info(
                 "[autoscaling request states] will carry request states on "
-                "first target PP batch for active_ranks=%s previous=%s",
-                active_ranks, self.active_pp_ranks)
+                "first target PP batch for active_ranks=%s previous=%s "
+                "refresh_ranks=%s",
+                active_ranks, self.active_pp_ranks, newly_active)
         self._set_active_pp_ranks_local(active_ranks)
         logger.info(
             "[autoscaling active ranks] committed local PP worker chain to "
@@ -673,6 +789,12 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         self,
         scheduler_output,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
+        request_states = getattr(scheduler_output,
+                                 "autoscaling_request_states", None)
+        if request_states:
+            self._autoscaling_request_states_pending = request_states
+            self._autoscaling_request_state_req_ids_pending = getattr(
+                scheduler_output, "autoscaling_request_state_req_ids", None)
         self._start_autoscaling_active_pp_ranks_chain(scheduler_output)
         active_ranks = self._active_ranks_for_scheduler_output(
             scheduler_output)
@@ -684,42 +806,92 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             raise NotImplementedError(
                 "dynamic Ray actor PP chain currently supports TP=1 only")
 
+        def launch_nccl_pp_refs(transport: str,
+                                metadata: PPNCCLIntermediateMetadata):
+            refs = []
+            upstream_barrier = None
+            strict_actor_chain = _dynamic_pp_strict_actor_chain()
+            for index, rank in enumerate(active_ranks):
+                worker_input = (scheduler_output if index == 0 else
+                                (scheduler_output, metadata))
+                if strict_actor_chain and upstream_barrier is not None:
+                    ref = self.workers[rank].execute_model_ray.remote(
+                        worker_input, upstream_barrier)
+                else:
+                    ref = self.workers[rank].execute_model_ray.remote(
+                        worker_input)
+                refs.append(ref)
+                upstream_barrier = ref
+            trace_info = _scheduler_ref_trace_info(scheduler_output,
+                                                   active_ranks, transport)
+            _log_pp_ref_trace(
+                "dispatch",
+                trace_info,
+                wait_all=_dynamic_pp_wait_all_rank_refs(),
+                strict_actor_chain=strict_actor_chain)
+            return refs, trace_info
+
         if _dynamic_pp_rdt_nccl_enabled():
             if getattr(self, "_dynamic_pp_rdt_group", None) is None:
                 self._init_dynamic_pp_rdt_transport()
             self._annotate_pp_nccl_debug_metadata(
                 scheduler_output, active_ranks)
-            ref_or_value = scheduler_output
-            refs = []
-            last_index = len(active_ranks) - 1
-            for index, rank in enumerate(active_ranks):
-                method = self.workers[rank].execute_model_ray
-                if index < last_index:
-                    ref_or_value = method.options(
-                        tensor_transport="nccl").remote(ref_or_value)
-                else:
-                    ref_or_value = method.remote(ref_or_value)
-                refs.append(ref_or_value)
+            if len(active_ranks) == 1:
+                final_ref = self.workers[active_ranks[0]].execute_model_ray.remote(
+                    scheduler_output)
+                if self.max_concurrent_batches == 1:
+                    return ray.get(final_ref)
+                return RayObjectRefFuture(final_ref)
+
+            # Ray RDT cannot reliably carry the autoscaling sync batch's
+            # nested (scheduler_output, IntermediateTensors) object through
+            # dynamic actor-chain dependencies. Keep the Ray calls CPU-only
+            # and move PP activations through the existing explicit NCCL path.
+            metadata = self._make_pp_nccl_intermediate_metadata(
+                scheduler_output)
+            refs, trace_info = launch_nccl_pp_refs("rdt_nccl", metadata)
+            final_ref = refs[-1]
             if self.max_concurrent_batches == 1:
-                return ray.get(ref_or_value)
-            return RayObjectRefFuture(ref_or_value, refs=refs)
+                if _dynamic_pp_wait_all_rank_refs():
+                    _log_pp_ref_trace("wait_all_enter", trace_info)
+                    result = ray.get(refs)[-1]
+                    _log_pp_ref_trace("wait_all_returned", trace_info)
+                    return result
+                _log_pp_ref_trace("final_only_enter", trace_info)
+                result = ray.get(final_ref)
+                _log_pp_ref_trace("final_only_returned", trace_info)
+                _watch_rank_refs_async(refs, active_ranks, trace_info,
+                                       "final_only_tail")
+                return result
+            return RayObjectRefFuture(final_ref,
+                                      refs=refs,
+                                      active_ranks=active_ranks,
+                                      trace_info=trace_info)
 
         if os.getenv("VLLM_DYNAMIC_PP_NCCL_TRANSPORT", "0") == "1":
             self._annotate_pp_nccl_debug_metadata(
                 scheduler_output, active_ranks)
             metadata = self._make_pp_nccl_intermediate_metadata(
                 scheduler_output)
-            refs = []
-            for index, rank in enumerate(active_ranks):
-                worker_input = (scheduler_output if index == 0 else
-                                (scheduler_output, metadata))
-                refs.append(self.workers[rank].execute_model_ray.remote(
-                    worker_input))
+            refs, trace_info = launch_nccl_pp_refs("nccl", metadata)
             self._last_pp_nccl_refs = refs
             final_ref = refs[-1]
             if self.max_concurrent_batches == 1:
-                return ray.get(final_ref)
-            return RayObjectRefFuture(final_ref, refs=refs)
+                if _dynamic_pp_wait_all_rank_refs():
+                    _log_pp_ref_trace("wait_all_enter", trace_info)
+                    result = ray.get(refs)[-1]
+                    _log_pp_ref_trace("wait_all_returned", trace_info)
+                    return result
+                _log_pp_ref_trace("final_only_enter", trace_info)
+                result = ray.get(final_ref)
+                _log_pp_ref_trace("final_only_returned", trace_info)
+                _watch_rank_refs_async(refs, active_ranks, trace_info,
+                                       "final_only_tail")
+                return result
+            return RayObjectRefFuture(final_ref,
+                                      refs=refs,
+                                      active_ranks=active_ranks,
+                                      trace_info=trace_info)
 
         ref_or_value = scheduler_output
         for rank in active_ranks:
@@ -811,8 +983,8 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             edge_start = time.time()
             src_ref = self.workers[src_rank].prewarm_ray_rdt_send.options(
                 tensor_transport="nccl").remote(src_rank, dst_rank)
-            dst_ref = self.workers[dst_rank].prewarm_ray_rdt_recv.remote(
-                src_ref, src_rank, dst_rank)
+            dst_ref = self.workers[dst_rank].prewarm_ray_rdt_recv.options(
+                tensor_transport="nccl").remote(src_ref, src_rank, dst_rank)
             checksum = ray.get(dst_ref)
             logger.info(
                 "Prewarmed Ray RDT NCCL PP edge %s->%s in %.3fs "
@@ -854,12 +1026,39 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             return
 
         scheduler_output.autoscaling_request_state_sync = True
+        pending_refresh_ranks = getattr(
+            self, "_autoscaling_request_state_refresh_ranks_pending", None)
+        if pending_refresh_ranks is not None:
+            refresh_ranks = pending_refresh_ranks
+        else:
+            refresh_ranks = tuple(
+                sorted(set(active_ranks) - set(current_active)))
+        scheduler_output.autoscaling_request_state_refresh_ranks = (
+            refresh_ranks)
+        request_states = getattr(scheduler_output,
+                                 "autoscaling_request_states", None)
+        pending_states = self._autoscaling_request_states_pending
+        if request_states is None and pending_states is not None:
+            scheduler_output.autoscaling_request_states = pending_states
+            scheduler_output.autoscaling_request_state_source_rank = -2
+            request_states = pending_states
+        req_ids = getattr(scheduler_output,
+                          "autoscaling_request_state_req_ids", None)
+        pending_req_ids = self._autoscaling_request_state_req_ids_pending
+        if req_ids is None and pending_req_ids is not None:
+            scheduler_output.autoscaling_request_state_req_ids = (
+                pending_req_ids)
+            req_ids = pending_req_ids
         self._autoscaling_request_state_sync_key = sync_key
         self._autoscaling_request_state_sync_pending = None
+        self._autoscaling_request_state_refresh_ranks_pending = None
+        self._autoscaling_request_states_pending = None
+        self._autoscaling_request_state_req_ids_pending = None
         logger.info(
             "Marked target PP actor chain %s to carry autoscaling request "
-            "states in-band",
-            active_ranks)
+            "states in-band; payload_states=%d req_ids=%d refresh_ranks=%s",
+            active_ranks, len(request_states or {}), len(req_ids or ()),
+            refresh_ranks)
 
     def _active_ranks_for_scheduler_output(self, scheduler_output) -> list[int]:
         pp_layer_config = getattr(scheduler_output, "pp_layer_config", None)

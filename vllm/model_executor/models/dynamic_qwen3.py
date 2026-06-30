@@ -313,7 +313,8 @@ class DynamicQwen3Model(Qwen3Model):
         # 从环境变量读取每个 layer 的超时时间（秒）
         time_start = time.time()
         with self.model_lock:
-            logger.info(f"getting model lock taking {human_readable_duration(time.time() - time_start)}")
+            logger.debug("getting model lock taking %s",
+                         human_readable_duration(time.time() - time_start))
             with set_current_vllm_config(self.vllm_config):
                 if get_pp_group().is_first_rank:
                     if inputs_embeds is not None:
@@ -353,7 +354,10 @@ class DynamicQwen3Model(Qwen3Model):
                         logger.error(f"Error in layer {layer_idx}: {e}")
                         raise
                     logger.debug(f"after Layer forwarding took {human_readable_duration(time.time() - layer_start_time)}, layer {layer_idx}")
-                logger.info(f"after forwarding took {human_readable_duration(time.time() - forwarding_start_time)}")
+                logger.debug(
+                    "after forwarding took %s",
+                    human_readable_duration(time.time() -
+                                            forwarding_start_time))
                 if not get_pp_group().is_last_rank:
                     return IntermediateTensors({
                         "hidden_states": hidden_states,

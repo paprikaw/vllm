@@ -53,6 +53,53 @@ def _dynamic_pp_rdt_transport_enabled() -> bool:
     return transport in ("nccl", "1", "true")
 
 
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _dynamic_pp_lifetime_trace_enabled() -> bool:
+    return (_truthy_env("VLLM_DYNAMIC_PP_LIFETIME_TRACE")
+            or _truthy_env("VLLM_AUTOSCALING_KVCACHED_DEBUG"))
+
+
+def _short_req_ids(req_ids) -> list[str]:
+    return [req_id[-8:] if isinstance(req_id, str) else str(req_id)
+            for req_id in (req_ids or ())]
+
+
+def _log_pp_lifetime_trace(phase: str,
+                           worker: Optional[DynamicGPUWorker],
+                           scheduler_output: Optional[DynamicSchedulerOutput],
+                           **extra) -> None:
+    if not _dynamic_pp_lifetime_trace_enabled():
+        return
+    rank = getattr(worker, "rank", None)
+    if scheduler_output is None:
+        logger.warning(
+            "[PP_LIFETIME_TRACE] phase=%s trace_ns=%s rank=%s extra=%s",
+            phase, time.time_ns(), rank, extra)
+        return
+    logger.warning(
+        "[PP_LIFETIME_TRACE] phase=%s trace_ns=%s rank=%s step_id=%s "
+        "sched_ver=%s pp_seq=%s req_ids=%s finished_req_ids=%s "
+        "total_tokens=%s migration=%s sync=%s sender_list=%s "
+        "receiver_list=%s extra=%s",
+        phase, time.time_ns(), rank,
+        getattr(scheduler_output, "scheduler_step_id", -1),
+        getattr(scheduler_output, "current_scheduler_output_version", -1),
+        getattr(scheduler_output, "pp_nccl_seq", -1),
+        _short_req_ids(getattr(scheduler_output, "num_scheduled_tokens", {})
+                       .keys()),
+        _short_req_ids(getattr(scheduler_output, "finished_req_ids", ()) or ()),
+        getattr(scheduler_output, "total_num_scheduled_tokens", 0),
+        getattr(scheduler_output, "migration_in_process", False),
+        getattr(scheduler_output, "is_sync_after_migration", False),
+        getattr(scheduler_output, "sender_list", None),
+        getattr(scheduler_output, "receiver_list", None), extra)
+
+
 def _vllm_ray_rdt_rank_to_device() -> list[int]:
     raw = os.getenv("VLLM_RAY_RDT_RANK_TO_DEVICE", "")
     if not raw:
@@ -244,6 +291,52 @@ def _dynamic_pp_nccl_debug_enabled() -> bool:
     return os.getenv("VLLM_DYNAMIC_PP_NCCL_DEBUG", "0") == "1"
 
 
+def _dynamic_pp_nccl_edge_trace_enabled() -> bool:
+    return (_dynamic_pp_nccl_debug_enabled()
+            or _truthy_env("VLLM_DYNAMIC_PP_NCCL_EDGE_TRACE"))
+
+
+def _dynamic_pp_nccl_seq_sentinel_enabled() -> bool:
+    return _truthy_env("VLLM_DYNAMIC_PP_NCCL_SEQ_SENTINEL")
+
+
+_PP_NCCL_SEQ_SENTINEL = "__pp_nccl_seq_sentinel__"
+
+
+def _stream_debug_id() -> Optional[int]:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        return int(current_stream().cuda_stream)
+    except Exception:
+        return None
+
+
+def _log_pp_nccl_edge_trace(phase: str,
+                            worker: DynamicGPUWorker,
+                            metadata: PPNCCLIntermediateMetadata,
+                            pp_group,
+                            **extra) -> None:
+    if not _dynamic_pp_nccl_edge_trace_enabled():
+        return
+    logger.warning(
+        "[PP_NCCL_EDGE_TRACE] phase=%s trace_ns=%s worker_rank=%s "
+        "pp_rank=%s group_ranks=%s active_ranks=%s routing_ranks=%s "
+        "first_rank=%s last_rank=%s prev_rank=%s next_rank=%s "
+        "seq=%s config=%s request_ids=%s total_tokens=%s stream=%s "
+        "extra=%s",
+        phase, time.time_ns(), getattr(worker, "rank", None),
+        getattr(pp_group, "rank", None), list(getattr(pp_group, "ranks", [])),
+        getattr(pp_group, "active_ranks", None),
+        list(getattr(pp_group, "routing_ranks", [])),
+        getattr(pp_group, "first_rank", None),
+        getattr(pp_group, "last_rank", None),
+        getattr(pp_group, "prev_rank", None),
+        getattr(pp_group, "next_rank", None), metadata.pp_nccl_seq,
+        metadata.pp_config_fingerprint, _short_req_ids(metadata.request_ids),
+        metadata.total_num_scheduled_tokens, _stream_debug_id(), extra)
+
+
 def _pending_pp_nccl_send_limit(pp_group, tensors_per_batch: int) -> int:
     env_limit = os.getenv("VLLM_DYNAMIC_PP_NCCL_PENDING_SEND_LIMIT")
     if env_limit is not None:
@@ -329,7 +422,24 @@ def _send_intermediate_tensors_nccl(
         },
         time.time(),
     )
+    send_items = list(tensors.tensors.items())
+    if _dynamic_pp_nccl_seq_sentinel_enabled():
+        metadata.tensors[_PP_NCCL_SEQ_SENTINEL] = (
+            (3, ), _dtype_to_name(torch.float32))
+        sentinel = torch.tensor(
+            [float(metadata.pp_nccl_seq),
+             float(worker.rank),
+             float(pp_group.next_rank)],
+            dtype=torch.float32,
+            device=worker.device)
+        send_items.append((_PP_NCCL_SEQ_SENTINEL, sentinel))
     debug_enabled = _dynamic_pp_nccl_debug_enabled()
+    _log_pp_nccl_edge_trace("send_enter",
+                            worker,
+                            metadata,
+                            pp_group,
+                            dst_index=dst,
+                            tensor_names=list(metadata.tensors))
     if debug_enabled:
         last_by_dst = getattr(worker, "_pp_nccl_last_send_seq_by_dst", None)
         if last_by_dst is None:
@@ -349,7 +459,7 @@ def _send_intermediate_tensors_nccl(
     nccl_lock = getattr(worker, "_nccl_lock", None)
     lock_context = nccl_lock if nccl_lock is not None else nullcontext()
     with lock_context:
-        for name, tensor in tensors.tensors.items():
+        for name, tensor in send_items:
             send_tensor = tensor.contiguous()
             if debug_enabled:
                 tensor_sum, tensor_norm, tensor_mean_abs = (
@@ -365,13 +475,25 @@ def _send_intermediate_tensors_nccl(
                     tensor_mean_abs)
             pp_group.send(send_tensor, dst=dst)
             pending.append(send_tensor)
+        _log_pp_nccl_edge_trace("send_ops_enqueued",
+                                worker,
+                                metadata,
+                                pp_group,
+                                dst_index=dst,
+                                pending_sends=len(pending))
         _sync_worker_inference_stream(worker)
+        _log_pp_nccl_edge_trace("send_after_sync",
+                                worker,
+                                metadata,
+                                pp_group,
+                                dst_index=dst,
+                                pending_sends=len(pending))
     keep_limit = _pending_pp_nccl_send_limit(pp_group, len(metadata.tensors))
     if len(pending) > keep_limit:
         del pending[:-keep_limit]
-    logger.info("[forward]: rank %s enqueued PP NCCL send to rank %s "
-                "for tensors %s, seq=%s", worker.rank, pp_group.next_rank,
-                list(metadata.tensors.keys()), metadata.pp_nccl_seq)
+    logger.debug("[forward]: rank %s enqueued PP NCCL send to rank %s "
+                 "for tensors %s, seq=%s", worker.rank, pp_group.next_rank,
+                 list(metadata.tensors.keys()), metadata.pp_nccl_seq)
     return metadata
 
 
@@ -382,7 +504,14 @@ def _recv_intermediate_tensors_nccl(
     pp_group = get_pp_group()
     src = _rank_to_group_index(pp_group, pp_group.prev_rank)
     tensors = {}
+    sentinel_tensor: Optional[torch.Tensor] = None
     debug_enabled = _dynamic_pp_nccl_debug_enabled()
+    _log_pp_nccl_edge_trace("recv_enter",
+                            worker,
+                            metadata,
+                            pp_group,
+                            src_index=src,
+                            tensor_names=list(metadata.tensors))
     if debug_enabled:
         last_by_src = getattr(worker, "_pp_nccl_last_recv_seq_by_src", None)
         if last_by_src is None:
@@ -399,10 +528,39 @@ def _recv_intermediate_tensors_nccl(
     lock_context = nccl_lock if nccl_lock is not None else nullcontext()
     with lock_context:
         for name, (shape, dtype_name) in metadata.tensors.items():
-            tensors[name] = pp_group.recv(torch.Size(shape),
-                                          _name_to_dtype(dtype_name),
-                                          src=src)
+            tensor = pp_group.recv(torch.Size(shape),
+                                   _name_to_dtype(dtype_name),
+                                   src=src)
+            if name == _PP_NCCL_SEQ_SENTINEL:
+                sentinel_tensor = tensor
+            else:
+                tensors[name] = tensor
+        _log_pp_nccl_edge_trace("recv_ops_enqueued",
+                                worker,
+                                metadata,
+                                pp_group,
+                                src_index=src,
+                                tensor_names=list(tensors))
         _sync_worker_inference_stream(worker)
+        _log_pp_nccl_edge_trace("recv_after_sync",
+                                worker,
+                                metadata,
+                                pp_group,
+                                src_index=src,
+                                tensor_names=list(tensors))
+        if sentinel_tensor is not None:
+            seq_value, src_value, dst_value = [
+                int(round(value))
+                for value in sentinel_tensor.detach().cpu().tolist()
+            ]
+            expected = (metadata.pp_nccl_seq, pp_group.prev_rank, worker.rank)
+            observed = (seq_value, src_value, dst_value)
+            if observed != expected:
+                raise AssertionError(
+                    "PP NCCL seq sentinel mismatch: "
+                    f"expected={expected}, observed={observed}, "
+                    f"metadata_active={metadata.active_ranks}, "
+                    f"metadata_reqs={metadata.request_ids}")
         if debug_enabled:
             for name, tensor in tensors.items():
                 tensor_sum, tensor_norm, tensor_mean_abs = (
@@ -415,9 +573,9 @@ def _recv_intermediate_tensors_nccl(
                     metadata.pp_config_fingerprint, metadata.active_ranks,
                     metadata.request_ids, name, tuple(tensor.shape),
                     tensor.dtype, tensor_sum, tensor_norm, tensor_mean_abs)
-    logger.info("[forward]: rank %s enqueued PP NCCL recv from rank %s "
-                "for tensors %s, seq=%s", pp_group.rank, pp_group.prev_rank,
-                list(tensors.keys()), metadata.pp_nccl_seq)
+    logger.debug("[forward]: rank %s enqueued PP NCCL recv from rank %s "
+                 "for tensors %s, seq=%s", pp_group.rank, pp_group.prev_rank,
+                 list(tensors.keys()), metadata.pp_nccl_seq)
     return IntermediateTensors(tensors)
 
 
@@ -430,11 +588,26 @@ def _batch_pp_routing(pp_layer_config):
         rank for rank, (start, end) in enumerate(pp_layer_config)
         if end >= start
     ]
+    if _dynamic_pp_nccl_edge_trace_enabled():
+        logger.warning(
+            "[PP_ROUTING_TRACE] phase=enter trace_ns=%s pp_rank=%s "
+            "previous_active=%s batch_active=%s routing_before=%s "
+            "pp_layer_config=%s",
+            time.time_ns(), getattr(pp_group, "rank", None),
+            previous_active_ranks, batch_active_ranks,
+            list(getattr(pp_group, "routing_ranks", [])), pp_layer_config)
     set_pp_group_active_ranks(batch_active_ranks)
     try:
         yield
     finally:
         set_pp_group_active_ranks(previous_active_ranks)
+        if _dynamic_pp_nccl_edge_trace_enabled():
+            logger.warning(
+                "[PP_ROUTING_TRACE] phase=exit trace_ns=%s pp_rank=%s "
+                "restored_active=%s routing_after=%s",
+                time.time_ns(), getattr(pp_group, "rank", None),
+                previous_active_ranks,
+                list(getattr(pp_group, "routing_ranks", [])))
 
 try:
     import ray
@@ -535,10 +708,12 @@ try:
                                     Tuple["DynamicSchedulerOutput",
                                           "IntermediateTensors", float],
                                     "ModelRunnerOutput"],
+            upstream_barrier: Optional[object] = None,
         ) -> Union["ModelRunnerOutput", Tuple["DynamicSchedulerOutput",
                                               "IntermediateTensors", float]]:
             # This method is used by Ray Compiled Graph to execute the model,
             # and it needs a special logic of self.setup_device_if_necessary()
+            del upstream_barrier
             time_recv = time.time()  # 记录接收时间
             assert isinstance(self.worker, DynamicGPUWorker)
             assert self.worker.inference_stream is not None, "high_priority_stream is not initialized"
@@ -553,10 +728,19 @@ try:
                     from ray.experimental.channel import ChannelContext
                     ChannelContext.get_current().set_torch_device(
                         torch.device(self.worker.device))
+                # Autoscaling KV migration uses a separate migration stream.
+                # Do not route normal inference through the coarse foreground
+                # gate here; correctness is enforced by stream syncs, the NCCL
+                # lock, and the narrower forward_lock scopes below.
                 with self.worker.inference_stream:
                     assert self.worker is not None, "Worker is not initialized"
                     assert isinstance(self.worker, DynamicGPUWorker), "Worker is not a DynamicGPUWorker"
                     assert isinstance(self.worker.model_runner, DynamicGPUModelRunner), "Model runner is not a DynamicGPUModelRunner"
+                    _log_pp_lifetime_trace(
+                        "task_enter_raw",
+                        self.worker,
+                        None,
+                        input_type=type(scheduler_output).__name__)
 
                     upstream_send_time = None
                     if isinstance(scheduler_output, tuple):
@@ -570,11 +754,21 @@ try:
                                 intermediate_tensors.send_time or None)
                             assert isinstance(scheduler_output,
                                               DynamicSchedulerOutput)
+                            _log_pp_lifetime_trace(
+                                "before_pp_recv",
+                                self.worker,
+                                scheduler_output,
+                                metadata_seq=intermediate_tensors.pp_nccl_seq,
+                                metadata_active_ranks=intermediate_tensors
+                                .active_ranks)
                             with _batch_pp_routing(
                                     scheduler_output.pp_layer_config):
                                 intermediate_tensors = (
                                     _recv_intermediate_tensors_nccl(
                                         intermediate_tensors, self.worker))
+                            _log_pp_lifetime_trace("after_pp_recv",
+                                                   self.worker,
+                                                   scheduler_output)
                     else:
                         scheduler_output, intermediate_tensors = (
                             scheduler_output, None)
@@ -587,18 +781,26 @@ try:
                             self.rpc_rank, type(scheduler_output).__name__)
                         return scheduler_output
 
+                    _log_pp_lifetime_trace("task_enter", self.worker,
+                                           scheduler_output)
                     time_before_lock = time.time()
                     inference_stream_synced = False
                     self.worker.prepare_autoscaling_request_states_from_sync_batch(
                         scheduler_output)
                     self.worker.async_migration_before_execute_callback(
                         scheduler_output)
+                    _log_pp_lifetime_trace(
+                        "after_before_execute_callback",
+                        self.worker,
+                        scheduler_output)
                     time_after_before_execute_callback = time.time()
                     with self.worker.model_runner.forward_lock:
-                        logger.info(
-                            f"[forward]: rank {self.rpc_rank} Acquired "
-                            "forward_lock for executing model, took "
-                            f"{human_readable_duration(time.time() - time_before_lock)}")
+                        logger.debug(
+                            "[forward]: rank %s acquired forward_lock for "
+                            "executing model, took %s",
+                            self.rpc_rank,
+                            human_readable_duration(time.time() -
+                                                    time_before_lock))
                         assert isinstance(
                             scheduler_output, DynamicSchedulerOutput), (
                                 "Scheduler output is not a "
@@ -606,7 +808,10 @@ try:
 
                         with _batch_pp_routing(scheduler_output.pp_layer_config):
                             try:
-                                logger.info(
+                                _log_pp_lifetime_trace("before_forward",
+                                                       self.worker,
+                                                       scheduler_output)
+                                logger.debug(
                                     "forwarding from layer%s to layer%s",
                                     scheduler_output.pp_layer_config[
                                         self.worker.rank][0],
@@ -618,6 +823,11 @@ try:
                                     scheduler_output.pp_layer_config[
                                         self.rpc_rank],
                                     intermediate_tensors)
+                                _log_pp_lifetime_trace(
+                                    "after_forward",
+                                    self.worker,
+                                    scheduler_output,
+                                    output_type=type(output).__name__)
                             except Exception as e:
                                 print(traceback.format_exc())
                                 print(f"scheduler_output: {scheduler_output}")
@@ -644,7 +854,11 @@ try:
                             sync_start = time.time()
                             _sync_worker_inference_stream(self.worker)
                             inference_stream_synced = True
-                            logger.info(
+                            _log_pp_lifetime_trace(
+                                "after_sender_pre_migration_sync",
+                                self.worker,
+                                scheduler_output)
+                            logger.debug(
                                 "[forward]: rank %s synchronized CUDA stream "
                                 "under forward_lock before KV sender can read "
                                 "cache, took %s",
@@ -654,6 +868,8 @@ try:
 
                     self.worker.async_migration_after_execute_callback(
                         scheduler_output)
+                    _log_pp_lifetime_trace("after_execute_callback",
+                                           self.worker, scheduler_output)
                     time_after_execute_callback = time.time()
 
                     sender_list = scheduler_output.sender_list
@@ -664,7 +880,11 @@ try:
                         sync_start = time.time()
                         _sync_worker_inference_stream(self.worker)
                         inference_stream_synced = True
-                        logger.info(
+                        _log_pp_lifetime_trace(
+                            "after_sender_post_execute_sync",
+                            self.worker,
+                            scheduler_output)
+                        logger.debug(
                             "[forward]: rank %s synchronized CUDA stream "
                             "before KV sender can read cache, took %s",
                             self.rpc_rank,
@@ -673,18 +893,29 @@ try:
 
                     if isinstance(output, IntermediateTensors):
                         send_time = time.time()
-                        if (_dynamic_pp_nccl_transport_enabled()
+                        if ((_dynamic_pp_nccl_transport_enabled()
+                             or _dynamic_pp_rdt_transport_enabled())
                                 and not envs.VLLM_USE_RAY_COMPILED_DAG):
                             with _batch_pp_routing(
                                     scheduler_output.pp_layer_config):
+                                _log_pp_lifetime_trace("before_pp_send",
+                                                       self.worker,
+                                                       scheduler_output)
                                 metadata = _send_intermediate_tensors_nccl(
                                     self.worker, output, scheduler_output)
+                                _log_pp_lifetime_trace(
+                                    "after_pp_send",
+                                    self.worker,
+                                    scheduler_output,
+                                    metadata_seq=metadata.pp_nccl_seq)
                             output = (scheduler_output, metadata)
                         else:
                             output = (scheduler_output, output, send_time)
 
                     self.worker.async_migration_after_pp_transfer_callback(
                         scheduler_output)
+                    _log_pp_lifetime_trace("after_pp_transfer_callback",
+                                           self.worker, scheduler_output)
 
                     if upstream_send_time is not None:
                         comm_time = (time_recv - upstream_send_time) * 1000
@@ -705,7 +936,7 @@ try:
                                     f"{total_size_mb / (comm_time / 1000):.2f} MB/s")
                             else:
                                 bandwidth_str = "N/A (comm_time too small)"
-                            logger.info(
+                            logger.debug(
                                 "[forward]: rank %s Communication time from "
                                 "upstream: %.2f ms, hidden_states dtype: %s, "
                                 "shape: %s, size: %.2f MB, residual dtype: %s, "
@@ -717,11 +948,25 @@ try:
                                 residual_size_mb, total_size_mb,
                                 bandwidth_str)
                         else:
-                            logger.info(
+                            logger.debug(
                                 "[forward]: rank %s Communication time from "
                                 "upstream: %.2f ms, no received data",
                                 self.rpc_rank, comm_time)
                     before_sync = time.time()
+                    will_sync_before_return = (
+                        not _dynamic_pp_nccl_transport_enabled()
+                        or envs.VLLM_USE_RAY_COMPILED_DAG
+                        or _sync_dynamic_pp_nccl_before_return()
+                        or not isinstance(output, tuple)
+                        or not isinstance(output[1],
+                                          PPNCCLIntermediateMetadata))
+                    _log_pp_lifetime_trace(
+                        "before_return_sync_gate",
+                        self.worker,
+                        scheduler_output,
+                        will_sync=will_sync_before_return,
+                        inference_stream_synced=inference_stream_synced,
+                        output_type=type(output).__name__)
                     if (not _dynamic_pp_nccl_transport_enabled()
                             or envs.VLLM_USE_RAY_COMPILED_DAG
                             or _sync_dynamic_pp_nccl_before_return()
@@ -730,16 +975,30 @@ try:
                                               PPNCCLIntermediateMetadata)):
                         if not inference_stream_synced:
                             _sync_worker_inference_stream(self.worker)
-                    logger.info(f"""
-                    [forward]: forwarding from layer{scheduler_output.pp_layer_config[self.worker.rank][0]} to layer{scheduler_output.pp_layer_config[self.worker.rank][1]},
-                    [forward]: before execute callback time: {time_after_before_execute_callback - time_recv:.2f} seconds,
-                    [forward]: execute time: {time_after_execute - time_after_before_execute_callback:.2f} seconds,
-                    [forward]: after execute callback time: {time_after_execute_callback - time_after_execute:.2f} seconds,
-                    [forward]: inference stream synchronize time: {time.time() - before_sync:.2f} seconds,
-                    [forward]: total time: {time.time() - time_recv:.2f} seconds
-                    """)
+                            _log_pp_lifetime_trace("after_return_sync",
+                                                   self.worker,
+                                                   scheduler_output)
+                    logger.debug(
+                        "[forward]: forwarding from layer%s to layer%s, "
+                        "before_execute_callback=%.2fs, execute=%.2fs, "
+                        "after_execute_callback=%.2fs, "
+                        "inference_stream_synchronize=%.2fs, total=%.2fs",
+                        scheduler_output.pp_layer_config[self.worker.rank][0],
+                        scheduler_output.pp_layer_config[self.worker.rank][1],
+                        time_after_before_execute_callback - time_recv,
+                        time_after_execute -
+                        time_after_before_execute_callback,
+                        time_after_execute_callback - time_after_execute,
+                        time.time() - before_sync,
+                        time.time() - time_recv)
+                    _log_pp_lifetime_trace("before_task_return", self.worker,
+                                           scheduler_output)
                     return output
             except Exception as e:
+                _log_pp_lifetime_trace("task_exception",
+                                       getattr(self, "worker", None),
+                                       None,
+                                       error=repr(e))
                 print(traceback.format_exc())
                 print(f"error is raised within the compiled ray DAG graph, error: {e}")
                 time.sleep(1)
