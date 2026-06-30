@@ -1008,6 +1008,11 @@ class DynamicEngineCore(EngineCore):
             human_readable_duration(time.time() - wait_start))
 
     def _wait_cleanup_before_autoscaling_schedule_release(self) -> bool:
+        # KVCacheD cleanup can unmap/remap backing pages. Letting scheduler
+        # resume before that finishes can overlap new KV writes with worker
+        # page cleanup on the first post-migration target batch.
+        if use_kvcached_backend():
+            return True
         return os.environ.get(
             "VLLM_AUTOSCALING_WAIT_CLEANUP_BEFORE_SCHEDULE", "0") == "1"
 
