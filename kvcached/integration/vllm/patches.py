@@ -49,6 +49,15 @@ def _is_attention_spec(spec: Any) -> bool:
     return isinstance(spec, candidates)
 
 
+def _autoscaling_debug_enabled() -> bool:
+    return os.environ.get("VLLM_AUTOSCALING_KVCACHED_DEBUG", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _is_mamba_spec(spec: Any) -> bool:
     """Check if a KV cache spec is a MambaSpec."""
     try:
@@ -568,6 +577,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         if block is not None and not getattr(block, "is_null", False)
                     ]
                     if block_ids:
+                        if _autoscaling_debug_enabled():
+                            logger.warning(
+                                "[KVCACHED_VLLM_FREE_DEBUG] free_blocks "
+                                "count=%d sample=%s",
+                                len(block_ids), block_ids[:32])
                         self.kv_cache_manager.free(block_ids)
                     return
 

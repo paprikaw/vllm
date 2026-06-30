@@ -66,6 +66,14 @@ bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
   return allocator->unmap_from_kv_tensors(offsets);
 }
 
+std::vector<offset_t>
+debug_unmapped_offsets(const std::vector<offset_t> &offsets,
+                       int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->debug_unmapped_offsets(offsets);
+}
+
 // PageAllocator bindings
 std::shared_ptr<PageAllocator> create_page_allocator(
     int64_t num_layers, int64_t mem_size_per_layer, int64_t page_size,
@@ -233,6 +241,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("offsets"), py::arg("group_id") = 0);
   m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
         "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
+  m.def("debug_unmapped_offsets", &kvcached::debug_unmapped_offsets,
+        "debug_unmapped_offsets", py::arg("offsets"), py::arg("group_id") = 0);
 
   // PageAllocator bindings
   py::class_<kvcached::PageAllocator, std::shared_ptr<kvcached::PageAllocator>>(

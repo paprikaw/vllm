@@ -12,6 +12,7 @@ import sys
 import importlib
 import importlib.util
 import inspect
+import math
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -39,6 +40,10 @@ _VMM_BACKENDS = {
     "0",
     "false",
 }
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
 
 
 class KVCacheDPhysicalResizePending(RuntimeError):
@@ -88,6 +93,330 @@ def use_direct_ptr_for_runtime(vllm_config: Any) -> bool:
     dynamic_config = getattr(vllm_config, "dynamic_config", None)
     return (use_flexi_kv_for_runtime(vllm_config)
             and bool(getattr(dynamic_config, "use_direct_ptr", False)))
+
+
+def kvcached_vmm_guard_enabled() -> bool:
+    return os.getenv("VLLM_AUTOSCALING_KVCACHED_GUARD",
+                     "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _kvcached_debug_geometry_for_runner(
+    kv_cache_shape: tuple[int, ...],
+    block_size: int,
+    dtype: torch.dtype,
+    num_layers: int,
+    vllm_config: Any,
+) -> dict[str, Any]:
+    from kvcached.utils import CONTIGUOUS_LAYOUT, LAYER_STACKING, PAGE_SIZE
+
+    num_kv_buffers = 2
+    if len(kv_cache_shape) <= 3:
+        raise ValueError(f"Unsupported KVCacheD guard shape: {kv_cache_shape}")
+    if kv_cache_shape[0] == num_kv_buffers:
+        blocks_dim_idx = 1
+    elif kv_cache_shape[1] == num_kv_buffers:
+        blocks_dim_idx = 0
+    else:
+        raise ValueError(f"Unsupported KVCacheD guard shape: {kv_cache_shape}")
+
+    dtype_size = torch.empty((), dtype=dtype).element_size()
+    requested_num_blocks = int(kv_cache_shape[blocks_dim_idx])
+    block_mem_bytes = int(math.prod(kv_cache_shape[2:]) * dtype_size)
+    page_attention_block_bytes = block_mem_bytes * num_kv_buffers
+
+    layer_stacking_enabled = bool(LAYER_STACKING)
+    if layer_stacking_enabled:
+        physical_block_size = _physical_block_size(vllm_config)
+        if physical_block_size is None:
+            physical_block_size = PAGE_SIZE
+        physical_block_size = int(physical_block_size)
+        layer_group_granularity = PAGE_SIZE // physical_block_size
+        layer_group_layout = True
+        physical_group_page_size = physical_block_size * layer_group_granularity
+    else:
+        physical_block_size = PAGE_SIZE
+        layer_group_granularity = 1
+        layer_group_layout = False
+        if CONTIGUOUS_LAYOUT:
+            physical_group_page_size = PAGE_SIZE * int(num_layers)
+        else:
+            physical_group_page_size = PAGE_SIZE
+
+    blocks_per_physical_page = max(
+        1, int(physical_block_size // page_attention_block_bytes))
+    num_blocks_per_layer = _align_up(requested_num_blocks,
+                                     blocks_per_physical_page)
+    num_layer_groups = max(1, int(num_layers) // layer_group_granularity)
+    group_total_span = (
+        (num_blocks_per_layer // blocks_per_physical_page) *
+        physical_group_page_size)
+    return {
+        "block_size": int(block_size),
+        "requested_num_blocks": requested_num_blocks,
+        "num_blocks_per_layer": int(num_blocks_per_layer),
+        "page_attention_block_bytes": int(page_attention_block_bytes),
+        "physical_block_size": int(physical_block_size),
+        "physical_group_page_size": int(physical_group_page_size),
+        "blocks_per_physical_page": int(blocks_per_physical_page),
+        "layer_stacking_enabled": layer_stacking_enabled,
+        "layer_group_layout": layer_group_layout,
+        "layer_group_granularity": int(layer_group_granularity),
+        "num_layer_groups": int(num_layer_groups),
+        "group_total_span": int(group_total_span),
+        "contiguous_layout": bool(CONTIGUOUS_LAYOUT),
+        "group_id": 0,
+    }
+
+
+def _set_kvcached_debug_geometry(owner: Any, geometry: dict[str, Any]) -> None:
+    setattr(owner, "_kvcached_debug_geometry", geometry)
+
+
+def _register_kvcached_migration_unmap_hook(kv_synchronizer: Any) -> None:
+    if getattr(kv_synchronizer, "_kvcached_unmap_hook_registered", False):
+        return
+    drop_slots = getattr(kv_synchronizer,
+                         "drop_slots_for_kvcached_unmap_offsets", None)
+    if drop_slots is None:
+        drop_slots = getattr(kv_synchronizer,
+                             "drop_slots_for_kvcached_unmapped_offsets", None)
+    if drop_slots is None:
+        return
+    try:
+        from kvcached.tp_ipc_util import register_pre_unmap_callback
+    except Exception as exc:
+        logger.warning(
+            "KVCacheD migration bitmap pre-unmap hook unavailable: %s", exc)
+        return
+
+    def _on_worker_pre_unmap(offsets: list[int], group_id: int) -> Any:
+        drop_slots(
+            offsets,
+            group_id=group_id,
+            reason="kvcached worker ipc pre-unmap")
+        return getattr(kv_synchronizer, "_kvcached_pre_unmap_context", None)
+
+    register_pre_unmap_callback(_on_worker_pre_unmap)
+    setattr(kv_synchronizer, "_kvcached_unmap_hook_registered", True)
+
+
+def _kvcached_slots_to_offsets(
+    owner: Any,
+    slots: Any,
+    block_size: int,
+    layer_ids: Optional[list[int]] = None,
+) -> tuple[list[int], list[int], list[int]]:
+    geometry = getattr(owner, "_kvcached_debug_geometry", None)
+    if not geometry:
+        return [], [], []
+
+    if isinstance(slots, torch.Tensor):
+        if slots.numel() == 0:
+            return [], [], []
+        slot_values = slots.detach().cpu().tolist()
+    elif slots is None:
+        return [], [], []
+    else:
+        slot_values = list(slots)
+
+    block_ids = sorted({
+        int(slot) // int(block_size)
+        for slot in slot_values
+        if int(slot) >= 0
+    })
+    if not block_ids:
+        return [], [], []
+
+    blocks_per_page = max(1, int(geometry["blocks_per_physical_page"]))
+    page_ids = sorted({block_id // blocks_per_page for block_id in block_ids})
+    map_page_size = int(geometry["physical_group_page_size"])
+
+    if geometry.get("layer_group_layout"):
+        granularity = max(1, int(geometry["layer_group_granularity"]))
+        num_layer_groups = max(1, int(geometry["num_layer_groups"]))
+        if layer_ids:
+            group_indices = sorted({
+                max(0, min(num_layer_groups - 1, int(layer_id) // granularity))
+                for layer_id in layer_ids
+            })
+        else:
+            group_indices = list(range(num_layer_groups))
+        group_total_span = int(geometry["group_total_span"])
+        offsets = sorted({
+            group_idx * group_total_span + page_id * map_page_size
+            for group_idx in group_indices
+            for page_id in page_ids
+        })
+    else:
+        offsets = [page_id * map_page_size for page_id in page_ids]
+    return block_ids, page_ids, offsets
+
+
+def filter_kvcached_vmm_mapped_slots(
+    source: str,
+    owner: Any,
+    slots: Any,
+    block_size: int,
+    layer_ids: Optional[list[int]] = None,
+    rank: Optional[int] = None,
+    group_id: int = 0,
+    sync_before_check: bool = False,
+) -> list[int]:
+    """Drop slots whose KVCacheD physical pages are already unmapped."""
+    if not use_kvcached_backend():
+        if isinstance(slots, torch.Tensor):
+            return [int(slot) for slot in slots.detach().cpu().tolist()]
+        if slots is None:
+            return []
+        return [int(slot) for slot in slots]
+
+    geometry = getattr(owner, "_kvcached_debug_geometry", None)
+    if not geometry:
+        if isinstance(slots, torch.Tensor):
+            return [
+                int(slot) for slot in slots.detach().cpu().tolist()
+                if int(slot) >= 0
+            ]
+        if slots is None:
+            return []
+        return [int(slot) for slot in slots if int(slot) >= 0]
+
+    if isinstance(slots, torch.Tensor):
+        slot_values = slots.detach().cpu().tolist()
+    elif slots is None:
+        return []
+    else:
+        slot_values = list(slots)
+    slot_values = [int(slot) for slot in slot_values if int(slot) >= 0]
+    if not slot_values:
+        return []
+
+    block_size = int(block_size)
+    blocks_per_page = max(1, int(geometry["blocks_per_physical_page"]))
+    map_page_size = int(geometry["physical_group_page_size"])
+    pages_for_slot: list[tuple[int, int]] = []
+    page_ids: set[int] = set()
+    for slot in slot_values:
+        block_id = slot // block_size
+        page_id = block_id // blocks_per_page
+        pages_for_slot.append((slot, page_id))
+        page_ids.add(page_id)
+
+    if geometry.get("layer_group_layout"):
+        granularity = max(1, int(geometry["layer_group_granularity"]))
+        num_layer_groups = max(1, int(geometry["num_layer_groups"]))
+        if layer_ids:
+            group_indices = sorted({
+                max(0, min(num_layer_groups - 1, int(layer_id) // granularity))
+                for layer_id in layer_ids
+            })
+        else:
+            group_indices = list(range(num_layer_groups))
+        group_total_span = int(geometry["group_total_span"])
+        offsets_by_page = {
+            page_id: [
+                group_idx * group_total_span + page_id * map_page_size
+                for group_idx in group_indices
+            ]
+            for page_id in page_ids
+        }
+    else:
+        offsets_by_page = {
+            page_id: [page_id * map_page_size]
+            for page_id in page_ids
+        }
+
+    offsets = sorted({
+        offset
+        for page_offsets in offsets_by_page.values()
+        for offset in page_offsets
+    })
+    if not offsets:
+        return slot_values
+    if sync_before_check and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    try:
+        from kvcached.vmm_ops import debug_unmapped_offsets
+    except Exception as exc:
+        logger.warning(
+            "[KVCACHED_FILTER_UNMAPPED_SLOTS_UNAVAILABLE] source=%s "
+            "rank=%s error=%s",
+            source, rank, exc)
+        return slot_values
+
+    unmapped_offsets = set(debug_unmapped_offsets(offsets, group_id=group_id))
+    if not unmapped_offsets:
+        return slot_values
+
+    kept_slots: list[int] = []
+    dropped_slots: list[int] = []
+    dropped_pages: set[int] = set()
+    for slot, page_id in pages_for_slot:
+        if any(offset in unmapped_offsets
+               for offset in offsets_by_page.get(page_id, [])):
+            dropped_slots.append(slot)
+            dropped_pages.add(page_id)
+        else:
+            kept_slots.append(slot)
+
+    logger.warning(
+        "[KVCACHED_FILTER_UNMAPPED_SLOTS] source=%s rank=%s layer_ids=%s "
+        "original_slots=%s kept_slots=%s dropped_slots=%s "
+        "dropped_pages=%s unmapped_offsets=%s geometry=%s trace_ns=%s",
+        source, rank, layer_ids, len(slot_values), len(kept_slots),
+        len(dropped_slots), sorted(dropped_pages)[:128],
+        sorted(unmapped_offsets)[:128], geometry, time.time_ns())
+    return kept_slots
+
+
+def guard_kvcached_vmm_slots_mapped(
+    source: str,
+    owner: Any,
+    slots: Any,
+    block_size: int,
+    layer_ids: Optional[list[int]] = None,
+    rank: Optional[int] = None,
+    group_id: int = 0,
+    sync_before_check: bool = False,
+    trace_info: Optional[dict[str, Any]] = None,
+) -> None:
+    if not kvcached_vmm_guard_enabled() or not use_kvcached_backend():
+        return
+    block_ids, page_ids, offsets = _kvcached_slots_to_offsets(
+        owner, slots, block_size, layer_ids=layer_ids)
+    if not offsets:
+        return
+    if sync_before_check and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    try:
+        from kvcached.vmm_ops import debug_unmapped_offsets
+    except Exception as exc:
+        logger.error(
+            "[KVCACHED_USE_AFTER_UNMAP_GUARD_MISSING] source=%s error=%s",
+            source, exc)
+        raise
+    unmapped_offsets = debug_unmapped_offsets(offsets, group_id=group_id)
+    if not unmapped_offsets:
+        return
+    geometry = getattr(owner, "_kvcached_debug_geometry", {})
+    if isinstance(slots, torch.Tensor):
+        slot_count = int(slots.numel())
+    elif slots is None:
+        slot_count = 0
+    else:
+        slot_count = len(slots)
+    logger.error(
+        "[KVCACHED_USE_AFTER_UNMAP] source=%s rank=%s layer_ids=%s "
+        "slot_count=%s block_size=%s blocks=%s pages=%s offsets=%s "
+        "unmapped_offsets=%s geometry=%s scheduler_trace=%s trace_ns=%s",
+        source, rank, layer_ids, slot_count, block_size, block_ids[:128],
+        page_ids[:128], offsets[:128], list(unmapped_offsets)[:128],
+        geometry, trace_info or {}, time.time_ns())
+    raise RuntimeError(
+        "KVCACHED_USE_AFTER_UNMAP: "
+        f"source={source}, rank={rank}, layer_ids={layer_ids}, "
+        f"unmapped_offsets={list(unmapped_offsets)[:16]}, "
+        f"scheduler_trace={trace_info or {}}")
 
 
 def _log_kvcached_fragmentation_stats(
@@ -162,6 +491,60 @@ def commit_kvcached_physical_resize_if_needed(
         if target is not None and hasattr(kv_cache_manager, "num_gpu_blocks"):
             kv_cache_manager.num_gpu_blocks = target
     return committed
+
+
+def _get_kvcached_physical_manager(owner: Any) -> Any:
+    kv_cache_manager = getattr(owner, "kv_cache_manager", owner)
+    if (hasattr(kv_cache_manager, "begin_defer_physical_free")
+            or hasattr(kv_cache_manager, "end_defer_physical_free")):
+        return kv_cache_manager
+    block_pool = getattr(kv_cache_manager, "block_pool", None)
+    return getattr(block_pool, "kv_cache_manager", None)
+
+
+def _get_kvcached_block_pool(owner: Any) -> Any:
+    kv_cache_manager = getattr(owner, "kv_cache_manager", owner)
+    block_pool = getattr(kv_cache_manager, "block_pool", None)
+    if block_pool is not None:
+        return block_pool
+    return getattr(owner, "block_pool", None)
+
+
+def begin_kvcached_physical_free_deferral_if_needed(
+    owner: Any,
+    reason: str,
+) -> bool:
+    if not use_kvcached_backend():
+        return False
+    manager = _get_kvcached_physical_manager(owner)
+    begin_defer = getattr(manager, "begin_defer_physical_free", None)
+    if begin_defer is None:
+        logger.warning(
+            "KVCacheD physical free deferral requested during %s, but no "
+            "underlying manager exposes begin_defer_physical_free", reason)
+        return False
+    begin_defer()
+    logger.info("KVCacheD physical free deferral active during %s", reason)
+    return True
+
+
+def end_kvcached_physical_free_deferral_if_needed(
+    owner: Any,
+    reason: str,
+) -> bool:
+    if not use_kvcached_backend():
+        return False
+    manager = _get_kvcached_physical_manager(owner)
+    end_defer = getattr(manager, "end_defer_physical_free", None)
+    if end_defer is None:
+        logger.warning(
+            "KVCacheD physical free deferral release requested during %s, "
+            "but no underlying manager exposes end_defer_physical_free",
+            reason)
+        return False
+    end_defer()
+    logger.info("KVCacheD physical free deferral released during %s", reason)
+    return True
 
 
 def _prepend_kvcached_home() -> None:
@@ -1215,6 +1598,18 @@ def _apply_dynamic_migration_kvcached_patches(
             self._kvcached_tensor_start_layer = 0
             self._kvcached_layer_names = local_layer_names
             self._kvcached_dynamic_kv_synchronizer = kv_synchronizer
+            debug_geometry = _kvcached_debug_geometry_for_runner(
+                tuple(int(dim) for dim in kv_cache_shape),
+                int(kv_cache_spec.block_size),
+                kv_cache_spec.dtype,
+                int(total_num_layers),
+                getattr(self, "vllm_config", None),
+            )
+            _set_kvcached_debug_geometry(self, debug_geometry)
+            _set_kvcached_debug_geometry(kv_synchronizer, debug_geometry)
+            setattr(kv_synchronizer, "_kvcached_pre_unmap_context",
+                    getattr(self, "forward_lock", None))
+            _register_kvcached_migration_unmap_hook(kv_synchronizer)
             if local_layer_names:
                 _rebind_kvcached_tensor_views(self, kv_synchronizer, num_blocks)
             else:
@@ -1321,6 +1716,18 @@ def _apply_dynamic_migration_kvcached_patches(
             self._kvcached_tensor_start_layer = 0
             self._kvcached_layer_names = local_layer_names
             self._kvcached_dynamic_kv_synchronizer = kv_synchronizer
+            debug_geometry = _kvcached_debug_geometry_for_runner(
+                tuple(int(dim) for dim in kv_cache_shape),
+                int(kv_cache_spec.block_size),
+                kv_cache_spec.dtype,
+                int(total_num_layers),
+                getattr(self, "vllm_config", None),
+            )
+            _set_kvcached_debug_geometry(self, debug_geometry)
+            _set_kvcached_debug_geometry(kv_synchronizer, debug_geometry)
+            setattr(kv_synchronizer, "_kvcached_pre_unmap_context",
+                    getattr(self, "forward_lock", None))
+            _register_kvcached_migration_unmap_hook(kv_synchronizer)
             self.grouped_handles = []
             self.key_handles = [[] for _ in local_layer_names]
             self.value_handles = [[] for _ in local_layer_names]

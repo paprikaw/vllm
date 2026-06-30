@@ -5,6 +5,7 @@
 #include <mutex>
 #include <torch/extension.h>
 #include <unordered_map>
+#include <utility>
 
 #include "allocator.hpp"
 #include "constants.hpp"
@@ -60,6 +61,7 @@ void FTensorAllocator::destroy() {
   ftensors_.clear();
   contiguous_kv_tensor_.reset();
   zero_page_.reset();
+  mapped_offset_refcounts_.clear();
 }
 
 void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
@@ -206,6 +208,39 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
     return false;
   }
 
+  std::vector<std::pair<FTensor *, offset_t>> mapped_offsets;
+  auto decrement_mapped_refcount = [&](offset_t offset) {
+    auto it = mapped_offset_refcounts_.find(offset);
+    if (it == mapped_offset_refcounts_.end()) {
+      return;
+    }
+    if (--it->second <= 0) {
+      mapped_offset_refcounts_.erase(it);
+    }
+  };
+  auto rollback_mapped_offsets = [&]() {
+    for (auto it = mapped_offsets.rbegin(); it != mapped_offsets.rend(); ++it) {
+      if (!it->first->unmap(it->second)) {
+        LOGGER(ERROR,
+               "FTensorAllocator failed to roll back mapped KV tensor "
+               "offset=%ld",
+               it->second);
+      }
+      decrement_mapped_refcount(it->second);
+    }
+  };
+  auto map_or_fail = [&](FTensor *ftensor, offset_t offset) {
+    if (!ftensor->map(offset)) {
+      LOGGER(ERROR, "FTensorAllocator failed to map KV tensor offset=%ld",
+             offset);
+      rollback_mapped_offsets();
+      return false;
+    }
+    mapped_offsets.emplace_back(ftensor, offset);
+    mapped_offset_refcounts_[offset]++;
+    return true;
+  };
+
   if (contiguous_layout_ || layer_group_layout_) {
     // In contiguous layout, use the single contiguous tensor for mapping
     // Each offset maps a block that contains all layers
@@ -214,7 +249,9 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
 
     for (auto offset : offsets) {
       // Map K and V regions for this block (covers all layers)
-      ftensor->map(offset);
+      if (!map_or_fail(ftensor, offset)) {
+        return false;
+      }
     }
   } else if (unified_pool_) {
     // Unified pool: K and V share a single block-interleaved FTensor per
@@ -223,7 +260,9 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
       auto kv_name = std::string(kv_prefix) + std::to_string(i);
       auto ftensor = ftensors_[kv_name].get();
       for (auto offset : offsets) {
-        ftensor->map(offset);
+        if (!map_or_fail(ftensor, offset)) {
+          return false;
+        }
       }
     }
   } else {
@@ -241,8 +280,10 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
       for (auto offset : offsets) {
         auto koffset = offset;
         auto voffset = offset + v_base_offset;
-        ftensor->map(koffset);
-        ftensor->map(voffset);
+        if (!map_or_fail(ftensor, koffset) ||
+            !map_or_fail(ftensor, voffset)) {
+          return false;
+        }
       }
     }
   }
@@ -265,7 +306,17 @@ bool FTensorAllocator::unmap_from_kv_tensors(
 
     for (auto offset : offsets) {
       // Unmap K and V regions for this block (covers all layers)
-      ftensor->unmap(offset);
+      if (!ftensor->unmap(offset)) {
+        LOGGER(ERROR, "FTensorAllocator failed to unmap KV tensor offset=%ld",
+               offset);
+        return false;
+      }
+      auto it = mapped_offset_refcounts_.find(offset);
+      if (it != mapped_offset_refcounts_.end()) {
+        if (--it->second <= 0) {
+          mapped_offset_refcounts_.erase(it);
+        }
+      }
     }
   } else if (unified_pool_) {
     // Unified pool: single unmap per pid.
@@ -273,7 +324,18 @@ bool FTensorAllocator::unmap_from_kv_tensors(
       auto kv_name = std::string(kv_prefix) + std::to_string(i);
       auto ftensor = ftensors_[kv_name].get();
       for (auto offset : offsets) {
-        ftensor->unmap(offset);
+        if (!ftensor->unmap(offset)) {
+          LOGGER(ERROR,
+                 "FTensorAllocator failed to unmap KV tensor offset=%ld",
+                 offset);
+          return false;
+        }
+        auto it = mapped_offset_refcounts_.find(offset);
+        if (it != mapped_offset_refcounts_.end()) {
+          if (--it->second <= 0) {
+            mapped_offset_refcounts_.erase(it);
+          }
+        }
       }
     }
   } else {
@@ -289,12 +351,48 @@ bool FTensorAllocator::unmap_from_kv_tensors(
       auto tensor = ftensor->get_tensor();
       auto v_base_offset = get_v_base_offset(tensor);
       for (auto offset : offsets) {
-        ftensor->unmap(offset);
-        ftensor->unmap(offset + v_base_offset);
+        if (!ftensor->unmap(offset)) {
+          LOGGER(ERROR,
+                 "FTensorAllocator failed to unmap K tensor offset=%ld",
+                 offset);
+          return false;
+        }
+        auto k_it = mapped_offset_refcounts_.find(offset);
+        if (k_it != mapped_offset_refcounts_.end()) {
+          if (--k_it->second <= 0) {
+            mapped_offset_refcounts_.erase(k_it);
+          }
+        }
+        if (!ftensor->unmap(offset + v_base_offset)) {
+          LOGGER(ERROR,
+                 "FTensorAllocator failed to unmap V tensor offset=%ld",
+                 offset + v_base_offset);
+          return false;
+        }
+        auto v_it = mapped_offset_refcounts_.find(offset + v_base_offset);
+        if (v_it != mapped_offset_refcounts_.end()) {
+          if (--v_it->second <= 0) {
+            mapped_offset_refcounts_.erase(v_it);
+          }
+        }
       }
     }
   }
   return true;
+}
+
+std::vector<offset_t>
+FTensorAllocator::debug_unmapped_offsets(const std::vector<offset_t> &offsets) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  std::vector<offset_t> unmapped;
+  unmapped.reserve(offsets.size());
+  for (auto offset : offsets) {
+    auto it = mapped_offset_refcounts_.find(offset);
+    if (it == mapped_offset_refcounts_.end() || it->second <= 0) {
+      unmapped.push_back(offset);
+    }
+  }
+  return unmapped;
 }
 
 std::string FTensorAllocator::get_anon_tensor_name_() {

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 
 #include "allocator.hpp"
@@ -23,6 +24,33 @@ constexpr double PREALLOC_THREAD_TIMEOUT = 2.0; // seconds
 
 static int64_t ceil_div(int64_t x, int64_t y) {
   return (x + y - 1) / y;
+}
+
+static bool autoscaling_debug_enabled() {
+  const char *env_val = std::getenv("VLLM_AUTOSCALING_KVCACHED_DEBUG");
+  return env_val && (std::strcmp(env_val, "1") == 0 ||
+                     std::strcmp(env_val, "true") == 0 ||
+                     std::strcmp(env_val, "TRUE") == 0 ||
+                     std::strcmp(env_val, "yes") == 0 ||
+                     std::strcmp(env_val, "on") == 0);
+}
+
+static std::string sample_page_ids(const std::vector<page_id_t> &page_ids,
+                                   size_t max_items = 32) {
+  std::ostringstream os;
+  os << "[";
+  const size_t n = std::min(max_items, page_ids.size());
+  for (size_t i = 0; i < n; ++i) {
+    if (i > 0) {
+      os << ", ";
+    }
+    os << page_ids[i];
+  }
+  if (page_ids.size() > n) {
+    os << ", ...";
+  }
+  os << "]";
+  return os.str();
 }
 
 // Environment variable based constants
@@ -273,6 +301,15 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
           end_time - start_time);
       LOGGER(DEBUG, "alloc 1 page fast path cost %lu us", duration.count());
+      if (autoscaling_debug_enabled()) {
+        LOGGER(WARNING,
+               "[KVCACHED_ALLOCATOR_DEBUG] alloc_reserved page=%ld "
+               "reserved_after=%zu free_list=%zu num_free=%ld mapped=%ld "
+               "physical_limit=%ld",
+               page_id, reserved_page_list_.size(), free_page_list_.size(),
+               num_free_pages_, get_num_mapped_pages_unlocked(),
+               physical_page_limit_);
+      }
       // std::cout << "alloc 1 page fast path cost " << duration.count() << "
       // us" << std::endl;
 
@@ -292,6 +329,15 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
       page_id = free_page_list_.front();
       free_page_list_.pop_front();
       num_free_pages_--;
+      if (autoscaling_debug_enabled()) {
+        LOGGER(WARNING,
+               "[KVCACHED_ALLOCATOR_DEBUG] alloc_slow_pop page=%ld "
+               "reserved=%zu free_list_after=%zu num_free=%ld mapped=%ld "
+               "physical_limit=%ld",
+               page_id, reserved_page_list_.size(), free_page_list_.size(),
+               num_free_pages_, get_num_mapped_pages_unlocked(),
+               physical_page_limit_);
+      }
       break;
     }
 
@@ -369,10 +415,14 @@ void PageAllocator::free_page(page_id_t page_id) {
 void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
   auto start_time = std::chrono::steady_clock::now();
 
+  std::vector<page_id_t> pages_reserved;
   std::vector<page_id_t> pages_to_unmap;
 
   {
     std::lock_guard<std::mutex> lock(lock_);
+    const int64_t mapped_before = get_num_mapped_pages_unlocked();
+    const size_t reserved_before = reserved_page_list_.size();
+    const size_t free_list_before = free_page_list_.size();
     num_free_pages_ += page_ids.size();
     int64_t num_to_reserve = max_reserved_pages_ - reserved_page_list_.size();
     int64_t budget_reserve_capacity =
@@ -385,10 +435,27 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
       auto reserve_end =
           page_ids.begin() +
           std::min(static_cast<size_t>(num_to_reserve), page_ids.size());
+      pages_reserved.assign(page_ids.begin(), reserve_end);
       reserved_page_list_.insert(reserved_page_list_.end(), page_ids.begin(),
                                  reserve_end);
 
       pages_to_unmap.assign(reserve_end, page_ids.end());
+
+      if (autoscaling_debug_enabled()) {
+        LOGGER(WARNING,
+               "[KVCACHED_ALLOCATOR_DEBUG] free_pages split input=%zu "
+               "reserve=%zu unmap=%zu reserved_before=%zu free_list_before=%zu "
+               "num_free_after_add=%ld mapped_before=%ld mapped_after_add=%ld "
+               "budget_capacity=%ld physical_limit=%ld sample_reserve=%s "
+               "sample_unmap=%s sample_input=%s",
+               page_ids.size(), pages_reserved.size(), pages_to_unmap.size(),
+               reserved_before, free_list_before, num_free_pages_,
+               mapped_before, get_num_mapped_pages_unlocked(),
+               budget_reserve_capacity, physical_page_limit_,
+               sample_page_ids(pages_reserved).c_str(),
+               sample_page_ids(pages_to_unmap).c_str(),
+               sample_page_ids(page_ids).c_str());
+      }
 
       if (pages_to_unmap.empty()) {
         update_memory_usage();
@@ -397,6 +464,19 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
       }
     } else {
       pages_to_unmap = page_ids;
+      if (autoscaling_debug_enabled()) {
+        LOGGER(WARNING,
+               "[KVCACHED_ALLOCATOR_DEBUG] free_pages split input=%zu "
+               "reserve=0 unmap=%zu reserved_before=%zu free_list_before=%zu "
+               "num_free_after_add=%ld mapped_before=%ld mapped_after_add=%ld "
+               "budget_capacity=%ld physical_limit=%ld sample_unmap=%s "
+               "sample_input=%s",
+               page_ids.size(), pages_to_unmap.size(), reserved_before,
+               free_list_before, num_free_pages_, mapped_before,
+               get_num_mapped_pages_unlocked(), budget_reserve_capacity,
+               physical_page_limit_, sample_page_ids(pages_to_unmap).c_str(),
+               sample_page_ids(page_ids).c_str());
+      }
     }
   }
 
@@ -409,6 +489,16 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
                            pages_to_unmap.end());
     update_memory_usage();
     cond_.notify_all();
+    if (autoscaling_debug_enabled()) {
+      LOGGER(WARNING,
+             "[KVCACHED_ALLOCATOR_DEBUG] free_pages published_unmapped "
+             "unmap=%zu free_list_after=%zu reserved_after=%zu "
+             "num_free=%ld mapped=%ld sample_unmap=%s",
+             pages_to_unmap.size(), free_page_list_.size(),
+             reserved_page_list_.size(), num_free_pages_,
+             get_num_mapped_pages_unlocked(),
+             sample_page_ids(pages_to_unmap).c_str());
+    }
   }
 
   auto end_time = std::chrono::steady_clock::now();
@@ -446,6 +536,17 @@ bool PageAllocator::resize(int64_t new_mem_size) {
       reserved_page_list_.pop_front();
     }
 
+    if (autoscaling_debug_enabled()) {
+      LOGGER(WARNING,
+             "[KVCACHED_ALLOCATOR_DEBUG] resize target_pages=%ld "
+             "mapped=%ld excess=%ld reserved_to_unmap=%ld "
+             "reserved_after_pop=%zu free_list=%zu num_free=%ld "
+             "sample_unmap=%s",
+             new_num_pages, mapped_pages, excess_pages, reserved_to_unmap,
+             reserved_page_list_.size(), free_page_list_.size(),
+             num_free_pages_, sample_page_ids(pages_to_unmap).c_str());
+    }
+
     if (pages_to_unmap.empty()) {
       update_memory_usage();
       return get_num_mapped_pages_unlocked() <= physical_page_limit_;
@@ -462,6 +563,16 @@ bool PageAllocator::resize(int64_t new_mem_size) {
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
     update_memory_usage();
+    if (autoscaling_debug_enabled()) {
+      LOGGER(WARNING,
+             "[KVCACHED_ALLOCATOR_DEBUG] resize published_unmapped "
+             "unmap=%zu free_list_after=%zu reserved_after=%zu "
+             "num_free=%ld mapped=%ld sample_unmap=%s",
+             pages_to_unmap.size(), free_page_list_.size(),
+             reserved_page_list_.size(), num_free_pages_,
+             get_num_mapped_pages_unlocked(),
+             sample_page_ids(pages_to_unmap).c_str());
+    }
     return get_num_mapped_pages_unlocked() <= physical_page_limit_;
   }
 }
@@ -474,6 +585,16 @@ void PageAllocator::trim() {
     pages_to_unmap.assign(reserved_page_list_.begin(),
                           reserved_page_list_.end());
     reserved_page_list_.clear();
+
+    if (autoscaling_debug_enabled()) {
+      LOGGER(WARNING,
+             "[KVCACHED_ALLOCATOR_DEBUG] trim reserved_unmap=%zu "
+             "free_list=%zu num_free=%ld mapped_after_clear=%ld "
+             "physical_limit=%ld sample_unmap=%s",
+             pages_to_unmap.size(), free_page_list_.size(), num_free_pages_,
+             get_num_mapped_pages_unlocked(), physical_page_limit_,
+             sample_page_ids(pages_to_unmap).c_str());
+    }
 
     if (pages_to_unmap.empty()) {
       update_memory_usage();
@@ -489,6 +610,16 @@ void PageAllocator::trim() {
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
     update_memory_usage();
+    if (autoscaling_debug_enabled()) {
+      LOGGER(WARNING,
+             "[KVCACHED_ALLOCATOR_DEBUG] trim published_unmapped "
+             "unmap=%zu free_list_after=%zu reserved_after=%zu "
+             "num_free=%ld mapped=%ld sample_unmap=%s",
+             pages_to_unmap.size(), free_page_list_.size(),
+             reserved_page_list_.size(), num_free_pages_,
+             get_num_mapped_pages_unlocked(),
+             sample_page_ids(pages_to_unmap).c_str());
+    }
   }
 }
 
@@ -697,6 +828,17 @@ void PageAllocator::prealloc_worker() {
       num_free_pages_--;
     }
 
+    if (autoscaling_debug_enabled()) {
+      LOGGER(WARNING,
+             "[KVCACHED_ALLOCATOR_DEBUG] prealloc_pop to_reserve=%ld "
+             "popped=%zu free_list_after_pop=%zu reserved=%zu "
+             "num_free=%ld mapped=%ld physical_limit=%ld sample=%s",
+             to_reserve, pages_to_reserve.size(), free_page_list_.size(),
+             reserved_page_list_.size(), num_free_pages_,
+             get_num_mapped_pages_unlocked(), physical_page_limit_,
+             sample_page_ids(pages_to_reserve).c_str());
+    }
+
     lock.unlock();
 
     if (!pages_to_reserve.empty()) {
@@ -711,6 +853,15 @@ void PageAllocator::prealloc_worker() {
         cond_.notify_all();
         LOGGER(INFO, "Preallocated %ld pages, reserved=%ld",
                pages_to_reserve.size(), reserved_page_list_.size());
+        if (autoscaling_debug_enabled()) {
+          LOGGER(WARNING,
+                 "[KVCACHED_ALLOCATOR_DEBUG] prealloc_published "
+                 "reserved_after=%zu free_list=%zu num_free=%ld mapped=%ld "
+                 "sample=%s",
+                 reserved_page_list_.size(), free_page_list_.size(),
+                 num_free_pages_, get_num_mapped_pages_unlocked(),
+                 sample_page_ids(pages_to_reserve).c_str());
+        }
       } catch (const std::exception &e) {
         lock.lock();
         free_page_list_.insert(free_page_list_.begin(),
@@ -732,6 +883,13 @@ void PageAllocator::prealloc_worker() {
 }
 
 void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
+  if (autoscaling_debug_enabled()) {
+    LOGGER(WARNING,
+           "[KVCACHED_ALLOCATOR_DEBUG] map_pages count=%zu sample=%s "
+           "world_size=%ld pp_rank=%ld group_id=%ld",
+           page_ids.size(), sample_page_ids(page_ids).c_str(), world_size_,
+           pp_rank_, group_id_);
+  }
   std::vector<offset_t> offsets;
   offsets.reserve(layer_group_layout_ ? page_ids.size() * num_layer_groups_
                                       : page_ids.size());
@@ -771,6 +929,14 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
 
 void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
   auto start_time = std::chrono::steady_clock::now();
+
+  if (autoscaling_debug_enabled()) {
+    LOGGER(WARNING,
+           "[KVCACHED_ALLOCATOR_DEBUG] unmap_pages count=%zu sample=%s "
+           "world_size=%ld pp_rank=%ld group_id=%ld",
+           page_ids.size(), sample_page_ids(page_ids).c_str(), world_size_,
+           pp_rank_, group_id_);
+  }
 
   std::vector<offset_t> offsets;
   offsets.reserve(layer_group_layout_ ? page_ids.size() * num_layer_groups_

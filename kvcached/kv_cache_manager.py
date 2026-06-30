@@ -44,6 +44,25 @@ KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
 PREALLOC_THREAD_TIMEOUT: float = 2.0  # seconds
 
 
+def _autoscaling_debug_enabled() -> bool:
+    return os.environ.get("VLLM_AUTOSCALING_KVCACHED_DEBUG", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _autoscaling_debug_verbose() -> bool:
+    return os.environ.get("VLLM_AUTOSCALING_KVCACHED_DEBUG_VERBOSE",
+                          "").lower() in {
+                              "1",
+                              "true",
+                              "yes",
+                              "on",
+                          }
+
+
 def synchronized(method):
     """
     A helper decorator to synchronize access to a method.
@@ -285,6 +304,7 @@ class KVCacheManager:
         self.defer_physical_free_pages: bool = False
         self.deferred_free_page_ids: List[int] = []
         self.deferred_free_page_id_set: set[int] = set()
+        self.deferred_free_page_blocks: Dict[int, List[int]] = {}
         self._closed: bool = False
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
@@ -505,9 +525,18 @@ class KVCacheManager:
                     raise ValueError(f"Freed index {idx} is in "
                                      " reserved_blocks, which is not allowed.")
 
-        idx_dict = self.page_allocator.group_indices_by_page(indices, self.block_mem_size)
+        idx_dict = self.page_allocator.group_indices_by_page(
+            indices, self.block_mem_size)
+        if _autoscaling_debug_enabled():
+            page_ids = sorted(idx_dict.keys())
+            logger.warning(
+                "[KVCACHED_FREE_DEBUG] free blocks=%d sample_blocks=%s "
+                "pages=%d sample_pages=%s defer_physical=%s in_shrink=%s",
+                len(indices), indices[:32], len(page_ids), page_ids[:32],
+                self.defer_physical_free_pages, self.in_shrink)
 
         pages_to_free: List[int] = []
+        page_blocks_for_trace: Dict[int, List[int]] = {}
         for page_id, idxs in idx_dict.items():
             # Find the page - it must be in either full_pages or avail_pages
             page = None
@@ -533,9 +562,43 @@ class KVCacheManager:
 
             if page.empty():
                 pages_to_free.append(page.page_id)
+                page_blocks_for_trace[page.page_id] = list(idxs)
                 self.num_avail_blocks -= page.num_free_blocks()
             else:
                 self.avail_pages[page_id] = page
+
+        if pages_to_free and _autoscaling_debug_enabled():
+            traced_pages = sorted(pages_to_free)
+            traced_blocks = {
+                int(page_id): [
+                    int(block)
+                    for block in page_blocks_for_trace.get(page_id, [])
+                ]
+                for page_id in traced_pages
+            }
+            if _autoscaling_debug_verbose():
+                logger.warning(
+                    "[KVCACHED_UNMAP_TRACE] phase=free_candidate "
+                    "defer_physical=%s in_shrink=%s pages=%s page_blocks=%s "
+                    "block_mem_size=%s page_size=%s blocks_per_page=%s "
+                    "group_id=%s pp_rank=%s",
+                    self.defer_physical_free_pages, self.in_shrink,
+                    traced_pages, traced_blocks, self.block_mem_size,
+                    self.page_size, self.blocks_per_physical_page,
+                    self.group_id, self.pp_rank)
+            else:
+                logger.warning(
+                    "[KVCACHED_UNMAP_TRACE] phase=free_candidate "
+                    "defer_physical=%s in_shrink=%s pages_count=%s "
+                    "sample_pages=%s sample_page_blocks=%s "
+                    "block_mem_size=%s page_size=%s blocks_per_page=%s "
+                    "group_id=%s pp_rank=%s",
+                    self.defer_physical_free_pages, self.in_shrink,
+                    len(traced_pages), traced_pages[:64],
+                    {page: traced_blocks[page]
+                     for page in traced_pages[:16]}, self.block_mem_size,
+                    self.page_size, self.blocks_per_physical_page,
+                    self.group_id, self.pp_rank)
 
         if pages_to_free and self.defer_physical_free_pages:
             new_pages = [
@@ -544,12 +607,30 @@ class KVCacheManager:
             ]
             self.deferred_free_page_ids.extend(new_pages)
             self.deferred_free_page_id_set.update(new_pages)
+            for page_id in new_pages:
+                self.deferred_free_page_blocks[page_id] = list(
+                    page_blocks_for_trace.get(page_id, []))
             logger.info(
                 "KVCacheD deferred physical free of %d pages during "
                 "migration (total_deferred=%d)",
                 len(new_pages), len(self.deferred_free_page_ids))
         elif pages_to_free:
             self.page_allocator.free_pages(pages_to_free)
+            if _autoscaling_debug_enabled():
+                logger.warning(
+                    "[KVCACHED_UNMAP_TRACE] phase=physical_free_done "
+                    "trace_ns=%s defer_physical=False pages=%s page_blocks=%s "
+                    "group_id=%s pp_rank=%s",
+                    time.time_ns(),
+                    sorted(pages_to_free),
+                    {
+                        int(page_id): [
+                            int(block) for block in
+                            page_blocks_for_trace.get(page_id, [])
+                        ]
+                        for page_id in sorted(pages_to_free)
+                    },
+                    self.group_id, self.pp_rank)
 
         if self.in_shrink:
             assert self.target_num_blocks is not None
@@ -623,8 +704,16 @@ class KVCacheManager:
     def end_defer_physical_free(self) -> None:
         self._wait_post_init()
         pages_to_free = list(self.deferred_free_page_ids)
+        page_blocks = {
+            int(page_id): [
+                int(block)
+                for block in self.deferred_free_page_blocks.get(page_id, [])
+            ]
+            for page_id in pages_to_free
+        }
         self.deferred_free_page_ids.clear()
         self.deferred_free_page_id_set.clear()
+        self.deferred_free_page_blocks.clear()
         self.defer_physical_free_pages = False
         if not pages_to_free:
             logger.info("KVCacheD ended physical free deferral: no pages")
@@ -632,7 +721,34 @@ class KVCacheManager:
         logger.info(
             "KVCacheD ending physical free deferral: freeing %d pages",
             len(pages_to_free))
+        if _autoscaling_debug_enabled():
+            if _autoscaling_debug_verbose():
+                logger.warning(
+                    "[KVCACHED_UNMAP_TRACE] phase=deferred_release pages=%s "
+                    "page_blocks=%s block_mem_size=%s page_size=%s "
+                    "blocks_per_page=%s group_id=%s pp_rank=%s",
+                    pages_to_free, page_blocks, self.block_mem_size,
+                    self.page_size, self.blocks_per_physical_page,
+                    self.group_id, self.pp_rank)
+            else:
+                logger.warning(
+                    "[KVCACHED_UNMAP_TRACE] phase=deferred_release "
+                    "pages_count=%s sample_pages=%s sample_page_blocks=%s "
+                    "block_mem_size=%s page_size=%s blocks_per_page=%s "
+                    "group_id=%s pp_rank=%s",
+                    len(pages_to_free), pages_to_free[:64],
+                    {page: page_blocks[page]
+                     for page in pages_to_free[:16]}, self.block_mem_size,
+                    self.page_size, self.blocks_per_physical_page,
+                    self.group_id, self.pp_rank)
         self.page_allocator.free_pages(pages_to_free)
+        if _autoscaling_debug_enabled():
+            logger.warning(
+                "[KVCACHED_UNMAP_TRACE] phase=physical_free_done "
+                "trace_ns=%s defer_physical=True pages=%s page_blocks=%s "
+                "group_id=%s pp_rank=%s",
+                time.time_ns(), pages_to_free, page_blocks, self.group_id,
+                self.pp_rank)
 
     def shutdown(self) -> None:
         """Stop background allocator activity before KV tensors are destroyed."""

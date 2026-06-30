@@ -37,6 +37,8 @@ public:
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
+  std::vector<offset_t>
+  debug_unmapped_offsets(const std::vector<offset_t> &offsets);
 
   // Global status interfaces.
   // init() creates the default allocator (group_id=0).
@@ -91,6 +93,7 @@ private:
   // For contiguous layout: single tensor containing all layers
   std::unique_ptr<FTensor> contiguous_kv_tensor_;
   std::shared_ptr<Page> zero_page_;
+  std::unordered_map<offset_t, int64_t> mapped_offset_refcounts_;
 };
 
 } // namespace kvcached

@@ -7,7 +7,8 @@ import pickle
 import socket
 import threading
 import uuid
-from typing import Any, Dict, Iterable, cast
+from contextlib import AbstractContextManager, ExitStack
+from typing import Any, Callable, Dict, Iterable, cast
 
 from kvcached.utils import DEFAULT_IPC_NAME
 from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
@@ -28,6 +29,12 @@ def _set_cuda_device(device_index: int | None) -> None:
         return
     import torch
     torch.cuda.set_device(device_index)
+
+
+def _synchronize_cuda_device() -> None:
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def _get_socket_dir_name() -> str:
@@ -93,6 +100,39 @@ def _iter_worker_targets(tp_size: int,
 # NOTE: All messages exchanged through the IPC layer are dictionaries with
 # string keys and arbitrary JSON-serialisable (picklable) values.
 Message = Dict[str, Any]
+PreUnmapCallback = Callable[[list[int], int],
+                            AbstractContextManager[Any] | None]
+_PRE_UNMAP_CALLBACKS: list[PreUnmapCallback] = []
+_PRE_UNMAP_CALLBACKS_LOCK = threading.Lock()
+
+
+def register_pre_unmap_callback(callback: PreUnmapCallback) -> None:
+    """Register a local worker callback invoked before KV tensor unmap.
+
+    A callback may return a context manager. The IPC listener keeps all returned
+    contexts entered while the underlying KV tensor unmap runs.
+    """
+    with _PRE_UNMAP_CALLBACKS_LOCK:
+        if callback not in _PRE_UNMAP_CALLBACKS:
+            _PRE_UNMAP_CALLBACKS.append(callback)
+
+
+def _enter_pre_unmap_callbacks(
+    offsets: list[int],
+    group_id: int,
+) -> ExitStack:
+    with _PRE_UNMAP_CALLBACKS_LOCK:
+        callbacks = list(_PRE_UNMAP_CALLBACKS)
+    stack = ExitStack()
+    try:
+        for callback in callbacks:
+            context = callback(offsets, group_id)
+            if context is not None:
+                stack.enter_context(context)
+    except BaseException:
+        stack.close()
+        raise
+    return stack
 
 
 def send_msg(sock: socket.socket, msg: Message) -> None:
@@ -162,11 +202,27 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                 # print(f"Worker {rank} received message: {msg}")
                 group_id: int = msg.get("group_id", 0)
                 if msg["cmd"] == "map_to_kv_tensors":
-                    map_to_kv_tensors(msg["offsets"], group_id=group_id)
-                    send_msg(conn, {"status": "success"})
+                    ok = map_to_kv_tensors(msg["offsets"], group_id=group_id)
+                    if ok:
+                        send_msg(conn, {"status": "success"})
+                    else:
+                        send_msg(conn, {
+                            "status": "error",
+                            "message": "map_to_kv_tensors returned false",
+                        })
                 elif msg["cmd"] == "unmap_from_kv_tensors":
-                    unmap_from_kv_tensors(msg["offsets"], group_id=group_id)
-                    send_msg(conn, {"status": "success"})
+                    offsets = [int(offset) for offset in msg["offsets"]]
+                    _synchronize_cuda_device()
+                    with _enter_pre_unmap_callbacks(offsets, group_id):
+                        ok = unmap_from_kv_tensors(offsets,
+                                                   group_id=group_id)
+                    if ok:
+                        send_msg(conn, {"status": "success"})
+                    else:
+                        send_msg(conn, {
+                            "status": "error",
+                            "message": "unmap_from_kv_tensors returned false",
+                        })
                 elif msg["cmd"] == "kv_tensors_created":
                     created: bool = kv_tensors_created(group_id=group_id)
                     send_msg(conn, {"status": "success", "created": created})
