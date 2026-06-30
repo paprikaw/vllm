@@ -376,6 +376,30 @@ def _sync_worker_inference_stream(worker: DynamicGPUWorker) -> None:
     _sync_cuda_stream(getattr(worker, "inference_stream", None))
 
 
+@contextmanager
+def _worker_inference_stream(worker: DynamicGPUWorker):
+    stream = getattr(worker, "inference_stream", None)
+    if stream is None or not torch.cuda.is_available():
+        yield
+        return
+
+    # torch.cuda.stream() does not update vllm.utils._current_stream, but
+    # pynccl reads vllm.utils.current_stream() when choosing its CUDA stream.
+    # Keep the cached vLLM stream and the actual torch stream aligned so PP
+    # NCCL send/recv is ordered with the model forward kernels.
+    import vllm.utils as vllm_utils
+
+    previous_cached_stream = getattr(vllm_utils, "_current_stream", None)
+    previous_torch_stream = torch.cuda.current_stream(device=stream.device)
+    torch.cuda.set_stream(stream)
+    vllm_utils._current_stream = stream
+    try:
+        yield
+    finally:
+        torch.cuda.set_stream(previous_torch_stream)
+        vllm_utils._current_stream = previous_cached_stream
+
+
 def _tensor_debug_stats(tensor: torch.Tensor) -> tuple[float, float, float]:
     if tensor.numel() == 0:
         return 0.0, 0.0, 0.0
@@ -732,7 +756,7 @@ try:
                 # Do not route normal inference through the coarse foreground
                 # gate here; correctness is enforced by stream syncs, the NCCL
                 # lock, and the narrower forward_lock scopes below.
-                with self.worker.inference_stream:
+                with _worker_inference_stream(self.worker):
                     assert self.worker is not None, "Worker is not initialized"
                     assert isinstance(self.worker, DynamicGPUWorker), "Worker is not a DynamicGPUWorker"
                     assert isinstance(self.worker.model_runner, DynamicGPUModelRunner), "Model runner is not a DynamicGPUModelRunner"
