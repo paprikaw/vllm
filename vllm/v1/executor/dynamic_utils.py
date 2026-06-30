@@ -287,6 +287,15 @@ def _sync_dynamic_pp_nccl_before_return() -> bool:
     return os.getenv("VLLM_DYNAMIC_PP_NCCL_SYNC_BEFORE_RETURN", "0") == "1"
 
 
+def _dynamic_pp_explicit_nccl_transfer_enabled() -> bool:
+    return (_dynamic_pp_nccl_transport_enabled()
+            or _dynamic_pp_rdt_transport_enabled())
+
+
+def _dynamic_pp_nccl_blocking_edge_sync_enabled() -> bool:
+    return _truthy_env("VLLM_DYNAMIC_PP_NCCL_BLOCKING_EDGE_SYNC")
+
+
 def _dynamic_pp_nccl_debug_enabled() -> bool:
     return os.getenv("VLLM_DYNAMIC_PP_NCCL_DEBUG", "0") == "1"
 
@@ -505,8 +514,12 @@ def _send_intermediate_tensors_nccl(
                                 pp_group,
                                 dst_index=dst,
                                 pending_sends=len(pending))
-        _sync_worker_inference_stream(worker)
-        _log_pp_nccl_edge_trace("send_after_sync",
+        if _dynamic_pp_nccl_blocking_edge_sync_enabled():
+            _sync_worker_inference_stream(worker)
+            send_done_phase = "send_after_sync"
+        else:
+            send_done_phase = "send_after_enqueue"
+        _log_pp_nccl_edge_trace(send_done_phase,
                                 worker,
                                 metadata,
                                 pp_group,
@@ -550,6 +563,10 @@ def _recv_intermediate_tensors_nccl(
         last_by_src[pp_group.prev_rank] = metadata.pp_nccl_seq
     nccl_lock = getattr(worker, "_nccl_lock", None)
     lock_context = nccl_lock if nccl_lock is not None else nullcontext()
+    pending_recvs = getattr(worker, "_pending_pp_nccl_recvs", None)
+    if pending_recvs is None:
+        pending_recvs = []
+        worker._pending_pp_nccl_recvs = pending_recvs
     with lock_context:
         for name, (shape, dtype_name) in metadata.tensors.items():
             tensor = pp_group.recv(torch.Size(shape),
@@ -559,44 +576,58 @@ def _recv_intermediate_tensors_nccl(
                 sentinel_tensor = tensor
             else:
                 tensors[name] = tensor
+            pending_recvs.append(tensor)
         _log_pp_nccl_edge_trace("recv_ops_enqueued",
                                 worker,
                                 metadata,
                                 pp_group,
                                 src_index=src,
                                 tensor_names=list(tensors))
-        _sync_worker_inference_stream(worker)
-        _log_pp_nccl_edge_trace("recv_after_sync",
-                                worker,
-                                metadata,
-                                pp_group,
-                                src_index=src,
-                                tensor_names=list(tensors))
-        if sentinel_tensor is not None:
-            seq_value, src_value, dst_value = [
-                int(round(value))
-                for value in sentinel_tensor.detach().cpu().tolist()
-            ]
-            expected = (metadata.pp_nccl_seq, pp_group.prev_rank, worker.rank)
-            observed = (seq_value, src_value, dst_value)
-            if observed != expected:
-                raise AssertionError(
-                    "PP NCCL seq sentinel mismatch: "
-                    f"expected={expected}, observed={observed}, "
-                    f"metadata_active={metadata.active_ranks}, "
-                    f"metadata_reqs={metadata.request_ids}")
-        if debug_enabled:
-            for name, tensor in tensors.items():
-                tensor_sum, tensor_norm, tensor_mean_abs = (
-                    _tensor_debug_stats(tensor))
-                logger.info(
-                    "[pp_nccl_debug] recv_post_sync seq=%s edge=%s->%s "
-                    "config=%s active=%s reqs=%s tensor=%s shape=%s "
-                    "dtype=%s sum=%.6e norm=%.6e mean_abs=%.6e",
-                    metadata.pp_nccl_seq, pp_group.prev_rank, worker.rank,
-                    metadata.pp_config_fingerprint, metadata.active_ranks,
-                    metadata.request_ids, name, tuple(tensor.shape),
-                    tensor.dtype, tensor_sum, tensor_norm, tensor_mean_abs)
+        if _dynamic_pp_nccl_blocking_edge_sync_enabled():
+            _sync_worker_inference_stream(worker)
+            _log_pp_nccl_edge_trace("recv_after_sync",
+                                    worker,
+                                    metadata,
+                                    pp_group,
+                                    src_index=src,
+                                    tensor_names=list(tensors))
+            if sentinel_tensor is not None:
+                seq_value, src_value, dst_value = [
+                    int(round(value))
+                    for value in sentinel_tensor.detach().cpu().tolist()
+                ]
+                expected = (metadata.pp_nccl_seq, pp_group.prev_rank,
+                            worker.rank)
+                observed = (seq_value, src_value, dst_value)
+                if observed != expected:
+                    raise AssertionError(
+                        "PP NCCL seq sentinel mismatch: "
+                        f"expected={expected}, observed={observed}, "
+                        f"metadata_active={metadata.active_ranks}, "
+                        f"metadata_reqs={metadata.request_ids}")
+            if debug_enabled:
+                for name, tensor in tensors.items():
+                    tensor_sum, tensor_norm, tensor_mean_abs = (
+                        _tensor_debug_stats(tensor))
+                    logger.info(
+                        "[pp_nccl_debug] recv_post_sync seq=%s edge=%s->%s "
+                        "config=%s active=%s reqs=%s tensor=%s shape=%s "
+                        "dtype=%s sum=%.6e norm=%.6e mean_abs=%.6e",
+                        metadata.pp_nccl_seq, pp_group.prev_rank, worker.rank,
+                        metadata.pp_config_fingerprint, metadata.active_ranks,
+                        metadata.request_ids, name, tuple(tensor.shape),
+                        tensor.dtype, tensor_sum, tensor_norm,
+                        tensor_mean_abs)
+        else:
+            _log_pp_nccl_edge_trace("recv_after_enqueue",
+                                    worker,
+                                    metadata,
+                                    pp_group,
+                                    src_index=src,
+                                    tensor_names=list(tensors))
+    keep_limit = _pending_pp_nccl_send_limit(pp_group, len(metadata.tensors))
+    if len(pending_recvs) > keep_limit:
+        del pending_recvs[:-keep_limit]
     logger.debug("[forward]: rank %s enqueued PP NCCL recv from rank %s "
                  "for tensors %s, seq=%s", pp_group.rank, pp_group.prev_rank,
                  list(tensors.keys()), metadata.pp_nccl_seq)
@@ -917,8 +948,7 @@ try:
 
                     if isinstance(output, IntermediateTensors):
                         send_time = time.time()
-                        if ((_dynamic_pp_nccl_transport_enabled()
-                             or _dynamic_pp_rdt_transport_enabled())
+                        if (_dynamic_pp_explicit_nccl_transfer_enabled()
                                 and not envs.VLLM_USE_RAY_COMPILED_DAG):
                             with _batch_pp_routing(
                                     scheduler_output.pp_layer_config):
@@ -978,7 +1008,7 @@ try:
                                 self.rpc_rank, comm_time)
                     before_sync = time.time()
                     will_sync_before_return = (
-                        not _dynamic_pp_nccl_transport_enabled()
+                        not _dynamic_pp_explicit_nccl_transfer_enabled()
                         or envs.VLLM_USE_RAY_COMPILED_DAG
                         or _sync_dynamic_pp_nccl_before_return()
                         or not isinstance(output, tuple)
@@ -991,7 +1021,7 @@ try:
                         will_sync=will_sync_before_return,
                         inference_stream_synced=inference_stream_synced,
                         output_type=type(output).__name__)
-                    if (not _dynamic_pp_nccl_transport_enabled()
+                    if (not _dynamic_pp_explicit_nccl_transfer_enabled()
                             or envs.VLLM_USE_RAY_COMPILED_DAG
                             or _sync_dynamic_pp_nccl_before_return()
                             or not isinstance(output, tuple)
