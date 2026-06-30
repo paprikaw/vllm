@@ -12,6 +12,7 @@ import time
 import threading
 import csv
 import statistics
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, asdict, field, replace
 from hashlib import sha1
 from pathlib import Path
@@ -740,12 +741,39 @@ def _server_ready_timeout(default_s: int) -> int:
         return default_s
 
 
-def wait_ready(base_url: str, timeout_s: int = 180) -> bool:
+def _normalize_loopback_base_url(base_url: str) -> str:
+    parsed = urlsplit(base_url)
+    if parsed.hostname != "localhost":
+        return base_url
+    netloc = "127.0.0.1"
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query,
+                       parsed.fragment))
+
+
+def _server_log_has_startup_complete(log_path: Optional[Path]) -> bool:
+    if log_path is None or not log_path.exists():
+        return False
+    try:
+        with open(log_path, "r", errors="ignore") as f:
+            return "Application startup complete" in f.read()
+    except OSError:
+        return False
+
+
+def wait_ready(
+    base_url: str,
+    timeout_s: int = 180,
+    startup_log_path: Optional[Path] = None,
+) -> bool:
+    base_url = _normalize_loopback_base_url(base_url)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
             r = requests.get(f"{base_url}/v1/models", timeout=3)
-            if r.ok:
+            if r.ok and (startup_log_path is None or
+                         _server_log_has_startup_complete(startup_log_path)):
                 return True
         except requests.RequestException:
             pass
@@ -764,6 +792,7 @@ def wait_ready_or_fail(
     Returns True if server is ready, False if timeout or process died.
     Prints error info if process dies early.
     """
+    base_url = _normalize_loopback_base_url(base_url)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         # Check if process died
@@ -776,7 +805,8 @@ def wait_ready_or_fail(
             return False
         # Check if ready
         try:
-            if requests.get(f"{base_url}/v1/models", timeout=3).ok:
+            if (requests.get(f"{base_url}/v1/models", timeout=3).ok
+                    and _server_log_has_startup_complete(log_path)):
                 return True
         except requests.RequestException:
             pass
@@ -1388,6 +1418,7 @@ def generate_experiment_specs(
             pipeline_autoscaling_enabled=exp_cfg.vllm.pipeline_autoscaling_enabled,
             autoscaling_candidate_ranks=exp_cfg.vllm.autoscaling_candidate_ranks,
             autoscaling_sequence=exp_cfg.vllm.autoscaling_sequence,
+            autoscaling_policy=exp_cfg.vllm.autoscaling_policy,
             pp_layer_partition=exp_cfg.vllm.pp_layer_partition,
             pp_layer_config=exp_cfg.vllm.pp_layer_config,
             alternative_configs=exp_cfg.vllm.get_alternative_configs(),
@@ -1412,12 +1443,15 @@ def generate_experiment_specs(
             num_total_requests=exp_cfg.benchmark.num_total_requests,
             request_rate=exp_cfg.benchmark.request_rate_dict,
             input_output_lens=exp_cfg.benchmark.input_output_lens,
+            arrival_trace=exp_cfg.benchmark.arrival_trace,
             pattern_batch_size=exp_cfg.benchmark.pattern_batch_size,
             burstiness=exp_cfg.benchmark.burstiness,
             repetition=exp_cfg.benchmark.repetition,
             restart_server_between_repetitions=exp_cfg.benchmark.restart_server_between_repetitions,
             print_outputs=exp_cfg.benchmark.print_outputs,
             profile=exp_cfg.benchmark.profile,
+            save_result=exp_cfg.benchmark.save_result,
+            save_detailed=exp_cfg.benchmark.save_detailed,
             ignore_eos=exp_cfg.benchmark.ignore_eos,
             warmup=exp_cfg.benchmark.warmup,
             # Pipeline config for repetition reset
@@ -1557,7 +1591,8 @@ def start_benchmark_for_sweep(
     Returns:
         True if benchmark succeeded
     """
-    if not wait_ready(spec.base_url, 300):
+    base_url = _normalize_loopback_base_url(spec.base_url)
+    if not wait_ready(base_url, 300):
         C.print("[red]ERROR[/] vLLM not ready in time")
         return False
     
@@ -1572,7 +1607,7 @@ def start_benchmark_for_sweep(
         "--backend", "openai-chat",
         "--model", spec.model_path,
         "--endpoint", "/v1/chat/completions",
-        "--base-url", spec.base_url,
+        "--base-url", base_url,
         "--dataset-name", dataset_name,
         "--served-model-name", spec.model_name,
         "--goodput", "tpot:300", "ttft:5000",
@@ -1595,6 +1630,14 @@ def start_benchmark_for_sweep(
         bench_args.append("--print-outputs")
     if spec.profile:
         bench_args.append("--profile")
+    if spec.save_result or spec.save_detailed:
+        bench_args.append("--save-result")
+        bench_args.extend([
+            "--result-dir",
+            str(Path(spec.benchmark_log_path).parent),
+        ])
+    if spec.save_detailed:
+        bench_args.append("--save-detailed")
     if spec.ignore_eos:
         bench_args.append("--ignore-eos")
     
@@ -2295,6 +2338,7 @@ async def call_set_pp_config(
         True if successful, False otherwise
     """
     import aiohttp
+    base_url = _normalize_loopback_base_url(base_url)
     url = f"{base_url}/set_pp_config"
     payload: Dict[str, Any] = {"pp_layer_config": pp_layer_config}
     
@@ -2785,7 +2829,8 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 C.print(f"[bold cyan]Monitor server status: tail -f {global_log_path}[/]")
                 if not wait_ready(
                         first_exp.bench_spec.base_url,
-                        _server_ready_timeout(300)):
+                        _server_ready_timeout(300),
+                        startup_log_path=global_log_path):
                     C.print(f"[red]ERROR: vLLM server not ready in time (sweep[{sweep_idx}])[/]")
                     continue
                 

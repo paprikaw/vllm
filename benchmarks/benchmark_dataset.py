@@ -18,6 +18,7 @@ import base64
 import io
 import json
 import logging
+import os
 import random
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
@@ -556,6 +557,15 @@ class BurstGPTDataset(BenchmarkDataset):
         self.data = gpt4_df
 
     def _sample_loaded_data(self, num_requests: int) -> list:
+        if os.getenv("VLLM_BURSTGPT_ORDERED") == "1":
+            if num_requests <= len(self.data):
+                data = self.data.head(num_requests)
+            else:
+                repeats = (num_requests + len(self.data) - 1) // len(self.data)
+                data = pd.concat([self.data] * repeats, ignore_index=True).head(
+                    num_requests)
+            return data.values.tolist()
+
         if num_requests <= len(self.data):
             data = self.data.sample(n=num_requests, random_state=self.random_seed)
         else:

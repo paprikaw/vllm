@@ -247,6 +247,8 @@ class BenchCfg(BaseModel):
     running_request_rates: list[float] = []
     profile: bool = False
     input_output_lens: list[list[int]]
+    arrival_trace: Optional[Dict[str, Any]] = None
+    """Optional native arrival trace replay config passed to benchmark_serving."""
     # Whether to print each request's generated output in benchmark logs
     print_outputs: bool = False
     # Path to benchmark script
@@ -493,6 +495,9 @@ class SweepBenchmarkConfig(BaseModel):
     requests: Dict[int, RequestStageConfig]
     """Request configurations indexed by request number.
     Example: {0: {request_rate: 1.8, input_lens: 800, output_lens: 64}, ...}"""
+
+    arrival_trace: Optional[Dict[str, Any]] = None
+    """Optional native arrival trace replay config for benchmark_serving."""
     
     @property
     def has_migration(self) -> bool:
@@ -890,6 +895,8 @@ class StaticVllmCfg(BaseModel):
     """Candidate PP ranks that may become active during autoscaling."""
     autoscaling_sequence: Optional[List[Dict[str, Any]]] = None
     """Optional explicit multi-step autoscaling sequence."""
+    autoscaling_policy: Optional[Dict[str, Any]] = None
+    """Optional runtime autoscaling policy, e.g. KV pressure threshold."""
 
 
 class StaticBenchCfg(BaseModel):
@@ -924,6 +931,8 @@ class StaticBenchCfg(BaseModel):
     pattern_batch_size: int = 150
     profile: bool = False
     print_outputs: bool = False
+    save_result: bool = False
+    save_detailed: bool = False
     ignore_eos: bool = False
     benchmark_script_path: str = "/root/vllm_workbench/vllm/benchmarks/benchmark_serving.py"
     burstiness: float = 100.0
@@ -1176,6 +1185,7 @@ class ExpVllmConfig:
     pipeline_autoscaling_enabled: bool = False
     autoscaling_candidate_ranks: Optional[List[int]] = None
     autoscaling_sequence: Optional[List[Dict[str, Any]]] = None
+    autoscaling_policy: Optional[Dict[str, Any]] = None
     pp_layer_config: Dict[int, str] = field(default_factory=dict)  # {0: "32,32", 100: "20,44"}
     
     @property
@@ -1259,6 +1269,7 @@ class ExpBenchmarkConfig:
     # From sweep benchmark_config (with defaults)
     request_rate_dict: Dict[int, float] = field(default_factory=dict)  # {0: 1.0, 100: 2.0}
     input_output_lens: List[List[int]] = field(default_factory=list)  # [[500, 100], [800, 200]]
+    arrival_trace: Optional[Dict[str, Any]] = None
     
     # From static_config.benchmark
     pattern_batch_size: int = 150
@@ -1266,6 +1277,8 @@ class ExpBenchmarkConfig:
     restart_server_between_repetitions: bool = False
     print_outputs: bool = False
     profile: bool = False
+    save_result: bool = False
+    save_detailed: bool = False
     ignore_eos: bool = False
     benchmark_script_path: str = ""
     warmup: Optional[WarmupBenchCfg] = None
@@ -1528,6 +1541,7 @@ class ExperimentConfig:
             pipeline_autoscaling_enabled=static_cfg.vllm.pipeline_autoscaling_enabled,
             autoscaling_candidate_ranks=static_cfg.vllm.autoscaling_candidate_ranks,
             autoscaling_sequence=static_cfg.vllm.autoscaling_sequence,
+            autoscaling_policy=static_cfg.vllm.autoscaling_policy,
             pp_layer_partition=initial_pp,
             pp_layer_config={k: v.replace(" ", "") for k, v in bench_cfg.pp_layer_config.items()},
         )
@@ -1540,11 +1554,14 @@ class ExperimentConfig:
             input_lens=initial_req_cfg.input_lens,
             output_lens=initial_req_cfg.output_lens,
             input_output_lens=bench_cfg.get_input_output_lens(),
+            arrival_trace=bench_cfg.arrival_trace,
             pattern_batch_size=static_cfg.benchmark.pattern_batch_size,
             burstiness=static_cfg.benchmark.burstiness,
             restart_server_between_repetitions=static_cfg.benchmark.restart_server_between_repetitions,
             print_outputs=static_cfg.benchmark.print_outputs,
             profile=static_cfg.benchmark.profile,
+            save_result=static_cfg.benchmark.save_result,
+            save_detailed=static_cfg.benchmark.save_detailed,
             ignore_eos=static_cfg.benchmark.ignore_eos,
             benchmark_script_path=static_cfg.benchmark.benchmark_script_path,
             warmup=static_cfg.benchmark.warmup,
@@ -1645,6 +1662,7 @@ class VllmServerSpec:
     pipeline_autoscaling_enabled: bool = False
     autoscaling_candidate_ranks: Optional[List[int]] = None
     autoscaling_sequence: Optional[List[Dict[str, Any]]] = None
+    autoscaling_policy: Optional[Dict[str, Any]] = None
     
     # Migration/Partition
     pp_layer_partition: str = ""
@@ -1690,6 +1708,8 @@ class VllmServerSpec:
             cfg["autoscaling_candidate_ranks"] = self.autoscaling_candidate_ranks
         if self.autoscaling_sequence is not None:
             cfg["autoscaling_sequence"] = self.autoscaling_sequence
+        if self.autoscaling_policy is not None:
+            cfg["autoscaling_policy"] = self.autoscaling_policy
         # Only include rank_to_ip if non-empty
         if self.rank_to_ip:
             cfg["rank_to_ip"] = {str(k): v for k, v in self.rank_to_ip.items()}
@@ -1721,6 +1741,7 @@ class BenchmarkSpec:
     num_total_requests: int = 0
     request_rate: Dict[int, float] = field(default_factory=dict)
     input_output_lens: List[List[int]] = field(default_factory=list)
+    arrival_trace: Optional[Dict[str, Any]] = None
     pattern_batch_size: int = 150
     burstiness: float = 100.0
     
@@ -1747,6 +1768,8 @@ class BenchmarkSpec:
     # Features
     print_outputs: bool = False
     profile: bool = False
+    save_result: bool = False
+    save_detailed: bool = False
     ignore_eos: bool = False
     
     # Optional warmup
@@ -1800,9 +1823,12 @@ class BenchmarkSpec:
             "data_num_requests": data_num_requests,
             "running_request_rates": running_request_rates,
             "input_output_lens": self.input_output_lens,
+            "arrival_trace": self.arrival_trace,
             "pattern_batch_size": self.pattern_batch_size,
             "profile": self.profile,
             "print_outputs": self.print_outputs,
+            "save_result": self.save_result,
+            "save_detailed": self.save_detailed,
             "ignore_eos": self.ignore_eos,
             "burstiness": self.burstiness,
             "warmup": self.warmup.model_dump() if self.warmup else None,

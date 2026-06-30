@@ -145,12 +145,13 @@ async def get_request(
             "request_intervals length mismatch: "
             f"expected {expected_intervals}, got {len(request_intervals)}"
         )
-
-    # Calculate scale parameter theta to maintain the desired request_rate.
-    assert burstiness > 0, (
-        f"A positive burstiness factor is expected, but given {burstiness}."
-    )
-    theta = 1.0 / (request_rate * burstiness)
+        theta = None
+    else:
+        # Calculate scale parameter theta to maintain the desired request_rate.
+        assert burstiness > 0, (
+            f"A positive burstiness factor is expected, but given {burstiness}."
+        )
+        theta = 1.0 / (request_rate * burstiness)
 
     for idx, request in enumerate(input_requests):
         yield request
@@ -167,6 +168,7 @@ async def get_request(
         else:
             # Sample the request interval from the gamma distribution.
             # If burstiness is 1, it follows exponential distribution.
+            assert theta is not None
             interval = np.random.gamma(shape=burstiness, scale=theta)
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
@@ -188,6 +190,78 @@ def build_request_intervals(
         float(np.random.gamma(shape=burstiness, scale=theta))
         for _ in range(num_requests - 1)
     ]
+
+
+def build_burstgpt_timestamp_intervals(
+    dataset_path: Optional[str],
+    num_requests: int,
+    arrival_trace: dict[str, Any],
+) -> list[float]:
+    if not dataset_path:
+        raise ValueError("dataset_path is required for BurstGPT timestamp replay.")
+    if arrival_trace.get("mode") != "burstgpt_timestamp":
+        raise ValueError(f"Unsupported arrival_trace mode: {arrival_trace!r}")
+
+    model_filter = str(arrival_trace.get("model_filter", "GPT-4"))
+    time_scale_factor = float(arrival_trace.get("time_scale_factor", 1.0))
+    if time_scale_factor <= 0:
+        raise ValueError("arrival_trace.time_scale_factor must be positive.")
+    max_total_tokens = arrival_trace.get("max_total_tokens")
+    window_start = arrival_trace.get("window_start")
+    window_duration_s = arrival_trace.get("window_duration_s")
+    max_replay_seconds = arrival_trace.get("max_replay_seconds")
+
+    timestamps: list[float] = []
+    with open(dataset_path, newline="", encoding="utf-8", errors="ignore") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                if row.get("Model") != model_filter:
+                    continue
+                timestamp = float(row["Timestamp"])
+                request_tokens = int(float(row["Request tokens"]))
+                response_tokens = int(float(row["Response tokens"]))
+                total_tokens = int(float(row.get(
+                    "Total tokens", request_tokens + response_tokens)))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if response_tokens <= 0:
+                continue
+            if max_total_tokens is not None and total_tokens > int(max_total_tokens):
+                continue
+            if window_start is not None and timestamp < float(window_start):
+                continue
+            if (window_start is not None and window_duration_s is not None
+                    and timestamp >= float(window_start) + float(window_duration_s)):
+                continue
+            timestamps.append(timestamp)
+
+    timestamps.sort()
+    if num_requests > len(timestamps):
+        raise ValueError(
+            "BurstGPT timestamp replay has fewer rows than requested: "
+            f"{len(timestamps)} < {num_requests}")
+    timestamps = timestamps[:num_requests]
+    if len(timestamps) <= 1:
+        return []
+
+    intervals = [
+        max(0.0, (timestamps[i + 1] - timestamps[i]) / time_scale_factor)
+        for i in range(len(timestamps) - 1)
+    ]
+    replay_seconds = sum(intervals)
+    if max_replay_seconds is not None and replay_seconds > float(max_replay_seconds):
+        raise ValueError(
+            "BurstGPT timestamp replay exceeds configured max runtime: "
+            f"{replay_seconds:.3f}s > {float(max_replay_seconds):.3f}s")
+
+    print(
+        "BurstGPT timestamp replay: "
+        f"requests={len(timestamps)} native_span={timestamps[-1] - timestamps[0]:.3f}s "
+        f"time_scale_factor={time_scale_factor:.3f} "
+        f"replay_span={replay_seconds:.3f}s zero_intervals="
+        f"{sum(1 for interval in intervals if interval == 0.0)}")
+    return intervals
 
 
 def calculate_metrics(
@@ -1230,6 +1304,7 @@ async def benchmark(
     migration_steps: Optional[list] = None,
     migration_mode: Optional[str] = None,
     weight_loading_mode: Optional[str] = None,
+    request_intervals: Optional[list[float]] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1294,7 +1369,8 @@ async def benchmark(
     # 检查是否使用多阶段基准测试
     print(f"compact list {compact_kv_request_rate_list}")
     print(f"running requests number:{running_num_requests}")
-    if compact_kv_request_rate_list and running_num_requests:
+    if (request_intervals is None and compact_kv_request_rate_list
+            and running_num_requests):
         assert len(compact_kv_request_rate_list) == len(running_num_requests), "request_rate_list and num_requests must have the same length"
         for i, (rate, num_req) in enumerate(zip(compact_kv_request_rate_list, running_num_requests)):
             print(f"  Stage {i+1}: {num_req} requests at {rate} req/s")
@@ -1397,7 +1473,9 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate, burstiness):
+    async for request in get_request(
+            input_requests, request_rate, burstiness,
+            request_intervals=request_intervals):
         prompt, prompt_len, output_len, mm_content = (
             request.prompt,
             request.prompt_len,
@@ -1901,6 +1979,14 @@ def main(args: argparse.Namespace):
         # (Files are provided by the launcher via env vars.)
         os.environ.setdefault("METRICS_FILE_NAME_MAIN", os.environ.get("METRICS_FILE_NAME", ""))
 
+    arrival_request_intervals = None
+    if benchmark_config.arrival_trace is not None:
+        arrival_request_intervals = build_burstgpt_timestamp_intervals(
+            args.dataset_path,
+            len(input_requests),
+            benchmark_config.arrival_trace,
+        )
+
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -1932,6 +2018,7 @@ def main(args: argparse.Namespace):
             migration_steps=migration_steps,
             migration_mode=migration_mode,
             weight_loading_mode=weight_loading_mode,
+            request_intervals=arrival_request_intervals,
         )
     )
 
