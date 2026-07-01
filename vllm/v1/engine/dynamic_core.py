@@ -24,9 +24,7 @@ from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.kvcached_integration import (
     KVCacheDPhysicalResizePending,
-    begin_kvcached_physical_free_deferral_if_needed,
     commit_kvcached_physical_resize_if_needed,
-    end_kvcached_physical_free_deferral_if_needed,
     maybe_apply_kvcached_vllm_patches,
     use_kvcached_backend,
     use_flexi_kv_for_runtime,
@@ -271,7 +269,6 @@ class DynamicEngineCore(EngineCore):
         self._migration_timeline_start: Optional[float] = None
         self._autoscaling_schedule_paused = False
         self._autoscaling_schedule_pause_start: Optional[float] = None
-        self._last_kvcached_quiescent_release_check = 0.0
 
         self.scheduler_kv_cache_config: Optional[KVCacheConfig]
 
@@ -765,13 +762,6 @@ class DynamicEngineCore(EngineCore):
                     self.batch_queue.task_done()
                     engine_core_outputs.append(self.scheduler.update_from_output(
                         scheduler_output, model_output))
-                    if self.batch_queue.empty():
-                        flush_delayed = getattr(
-                            self.scheduler,
-                            "flush_pipeline_delayed_frees",
-                            None)
-                        if flush_delayed is not None:
-                            flush_delayed("sync drain batch queue empty")
                     continue
 
                 if not finish_waiting:
@@ -794,12 +784,6 @@ class DynamicEngineCore(EngineCore):
                 model_output = future.result()
                 engine_core_outputs.append(self.scheduler.update_from_output(
                     scheduler_output, model_output))
-                flush_delayed = getattr(
-                    self.scheduler,
-                    "flush_pipeline_delayed_frees",
-                    None)
-                if flush_delayed is not None:
-                    flush_delayed("sync drain direct execution")
         finally:
             if finish_waiting:
                 self.scheduler.finish_sync_drain()
@@ -848,113 +832,6 @@ class DynamicEngineCore(EngineCore):
                 last_log = now
             time.sleep(poll_s)
 
-    def _should_keep_kvcached_physical_free_deferred(self) -> bool:
-        if not use_kvcached_backend():
-            return False
-        dynamic_config = getattr(self.vllm_config, "dynamic_config", None)
-        if not getattr(dynamic_config, "pipeline_autoscaling_enabled", False):
-            return False
-        value = os.environ.get(
-            "VLLM_AUTOSCALING_DEFER_KVCACHED_PHYSICAL_FREE", "0")
-        return value.strip().lower() not in {"0", "false", "no", "off"}
-
-    def _end_kvcached_physical_free_deferral_if_safe(
-        self,
-        reason: str,
-    ) -> bool:
-        force_cleanup_release = (
-            os.environ.get(
-                "VLLM_AUTOSCALING_FORCE_KVCACHED_CLEANUP_FREE_RELEASE", "")
-            .strip().lower() in {"1", "true", "yes", "on"}
-            and "autoscaling async worker cleanup" in reason)
-        if (self._should_keep_kvcached_physical_free_deferred()
-                and not force_cleanup_release):
-            logger.info(
-                "KVCacheD physical free deferral remains active during %s; "
-                "serving-time page unmap is deferred for async autoscaling",
-                reason)
-            return False
-        if force_cleanup_release:
-            logger.warning(
-                "KVCacheD debug forcing physical free deferral release during "
-                "%s", reason)
-        log_deferred = getattr(self.scheduler,
-                               "log_kvcached_deferred_release_invariant",
-                               None)
-        if log_deferred is not None:
-            log_deferred(reason)
-        return end_kvcached_physical_free_deferral_if_needed(
-            self.scheduler, reason)
-
-    def _release_kvcached_physical_free_deferral_at_quiescent_point(
-        self,
-        reason: str,
-    ) -> bool:
-        """Physically reclaim deferred KVCacheD pages only when no batch runs.
-
-        KVCacheD can pack multiple PageAttention blocks into one backing page.
-        During async autoscaling, unmapping those pages while any PP batch is
-        still executing can invalidate memory another worker stream may read.
-        We therefore keep physical frees deferred during serving, and briefly
-        release/re-arm that deferral only at a pipeline quiescent point.
-        """
-        if not self._should_keep_kvcached_physical_free_deferred():
-            return False
-        if self.migration_status is not MigrationStatus.NOT_MIGRATING:
-            return False
-        if self._autoscaling_schedule_paused:
-            return False
-        if self.batch_queue is not None and not self.batch_queue.empty():
-            return False
-        if getattr(self.scheduler, "running", None):
-            return False
-        if getattr(self.scheduler, "waiting", None):
-            return False
-        if getattr(self.scheduler, "requests", None):
-            return False
-        if getattr(self.scheduler, "_pipeline_pending_free_requests", None):
-            return False
-
-        now = time.time()
-        if now - self._last_kvcached_quiescent_release_check < 0.5:
-            return False
-        self._last_kvcached_quiescent_release_check = now
-
-        if isinstance(self.model_executor, DynamicRayDistributedExecutor):
-            try:
-                resizing_done = self.model_executor.get_is_kv_resizing_done()
-            except Exception:
-                logger.exception(
-                    "Failed to query KV resize state before KVCacheD "
-                    "quiescent physical free release")
-                return False
-            if not all(resizing_done):
-                logger.debug(
-                    "Skipping KVCacheD quiescent physical free release during "
-                    "%s because worker cleanup/resize is still active: %s",
-                    reason, resizing_done)
-                return False
-
-        flush_delayed = getattr(self.scheduler,
-                                "flush_pipeline_delayed_frees", None)
-        if flush_delayed is not None:
-            flush_delayed(f"{reason} before quiescent physical free release")
-
-        log_deferred = getattr(self.scheduler,
-                               "log_kvcached_deferred_release_invariant",
-                               None)
-        if log_deferred is not None:
-            log_deferred(reason)
-        released = end_kvcached_physical_free_deferral_if_needed(
-            self.scheduler, reason)
-        if released:
-            begin_kvcached_physical_free_deferral_if_needed(
-                self.scheduler, f"{reason} re-arm")
-            logger.info(
-                "KVCacheD physical free deferral released and re-armed at "
-                "pipeline quiescent point during %s", reason)
-        return released
-
     def _wait_for_worker_resize_cleanup_after_patch_done(
         self,
         resized_block_num: int,
@@ -977,9 +854,6 @@ class DynamicEngineCore(EngineCore):
                 resizing_done)
             if all(resizing_done):
                 with self.scheduler.lock:
-                    if is_kvcached:
-                        self._end_kvcached_physical_free_deferral_if_safe(
-                            "autoscaling async worker cleanup")
                     current_blocks = self.scheduler.kv_cache_manager.num_gpu_blocks
                     if resized_block_num > current_blocks:
                         self.scheduler.extend_block_pool(resized_block_num)
@@ -1008,11 +882,9 @@ class DynamicEngineCore(EngineCore):
             human_readable_duration(time.time() - wait_start))
 
     def _wait_cleanup_before_autoscaling_schedule_release(self) -> bool:
-        # KVCacheD cleanup can unmap/remap backing pages. Letting scheduler
-        # resume before that finishes can overlap new KV writes with worker
-        # page cleanup on the first post-migration target batch.
-        if use_kvcached_backend():
-            return True
+        # Keep this as an explicit debug/safety switch. Worker-side cleanup is
+        # expected to serialize its target-visible state mutation with forward
+        # while the scheduler pause is released after KV patches are applied.
         return os.environ.get(
             "VLLM_AUTOSCALING_WAIT_CLEANUP_BEFORE_SCHEDULE", "0") == "1"
 
@@ -1258,21 +1130,9 @@ class DynamicEngineCore(EngineCore):
                 assert isinstance(scheduler_output, DynamicSchedulerOutput)
                 self._finish_autoscaling_schedule_pause_if_needed(
                     scheduler_output)
-                if self.batch_queue.empty():
-                    flush_delayed = getattr(
-                        self.scheduler,
-                        "flush_pipeline_delayed_frees",
-                        None)
-                    if flush_delayed is not None:
-                        flush_delayed("batch queue empty")
-                    self._release_kvcached_physical_free_deferral_at_quiescent_point(
-                        "batch queue empty")
                 if (getattr(self, "_pending_batch_queue_size", None)
                         is not None and self.batch_queue.empty()):
                     self._refresh_batch_queue_for_active_pp_ranks()
-            elif not scheduled_batch and self.batch_queue.empty():
-                self._release_kvcached_physical_free_deferral_at_quiescent_point(
-                    "idle scheduler step")
             logger.debug(
                 "[forward]: step with batch queue in %.2f seconds",
                 time.time() - time_start)
@@ -1288,8 +1148,6 @@ class DynamicEngineCore(EngineCore):
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
         with self.engine_lock:
             if not self.scheduler.has_requests():
-                self._release_kvcached_physical_free_deferral_at_quiescent_point(
-                    "idle single batch step")
                 return EngineCoreOutputs(
                     outputs=[],
                     scheduler_stats=self.scheduler.make_stats(),
@@ -1314,14 +1172,6 @@ class DynamicEngineCore(EngineCore):
                 scheduler_output, model_output)
             self._finish_autoscaling_schedule_pause_if_needed(
                 scheduler_output)
-            flush_delayed = getattr(
-                self.scheduler,
-                "flush_pipeline_delayed_frees",
-                None)
-            if flush_delayed is not None:
-                flush_delayed("single batch execution")
-            self._release_kvcached_physical_free_deferral_at_quiescent_point(
-                "single batch execution")
             return engine_core_outputs
 
     def change_model_configuration_by_reinitialize_kv_cache(self, pp_layer_config: list[Tuple[int, int]]) -> list[EngineCoreOutputs]:
@@ -1891,9 +1741,6 @@ class DynamicEngineCore(EngineCore):
             return
 
         if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
-            if is_kvcached:
-                self._end_kvcached_physical_free_deferral_if_safe(
-                    "async migration no-resize completion")
             logger.info(f"no need to resize kv cache during migration, directly synchronize the kv cache, sleep for 4 seconds")
             time.sleep(4)
             logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
@@ -1908,9 +1755,6 @@ class DynamicEngineCore(EngineCore):
             logger.info(f"resizing_done status: {resizing_done}")
             if all(resizing_done):
                 with self.scheduler.lock:
-                    if is_kvcached:
-                        self._end_kvcached_physical_free_deferral_if_safe(
-                            "async migration resize completion")
                     self.scheduler.extend_block_pool(resized_block_num)
                 break
 
@@ -2158,9 +2002,6 @@ class DynamicEngineCore(EngineCore):
 
         assert resized_block_num != 0
         if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
-            if is_kvcached:
-                self._end_kvcached_physical_free_deferral_if_safe(
-                    "async_fast migration no-resize completion")
             logger.info(f"[async_fast] no need to resize kv cache, migration setup complete in {human_readable_duration(time.time() - time_start)}")
             self.migration_status = MigrationStatus.NOT_MIGRATING
             self._migration_done_event.set()
@@ -2174,9 +2015,6 @@ class DynamicEngineCore(EngineCore):
             logger.info(f"resizing_done status: {resizing_done}")
             if all(resizing_done):
                 with self.scheduler.lock:
-                    if is_kvcached:
-                        self._end_kvcached_physical_free_deferral_if_safe(
-                            "async_fast migration resize completion")
                     self.scheduler.extend_block_pool(resized_block_num)
                 break
 

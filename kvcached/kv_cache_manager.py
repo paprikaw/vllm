@@ -15,10 +15,15 @@ import functools
 import os
 import threading
 import time
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
 from kvcached.locks import NoOpLock
-from kvcached.tp_ipc_util import broadcast_kv_tensors_created
+from kvcached.tp_ipc_util import (
+    _enter_pre_unmap_callbacks,
+    _notify_post_map_callbacks,
+    broadcast_kv_tensors_created,
+)
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     DEFAULT_IPC_NAME,
@@ -255,42 +260,47 @@ class KVCacheManager:
             layer_group_granularity=self.layer_group_granularity,
             map_page_size=self.physical_group_page_size,
         )
-        # Register should_use_worker_ipc callback so C++ PageAllocator
-        # knows when to use broadcast IPC even with world_size == 1
+        # Register should_use_worker_ipc callback so C++ PageAllocator knows
+        # when the allocator should use worker IPC even with world_size == 1
         # (e.g. vLLM V1 EngineCore + worker in separate processes).
         try:
-            from kvcached.integration.vllm.interfaces import should_use_worker_ipc
-            self.page_allocator.set_should_use_worker_ipc_callback(should_use_worker_ipc)
+            from kvcached.integration.vllm.interfaces import (
+                should_use_worker_ipc,
+            )
+            self.page_allocator.set_should_use_worker_ipc_callback(
+                should_use_worker_ipc)
             use_worker_ipc = should_use_worker_ipc()
         except ImportError:
             use_worker_ipc = False
 
-        if self.world_size > 1 or use_worker_ipc:
-            try:
-                from kvcached.tp_ipc_util import (
-                    broadcast_map_to_kv_tensors,
-                    broadcast_unmap_from_kv_tensors,
-                )
+        try:
+            from kvcached.tp_ipc_util import (
+                broadcast_map_to_kv_tensors,
+                broadcast_unmap_from_kv_tensors,
+            )
 
-                # Wrap Python functions to match C++ callback signature
-                def map_callback(world_size: int, offsets: List[int], pp_rank: int = 0, group_id: int = 0) -> None:
-                    """Wrapper for Python broadcast function"""
-                    broadcast_map_to_kv_tensors(world_size, offsets, pp_rank, group_id)
+            # Wrap Python functions to match C++ callback signature.
+            def map_callback(world_size: int, offsets: List[int], pp_rank: int = 0, group_id: int = 0) -> None:
+                broadcast_map_to_kv_tensors(world_size, offsets, pp_rank, group_id)
 
-                def unmap_callback(world_size: int, offsets: List[int], pp_rank: int = 0, group_id: int = 0) -> None:
-                    """Wrapper for Python broadcast function"""
-                    broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
+            def unmap_callback(world_size: int, offsets: List[int], pp_rank: int = 0, group_id: int = 0) -> None:
+                broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
 
-                # Set the callbacks in the PageAllocator
-                self.page_allocator.set_broadcast_map_callback(map_callback)
-                self.page_allocator.set_broadcast_unmap_callback(unmap_callback)
+            self.page_allocator.set_broadcast_map_callback(map_callback)
+            self.page_allocator.set_broadcast_unmap_callback(unmap_callback)
 
-                logger.info("Set up broadcast callbacks for multi-process (world_size=%d, use_worker_ipc=%s)",
-                            self.world_size, use_worker_ipc)
-            except ImportError as e:
-                logger.warning("Failed to import tp_ipc_util module: %s. Broadcast callbacks will not be available.", e)
-            except Exception as e:
-                logger.warning("Failed to set up broadcast callbacks: %s. Falling back to single-process mode.", e)
+            logger.info(
+                "Set up broadcast callbacks for multi-process "
+                "(world_size=%d, use_worker_ipc=%s)",
+                self.world_size, use_worker_ipc)
+        except ImportError as e:
+            logger.warning(
+                "Failed to import tp_ipc_util module: %s. Broadcast "
+                "callbacks will not be available.", e)
+        except Exception as e:
+            logger.warning(
+                "Failed to set up broadcast callbacks: %s. Falling back to "
+                "single-process mode.", e)
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
         self.avail_pages: Dict[int, InternalPage] = {}
@@ -360,6 +370,43 @@ class KVCacheManager:
     def _wait_post_init(self):
         if not self._post_init_done.is_set():
             self._post_init_done.wait()
+
+    def _page_ids_to_unmap_offsets(self, page_ids: List[int]) -> List[int]:
+        if not page_ids:
+            return []
+        pages = [int(page_id) for page_id in page_ids]
+        if self.layer_stacking_enabled:
+            group_total_span = self.num_blocks * self.physical_group_page_size
+            return [
+                group_idx * group_total_span
+                + page_id * self.physical_group_page_size
+                for group_idx in range(self.num_layer_groups)
+                for page_id in pages
+            ]
+        if CONTIGUOUS_LAYOUT:
+            return [
+                page_id * self.physical_group_page_size
+                for page_id in pages
+            ]
+        return [page_id * self.page_size for page_id in pages]
+
+    def _direct_pre_unmap_context(self, page_ids: List[int]):
+        offsets = self._page_ids_to_unmap_offsets(page_ids)
+        if not offsets:
+            return nullcontext()
+        return _enter_pre_unmap_callbacks(offsets, self.group_id)
+
+    def _notify_pages_mapped(self, page_ids: List[int]) -> None:
+        offsets = self._page_ids_to_unmap_offsets(page_ids)
+        if offsets:
+            _notify_post_map_callbacks(offsets, self.group_id)
+
+    def free_pages_with_pre_unmap(self, page_ids: List[int]) -> None:
+        if not page_ids:
+            return
+        pages = [int(page_id) for page_id in page_ids]
+        with self._direct_pre_unmap_context(pages):
+            self.page_allocator.free_pages(pages)
 
     def _log_allocator_state(self, label: str) -> None:
         reserved_pages = self.page_allocator.get_num_reserved_pages()
@@ -486,6 +533,7 @@ class KVCacheManager:
                     if ret_index:
                         self.free(ret_index)
                     return None
+                self._notify_pages_mapped([page.page_id])
                 page.init(self.block_mem_size)
                 if hasattr(page, "cap_blocks"):
                     page.cap_blocks(self.num_blocks)
@@ -615,7 +663,7 @@ class KVCacheManager:
                 "migration (total_deferred=%d)",
                 len(new_pages), len(self.deferred_free_page_ids))
         elif pages_to_free:
-            self.page_allocator.free_pages(pages_to_free)
+            self.free_pages_with_pre_unmap(pages_to_free)
             if _autoscaling_debug_enabled():
                 logger.warning(
                     "[KVCACHED_UNMAP_TRACE] phase=physical_free_done "
@@ -741,7 +789,7 @@ class KVCacheManager:
                      for page in pages_to_free[:16]}, self.block_mem_size,
                     self.page_size, self.blocks_per_physical_page,
                     self.group_id, self.pp_rank)
-        self.page_allocator.free_pages(pages_to_free)
+        self.free_pages_with_pre_unmap(pages_to_free)
         if _autoscaling_debug_enabled():
             logger.warning(
                 "[KVCACHED_UNMAP_TRACE] phase=physical_free_done "
@@ -990,7 +1038,7 @@ class KVCacheManager:
         for page in self.full_pages.values():
             pages_to_free.append(page.page_id)
         if pages_to_free:
-            self.page_allocator.free_pages(pages_to_free)
+            self.free_pages_with_pre_unmap(pages_to_free)
         self.avail_pages.clear()
         self.full_pages.clear()
 

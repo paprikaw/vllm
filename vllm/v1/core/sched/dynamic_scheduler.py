@@ -198,16 +198,6 @@ class DynamicScheduler(Scheduler):
         self._debug_request_free_epoch = 0
         self._debug_block_free_epoch = 0
         self._debug_request_free_epochs: dict[str, int] = {}
-        self._delay_pipeline_request_free = (
-            self.vllm_config.parallel_config.pipeline_parallel_size > 1)
-        if os.environ.get(
-                "VLLM_AUTOSCALING_DISABLE_PIPELINE_FINISHED_ID_FREE_DELAY",
-                "").strip().lower() in {"1", "true", "yes", "on"}:
-            logger.warning(
-                "KVCacheD debug disabled pipeline finished-id KV free delay")
-            self._delay_pipeline_request_free = False
-        self._pipeline_pending_free_requests: dict[str, Request] = {}
-        self._pipeline_delivered_free_request_ids: set[str] = set()
 
         # 用以记录在迁移过程中，哪些rank是sender，哪些rank是receiver
         self.sender_list_during_migration: Optional[set[int]] = None 
@@ -419,17 +409,7 @@ class DynamicScheduler(Scheduler):
         self.finished_req_ids.add(request.request_id)
 
         if not delay_free_blocks:
-            if self._delay_pipeline_request_free:
-                self._pipeline_pending_free_requests[
-                    request.request_id] = request
-                self._pipeline_delivered_free_request_ids.discard(
-                    request.request_id)
-                logger.debug(
-                    "Delayed KV block free for finished request %s until "
-                    "workers consume finished_req_ids",
-                    request.request_id)
-            else:
-                self._free_blocks(request)
+            self._free_blocks(request)
 
         return kv_xfer_params
 
@@ -567,52 +547,6 @@ class DynamicScheduler(Scheduler):
                 for block_id in list(overlap)[:16]
             })
 
-    def flush_pipeline_delayed_frees(self, reason: str) -> int:
-        if not self._delay_pipeline_request_free:
-            return 0
-        with self.lock:
-            if not self._pipeline_pending_free_requests:
-                return 0
-            requests = [
-                (req_id, request)
-                for req_id, request in
-                self._pipeline_pending_free_requests.items()
-                if req_id in self._pipeline_delivered_free_request_ids
-            ]
-            if not requests:
-                return 0
-            if _autoscaling_kvcached_debug_enabled():
-                logger.warning(
-                    "[KVCACHED_PIPELINE_FREE_TRACE] phase=flush_enter "
-                    "trace_ns=%s reason=%s pending=%s delivered=%s "
-                    "flush_req_ids=%s",
-                    time.time_ns(), reason,
-                    [_short_req_id(req_id)
-                     for req_id in self._pipeline_pending_free_requests],
-                    [_short_req_id(req_id)
-                     for req_id in self._pipeline_delivered_free_request_ids],
-                    [_short_req_id(req_id) for req_id, _ in requests])
-            freed = 0
-            for req_id, request in requests:
-                if _autoscaling_kvcached_debug_enabled():
-                    logger.warning(
-                        "[KVCACHED_PIPELINE_FREE_TRACE] phase=flush_free_one "
-                        "trace_ns=%s reason=%s req_id=%s status=%s",
-                        time.time_ns(), reason, _short_req_id(req_id),
-                        request.status)
-                self._pipeline_pending_free_requests.pop(req_id, None)
-                self._pipeline_delivered_free_request_ids.discard(req_id)
-                self._cached_reqs_data.pop(req_id, None)
-                if req_id not in self.requests:
-                    continue
-                self._free_blocks(request)
-                freed += 1
-            if freed:
-                logger.info(
-                    "Freed KV blocks for %d finished requests after pipeline "
-                    "finished-id delivery (%s)", freed, reason)
-            return freed
-
     def add_request(self, request: Request) -> None:
         if self._sync_drain_pending_waiting is not None:
             self._sync_drain_pending_waiting.append(request)
@@ -694,27 +628,6 @@ class DynamicScheduler(Scheduler):
             outputs = super().update_from_output(
                 create_from_dynamic_scheduler_output(scheduler_output),
                 model_runner_output)
-            for req_id in scheduler_output.finished_req_ids:
-                if req_id in self._pipeline_pending_free_requests:
-                    self._pipeline_delivered_free_request_ids.add(req_id)
-            if (_autoscaling_kvcached_debug_enabled()
-                    and scheduler_output.finished_req_ids):
-                logger.warning(
-                    "[KVCACHED_PIPELINE_FREE_TRACE] phase=mark_delivered "
-                    "trace_ns=%s step_id=%s sched_ver=%s finished_req_ids=%s "
-                    "pending=%s delivered=%s",
-                    time.time_ns(),
-                    getattr(scheduler_output, "scheduler_step_id", -1),
-                    getattr(scheduler_output,
-                            "current_scheduler_output_version", -1),
-                    [_short_req_id(req_id)
-                     for req_id in scheduler_output.finished_req_ids],
-                    [_short_req_id(req_id)
-                     for req_id in self._pipeline_pending_free_requests],
-                    [_short_req_id(req_id)
-                     for req_id in self._pipeline_delivered_free_request_ids])
-            for req_id in self._pipeline_pending_free_requests:
-                self._cached_reqs_data.pop(req_id, None)
             return outputs
 
     def make_stats(

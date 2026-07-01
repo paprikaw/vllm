@@ -100,10 +100,20 @@ def _iter_worker_targets(tp_size: int,
 # NOTE: All messages exchanged through the IPC layer are dictionaries with
 # string keys and arbitrary JSON-serialisable (picklable) values.
 Message = Dict[str, Any]
+PostMapCallback = Callable[[list[int], int], None]
 PreUnmapCallback = Callable[[list[int], int],
                             AbstractContextManager[Any] | None]
+_POST_MAP_CALLBACKS: list[PostMapCallback] = []
+_POST_MAP_CALLBACKS_LOCK = threading.Lock()
 _PRE_UNMAP_CALLBACKS: list[PreUnmapCallback] = []
 _PRE_UNMAP_CALLBACKS_LOCK = threading.Lock()
+
+
+def register_post_map_callback(callback: PostMapCallback) -> None:
+    """Register a local worker callback invoked after KV tensor map."""
+    with _POST_MAP_CALLBACKS_LOCK:
+        if callback not in _POST_MAP_CALLBACKS:
+            _POST_MAP_CALLBACKS.append(callback)
 
 
 def register_pre_unmap_callback(callback: PreUnmapCallback) -> None:
@@ -115,6 +125,16 @@ def register_pre_unmap_callback(callback: PreUnmapCallback) -> None:
     with _PRE_UNMAP_CALLBACKS_LOCK:
         if callback not in _PRE_UNMAP_CALLBACKS:
             _PRE_UNMAP_CALLBACKS.append(callback)
+
+
+def _notify_post_map_callbacks(
+    offsets: list[int],
+    group_id: int,
+) -> None:
+    with _POST_MAP_CALLBACKS_LOCK:
+        callbacks = list(_POST_MAP_CALLBACKS)
+    for callback in callbacks:
+        callback(offsets, group_id)
 
 
 def _enter_pre_unmap_callbacks(
@@ -202,7 +222,10 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                 # print(f"Worker {rank} received message: {msg}")
                 group_id: int = msg.get("group_id", 0)
                 if msg["cmd"] == "map_to_kv_tensors":
-                    ok = map_to_kv_tensors(msg["offsets"], group_id=group_id)
+                    offsets = [int(offset) for offset in msg["offsets"]]
+                    ok = map_to_kv_tensors(offsets, group_id=group_id)
+                    if ok:
+                        _notify_post_map_callbacks(offsets, group_id)
                     if ok:
                         send_msg(conn, {"status": "success"})
                     else:

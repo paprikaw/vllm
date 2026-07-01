@@ -14,6 +14,7 @@ import importlib.util
 import inspect
 import math
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Optional
 
@@ -183,19 +184,45 @@ def _register_kvcached_migration_unmap_hook(kv_synchronizer: Any) -> None:
     if drop_slots is None:
         return
     try:
-        from kvcached.tp_ipc_util import register_pre_unmap_callback
+        from kvcached.tp_ipc_util import (
+            register_post_map_callback,
+            register_pre_unmap_callback,
+        )
     except Exception as exc:
         logger.warning(
             "KVCacheD migration bitmap pre-unmap hook unavailable: %s", exc)
         return
 
-    def _on_worker_pre_unmap(offsets: list[int], group_id: int) -> Any:
-        drop_slots(
-            offsets,
-            group_id=group_id,
-            reason="kvcached worker ipc pre-unmap")
-        return getattr(kv_synchronizer, "_kvcached_pre_unmap_context", None)
+    def _on_worker_post_map(offsets: list[int], group_id: int) -> None:
+        notify_mapped = getattr(
+            kv_synchronizer, "notify_kvcached_map_offsets", None)
+        if notify_mapped is not None:
+            notify_mapped(
+                offsets,
+                group_id=group_id,
+                reason="kvcached worker ipc post-map")
 
+    def _on_worker_pre_unmap(offsets: list[int], group_id: int) -> Any:
+        stack = ExitStack()
+        try:
+            page_context = getattr(
+                kv_synchronizer, "kvcached_page_lifetime_context", None)
+            if page_context is not None:
+                stack.enter_context(page_context())
+            drop_slots(
+                offsets,
+                group_id=group_id,
+                reason="kvcached worker ipc pre-unmap")
+            forward_context = getattr(kv_synchronizer,
+                                      "_kvcached_pre_unmap_context", None)
+            if forward_context is not None:
+                stack.enter_context(forward_context)
+        except BaseException:
+            stack.close()
+            raise
+        return stack
+
+    register_post_map_callback(_on_worker_post_map)
     register_pre_unmap_callback(_on_worker_pre_unmap)
     setattr(kv_synchronizer, "_kvcached_unmap_hook_registered", True)
 
@@ -250,123 +277,6 @@ def _kvcached_slots_to_offsets(
     else:
         offsets = [page_id * map_page_size for page_id in page_ids]
     return block_ids, page_ids, offsets
-
-
-def filter_kvcached_vmm_mapped_slots(
-    source: str,
-    owner: Any,
-    slots: Any,
-    block_size: int,
-    layer_ids: Optional[list[int]] = None,
-    rank: Optional[int] = None,
-    group_id: int = 0,
-    sync_before_check: bool = False,
-) -> list[int]:
-    """Drop slots whose KVCacheD physical pages are already unmapped."""
-    if not use_kvcached_backend():
-        if isinstance(slots, torch.Tensor):
-            return [int(slot) for slot in slots.detach().cpu().tolist()]
-        if slots is None:
-            return []
-        return [int(slot) for slot in slots]
-
-    geometry = getattr(owner, "_kvcached_debug_geometry", None)
-    if not geometry:
-        if isinstance(slots, torch.Tensor):
-            return [
-                int(slot) for slot in slots.detach().cpu().tolist()
-                if int(slot) >= 0
-            ]
-        if slots is None:
-            return []
-        return [int(slot) for slot in slots if int(slot) >= 0]
-
-    if isinstance(slots, torch.Tensor):
-        slot_values = slots.detach().cpu().tolist()
-    elif slots is None:
-        return []
-    else:
-        slot_values = list(slots)
-    slot_values = [int(slot) for slot in slot_values if int(slot) >= 0]
-    if not slot_values:
-        return []
-
-    block_size = int(block_size)
-    blocks_per_page = max(1, int(geometry["blocks_per_physical_page"]))
-    map_page_size = int(geometry["physical_group_page_size"])
-    pages_for_slot: list[tuple[int, int]] = []
-    page_ids: set[int] = set()
-    for slot in slot_values:
-        block_id = slot // block_size
-        page_id = block_id // blocks_per_page
-        pages_for_slot.append((slot, page_id))
-        page_ids.add(page_id)
-
-    if geometry.get("layer_group_layout"):
-        granularity = max(1, int(geometry["layer_group_granularity"]))
-        num_layer_groups = max(1, int(geometry["num_layer_groups"]))
-        if layer_ids:
-            group_indices = sorted({
-                max(0, min(num_layer_groups - 1, int(layer_id) // granularity))
-                for layer_id in layer_ids
-            })
-        else:
-            group_indices = list(range(num_layer_groups))
-        group_total_span = int(geometry["group_total_span"])
-        offsets_by_page = {
-            page_id: [
-                group_idx * group_total_span + page_id * map_page_size
-                for group_idx in group_indices
-            ]
-            for page_id in page_ids
-        }
-    else:
-        offsets_by_page = {
-            page_id: [page_id * map_page_size]
-            for page_id in page_ids
-        }
-
-    offsets = sorted({
-        offset
-        for page_offsets in offsets_by_page.values()
-        for offset in page_offsets
-    })
-    if not offsets:
-        return slot_values
-    if sync_before_check and torch.cuda.is_available():
-        torch.cuda.synchronize()
-    try:
-        from kvcached.vmm_ops import debug_unmapped_offsets
-    except Exception as exc:
-        logger.warning(
-            "[KVCACHED_FILTER_UNMAPPED_SLOTS_UNAVAILABLE] source=%s "
-            "rank=%s error=%s",
-            source, rank, exc)
-        return slot_values
-
-    unmapped_offsets = set(debug_unmapped_offsets(offsets, group_id=group_id))
-    if not unmapped_offsets:
-        return slot_values
-
-    kept_slots: list[int] = []
-    dropped_slots: list[int] = []
-    dropped_pages: set[int] = set()
-    for slot, page_id in pages_for_slot:
-        if any(offset in unmapped_offsets
-               for offset in offsets_by_page.get(page_id, [])):
-            dropped_slots.append(slot)
-            dropped_pages.add(page_id)
-        else:
-            kept_slots.append(slot)
-
-    logger.warning(
-        "[KVCACHED_FILTER_UNMAPPED_SLOTS] source=%s rank=%s layer_ids=%s "
-        "original_slots=%s kept_slots=%s dropped_slots=%s "
-        "dropped_pages=%s unmapped_offsets=%s geometry=%s trace_ns=%s",
-        source, rank, layer_ids, len(slot_values), len(kept_slots),
-        len(dropped_slots), sorted(dropped_pages)[:128],
-        sorted(unmapped_offsets)[:128], geometry, time.time_ns())
-    return kept_slots
 
 
 def guard_kvcached_vmm_slots_mapped(
@@ -491,60 +401,6 @@ def commit_kvcached_physical_resize_if_needed(
         if target is not None and hasattr(kv_cache_manager, "num_gpu_blocks"):
             kv_cache_manager.num_gpu_blocks = target
     return committed
-
-
-def _get_kvcached_physical_manager(owner: Any) -> Any:
-    kv_cache_manager = getattr(owner, "kv_cache_manager", owner)
-    if (hasattr(kv_cache_manager, "begin_defer_physical_free")
-            or hasattr(kv_cache_manager, "end_defer_physical_free")):
-        return kv_cache_manager
-    block_pool = getattr(kv_cache_manager, "block_pool", None)
-    return getattr(block_pool, "kv_cache_manager", None)
-
-
-def _get_kvcached_block_pool(owner: Any) -> Any:
-    kv_cache_manager = getattr(owner, "kv_cache_manager", owner)
-    block_pool = getattr(kv_cache_manager, "block_pool", None)
-    if block_pool is not None:
-        return block_pool
-    return getattr(owner, "block_pool", None)
-
-
-def begin_kvcached_physical_free_deferral_if_needed(
-    owner: Any,
-    reason: str,
-) -> bool:
-    if not use_kvcached_backend():
-        return False
-    manager = _get_kvcached_physical_manager(owner)
-    begin_defer = getattr(manager, "begin_defer_physical_free", None)
-    if begin_defer is None:
-        logger.warning(
-            "KVCacheD physical free deferral requested during %s, but no "
-            "underlying manager exposes begin_defer_physical_free", reason)
-        return False
-    begin_defer()
-    logger.info("KVCacheD physical free deferral active during %s", reason)
-    return True
-
-
-def end_kvcached_physical_free_deferral_if_needed(
-    owner: Any,
-    reason: str,
-) -> bool:
-    if not use_kvcached_backend():
-        return False
-    manager = _get_kvcached_physical_manager(owner)
-    end_defer = getattr(manager, "end_defer_physical_free", None)
-    if end_defer is None:
-        logger.warning(
-            "KVCacheD physical free deferral release requested during %s, "
-            "but no underlying manager exposes end_defer_physical_free",
-            reason)
-        return False
-    end_defer()
-    logger.info("KVCacheD physical free deferral released during %s", reason)
-    return True
 
 
 def _prepend_kvcached_home() -> None:
@@ -970,7 +826,11 @@ def _enhance_elastic_block_pool_for_dynamic_resize(
             _put_kvcached_page(self, page, pages_to_free)
 
         if pages_to_free:
-            manager.page_allocator.free_pages(pages_to_free)
+            free_pages = getattr(manager, "free_pages_with_pre_unmap", None)
+            if free_pages is not None:
+                free_pages(pages_to_free)
+            else:
+                manager.page_allocator.free_pages(pages_to_free)
         num_moves = len(moves)
         moves.clear()
         logger.info("KVCacheD committed %s pending compact block moves",
@@ -986,7 +846,7 @@ def _enhance_elastic_block_pool_for_dynamic_resize(
             self.num_gpu_blocks = new_block_num
             self._pending_physical_num_gpu_blocks = new_block_num
             logger.info(
-                "KVCacheD deferred physical shrink to %s blocks without "
+                "KVCacheD recorded pending physical shrink target %s without "
                 "logical KV block compaction", new_block_num)
             return
         for block in self.kv_block_pool[new_block_num:]:
@@ -999,8 +859,8 @@ def _enhance_elastic_block_pool_for_dynamic_resize(
         self.num_gpu_blocks = new_block_num
         self._pending_physical_num_gpu_blocks = new_block_num
         logger.info(
-            "KVCacheD deferred physical shrink to %s blocks until worker "
-            "KV compaction completes", new_block_num)
+            "Recorded pending physical shrink target %s until worker KV "
+            "compaction completes", new_block_num)
 
     def extend_block_pool(self, new_block_num: int) -> None:
         assert new_block_num >= self.num_gpu_blocks

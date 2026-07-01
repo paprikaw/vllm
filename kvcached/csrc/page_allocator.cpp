@@ -960,7 +960,21 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
     }
   }
 
-  if ((world_size_ > 1 || should_use_worker_ipc()) &&
+  const bool use_worker_ipc = should_use_worker_ipc();
+  const bool scheduler_wide_unmap = pp_rank_ < 0;
+  const bool has_broadcast_unmap_callback =
+      static_cast<bool>(broadcast_unmap_callback_);
+  if (autoscaling_debug_enabled()) {
+    LOGGER(WARNING,
+           "[KVCACHED_ALLOCATOR_DEBUG] unmap_pages_route "
+           "world_size=%ld pp_rank=%ld group_id=%ld use_worker_ipc=%d "
+           "scheduler_wide_unmap=%d has_broadcast_unmap_callback=%d",
+           world_size_, pp_rank_, group_id_, use_worker_ipc,
+           scheduler_wide_unmap,
+           has_broadcast_unmap_callback);
+  }
+
+  if ((world_size_ > 1 || use_worker_ipc || scheduler_wide_unmap) &&
       broadcast_unmap_callback_) {
     // Multi-process mode: execute unmap on all TP workers via broadcast
     // callback

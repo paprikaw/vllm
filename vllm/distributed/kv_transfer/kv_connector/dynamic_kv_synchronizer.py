@@ -31,7 +31,6 @@ from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import (
     KVTensorMeta,
 )
 from vllm.kvcached_integration import (
-    filter_kvcached_vmm_mapped_slots,
     guard_kvcached_vmm_slots_mapped,
     use_flexi_kv_for_runtime,
     use_kvcached_backend,
@@ -127,6 +126,142 @@ class KVPatchBuffer:
             self._cv.notify_all()
             return patch
 
+class KVSlotSnapshot:
+    """A materialized KV migration bitmap snapshot.
+
+    KVCacheD unmap invalidates both pending bitmaps and active snapshots. The
+    sender releases the snapshot after it finishes gathering the referenced KV
+    payload, so an unmap either trims the snapshot before gather starts or waits
+    for the gather-side page lifetime lock to be released.
+    """
+
+    def __init__(
+        self,
+        owner: "KVSlotMapping",
+        snapshot_id: int,
+        slot_mapping: list[int],
+        is_finished: bool,
+        stored_tokens: int,
+        trace_info: dict[str, list[int]],
+    ) -> None:
+        self._owner = owner
+        self.snapshot_id = snapshot_id
+        self.slot_mapping = slot_mapping
+        self.is_finished = is_finished
+        self.stored_tokens = stored_tokens
+        self.trace_info = trace_info
+        self.original_slot_count = len(slot_mapping)
+        self.dropped_slots = 0
+        self._released = False
+
+    def replace_slots(self, slots: list[int]) -> None:
+        dropped = max(0, len(self.slot_mapping) - len(slots))
+        self.slot_mapping = slots
+        self.dropped_slots += dropped
+
+    def clear_slots_for_blocks(
+        self,
+        block_ids: list[int],
+        block_size: int,
+    ) -> dict[str, int]:
+        if not self.slot_mapping or not block_ids:
+            return {
+                "cleared_slots": 0,
+                "remaining_slots": len(self.slot_mapping),
+            }
+
+        block_id_set = {int(block_id) for block_id in block_ids}
+        kept_slots: list[int] = []
+        cleared_slots = 0
+        for slot in self.slot_mapping:
+            if int(slot) < 0:
+                kept_slots.append(slot)
+                continue
+            if int(slot) // int(block_size) in block_id_set:
+                cleared_slots += 1
+            else:
+                kept_slots.append(slot)
+
+        if cleared_slots:
+            self.slot_mapping = kept_slots
+            self.dropped_slots += cleared_slots
+
+        return {
+            "cleared_slots": cleared_slots,
+            "remaining_slots": len(self.slot_mapping),
+        }
+
+    def meta_num_tokens(self) -> int:
+        if self.dropped_slots:
+            return len(self.slot_mapping)
+        return self.stored_tokens
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._owner.release_snapshot(self.snapshot_id)
+
+
+class KVOutboundPatchSnapshot:
+    """Materialized outbound patch kept invalidatable until send completes."""
+
+    def __init__(
+        self,
+        snapshot_id: int,
+        kv_patch: KVPatch,
+        block_size: int,
+    ) -> None:
+        self.snapshot_id = snapshot_id
+        self.kv_patch = kv_patch
+        self.block_size = int(block_size)
+        self.dropped_slots = 0
+
+    def clear_slots_for_blocks(
+        self,
+        block_ids: list[int],
+    ) -> dict[str, int]:
+        slot_mapping = self.kv_patch.slot_mapping
+        kv_payload = self.kv_patch.kv_payload
+        if (self.block_size <= 0 or not block_ids
+                or slot_mapping is None or slot_mapping.numel() == 0):
+            return {
+                "cleared_slots": 0,
+                "remaining_slots": (
+                    0 if slot_mapping is None else int(slot_mapping.numel())),
+            }
+
+        block_id_set = {int(block_id) for block_id in block_ids}
+        slot_values = [int(slot) for slot in slot_mapping.detach().cpu().tolist()]
+        keep_indices = [
+            idx for idx, slot in enumerate(slot_values)
+            if slot < 0 or slot // self.block_size not in block_id_set
+        ]
+        cleared_slots = len(slot_values) - len(keep_indices)
+        if cleared_slots <= 0:
+            return {
+                "cleared_slots": 0,
+                "remaining_slots": len(slot_values),
+            }
+
+        index = torch.tensor(keep_indices,
+                             dtype=torch.long,
+                             device=slot_mapping.device)
+        payload_index = index.to(kv_payload.device, non_blocking=True)
+        token_dim = 2 if kv_payload.dim() >= 5 else 1
+        self.kv_patch.slot_mapping = slot_mapping.index_select(0, index)
+        self.kv_patch.kv_payload = kv_payload.index_select(
+            token_dim, payload_index)
+        self.kv_patch.meta.num_tokens = int(self.kv_patch.slot_mapping.numel())
+        self.kv_patch.meta.slot_mapping_shape = self.kv_patch.slot_mapping.shape
+        self.kv_patch.meta.kv_payload_shape = self.kv_patch.kv_payload.shape
+        self.dropped_slots += cleared_slots
+        return {
+            "cleared_slots": cleared_slots,
+            "remaining_slots": int(self.kv_patch.slot_mapping.numel()),
+        }
+
+
 class KVSlotMapping:
     def __init__(self, size: int):
         self.bitmap = bitarray.bitarray(size)
@@ -136,6 +271,8 @@ class KVSlotMapping:
         self.is_finished = False
         self.stored_tokens = 0
         self.trace_infos: list[dict[str, Any]] = []
+        self._next_snapshot_id = 0
+        self._active_snapshots: dict[int, KVSlotSnapshot] = {}
 
     def resize(self, size: int) -> None:
         with self._cv:
@@ -198,10 +335,15 @@ class KVSlotMapping:
                 summary[f"{key}s"] = values
         return summary
 
-    def get_all_slot_mappings(self) -> Tuple[list[int], bool, int, dict[str, list[int]]]:
+    def wait_for_slot_mappings(self) -> None:
         with self._cv:
             while self.bitmap.count() == 0 and not self.is_finished:
                 self._cv.wait()
+
+    def pop_slot_mapping_snapshot(self) -> Optional[KVSlotSnapshot]:
+        with self._cv:
+            if self.bitmap.count() == 0 and not self.is_finished:
+                return None
             slot_mapping = list(self.bitmap.search(1))
             stored_tokens = self.stored_tokens
             is_finished = self.is_finished
@@ -211,7 +353,43 @@ class KVSlotMapping:
             self.stored_tokens = 0
             self.is_finished = False
             self.trace_infos.clear()
-        return slot_mapping, is_finished, stored_tokens, trace_info
+
+            snapshot_id = self._next_snapshot_id
+            self._next_snapshot_id += 1
+            snapshot = KVSlotSnapshot(
+                self,
+                snapshot_id,
+                slot_mapping,
+                is_finished,
+                stored_tokens,
+                trace_info,
+            )
+            if slot_mapping:
+                self._active_snapshots[snapshot_id] = snapshot
+            return snapshot
+
+    def get_all_slot_mapping_snapshot(self) -> KVSlotSnapshot:
+        while True:
+            self.wait_for_slot_mappings()
+            snapshot = self.pop_slot_mapping_snapshot()
+            if snapshot is not None:
+                return snapshot
+
+    def release_snapshot(self, snapshot_id: int) -> None:
+        with self._cv:
+            self._active_snapshots.pop(snapshot_id, None)
+
+    def get_all_slot_mappings(self) -> Tuple[list[int], bool, int, dict[str, list[int]]]:
+        snapshot = self.get_all_slot_mapping_snapshot()
+        try:
+            return (
+                list(snapshot.slot_mapping),
+                snapshot.is_finished,
+                snapshot.stored_tokens,
+                snapshot.trace_info,
+            )
+        finally:
+            snapshot.release()
 
     def clear_slots_for_blocks(
         self,
@@ -226,6 +404,7 @@ class KVSlotMapping:
             if int(block_id) >= 0
         })
         cleared_slots = 0
+        active_cleared_slots = 0
         with self._cv:
             bitmap_len = len(self.bitmap)
             for block_id in unique_blocks:
@@ -240,11 +419,18 @@ class KVSlotMapping:
                 zeros.setall(0)
                 self.bitmap[start:end] = zeros
                 cleared_slots += old_count
-            if cleared_slots:
+            for snapshot in list(self._active_snapshots.values()):
+                stats = snapshot.clear_slots_for_blocks(unique_blocks,
+                                                        block_size)
+                active_cleared_slots += int(stats.get("cleared_slots", 0))
+            if cleared_slots or active_cleared_slots:
                 self._cv.notify_all()
         return {
             "blocks": len(unique_blocks),
-            "cleared_slots": cleared_slots,
+            "cleared_slots": cleared_slots + active_cleared_slots,
+            "pending_cleared_slots": cleared_slots,
+            "active_cleared_slots": active_cleared_slots,
+            "active_snapshots": len(self._active_snapshots),
         }
 
 class PairPipe:
@@ -524,6 +710,12 @@ class DynamicKVSynchronizer():
         self.device = device
         self.sending_synchronizer_lock = threading.Lock()
         self.recv_synchronizer_lock = threading.Lock()
+        self._kvcached_page_lifetime_lock = threading.RLock()
+        self._next_outbound_patch_snapshot_id = 0
+        self._active_outbound_patch_snapshots: dict[
+            int, KVOutboundPatchSnapshot] = {}
+        self._outbound_patch_snapshot_ids_by_object: dict[int, int] = {}
+        self._kvcached_invalidated_block_ids: set[int] = set()
         
         # NCCL lock to prevent deadlock between KV synchronizer and Ray compiled_dag
         # This lock ensures that only one NCCL operation can be executed at a time
@@ -562,6 +754,217 @@ class DynamicKVSynchronizer():
         """Return the NCCL lock for external use (e.g., Ray compiled_dag)."""
         return self._nccl_lock
 
+    def kvcached_page_lifetime_context(self) -> threading.RLock:
+        return self._kvcached_page_lifetime_lock
+
+    def _register_kvcached_outbound_patch_snapshot_locked(
+        self,
+        kv_patch: KVPatch,
+        block_size: Optional[int],
+    ) -> None:
+        if (not use_kvcached_backend() or block_size is None
+                or int(block_size) <= 0):
+            return
+        slot_mapping = kv_patch.slot_mapping
+        if slot_mapping is None or slot_mapping.numel() == 0:
+            return
+        snapshot_id = self._next_outbound_patch_snapshot_id
+        self._next_outbound_patch_snapshot_id += 1
+        self._active_outbound_patch_snapshots[snapshot_id] = (
+            KVOutboundPatchSnapshot(snapshot_id, kv_patch, int(block_size)))
+        self._outbound_patch_snapshot_ids_by_object[id(kv_patch)] = snapshot_id
+
+    def release_kvcached_outbound_patch_snapshot(
+        self,
+        kv_patch: KVPatch,
+    ) -> None:
+        if not use_kvcached_backend():
+            return
+        with self.kvcached_page_lifetime_context():
+            snapshot_id = self._outbound_patch_snapshot_ids_by_object.pop(
+                id(kv_patch), None)
+            if snapshot_id is None:
+                return
+            snapshot = self._active_outbound_patch_snapshots.pop(
+                snapshot_id, None)
+            if snapshot is not None and snapshot.dropped_slots:
+                logger.info(
+                    "[KVCACHED_MIGRATION_BITMAP_TRACE] "
+                    "phase=outbound_patch_release rank=%s snapshot_id=%s "
+                    "dropped_slots=%s remaining_slots=%s",
+                    self.rank, snapshot_id, snapshot.dropped_slots,
+                    int(snapshot.kv_patch.slot_mapping.numel()))
+
+    def _clear_outbound_patch_snapshots_for_blocks_locked(
+        self,
+        block_ids: list[int],
+    ) -> dict[str, int]:
+        cleared_slots = 0
+        touched_snapshots = 0
+        for snapshot in list(self._active_outbound_patch_snapshots.values()):
+            stats = snapshot.clear_slots_for_blocks(block_ids)
+            snapshot_cleared = int(stats.get("cleared_slots", 0))
+            if snapshot_cleared:
+                touched_snapshots += 1
+                cleared_slots += snapshot_cleared
+        return {
+            "cleared_slots": cleared_slots,
+            "touched_snapshots": touched_snapshots,
+            "active_outbound_snapshots":
+            len(self._active_outbound_patch_snapshots),
+        }
+
+    def _kvcached_offsets_to_pages_and_blocks(
+        self,
+        offsets: list[int],
+    ) -> tuple[list[int], list[int]]:
+        geometry = getattr(self, "_kvcached_debug_geometry", None)
+        if not offsets or not geometry:
+            return [], []
+
+        map_page_size = max(1, int(geometry["physical_group_page_size"]))
+        blocks_per_page = max(1, int(geometry["blocks_per_physical_page"]))
+
+        page_ids: set[int] = set()
+        if geometry.get("layer_group_layout"):
+            group_total_span = max(1, int(geometry["group_total_span"]))
+            for offset in offsets:
+                page_ids.add((int(offset) % group_total_span) //
+                             map_page_size)
+        else:
+            for offset in offsets:
+                page_ids.add(int(offset) // map_page_size)
+
+        sorted_pages = sorted(page_ids)
+        block_ids = [
+            page_id * blocks_per_page + block_offset
+            for page_id in sorted_pages
+            for block_offset in range(blocks_per_page)
+        ]
+        return sorted_pages, block_ids
+
+    def notify_kvcached_map_offsets(
+        self,
+        offsets: list[int],
+        group_id: int = 0,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Mark KVCacheD pages as mapped again after a page allocation."""
+        page_ids, block_ids = self._kvcached_offsets_to_pages_and_blocks(
+            offsets)
+        if not block_ids:
+            return {}
+        with self.kvcached_page_lifetime_context():
+            before = len(self._kvcached_invalidated_block_ids)
+            self._kvcached_invalidated_block_ids.difference_update(block_ids)
+            cleared_blocks = before - len(self._kvcached_invalidated_block_ids)
+
+        if cleared_blocks:
+            logger.info(
+                "[KVCACHED_MIGRATION_BITMAP_TRACE] phase=post_map_restore "
+                "rank=%s group_id=%s reason=%s offsets=%d pages=%d "
+                "cleared_blocks=%d sample_pages=%s sample_blocks=%s",
+                self.rank, group_id, reason, len(offsets), len(page_ids),
+                cleared_blocks, page_ids[:64], block_ids[:64])
+        return {
+            "pages": len(page_ids),
+            "blocks": len(block_ids),
+            "cleared_blocks": cleared_blocks,
+        }
+
+    def filter_slots_for_kvcached_live_blocks(
+        self,
+        slots: list[int],
+        block_size: int,
+        reason: str = "",
+    ) -> list[int]:
+        """Drop slots whose pages were invalidated by the unmap path."""
+        if not slots or not use_kvcached_backend():
+            return list(slots)
+        block_size = int(block_size)
+        if block_size <= 0:
+            return list(slots)
+
+        with self.kvcached_page_lifetime_context():
+            invalidated = set(self._kvcached_invalidated_block_ids)
+            if not invalidated:
+                return list(slots)
+            kept = [
+                int(slot) for slot in slots
+                if int(slot) < 0 or int(slot) // block_size not in invalidated
+            ]
+
+        dropped = len(slots) - len(kept)
+        if dropped:
+            dropped_blocks = sorted({
+                int(slot) // block_size
+                for slot in slots
+                if int(slot) >= 0
+                and int(slot) // block_size in invalidated
+            })
+            logger.info(
+                "[KVCACHED_MIGRATION_BITMAP_TRACE] "
+                "phase=invalidated_slot_filter rank=%s reason=%s "
+                "original_slots=%d kept_slots=%d dropped_slots=%d "
+                "sample_blocks=%s",
+                self.rank, reason, len(slots), len(kept), dropped,
+                dropped_blocks[:64])
+        return kept
+
+    def filter_kvcached_patch_tensors_for_live_blocks(
+        self,
+        slot_mapping: torch.Tensor,
+        kv_payload: torch.Tensor,
+        block_size: int,
+        reason: str = "",
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Drop incoming patch tokens whose target blocks were unmapped."""
+        if (not use_kvcached_backend() or slot_mapping is None
+                or slot_mapping.numel() == 0):
+            return slot_mapping, kv_payload, 0
+        block_size = int(block_size)
+        if block_size <= 0:
+            return slot_mapping, kv_payload, 0
+
+        with self.kvcached_page_lifetime_context():
+            invalidated = set(self._kvcached_invalidated_block_ids)
+            if not invalidated:
+                return slot_mapping, kv_payload, 0
+            slot_values = [
+                int(slot) for slot in slot_mapping.detach().cpu().tolist()
+            ]
+            keep_indices = [
+                idx for idx, slot in enumerate(slot_values)
+                if slot < 0 or slot // block_size not in invalidated
+            ]
+
+        dropped = len(slot_values) - len(keep_indices)
+        if dropped <= 0:
+            return slot_mapping, kv_payload, 0
+
+        index = torch.tensor(keep_indices,
+                             dtype=torch.long,
+                             device=slot_mapping.device)
+        payload_index = index.to(kv_payload.device, non_blocking=True)
+        token_dim = 2 if kv_payload.dim() >= 5 else 1
+        filtered_slot_mapping = slot_mapping.index_select(0, index)
+        filtered_kv_payload = kv_payload.index_select(token_dim,
+                                                      payload_index)
+        dropped_blocks = sorted({
+            slot // block_size
+            for slot in slot_values
+            if slot >= 0 and slot // block_size in invalidated
+        })
+        logger.info(
+            "[KVCACHED_MIGRATION_BITMAP_TRACE] "
+            "phase=incoming_patch_filter rank=%s reason=%s "
+            "original_slots=%d kept_slots=%d dropped_slots=%d "
+            "sample_blocks=%s",
+            self.rank, reason, len(slot_values),
+            int(filtered_slot_mapping.numel()), dropped,
+            dropped_blocks[:64])
+        return filtered_slot_mapping, filtered_kv_payload, dropped
+
     def create_slot_mappings(self, num_block: int) -> None:
         """Initialize slot mapping for each peer rank.
 
@@ -570,14 +973,15 @@ class DynamicKVSynchronizer():
         """
         pp_size = int(self.vllm_config.parallel_config.pipeline_parallel_size)
 
-        for peer in range(pp_size):
-            if peer == self.rank:
-                continue
-            existing = self.slot_mappings.get(peer)
-            if existing is None:
-                self.slot_mappings[peer] = KVSlotMapping(num_block)
-            else:
-                existing.resize(num_block)
+        with self.kvcached_page_lifetime_context():
+            for peer in range(pp_size):
+                if peer == self.rank:
+                    continue
+                existing = self.slot_mappings.get(peer)
+                if existing is None:
+                    self.slot_mappings[peer] = KVSlotMapping(num_block)
+                else:
+                    existing.resize(num_block)
 
     def drop_slots_for_kvcached_unmap_offsets(
         self,
@@ -591,47 +995,40 @@ class DynamicKVSynchronizer():
         geometry = getattr(self, "_kvcached_debug_geometry", None)
         if not geometry:
             return {}
-
-        map_page_size = max(1, int(geometry["physical_group_page_size"]))
-        blocks_per_page = max(1, int(geometry["blocks_per_physical_page"]))
         block_size = max(1, int(geometry["block_size"]))
-
-        page_ids: set[int] = set()
-        if geometry.get("layer_group_layout"):
-            group_total_span = max(1, int(geometry["group_total_span"]))
-            for offset in offsets:
-                page_ids.add((int(offset) % group_total_span) // map_page_size)
-        else:
-            for offset in offsets:
-                page_ids.add(int(offset) // map_page_size)
-
-        block_ids = [
-            page_id * blocks_per_page + block_offset
-            for page_id in sorted(page_ids)
-            for block_offset in range(blocks_per_page)
-        ]
+        page_ids, block_ids = self._kvcached_offsets_to_pages_and_blocks(
+            offsets)
         total_cleared = 0
+        outbound_stats: dict[str, int] = {}
         per_peer: dict[int, dict[str, int]] = {}
-        for peer, slot_mapping in self.slot_mappings.items():
-            stats = slot_mapping.clear_slots_for_blocks(block_ids, block_size)
-            if stats.get("cleared_slots", 0):
-                per_peer[int(peer)] = stats
-                total_cleared += int(stats["cleared_slots"])
+        with self.kvcached_page_lifetime_context():
+            self._kvcached_invalidated_block_ids.update(block_ids)
+            for peer, slot_mapping in self.slot_mappings.items():
+                stats = slot_mapping.clear_slots_for_blocks(
+                    block_ids, block_size)
+                if stats.get("cleared_slots", 0):
+                    per_peer[int(peer)] = stats
+                    total_cleared += int(stats["cleared_slots"])
+            outbound_stats = (
+                self._clear_outbound_patch_snapshots_for_blocks_locked(
+                    block_ids))
+            total_cleared += int(outbound_stats.get("cleared_slots", 0))
 
         if total_cleared:
             logger.info(
                 "[KVCACHED_MIGRATION_BITMAP_TRACE] phase=pre_unmap_clear "
                 "rank=%s group_id=%s reason=%s offsets=%d pages=%d "
-                "blocks=%d cleared_slots=%d peers=%s sample_pages=%s "
-                "sample_blocks=%s",
+                "blocks=%d cleared_slots=%d peers=%s outbound=%s "
+                "sample_pages=%s sample_blocks=%s",
                 self.rank, group_id, reason, len(offsets), len(page_ids),
-                len(block_ids), total_cleared, per_peer,
-                sorted(page_ids)[:64], block_ids[:64])
+                len(block_ids), total_cleared, per_peer, outbound_stats,
+                page_ids[:64], block_ids[:64])
         return {
             "pages": len(page_ids),
             "blocks": len(block_ids),
             "cleared_slots": total_cleared,
             "peers": per_peer,
+            "outbound": outbound_stats,
         }
 
     def drop_slots_for_kvcached_unmapped_offsets(
@@ -998,7 +1395,8 @@ class DynamicKVSynchronizer():
                                             key_cache_ptrs=key_cache_ptrs,
                                             value_cache_ptrs=value_cache_ptrs,
                                             start_layer_id=start_layer_id,
-                                            cuda_op_lock=cuda_op_lock)
+                                            cuda_op_lock=cuda_op_lock,
+                                            block_size=block_size)
         else:
             if kv_caches is None:
                 kv_caches = self.kv_caches
@@ -1030,63 +1428,112 @@ class DynamicKVSynchronizer():
                         key_cache_ptrs: list[int],
                         value_cache_ptrs: list[int],
                         start_layer_id: int,
-                        cuda_op_lock=None) -> Generator[KVPatch, None, None]:
+                        cuda_op_lock=None,
+                        block_size: Optional[int] = None,
+                        ) -> Generator[KVPatch, None, None]:
         while True:
             logger.info(f"start to get slot mapping for rank {rank}")
-            slot_mapping, is_finished, stored_tokens, scheduler_trace = (
-                self.slot_mappings[rank].get_all_slot_mappings())
-            block_size, num_head, head_dim = kv_cache_meta.shape
-            lock_context = cuda_op_lock if cuda_op_lock is not None else nullcontext()
+            meta_block_size, num_head, head_dim = kv_cache_meta.shape
+            patch_block_size = (
+                int(block_size) if block_size is not None
+                and int(block_size) > 0 else int(meta_block_size))
+            snapshot: Optional[KVSlotSnapshot] = None
+            kv_patch: Optional[KVPatch] = None
+            if use_kvcached_backend():
+                self.slot_mappings[rank].wait_for_slot_mappings()
+                lock_context = self.kvcached_page_lifetime_context()
+            else:
+                lock_context = (cuda_op_lock
+                                if cuda_op_lock is not None else nullcontext())
             with lock_context:
-                slot_mapping_dev = torch.tensor(slot_mapping,
-                                                device=kv_cache_meta.device,
-                                                dtype=torch.int64)
-                # 为了匹配receiver端的期望，使用shape: [2, num_layers, num_tokens, num_heads, head_dim]
-                # 第0维是K/V区分，第1维是layers
-                kv_out = torch.empty(2, len(layer_ids),
-                                     slot_mapping_dev.size(0), num_head,
-                                     head_dim, dtype=kv_cache_meta.dtype,
-                                     device=kv_cache_meta.device)
-                logger.info(f"layer_ids: {layer_ids}, kv_out shape: {kv_out.shape}, slot mapping shape: {slot_mapping_dev.shape}, start_layer_id: {start_layer_id}")
-                if slot_mapping_dev.numel() > 0:
-                    for idx, layer_id in enumerate(layer_ids):
-                        local_layer_id = layer_id - start_layer_id
-                        if (local_layer_id < 0
-                                or local_layer_id >= len(key_cache_ptrs)):
-                            raise IndexError(
-                                "KV patch sender layer index out of range: "
-                                f"layer_id={layer_id}, "
-                                f"start_layer_id={start_layer_id}, "
-                                f"local_layer_id={local_layer_id}, "
-                                f"num_key_cache_ptrs={len(key_cache_ptrs)}")
-                        key_cache_ptr = key_cache_ptrs[local_layer_id]
-                        value_cache_ptr = value_cache_ptrs[local_layer_id]
-                        if key_cache_ptr == 0 or value_cache_ptr == 0:
-                            raise RuntimeError(
-                                "KV patch sender resolved an empty cache "
-                                "pointer for non-empty slot mapping: "
-                                f"layer_id={layer_id}, "
-                                f"start_layer_id={start_layer_id}, "
-                                f"local_layer_id={local_layer_id}, "
-                                f"num_key_cache_ptrs={len(key_cache_ptrs)}")
-                        # 填充到 kv_out[0][idx] (keys) 和 kv_out[1][idx] (values)
-                        ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[0][idx], kv_out[1][idx], block_size)
-                self._sync_kvcached_stream("flexi KV patch gather")
-            yield KVPatch(
-                KVPatchMeta(
-                    type='kv_patch_meta' if not is_finished else "kv_patch_finished",
-                    id=self.last_patch_ids[rank],
-                    layer_ids=layer_ids,
-                    num_tokens=stored_tokens,
-                    slot_mapping_dtype=torch.int64,
-                    slot_mapping_shape=slot_mapping_dev.shape,
-                    kv_payload_dtype=kv_out.dtype,
-                    kv_payload_shape=kv_out.shape,
-                    scheduler_trace=scheduler_trace,
-                ),
-                kv_out,
-                slot_mapping_dev
-            )
+                try:
+                    if use_kvcached_backend():
+                        snapshot = (
+                            self.slot_mappings[rank]
+                            .pop_slot_mapping_snapshot())
+                        if snapshot is None:
+                            continue
+                        slot_mapping = snapshot.slot_mapping
+                        is_finished = snapshot.is_finished
+                        stored_tokens = snapshot.stored_tokens
+                        scheduler_trace = snapshot.trace_info
+                    else:
+                        slot_mapping, is_finished, stored_tokens, scheduler_trace = (
+                            self.slot_mappings[rank].get_all_slot_mappings())
+                    slot_mapping_dev = torch.tensor(slot_mapping,
+                                                    device=kv_cache_meta.device,
+                                                    dtype=torch.int64)
+                    # 为了匹配receiver端的期望，使用shape: [2, num_layers, num_tokens, num_heads, head_dim]
+                    # 第0维是K/V区分，第1维是layers
+                    kv_out = torch.empty(2, len(layer_ids),
+                                         slot_mapping_dev.size(0), num_head,
+                                         head_dim, dtype=kv_cache_meta.dtype,
+                                         device=kv_cache_meta.device)
+                    logger.info(f"layer_ids: {layer_ids}, kv_out shape: {kv_out.shape}, slot mapping shape: {slot_mapping_dev.shape}, start_layer_id: {start_layer_id}")
+                    if slot_mapping_dev.numel() > 0:
+                        if use_kvcached_backend():
+                            guard_kvcached_vmm_slots_mapped(
+                                "migration_flexi_patch_gather_snapshot:"
+                                f"target={rank}:patch={self.last_patch_ids[rank]}:"
+                                f"trace={scheduler_trace}",
+                                self,
+                                slot_mapping,
+                                patch_block_size,
+                                layer_ids=[
+                                    int(layer_id) for layer_id in layer_ids
+                                ],
+                                rank=self.rank,
+                                trace_info=scheduler_trace,
+                            )
+                        for idx, layer_id in enumerate(layer_ids):
+                            local_layer_id = layer_id - start_layer_id
+                            if (local_layer_id < 0
+                                    or local_layer_id >= len(key_cache_ptrs)):
+                                raise IndexError(
+                                    "KV patch sender layer index out of range: "
+                                    f"layer_id={layer_id}, "
+                                    f"start_layer_id={start_layer_id}, "
+                                    f"local_layer_id={local_layer_id}, "
+                                    f"num_key_cache_ptrs={len(key_cache_ptrs)}")
+                            key_cache_ptr = key_cache_ptrs[local_layer_id]
+                            value_cache_ptr = value_cache_ptrs[local_layer_id]
+                            if key_cache_ptr == 0 or value_cache_ptr == 0:
+                                raise RuntimeError(
+                                    "KV patch sender resolved an empty cache "
+                                    "pointer for non-empty slot mapping: "
+                                    f"layer_id={layer_id}, "
+                                    f"start_layer_id={start_layer_id}, "
+                                    f"local_layer_id={local_layer_id}, "
+                                    f"num_key_cache_ptrs={len(key_cache_ptrs)}")
+                            # 填充到 kv_out[0][idx] (keys) 和 kv_out[1][idx] (values)
+                            ops.flexi_gather_pages(key_cache_ptr, value_cache_ptr, slot_mapping_dev, kv_out[0][idx], kv_out[1][idx], patch_block_size)
+                    self._sync_kvcached_stream("flexi KV patch gather")
+                    meta_num_tokens = (
+                        snapshot.meta_num_tokens()
+                        if snapshot is not None else stored_tokens)
+                    kv_patch = KVPatch(
+                        KVPatchMeta(
+                            type=('kv_patch_meta' if not is_finished else
+                                  "kv_patch_finished"),
+                            id=self.last_patch_ids[rank],
+                            layer_ids=layer_ids,
+                            num_tokens=meta_num_tokens,
+                            slot_mapping_dtype=torch.int64,
+                            slot_mapping_shape=slot_mapping_dev.shape,
+                            kv_payload_dtype=kv_out.dtype,
+                            kv_payload_shape=kv_out.shape,
+                            scheduler_trace=scheduler_trace,
+                        ),
+                        kv_out,
+                        slot_mapping_dev,
+                    )
+                    self._register_kvcached_outbound_patch_snapshot_locked(
+                        kv_patch, patch_block_size)
+                finally:
+                    if snapshot is not None:
+                        snapshot.release()
+            assert kv_patch is not None
+            yield kv_patch
             self.last_patch_ids[rank] += 1
             if is_finished: 
                 self.kv_cache_transfer_in_process[rank] = False
@@ -1105,206 +1552,236 @@ class DynamicKVSynchronizer():
         while True:
             patch_id = self.last_patch_ids[rank]
             logger.info(f"start to get slot mapping for rank {rank}")
-            slot_mapping, is_finished, stored_tokens, scheduler_trace = (
-                self.slot_mappings[rank].get_all_slot_mappings())
-            original_slot_count = len(slot_mapping)
-            live_blocks_for_patch = (
-                live_block_ids_getter()
-                if live_block_ids_getter is not None else live_block_ids)
-            if (slot_mapping and live_blocks_for_patch is not None
-                    and block_size is not None and block_size > 0):
-                original_slot_mapping = list(slot_mapping)
-                slot_mapping = [
-                    slot for slot in slot_mapping
-                    if int(slot) // int(block_size) in live_blocks_for_patch
-                ]
-                dropped_slots = original_slot_count - len(slot_mapping)
-                if dropped_slots:
-                    dropped_slot_mapping = [
-                        slot for slot in original_slot_mapping
-                        if int(slot) // int(block_size) not in
-                        live_blocks_for_patch
-                    ]
-                    kept_blocks = _blocks_from_slots(slot_mapping, block_size)
-                    dropped_blocks = _blocks_from_slots(dropped_slot_mapping,
-                                                        block_size)
-                    logger.info(
-                        "Filtered KV patch slots against live request blocks: "
-                        "rank=%s patch_id=%s original_slots=%s kept_slots=%s "
-                        "dropped_slots=%s live_blocks=%s stored_tokens=%s",
-                        rank, patch_id, original_slot_count, len(slot_mapping),
-                        dropped_slots, len(live_blocks_for_patch),
-                        stored_tokens)
-                    if _autoscaling_kvcached_debug_enabled():
-                        if _autoscaling_kvcached_debug_verbose():
-                            logger.warning(
-                                "[KVCACHED_MIGRATION_PATCH_TRACE] "
-                                "sender_rank=%s target_rank=%s patch_id=%s "
-                                "phase=filtered original_slots=%s kept_slots=%s "
-                                "dropped_slots=%s block_size=%s "
-                                "kept_blocks=%s dropped_blocks=%s "
-                                "stored_tokens=%s is_finished=%s",
-                                self.rank, rank, patch_id,
-                                original_slot_count, len(slot_mapping),
-                                dropped_slots, block_size, kept_blocks,
-                                dropped_blocks, stored_tokens, is_finished)
-                        else:
-                            logger.warning(
-                                "[KVCACHED_MIGRATION_PATCH_TRACE] "
-                                "sender_rank=%s target_rank=%s patch_id=%s "
-                                "phase=filtered original_slots=%s kept_slots=%s "
-                                "dropped_slots=%s block_size=%s "
-                                "kept_blocks_count=%s sample_kept_blocks=%s "
-                                "dropped_blocks_count=%s sample_dropped_blocks=%s "
-                                "stored_tokens=%s is_finished=%s",
-                                self.rank, rank, patch_id,
-                                original_slot_count, len(slot_mapping),
-                                dropped_slots, block_size, len(kept_blocks),
-                                kept_blocks[:64], len(dropped_blocks),
-                                dropped_blocks[:64], stored_tokens,
-                                is_finished)
-            if (use_kvcached_backend() and block_size is not None
-                    and block_size > 0 and len(slot_mapping) > 0):
-                mapped_slot_mapping = filter_kvcached_vmm_mapped_slots(
-                    "migration_patch_gather_prefilter:"
-                    f"target={rank}:patch={patch_id}",
-                    self,
-                    slot_mapping,
-                    int(block_size),
-                    layer_ids=[int(layer_id) for layer_id in layer_ids],
-                    rank=self.rank,
-                    sync_before_check=True,
-                )
-                if len(mapped_slot_mapping) != len(slot_mapping):
-                    logger.warning(
-                        "[KVCACHED_MIGRATION_PATCH_TRACE] "
-                        "sender_rank=%s target_rank=%s patch_id=%s "
-                        "phase=unmapped_prefilter original_slots=%s "
-                        "kept_slots=%s dropped_slots=%s block_size=%s "
-                        "stored_tokens=%s is_finished=%s",
-                        self.rank, rank, patch_id, len(slot_mapping),
-                        len(mapped_slot_mapping),
-                        len(slot_mapping) - len(mapped_slot_mapping),
-                        block_size, stored_tokens, is_finished)
-                    slot_mapping = mapped_slot_mapping
-            if is_finished and not slot_mapping:
-                dtype = torch.bfloat16
-                if kv_cache:
-                    dtype = kv_cache[0][0].dtype
-                slot_mapping_dev = torch.empty(0,
-                                               device=self.device,
-                                               dtype=torch.int64)
-                kv_out = torch.empty(
-                    2,
-                    len(layer_ids),
-                    0,
-                    self.num_heads,
-                    self.head_size,
-                    dtype=dtype,
-                    device=self.device)
-                yield KVPatch(
-                    KVPatchMeta(
-                        type='kv_patch_finished',
-                        id=patch_id,
-                        layer_ids=layer_ids,
-                        num_tokens=0,
-                        slot_mapping_dtype=torch.int64,
-                        slot_mapping_shape=slot_mapping_dev.shape,
-                        kv_payload_dtype=kv_out.dtype,
-                        kv_payload_shape=kv_out.shape,
-                        scheduler_trace=scheduler_trace,
-                    ),
-                    kv_out,
-                    slot_mapping_dev,
-                )
-                self.kv_cache_transfer_in_process[rank] = False
-                self.kv_patch_sending = False
-                self.last_patch_ids[rank] = 0
-                break
-            if not slot_mapping:
-                dtype = torch.bfloat16
-                device = self.device
-                if kv_cache:
-                    dtype = kv_cache[0][0].dtype
-                    device = kv_cache[0][0].device
-                slot_mapping_dev = torch.empty(0,
-                                               device=device,
-                                               dtype=torch.int64)
-                kv_out = torch.empty(
-                    2,
-                    len(layer_ids),
-                    0,
-                    self.num_heads,
-                    self.head_size,
-                    dtype=dtype,
-                    device=device)
-                yield KVPatch(
-                    KVPatchMeta(
-                        type='kv_patch_meta',
-                        id=patch_id,
-                        layer_ids=layer_ids,
-                        num_tokens=stored_tokens,
-                        slot_mapping_dtype=torch.int64,
-                        slot_mapping_shape=slot_mapping_dev.shape,
-                        kv_payload_dtype=kv_out.dtype,
-                        kv_payload_shape=kv_out.shape,
-                        scheduler_trace=scheduler_trace,
-                    ),
-                    kv_out,
-                    slot_mapping_dev,
-                )
-                self.last_patch_ids[rank] += 1
-                continue
-            if (_autoscaling_kvcached_debug_enabled()
-                    and block_size is not None and block_size > 0):
-                patch_blocks = _blocks_from_slots(slot_mapping, block_size)
-                if _autoscaling_kvcached_debug_verbose():
-                    logger.warning(
-                        "[KVCACHED_MIGRATION_GATHER_TRACE] rank=%s "
-                        "target=%s phase=patch_gather patch_id=%s "
-                        "slot_count=%s block_size=%s blocks=%s "
-                        "stored_tokens=%s is_finished=%s scheduler_trace=%s",
-                        self.rank, rank, patch_id, len(slot_mapping),
-                        block_size, patch_blocks, stored_tokens, is_finished,
-                        scheduler_trace)
-                else:
-                    logger.warning(
-                        "[KVCACHED_MIGRATION_GATHER_TRACE] rank=%s "
-                        "target=%s phase=patch_gather patch_id=%s "
-                        "slot_count=%s block_size=%s blocks_count=%s "
-                        "sample_blocks=%s stored_tokens=%s is_finished=%s "
-                        "scheduler_trace=%s",
-                        self.rank, rank, patch_id, len(slot_mapping),
-                        block_size, len(patch_blocks), patch_blocks[:64],
-                        stored_tokens, is_finished, scheduler_trace)
-            if (use_kvcached_backend() and block_size is not None
-                    and block_size > 0 and len(slot_mapping) > 0):
-                guard_kvcached_vmm_slots_mapped(
-                    f"migration_patch_gather:target={rank}:patch={patch_id}:"
-                    f"trace={scheduler_trace}",
-                    self,
-                    slot_mapping,
-                    int(block_size),
-                    layer_ids=[int(layer_id) for layer_id in layer_ids],
-                    rank=self.rank,
-                    trace_info=scheduler_trace,
-                )
-            lock_context = cuda_op_lock if cuda_op_lock is not None else nullcontext()
+            snapshot: Optional[KVSlotSnapshot] = None
+            if use_kvcached_backend():
+                self.slot_mappings[rank].wait_for_slot_mappings()
+                lock_context = self.kvcached_page_lifetime_context()
+            else:
+                lock_context = (cuda_op_lock
+                                if cuda_op_lock is not None else nullcontext())
+            empty_patch: Optional[KVPatch] = None
+            kv_patch: Optional[KVPatch] = None
+            is_finished = False
+
             with lock_context:
-                slot_mapping_dev = torch.tensor(slot_mapping,
-                                                dtype=torch.int64)
-                kv_patch = self.kv_helper.extract_kv_patch_from_kv_cache(
-                    patch_id=patch_id,
-                    kv_caches=kv_cache,
-                    layer_ids=layer_ids,
-                    start_layer_id=start_layer_id,
-                    slot_mapping=slot_mapping_dev,
-                    is_finished=is_finished,
-                    slot_mapping_already_valid=True,
-                )
-                self._sync_kvcached_stream("regular KV patch gather")
-            kv_patch.meta.num_tokens = stored_tokens
-            kv_patch.meta.scheduler_trace = scheduler_trace
+                try:
+                    if use_kvcached_backend():
+                        snapshot = (
+                            self.slot_mappings[rank]
+                            .pop_slot_mapping_snapshot())
+                        if snapshot is None:
+                            continue
+                        slot_mapping = snapshot.slot_mapping
+                        is_finished = snapshot.is_finished
+                        stored_tokens = snapshot.stored_tokens
+                        scheduler_trace = snapshot.trace_info
+                    else:
+                        slot_mapping, is_finished, stored_tokens, scheduler_trace = (
+                            self.slot_mappings[rank].get_all_slot_mappings())
+
+                    original_slot_count = len(slot_mapping)
+                    live_blocks_for_patch = (
+                        live_block_ids_getter()
+                        if live_block_ids_getter is not None else live_block_ids)
+                    if (slot_mapping and live_blocks_for_patch is not None
+                            and block_size is not None and block_size > 0):
+                        original_slot_mapping = list(slot_mapping)
+                        filtered_slot_mapping = [
+                            slot for slot in slot_mapping
+                            if int(slot) // int(block_size) in
+                            live_blocks_for_patch
+                        ]
+                        dropped_slots = (original_slot_count -
+                                         len(filtered_slot_mapping))
+                        if dropped_slots:
+                            dropped_slot_mapping = [
+                                slot for slot in original_slot_mapping
+                                if int(slot) // int(block_size) not in
+                                live_blocks_for_patch
+                            ]
+                            kept_blocks = _blocks_from_slots(
+                                filtered_slot_mapping, block_size)
+                            dropped_blocks = _blocks_from_slots(
+                                dropped_slot_mapping, block_size)
+                            logger.info(
+                                "Filtered KV patch slots against live request blocks: "
+                                "rank=%s patch_id=%s original_slots=%s kept_slots=%s "
+                                "dropped_slots=%s live_blocks=%s stored_tokens=%s",
+                                rank, patch_id, original_slot_count,
+                                len(filtered_slot_mapping), dropped_slots,
+                                len(live_blocks_for_patch), stored_tokens)
+                            if _autoscaling_kvcached_debug_enabled():
+                                if _autoscaling_kvcached_debug_verbose():
+                                    logger.warning(
+                                        "[KVCACHED_MIGRATION_PATCH_TRACE] "
+                                        "sender_rank=%s target_rank=%s patch_id=%s "
+                                        "phase=filtered original_slots=%s kept_slots=%s "
+                                        "dropped_slots=%s block_size=%s "
+                                        "kept_blocks=%s dropped_blocks=%s "
+                                        "stored_tokens=%s is_finished=%s",
+                                        self.rank, rank, patch_id,
+                                        original_slot_count,
+                                        len(filtered_slot_mapping),
+                                        dropped_slots, block_size, kept_blocks,
+                                        dropped_blocks, stored_tokens,
+                                        is_finished)
+                                else:
+                                    logger.warning(
+                                        "[KVCACHED_MIGRATION_PATCH_TRACE] "
+                                        "sender_rank=%s target_rank=%s patch_id=%s "
+                                        "phase=filtered original_slots=%s kept_slots=%s "
+                                        "dropped_slots=%s block_size=%s "
+                                        "kept_blocks_count=%s sample_kept_blocks=%s "
+                                        "dropped_blocks_count=%s sample_dropped_blocks=%s "
+                                        "stored_tokens=%s is_finished=%s",
+                                        self.rank, rank, patch_id,
+                                        original_slot_count,
+                                        len(filtered_slot_mapping),
+                                        dropped_slots, block_size,
+                                        len(kept_blocks), kept_blocks[:64],
+                                        len(dropped_blocks),
+                                        dropped_blocks[:64], stored_tokens,
+                                        is_finished)
+                            slot_mapping = filtered_slot_mapping
+                            if snapshot is not None:
+                                snapshot.replace_slots(filtered_slot_mapping)
+
+                    if is_finished and not slot_mapping:
+                        dtype = torch.bfloat16
+                        if kv_cache:
+                            dtype = kv_cache[0][0].dtype
+                        slot_mapping_dev = torch.empty(0,
+                                                       device=self.device,
+                                                       dtype=torch.int64)
+                        kv_out = torch.empty(
+                            2,
+                            len(layer_ids),
+                            0,
+                            self.num_heads,
+                            self.head_size,
+                            dtype=dtype,
+                            device=self.device)
+                        empty_patch = KVPatch(
+                            KVPatchMeta(
+                                type='kv_patch_finished',
+                                id=patch_id,
+                                layer_ids=layer_ids,
+                                num_tokens=0,
+                                slot_mapping_dtype=torch.int64,
+                                slot_mapping_shape=slot_mapping_dev.shape,
+                                kv_payload_dtype=kv_out.dtype,
+                                kv_payload_shape=kv_out.shape,
+                                scheduler_trace=scheduler_trace,
+                            ),
+                            kv_out,
+                            slot_mapping_dev,
+                        )
+                    elif not slot_mapping:
+                        dtype = torch.bfloat16
+                        device = self.device
+                        if kv_cache:
+                            dtype = kv_cache[0][0].dtype
+                            device = kv_cache[0][0].device
+                        slot_mapping_dev = torch.empty(0,
+                                                       device=device,
+                                                       dtype=torch.int64)
+                        kv_out = torch.empty(
+                            2,
+                            len(layer_ids),
+                            0,
+                            self.num_heads,
+                            self.head_size,
+                            dtype=dtype,
+                            device=device)
+                        empty_patch = KVPatch(
+                            KVPatchMeta(
+                                type='kv_patch_meta',
+                                id=patch_id,
+                                layer_ids=layer_ids,
+                                num_tokens=0,
+                                slot_mapping_dtype=torch.int64,
+                                slot_mapping_shape=slot_mapping_dev.shape,
+                                kv_payload_dtype=kv_out.dtype,
+                                kv_payload_shape=kv_out.shape,
+                                scheduler_trace=scheduler_trace,
+                            ),
+                            kv_out,
+                            slot_mapping_dev,
+                        )
+                    else:
+                        if (_autoscaling_kvcached_debug_enabled()
+                                and block_size is not None and block_size > 0):
+                            patch_blocks = _blocks_from_slots(slot_mapping,
+                                                              block_size)
+                            if _autoscaling_kvcached_debug_verbose():
+                                logger.warning(
+                                    "[KVCACHED_MIGRATION_GATHER_TRACE] rank=%s "
+                                    "target=%s phase=patch_gather patch_id=%s "
+                                    "slot_count=%s block_size=%s blocks=%s "
+                                    "stored_tokens=%s is_finished=%s scheduler_trace=%s",
+                                    self.rank, rank, patch_id,
+                                    len(slot_mapping), block_size,
+                                    patch_blocks, stored_tokens, is_finished,
+                                    scheduler_trace)
+                            else:
+                                logger.warning(
+                                    "[KVCACHED_MIGRATION_GATHER_TRACE] rank=%s "
+                                    "target=%s phase=patch_gather patch_id=%s "
+                                    "slot_count=%s block_size=%s blocks_count=%s "
+                                    "sample_blocks=%s stored_tokens=%s is_finished=%s "
+                                    "scheduler_trace=%s",
+                                    self.rank, rank, patch_id,
+                                    len(slot_mapping), block_size,
+                                    len(patch_blocks), patch_blocks[:64],
+                                    stored_tokens, is_finished,
+                                    scheduler_trace)
+
+                        if (use_kvcached_backend() and block_size is not None
+                                and block_size > 0):
+                            guard_kvcached_vmm_slots_mapped(
+                                "migration_patch_gather_snapshot:"
+                                f"target={rank}:patch={patch_id}:"
+                                f"trace={scheduler_trace}",
+                                self,
+                                slot_mapping,
+                                int(block_size),
+                                layer_ids=[
+                                    int(layer_id) for layer_id in layer_ids
+                                ],
+                                rank=self.rank,
+                                trace_info=scheduler_trace,
+                            )
+                        slot_mapping_dev = torch.tensor(slot_mapping,
+                                                        dtype=torch.int64)
+                        kv_patch = self.kv_helper.extract_kv_patch_from_kv_cache(
+                            patch_id=patch_id,
+                            kv_caches=kv_cache,
+                            layer_ids=layer_ids,
+                            start_layer_id=start_layer_id,
+                            slot_mapping=slot_mapping_dev,
+                            is_finished=is_finished,
+                            slot_mapping_already_valid=True,
+                        )
+                        self._sync_kvcached_stream("regular KV patch gather")
+                        kv_patch.meta.num_tokens = (
+                            snapshot.meta_num_tokens()
+                            if snapshot is not None else stored_tokens)
+                        kv_patch.meta.scheduler_trace = scheduler_trace
+                        self._register_kvcached_outbound_patch_snapshot_locked(
+                            kv_patch, block_size)
+                finally:
+                    if snapshot is not None:
+                        snapshot.release()
+            if empty_patch is not None:
+                yield empty_patch
+                self.last_patch_ids[rank] += 1
+                if is_finished:
+                    self.kv_cache_transfer_in_process[rank] = False
+                    self.kv_patch_sending = False
+                    self.last_patch_ids[rank] = 0
+                    break
+                continue
+            assert kv_patch is not None
             yield kv_patch
             self.last_patch_ids[rank] += 1
             if is_finished: 
@@ -1674,6 +2151,7 @@ class DynamicKVSynchronizer():
                         logger.info(f"sent kv payload to rank {target_rank}, patch id: {meta.id}, shape:{kv_payload.shape}")
                     finally:
                         nccl_lock.release()
+                self._wait_kv_patch_applied_ack(target_rank, meta.id)
                 break  # Success, exit loop
             elif response == "REJECT":
                 logger.info(f"received REJECT from rank {target_rank}, retry in 5ms")
@@ -1844,8 +2322,9 @@ class DynamicKVSynchronizer():
         is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
         for rank in self.last_patch_ids:
             if is_flexi:
-                self.slot_mappings[rank].add_slot_mappings(
-                    [], is_finished=True, num_total_new_tokens=0)
+                with self.kvcached_page_lifetime_context():
+                    self.slot_mappings[rank].add_slot_mappings(
+                        [], is_finished=True, num_total_new_tokens=0)
             else:
                 meta = KVPatchMeta(
                     type='kv_patch_finished',
@@ -1871,11 +2350,12 @@ class DynamicKVSynchronizer():
         slot_mapping_list = (slot_mapping.tolist()
                              if isinstance(slot_mapping, torch.Tensor)
                              else slot_mapping)
-        self.slot_mappings[rank].add_slot_mappings(
-            slot_mapping_list,
-            is_finished=is_finished,
-            num_total_new_tokens=num_total_new_tokens,
-            trace_info=trace_info)
+        with self.kvcached_page_lifetime_context():
+            self.slot_mappings[rank].add_slot_mappings(
+                slot_mapping_list,
+                is_finished=is_finished,
+                num_total_new_tokens=num_total_new_tokens,
+                trace_info=trace_info)
 
 
     # ########################################## #
@@ -2056,6 +2536,35 @@ class DynamicKVSynchronizer():
 
         return slot_mapping, kv_payload
 
+    def notify_kv_patch_applied(
+        self,
+        from_rank: int,
+        patch_id: int,
+    ) -> None:
+        pipe = self._pair_pipes_recv[from_rank]
+        pipe.signal_group.send_obj({
+            "type": "PATCH_APPLIED",
+            "id": int(patch_id),
+        }, dst=pipe.peer_rank)
+
+    def _wait_kv_patch_applied_ack(
+        self,
+        target_rank: int,
+        patch_id: int,
+    ) -> None:
+        pipe = self._pair_pipes_send[target_rank]
+        response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
+        if (not isinstance(response, dict)
+                or response.get("type") != "PATCH_APPLIED"
+                or int(response.get("id", -1)) != int(patch_id)):
+            raise RuntimeError(
+                "Unexpected KV patch apply acknowledgement: "
+                f"target_rank={target_rank}, patch_id={patch_id}, "
+                f"response={response}")
+        logger.info(
+            "received PATCH_APPLIED from rank %s for patch id %s",
+            target_rank, patch_id)
+
     # def put_kv_patch_to_buffer(self, rank: int, kv_caches: list[torch.Tensor], layer_ids: list[int], start_layer_id: int, slot_mapping: torch.Tensor) -> None:
     #     time_start = time.time()
     #     kv_patch = self.kv_synchronizer_helper.extract_kv_patch_from_kv_cache(self.last_patch_ids[rank], kv_caches, layer_ids, start_layer_id, slot_mapping)
@@ -2080,11 +2589,36 @@ class DynamicKVSynchronizer():
             key_cache_ptrs: Optional[list[int]] = None,
             value_cache_ptrs: Optional[list[int]] = None,
     ) -> int:
-        keys = kv_payload[0]
-        values = kv_payload[1]
         logger.info(f"apply one patch with id {meta.id}, num_tokens: {meta.num_tokens}")
         # slot_mapping 已经被裁剪过，只包含有效的 token
         is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
+        if use_kvcached_backend() and slot_mapping.numel() > 0:
+            patch_block_size: Optional[int] = None
+            if is_flexi:
+                if page_meta is not None and page_meta.dim() > 0:
+                    patch_block_size = int(page_meta.size(0))
+            elif meta.layer_ids:
+                first_local_layer_id = int(meta.layer_ids[0]) - start_layer_id
+                if (0 <= first_local_layer_id
+                        < len(getattr(self, "kv_caches", []))):
+                    first_kv_cache = self.kv_caches[first_local_layer_id]
+                    if first_kv_cache.dim() >= 3:
+                        patch_block_size = int(first_kv_cache.size(2))
+            if patch_block_size is not None and patch_block_size > 0:
+                slot_mapping, kv_payload, dropped_tokens = (
+                    self.filter_kvcached_patch_tensors_for_live_blocks(
+                        slot_mapping,
+                        kv_payload,
+                        patch_block_size,
+                        reason=(
+                            f"patch_apply:patch={meta.id}:"
+                            f"layers={meta.layer_ids}")))
+                if dropped_tokens:
+                    meta.num_tokens = int(slot_mapping.numel())
+                    meta.slot_mapping_shape = slot_mapping.shape
+                    meta.kv_payload_shape = kv_payload.shape
+        keys = kv_payload[0]
+        values = kv_payload[1]
         # assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
         if slot_mapping.size(0) != meta.num_tokens:
             logger.info(f"Warning: slot_mapping size {slot_mapping.size(0)} does not match num_tokens {meta.num_tokens}, proceed anyway.")
