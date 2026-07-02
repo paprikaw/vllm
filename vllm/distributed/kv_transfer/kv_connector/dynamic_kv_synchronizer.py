@@ -73,6 +73,93 @@ def _blocks_from_slots(slot_mapping: Union[torch.Tensor, list[int]],
     })
 
 
+def _shape_tuple(shape: Any) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in shape)
+
+
+def _kv_signal_identity(
+    meta: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta,
+                KVCachedSparseKVTensorMeta],
+) -> dict[str, Any]:
+    if isinstance(meta, KVPatchMeta):
+        return {
+            "phase": "kv_patch",
+            "meta_type": meta.type,
+            "patch_id": int(meta.id),
+            "layer_ids": tuple(int(layer_id) for layer_id in meta.layer_ids),
+            "num_tokens": int(meta.num_tokens),
+            "slot_mapping_shape": _shape_tuple(meta.slot_mapping_shape),
+            "kv_payload_shape": _shape_tuple(meta.kv_payload_shape),
+        }
+    if isinstance(meta, KVTensorMeta):
+        return {
+            "phase": "kv_tensor",
+            "meta_type": meta.type,
+            "layer_id": int(meta.layer_id),
+            "layers": tuple(sorted(int(layer_id)
+                                   for layer_id in meta.layer_to_be_received)),
+            "num_tokens": int(meta.num_tokens),
+            "kv_payload_shape": _shape_tuple(meta.shape),
+        }
+    return {
+        "phase": "kv_tensor",
+        "meta_type": meta.type,
+        "layer_id": int(meta.layer_id),
+        "layers": tuple(sorted(int(layer_id)
+                               for layer_id in meta.layer_to_be_received)),
+        "num_tokens": int(meta.num_tokens),
+        "slot_mapping_shape": _shape_tuple(meta.slot_mapping_shape),
+        "kv_payload_shape": _shape_tuple(meta.kv_payload_shape),
+    }
+
+
+def _kv_transfer_signal(
+    status: Literal["ACCEPT", "REJECT"],
+    meta: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta,
+                KVCachedSparseKVTensorMeta],
+) -> dict[str, Any]:
+    signal = {
+        "type": "KV_TRANSFER_SIGNAL",
+        "status": status,
+    }
+    signal.update(_kv_signal_identity(meta))
+    return signal
+
+
+def _kv_signal_matches(
+    response: Any,
+    status: Literal["ACCEPT", "REJECT"],
+    meta: Union[KVTensorMeta, KVPatchMeta, FlexiKVTensorMeta,
+                KVCachedSparseKVTensorMeta],
+) -> bool:
+    if response == status:
+        return True
+    if not isinstance(response, dict):
+        return False
+    if response.get("type") != "KV_TRANSFER_SIGNAL":
+        return False
+    if response.get("status") != status:
+        return False
+    identity = _kv_signal_identity(meta)
+    return all(response.get(key) == value for key, value in identity.items())
+
+
+def _kv_patch_ready_signal() -> dict[str, str]:
+    return {
+        "type": "KV_TRANSFER_SIGNAL",
+        "status": "READY",
+        "phase": "kv_patch_ready",
+    }
+
+
+def _kv_patch_ready_matches(response: Any) -> bool:
+    return (response == "ack"
+            or (isinstance(response, dict)
+                and response.get("type") == "KV_TRANSFER_SIGNAL"
+                and response.get("status") == "READY"
+                and response.get("phase") == "kv_patch_ready"))
+
+
 # ===================== Pydantic models for control metadata =====================
 class KVPatchBuffer:
     def __init__(self, size: int):
@@ -201,65 +288,6 @@ class KVSlotSnapshot:
             return
         self._released = True
         self._owner.release_snapshot(self.snapshot_id)
-
-
-class KVOutboundPatchSnapshot:
-    """Materialized outbound patch kept invalidatable until send completes."""
-
-    def __init__(
-        self,
-        snapshot_id: int,
-        kv_patch: KVPatch,
-        block_size: int,
-    ) -> None:
-        self.snapshot_id = snapshot_id
-        self.kv_patch = kv_patch
-        self.block_size = int(block_size)
-        self.dropped_slots = 0
-
-    def clear_slots_for_blocks(
-        self,
-        block_ids: list[int],
-    ) -> dict[str, int]:
-        slot_mapping = self.kv_patch.slot_mapping
-        kv_payload = self.kv_patch.kv_payload
-        if (self.block_size <= 0 or not block_ids
-                or slot_mapping is None or slot_mapping.numel() == 0):
-            return {
-                "cleared_slots": 0,
-                "remaining_slots": (
-                    0 if slot_mapping is None else int(slot_mapping.numel())),
-            }
-
-        block_id_set = {int(block_id) for block_id in block_ids}
-        slot_values = [int(slot) for slot in slot_mapping.detach().cpu().tolist()]
-        keep_indices = [
-            idx for idx, slot in enumerate(slot_values)
-            if slot < 0 or slot // self.block_size not in block_id_set
-        ]
-        cleared_slots = len(slot_values) - len(keep_indices)
-        if cleared_slots <= 0:
-            return {
-                "cleared_slots": 0,
-                "remaining_slots": len(slot_values),
-            }
-
-        index = torch.tensor(keep_indices,
-                             dtype=torch.long,
-                             device=slot_mapping.device)
-        payload_index = index.to(kv_payload.device, non_blocking=True)
-        token_dim = 2 if kv_payload.dim() >= 5 else 1
-        self.kv_patch.slot_mapping = slot_mapping.index_select(0, index)
-        self.kv_patch.kv_payload = kv_payload.index_select(
-            token_dim, payload_index)
-        self.kv_patch.meta.num_tokens = int(self.kv_patch.slot_mapping.numel())
-        self.kv_patch.meta.slot_mapping_shape = self.kv_patch.slot_mapping.shape
-        self.kv_patch.meta.kv_payload_shape = self.kv_patch.kv_payload.shape
-        self.dropped_slots += cleared_slots
-        return {
-            "cleared_slots": cleared_slots,
-            "remaining_slots": int(self.kv_patch.slot_mapping.numel()),
-        }
 
 
 class KVSlotMapping:
@@ -513,13 +541,20 @@ class PairPipe:
 
     def wait_ready_for_kv_patch(self) -> None:
         logger.info(f"[PairPipe.wait_ready_for_kv_patch] Waiting for ready signal from peer {self.peer_rank}")
-        obj = self.signal_group.recv_obj(src=self.peer_rank)
-        assert obj == "ack", f"Expected 'ack' but got {obj}"
+        while True:
+            obj = self.signal_group.recv_obj(src=self.peer_rank)
+            if _kv_patch_ready_matches(obj):
+                return
+            logger.warning(
+                "[PairPipe.wait_ready_for_kv_patch] Ignoring stale signal "
+                "while waiting for patch-ready from peer %s: %s",
+                self.peer_rank, obj)
         return
 
     def notify_ready_for_kv_patch(self) -> None:
         logger.info(f"[PairPipe.notify_ready_for_kv_patch] Notifying peer {self.peer_rank} that ready")
-        self.signal_group.send_obj("ack", dst=self.peer_rank)
+        self.signal_group.send_obj(_kv_patch_ready_signal(),
+                                   dst=self.peer_rank)
         return
 
     def send_data(self, tensor: torch.Tensor, stream=None, wait_for_ack: bool = False) -> None:
@@ -578,7 +613,8 @@ class PairPipe:
                   shape: torch.Size,
                   stream=None,
                   send_ack: bool = False,
-                  synchronize: bool = True) -> torch.Tensor:
+                  synchronize: bool = True,
+                  recv_buffer: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Data-plane receive: allocate buffer and perform NCCL recv.
 
         Protocol for deadlock prevention:
@@ -602,7 +638,14 @@ class PairPipe:
         time_start = time.time()
         if self.is_use_nccl:
             assert self._nccl is not None, "The nccl communicator should be initialized"
-            buf = self._prepare_recv_buffer(dtype, shape)
+            if recv_buffer is None:
+                buf = self._prepare_recv_buffer(dtype, shape)
+            else:
+                assert tuple(recv_buffer.shape) == tuple(shape), (
+                    f"recv buffer shape {recv_buffer.shape} does not match {shape}")
+                assert recv_buffer.dtype == dtype, (
+                    f"recv buffer dtype {recv_buffer.dtype} does not match {dtype}")
+                buf = recv_buffer
             logger.info(f"[PairPipe.recv_data] Buffer prepared, calling NCCL recv, nccl_rank={self._nccl.rank}, peer_rank={self.peer_rank}")
             # Protocol: acquire lock BEFORE sending ACK, then recv within lock
             logger.info(f"[PairPipe.recv_data] Acquiring NCCL lock before sending ACK")
@@ -711,10 +754,6 @@ class DynamicKVSynchronizer():
         self.sending_synchronizer_lock = threading.Lock()
         self.recv_synchronizer_lock = threading.Lock()
         self._kvcached_page_lifetime_lock = threading.RLock()
-        self._next_outbound_patch_snapshot_id = 0
-        self._active_outbound_patch_snapshots: dict[
-            int, KVOutboundPatchSnapshot] = {}
-        self._outbound_patch_snapshot_ids_by_object: dict[int, int] = {}
         self._kvcached_invalidated_block_ids: set[int] = set()
         
         # NCCL lock to prevent deadlock between KV synchronizer and Ray compiled_dag
@@ -756,63 +795,6 @@ class DynamicKVSynchronizer():
 
     def kvcached_page_lifetime_context(self) -> threading.RLock:
         return self._kvcached_page_lifetime_lock
-
-    def _register_kvcached_outbound_patch_snapshot_locked(
-        self,
-        kv_patch: KVPatch,
-        block_size: Optional[int],
-    ) -> None:
-        if (not use_kvcached_backend() or block_size is None
-                or int(block_size) <= 0):
-            return
-        slot_mapping = kv_patch.slot_mapping
-        if slot_mapping is None or slot_mapping.numel() == 0:
-            return
-        snapshot_id = self._next_outbound_patch_snapshot_id
-        self._next_outbound_patch_snapshot_id += 1
-        self._active_outbound_patch_snapshots[snapshot_id] = (
-            KVOutboundPatchSnapshot(snapshot_id, kv_patch, int(block_size)))
-        self._outbound_patch_snapshot_ids_by_object[id(kv_patch)] = snapshot_id
-
-    def release_kvcached_outbound_patch_snapshot(
-        self,
-        kv_patch: KVPatch,
-    ) -> None:
-        if not use_kvcached_backend():
-            return
-        with self.kvcached_page_lifetime_context():
-            snapshot_id = self._outbound_patch_snapshot_ids_by_object.pop(
-                id(kv_patch), None)
-            if snapshot_id is None:
-                return
-            snapshot = self._active_outbound_patch_snapshots.pop(
-                snapshot_id, None)
-            if snapshot is not None and snapshot.dropped_slots:
-                logger.info(
-                    "[KVCACHED_MIGRATION_BITMAP_TRACE] "
-                    "phase=outbound_patch_release rank=%s snapshot_id=%s "
-                    "dropped_slots=%s remaining_slots=%s",
-                    self.rank, snapshot_id, snapshot.dropped_slots,
-                    int(snapshot.kv_patch.slot_mapping.numel()))
-
-    def _clear_outbound_patch_snapshots_for_blocks_locked(
-        self,
-        block_ids: list[int],
-    ) -> dict[str, int]:
-        cleared_slots = 0
-        touched_snapshots = 0
-        for snapshot in list(self._active_outbound_patch_snapshots.values()):
-            stats = snapshot.clear_slots_for_blocks(block_ids)
-            snapshot_cleared = int(stats.get("cleared_slots", 0))
-            if snapshot_cleared:
-                touched_snapshots += 1
-                cleared_slots += snapshot_cleared
-        return {
-            "cleared_slots": cleared_slots,
-            "touched_snapshots": touched_snapshots,
-            "active_outbound_snapshots":
-            len(self._active_outbound_patch_snapshots),
-        }
 
     def _kvcached_offsets_to_pages_and_blocks(
         self,
@@ -911,45 +893,58 @@ class DynamicKVSynchronizer():
                 dropped_blocks[:64])
         return kept
 
-    def filter_kvcached_patch_tensors_for_live_blocks(
+    def kvcached_patch_apply_ranges_for_live_blocks_locked(
         self,
         slot_mapping: torch.Tensor,
-        kv_payload: torch.Tensor,
         block_size: int,
         reason: str = "",
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Drop incoming patch tokens whose target blocks were unmapped."""
+    ) -> tuple[list[tuple[int, int]], int]:
+        """Return contiguous token ranges that skip invalidated blocks.
+
+        Caller must hold the KVCacheD page lifetime lock until the selected
+        slots have been written and the write stream has been synchronized.
+        """
+        full_range = (
+            [(0, int(slot_mapping.numel()))]
+            if slot_mapping is not None and slot_mapping.numel() > 0 else [])
         if (not use_kvcached_backend() or slot_mapping is None
                 or slot_mapping.numel() == 0):
-            return slot_mapping, kv_payload, 0
+            return full_range, 0
         block_size = int(block_size)
         if block_size <= 0:
-            return slot_mapping, kv_payload, 0
+            return full_range, 0
 
-        with self.kvcached_page_lifetime_context():
-            invalidated = set(self._kvcached_invalidated_block_ids)
-            if not invalidated:
-                return slot_mapping, kv_payload, 0
-            slot_values = [
-                int(slot) for slot in slot_mapping.detach().cpu().tolist()
-            ]
-            keep_indices = [
-                idx for idx, slot in enumerate(slot_values)
-                if slot < 0 or slot // block_size not in invalidated
-            ]
+        invalidated = set(self._kvcached_invalidated_block_ids)
+        if not invalidated:
+            return full_range, 0
+        slot_values = [
+            int(slot) for slot in slot_mapping.detach().cpu().tolist()
+        ]
+        keep_indices = [
+            idx for idx, slot in enumerate(slot_values)
+            if slot < 0 or slot // block_size not in invalidated
+        ]
 
         dropped = len(slot_values) - len(keep_indices)
         if dropped <= 0:
-            return slot_mapping, kv_payload, 0
+            return full_range, 0
 
-        index = torch.tensor(keep_indices,
-                             dtype=torch.long,
-                             device=slot_mapping.device)
-        payload_index = index.to(kv_payload.device, non_blocking=True)
-        token_dim = 2 if kv_payload.dim() >= 5 else 1
-        filtered_slot_mapping = slot_mapping.index_select(0, index)
-        filtered_kv_payload = kv_payload.index_select(token_dim,
-                                                      payload_index)
+        ranges: list[tuple[int, int]] = []
+        range_start: Optional[int] = None
+        prev_idx: Optional[int] = None
+        for idx in keep_indices:
+            if range_start is None:
+                range_start = idx
+                prev_idx = idx
+            elif prev_idx is not None and idx == prev_idx + 1:
+                prev_idx = idx
+            else:
+                ranges.append((range_start, int(prev_idx) + 1))
+                range_start = idx
+                prev_idx = idx
+        if range_start is not None and prev_idx is not None:
+            ranges.append((range_start, int(prev_idx) + 1))
+
         dropped_blocks = sorted({
             slot // block_size
             for slot in slot_values
@@ -957,13 +952,13 @@ class DynamicKVSynchronizer():
         })
         logger.info(
             "[KVCACHED_MIGRATION_BITMAP_TRACE] "
-            "phase=incoming_patch_filter rank=%s reason=%s "
+            "phase=incoming_patch_apply_skip rank=%s reason=%s "
             "original_slots=%d kept_slots=%d dropped_slots=%d "
-            "sample_blocks=%s",
+            "ranges=%d sample_blocks=%s",
             self.rank, reason, len(slot_values),
-            int(filtered_slot_mapping.numel()), dropped,
+            sum(end - start for start, end in ranges), dropped, len(ranges),
             dropped_blocks[:64])
-        return filtered_slot_mapping, filtered_kv_payload, dropped
+        return ranges, dropped
 
     def create_slot_mappings(self, num_block: int) -> None:
         """Initialize slot mapping for each peer rank.
@@ -999,7 +994,6 @@ class DynamicKVSynchronizer():
         page_ids, block_ids = self._kvcached_offsets_to_pages_and_blocks(
             offsets)
         total_cleared = 0
-        outbound_stats: dict[str, int] = {}
         per_peer: dict[int, dict[str, int]] = {}
         with self.kvcached_page_lifetime_context():
             self._kvcached_invalidated_block_ids.update(block_ids)
@@ -1009,26 +1003,21 @@ class DynamicKVSynchronizer():
                 if stats.get("cleared_slots", 0):
                     per_peer[int(peer)] = stats
                     total_cleared += int(stats["cleared_slots"])
-            outbound_stats = (
-                self._clear_outbound_patch_snapshots_for_blocks_locked(
-                    block_ids))
-            total_cleared += int(outbound_stats.get("cleared_slots", 0))
 
         if total_cleared:
             logger.info(
                 "[KVCACHED_MIGRATION_BITMAP_TRACE] phase=pre_unmap_clear "
                 "rank=%s group_id=%s reason=%s offsets=%d pages=%d "
-                "blocks=%d cleared_slots=%d peers=%s outbound=%s "
+                "blocks=%d cleared_slots=%d peers=%s "
                 "sample_pages=%s sample_blocks=%s",
                 self.rank, group_id, reason, len(offsets), len(page_ids),
-                len(block_ids), total_cleared, per_peer, outbound_stats,
-                page_ids[:64], block_ids[:64])
+                len(block_ids), total_cleared, per_peer, page_ids[:64],
+                block_ids[:64])
         return {
             "pages": len(page_ids),
             "blocks": len(block_ids),
             "cleared_slots": total_cleared,
             "peers": per_peer,
-            "outbound": outbound_stats,
         }
 
     def drop_slots_for_kvcached_unmapped_offsets(
@@ -1192,12 +1181,15 @@ class DynamicKVSynchronizer():
     def _recv_slot_mapping_from_rank(self, rank: int,
                                      dtype: torch.dtype,
                                      shape: torch.Size,
-                                     synchronize: bool = True) -> torch.Tensor:
+                                     synchronize: bool = True,
+                                     recv_buffer: Optional[torch.Tensor] = None
+                                     ) -> torch.Tensor:
         pipe = self._ensure_pipe_and_buffer(rank, 'recv')
         pipe = self._pair_pipes_recv[rank]
         slot_mapping = self._recv_data_from_rank(rank, dtype, shape,
                                                  send_ack=False,
-                                                 synchronize=synchronize)
+                                                 synchronize=synchronize,
+                                                 recv_buffer=recv_buffer)
         assert tuple(slot_mapping.shape) == tuple(shape), (
             f"slot_mapping shape {slot_mapping.shape} does not match {shape}")
         logger.info("[slot_mapping_nccl]: received slot mapping from rank %s, "
@@ -1220,7 +1212,9 @@ class DynamicKVSynchronizer():
                                dtype: torch.dtype,
                                shape: torch.Size,
                                send_ack: bool = False,
-                               synchronize: bool = True) -> torch.Tensor:
+                               synchronize: bool = True,
+                               recv_buffer: Optional[torch.Tensor] = None
+                               ) -> torch.Tensor:
         """Given previously received metadata, receive tensor payload via NCCL.
 
         Args:
@@ -1239,7 +1233,8 @@ class DynamicKVSynchronizer():
             return pipe.recv_data(dtype, shape,
                                   stream=stream,
                                   send_ack=send_ack,
-                                  synchronize=synchronize)
+                                  synchronize=synchronize,
+                                  recv_buffer=recv_buffer)
 
     def get_recv_pipe(self, rank: int) -> PairPipe:
         self._ensure_pipe_and_buffer(rank, 'recv')
@@ -1527,8 +1522,6 @@ class DynamicKVSynchronizer():
                         kv_out,
                         slot_mapping_dev,
                     )
-                    self._register_kvcached_outbound_patch_snapshot_locked(
-                        kv_patch, patch_block_size)
                 finally:
                     if snapshot is not None:
                         snapshot.release()
@@ -1767,8 +1760,6 @@ class DynamicKVSynchronizer():
                             snapshot.meta_num_tokens()
                             if snapshot is not None else stored_tokens)
                         kv_patch.meta.scheduler_trace = scheduler_trace
-                        self._register_kvcached_outbound_patch_snapshot_locked(
-                            kv_patch, block_size)
                 finally:
                     if snapshot is not None:
                         snapshot.release()
@@ -2062,9 +2053,18 @@ class DynamicKVSynchronizer():
             self._send_meta_to_rank(rank, kv_tensor_meta)
             logger.info(f"[send_kv_tensor_to_rank]: sent meta to rank {rank}, waiting for ACCEPT/REJECT")
 
-            response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
+            while True:
+                response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
+                if (_kv_signal_matches(response, "ACCEPT", kv_tensor_meta)
+                        or _kv_signal_matches(response, "REJECT",
+                                              kv_tensor_meta)):
+                    break
+                logger.warning(
+                    "[send_kv_tensor_to_rank]: ignoring stale or mismatched "
+                    "signal from rank %s for current meta %s: %s",
+                    rank, _kv_signal_identity(kv_tensor_meta), response)
 
-            if response == "ACCEPT":
+            if _kv_signal_matches(response, "ACCEPT", kv_tensor_meta):
                 logger.info(f"[send_kv_tensor_to_rank]: received ACCEPT from rank {rank}")
                 execution_context = (cuda_op_lock if cuda_op_lock is not None
                                      else nullcontext())
@@ -2084,11 +2084,11 @@ class DynamicKVSynchronizer():
                             self._send_data_to_rank(rank, kv_tensor,
                                                     wait_for_ack=False,
                                                     wait_current_stream=False)
-                            logger.info(f"[send_kv_tensor_to_rank]: sent kv tensor to rank {rank}")
+                        logger.info(f"[send_kv_tensor_to_rank]: sent kv tensor to rank {rank}")
                     finally:
                         nccl_lock.release()
                 break  # Success
-            elif response == "REJECT":
+            elif _kv_signal_matches(response, "REJECT", kv_tensor_meta):
                 logger.info(f"[send_kv_tensor_to_rank]: received REJECT from rank {rank}, retry in 5ms")
                 should_retry = True
             else:
@@ -2130,9 +2130,17 @@ class DynamicKVSynchronizer():
             self._send_meta_to_rank(target_rank, meta)
             logger.info(f"sent meta to rank {target_rank}, patch id: {meta.id}, waiting for ACCEPT/REJECT")
 
-            response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
+            while True:
+                response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
+                if (_kv_signal_matches(response, "ACCEPT", meta)
+                        or _kv_signal_matches(response, "REJECT", meta)):
+                    break
+                logger.warning(
+                    "send_kv_patch_to_rank: ignoring stale or mismatched "
+                    "signal from rank %s for current meta %s: %s",
+                    target_rank, _kv_signal_identity(meta), response)
 
-            if response == "ACCEPT":
+            if _kv_signal_matches(response, "ACCEPT", meta):
                 logger.info(f"received ACCEPT from rank {target_rank}, sending data")
                 execution_context = (cuda_op_lock if cuda_op_lock is not None
                                      else nullcontext())
@@ -2153,7 +2161,7 @@ class DynamicKVSynchronizer():
                         nccl_lock.release()
                 self._wait_kv_patch_applied_ack(target_rank, meta.id)
                 break  # Success, exit loop
-            elif response == "REJECT":
+            elif _kv_signal_matches(response, "REJECT", meta):
                 logger.info(f"received REJECT from rank {target_rank}, retry in 5ms")
                 should_retry = True
             else:
@@ -2406,11 +2414,25 @@ class DynamicKVSynchronizer():
 
                 if lock_acquired:
                     try:
-                        # Step 4: Lock acquired - serialize against local PP forward,
-                        # then send ACCEPT and recv.
+                        if isinstance(current_meta, (FlexiKVTensorMeta,
+                                                     KVCachedSparseKVTensorMeta)):
+                            slot_mapping_buffer = pipe._prepare_recv_buffer(
+                                current_meta.slot_mapping_dtype,
+                                current_meta.slot_mapping_shape)
+                            kv_payload_buffer = pipe._prepare_recv_buffer(
+                                current_meta.kv_payload_dtype,
+                                current_meta.kv_payload_shape)
+                        else:
+                            slot_mapping_buffer = None
+                            kv_payload_buffer = pipe._prepare_recv_buffer(
+                                current_meta.dtype, current_meta.shape)
+
+                        # Step 4: Lock acquired and buffers prepared. Only now
+                        # tell the sender it can enqueue NCCL sends.
                         time_lock_acquired = time.time()
-                        pipe.signal_group.send_obj("ACCEPT",
-                                                   dst=pipe.peer_rank)
+                        pipe.signal_group.send_obj(
+                            _kv_transfer_signal("ACCEPT", current_meta),
+                            dst=pipe.peer_rank)
                         logger.info(
                             "recv_kv_tensor: lock acquired in %ss, sent ACCEPT",
                             time_lock_acquired - time_start)
@@ -2419,17 +2441,20 @@ class DynamicKVSynchronizer():
                                                      KVCachedSparseKVTensorMeta)):
                             slot_mapping = self._recv_slot_mapping_from_rank(
                                 from_rank, current_meta.slot_mapping_dtype,
-                                current_meta.slot_mapping_shape)
+                                current_meta.slot_mapping_shape,
+                                recv_buffer=slot_mapping_buffer)
                             logger.info(f"recv_kv_tensor: received slot mapping, took {time.time() - time_start}s")
                             kv_payload = self._recv_data_from_rank(
                                 from_rank, current_meta.kv_payload_dtype,
                                 current_meta.kv_payload_shape, send_ack=False,
-                                synchronize=True)
+                                synchronize=True,
+                                recv_buffer=kv_payload_buffer)
                             logger.info(f"recv_kv_tensor: received kv payload, took {time.time() - time_start}s")
                         else:
                             kv_payload = self._recv_data_from_rank(
                                 from_rank, current_meta.dtype,
-                                current_meta.shape, send_ack=False)
+                                current_meta.shape, send_ack=False,
+                                recv_buffer=kv_payload_buffer)
                             slot_mapping = None
                     finally:
                         nccl_lock.release()
@@ -2438,7 +2463,9 @@ class DynamicKVSynchronizer():
             if not lock_acquired:
                 # Step 3: Lock held by others - send REJECT immediately
                 logger.info(f"recv_kv_tensor: lock held by others, sending REJECT")
-                pipe.signal_group.send_obj("REJECT", dst=pipe.peer_rank)
+                pipe.signal_group.send_obj(
+                    _kv_transfer_signal("REJECT", current_meta),
+                    dst=pipe.peer_rank)
                 # Sender will backoff and resend meta, we need to receive it
                 new_meta = self.recv_controller(from_rank)
                 assert isinstance(
@@ -2492,22 +2519,32 @@ class DynamicKVSynchronizer():
 
                 if lock_acquired:
                     try:
-                        # Step 4: Lock acquired - serialize against local PP forward,
-                        # then send ACCEPT and recv.
+                        slot_mapping_buffer = pipe._prepare_recv_buffer(
+                            current_meta.slot_mapping_dtype,
+                            current_meta.slot_mapping_shape)
+                        kv_payload_buffer = pipe._prepare_recv_buffer(
+                            current_meta.kv_payload_dtype,
+                            current_meta.kv_payload_shape)
+
+                        # Step 4: Lock acquired and buffers prepared. Only now
+                        # tell the sender it can enqueue NCCL sends.
                         time_lock_acquired = time.time()
-                        pipe.signal_group.send_obj("ACCEPT",
-                                                   dst=pipe.peer_rank)
+                        pipe.signal_group.send_obj(
+                            _kv_transfer_signal("ACCEPT", current_meta),
+                            dst=pipe.peer_rank)
                         logger.info(
                             "recv_kv_patch: lock acquired in %ss, sent ACCEPT",
                             time_lock_acquired - time_start)
 
                         slot_mapping = self._recv_slot_mapping_from_rank(
                             from_rank, current_meta.slot_mapping_dtype,
-                            current_meta.slot_mapping_shape)
+                            current_meta.slot_mapping_shape,
+                            recv_buffer=slot_mapping_buffer)
                         kv_payload = self._recv_data_from_rank(
                             from_rank, current_meta.kv_payload_dtype,
                             current_meta.kv_payload_shape, False,
-                            synchronize=True)
+                            synchronize=True,
+                            recv_buffer=kv_payload_buffer)
                     finally:
                         nccl_lock.release()
                     break  # Success, exit loop
@@ -2515,7 +2552,9 @@ class DynamicKVSynchronizer():
             if not lock_acquired:
                 # Step 3: Lock held by others - send REJECT immediately
                 logger.info(f"recv_kv_patch: lock held by others, sending REJECT")
-                pipe.signal_group.send_obj("REJECT", dst=pipe.peer_rank)
+                pipe.signal_group.send_obj(
+                    _kv_transfer_signal("REJECT", current_meta),
+                    dst=pipe.peer_rank)
                 # Sender will backoff and resend meta, we need to receive it
                 new_meta = self.recv_controller(from_rank)
                 assert isinstance(new_meta, KVPatchMeta), f"Expected KVPatchMeta, got {type(new_meta)}"
@@ -2545,6 +2584,8 @@ class DynamicKVSynchronizer():
         pipe.signal_group.send_obj({
             "type": "PATCH_APPLIED",
             "id": int(patch_id),
+            "sender_rank": int(from_rank),
+            "target_rank": int(self.rank),
         }, dst=pipe.peer_rank)
 
     def _wait_kv_patch_applied_ack(
@@ -2553,14 +2594,18 @@ class DynamicKVSynchronizer():
         patch_id: int,
     ) -> None:
         pipe = self._pair_pipes_send[target_rank]
-        response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
-        if (not isinstance(response, dict)
-                or response.get("type") != "PATCH_APPLIED"
-                or int(response.get("id", -1)) != int(patch_id)):
-            raise RuntimeError(
-                "Unexpected KV patch apply acknowledgement: "
-                f"target_rank={target_rank}, patch_id={patch_id}, "
-                f"response={response}")
+        while True:
+            response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
+            if (isinstance(response, dict)
+                    and response.get("type") == "PATCH_APPLIED"
+                    and int(response.get("id", -1)) == int(patch_id)
+                    and int(response.get("sender_rank", self.rank)) == int(self.rank)
+                    and int(response.get("target_rank", target_rank)) == int(target_rank)):
+                break
+            logger.warning(
+                "Ignoring stale KV patch apply acknowledgement while waiting "
+                "for target_rank=%s patch_id=%s: %s",
+                target_rank, patch_id, response)
         logger.info(
             "received PATCH_APPLIED from rank %s for patch id %s",
             target_rank, patch_id)
@@ -2590,10 +2635,9 @@ class DynamicKVSynchronizer():
             value_cache_ptrs: Optional[list[int]] = None,
     ) -> int:
         logger.info(f"apply one patch with id {meta.id}, num_tokens: {meta.num_tokens}")
-        # slot_mapping 已经被裁剪过，只包含有效的 token
         is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
+        patch_block_size: Optional[int] = None
         if use_kvcached_backend() and slot_mapping.numel() > 0:
-            patch_block_size: Optional[int] = None
             if is_flexi:
                 if page_meta is not None and page_meta.dim() > 0:
                     patch_block_size = int(page_meta.size(0))
@@ -2604,85 +2648,100 @@ class DynamicKVSynchronizer():
                     first_kv_cache = self.kv_caches[first_local_layer_id]
                     if first_kv_cache.dim() >= 3:
                         patch_block_size = int(first_kv_cache.size(2))
-            if patch_block_size is not None and patch_block_size > 0:
-                slot_mapping, kv_payload, dropped_tokens = (
-                    self.filter_kvcached_patch_tensors_for_live_blocks(
-                        slot_mapping,
-                        kv_payload,
-                        patch_block_size,
-                        reason=(
-                            f"patch_apply:patch={meta.id}:"
-                            f"layers={meta.layer_ids}")))
-                if dropped_tokens:
-                    meta.num_tokens = int(slot_mapping.numel())
-                    meta.slot_mapping_shape = slot_mapping.shape
-                    meta.kv_payload_shape = kv_payload.shape
         keys = kv_payload[0]
         values = kv_payload[1]
         # assert slot_mapping.size(0) == meta.num_tokens, f"slot_mapping size {slot_mapping.size(0)} should match num_tokens {meta.num_tokens}"
         if slot_mapping.size(0) != meta.num_tokens:
             logger.info(f"Warning: slot_mapping size {slot_mapping.size(0)} does not match num_tokens {meta.num_tokens}, proceed anyway.")
+
+        should_hold_page_lifetime = (
+            use_kvcached_backend() and slot_mapping.numel() > 0
+            and patch_block_size is not None and int(patch_block_size) > 0)
+        patch_page_context = (
+            self.kvcached_page_lifetime_context()
+            if should_hold_page_lifetime else nullcontext())
+        if is_flexi:
+            if key_cache_ptrs is None:
+                key_cache_ptrs = self.key_cache_ptrs
+            if value_cache_ptrs is None:
+                value_cache_ptrs = self.value_cache_ptrs
+
         # The operations below are executed in the default stream and will be properly ordered.
         with self.device:
             logger.info(f"[listen loop] apply kv patch to kv cache on device {self.device}")
             patch_trace_logged = False
-            if is_flexi:
-                if key_cache_ptrs is None:
-                    key_cache_ptrs = self.key_cache_ptrs
-                if value_cache_ptrs is None:
-                    value_cache_ptrs = self.value_cache_ptrs
-            for layer_id, key, value in zip(meta.layer_ids, keys, values):
-                local_layer_id = layer_id - start_layer_id
-                if is_flexi:
-                    assert page_meta is not None, "page_meta should be provided when using flexi flash attention"
-                    if (local_layer_id < 0
-                            or local_layer_id >= len(key_cache_ptrs)):
-                        raise IndexError(
-                            "KV receiver patch layer index out of range: "
-                            f"layer_id={layer_id}, "
-                            f"start_layer_id={start_layer_id}, "
-                            f"local_layer_id={local_layer_id}, "
-                            f"num_key_cache_ptrs={len(key_cache_ptrs)}")
-                    key_cache_ptr = key_cache_ptrs[local_layer_id]
-                    value_cache_ptr = value_cache_ptrs[local_layer_id]
-                    if key_cache_ptr == 0 or value_cache_ptr == 0:
-                        raise RuntimeError(
-                            "KV receiver patch resolved an empty cache "
-                            "pointer: "
-                            f"layer_id={layer_id}, "
-                            f"start_layer_id={start_layer_id}, "
-                            f"local_layer_id={local_layer_id}, "
-                            f"num_key_cache_ptrs={len(key_cache_ptrs)}")
-                    self.kv_helper.flexi_put_kv_to_cache(
-                        model_executable=self.model_executable,
-                        page_meta=page_meta,
-                        keys=key,
-                        values=value,
-                        key_cache_ptr=key_cache_ptr,
-                        value_cache_ptr=value_cache_ptr,
-                        layer=layer_id,
-                        slot_mapping=slot_mapping,
-                    )
-                else:
-                    if (local_layer_id < 0
-                            or local_layer_id >= len(self.kv_caches)):
-                        raise IndexError(
-                            "KV receiver patch layer index out of range: "
-                            f"layer_id={layer_id}, "
-                            f"start_layer_id={start_layer_id}, "
-                            f"local_layer_id={local_layer_id}, "
-                            f"num_kv_caches={len(self.kv_caches)}, "
-                            f"patch_layer_ids={meta.layer_ids}")
-                    kv_cache = self.kv_caches[local_layer_id]
-                    scheduler_trace = getattr(meta, "scheduler_trace", {})
+            scheduler_trace = getattr(meta, "scheduler_trace", {})
+            with patch_page_context:
+                apply_ranges = ([(0, int(slot_mapping.numel()))]
+                                if slot_mapping.numel() > 0 else [])
+                if should_hold_page_lifetime:
+                    apply_ranges, _ = (
+                        self.kvcached_patch_apply_ranges_for_live_blocks_locked(
+                            slot_mapping,
+                            int(patch_block_size),
+                            reason=(
+                                f"patch_apply:patch={meta.id}:"
+                                f"layers={meta.layer_ids}")))
+                applied_num_tokens = sum(
+                    end - start for start, end in apply_ranges)
+                if applied_num_tokens == 0:
+                    return 0
+
+                for layer_id, key, value in zip(meta.layer_ids, keys, values):
+                    local_layer_id = layer_id - start_layer_id
+                    layer_block_size = patch_block_size
+                    if is_flexi:
+                        assert page_meta is not None, "page_meta should be provided when using flexi flash attention"
+                        if (local_layer_id < 0
+                                or local_layer_id >= len(key_cache_ptrs)):
+                            raise IndexError(
+                                "KV receiver patch layer index out of range: "
+                                f"layer_id={layer_id}, "
+                                f"start_layer_id={start_layer_id}, "
+                                f"local_layer_id={local_layer_id}, "
+                                f"num_key_cache_ptrs={len(key_cache_ptrs)}")
+                        key_cache_ptr = key_cache_ptrs[local_layer_id]
+                        value_cache_ptr = value_cache_ptrs[local_layer_id]
+                        if key_cache_ptr == 0 or value_cache_ptr == 0:
+                            raise RuntimeError(
+                                "KV receiver patch resolved an empty cache "
+                                "pointer: "
+                                f"layer_id={layer_id}, "
+                                f"start_layer_id={start_layer_id}, "
+                                f"local_layer_id={local_layer_id}, "
+                                f"num_key_cache_ptrs={len(key_cache_ptrs)}")
+                    else:
+                        if (local_layer_id < 0
+                                or local_layer_id >= len(self.kv_caches)):
+                            raise IndexError(
+                                "KV receiver patch layer index out of range: "
+                                f"layer_id={layer_id}, "
+                                f"start_layer_id={start_layer_id}, "
+                                f"local_layer_id={local_layer_id}, "
+                                f"num_kv_caches={len(self.kv_caches)}, "
+                                f"patch_layer_ids={meta.layer_ids}")
+                        kv_cache = self.kv_caches[local_layer_id]
+                        if layer_block_size is None and kv_cache.dim() >= 3:
+                            layer_block_size = int(kv_cache.size(2))
+
                     if (_autoscaling_kvcached_debug_enabled()
                             and use_kvcached_backend()
                             and not patch_trace_logged
+                            and not is_flexi
                             and kv_cache.dim() == 5
-                            and slot_mapping.numel() > 0):
-                        block_size_for_trace = int(kv_cache.size(2))
+                            and apply_ranges):
+                        block_size_for_trace = int(layer_block_size)
+                        if len(apply_ranges) == 1:
+                            trace_slot_mapping = slot_mapping[
+                                apply_ranges[0][0]:apply_ranges[0][1]]
+                        else:
+                            trace_slot_mapping = torch.cat([
+                                slot_mapping[start:end]
+                                for start, end in apply_ranges
+                                if end > start
+                            ])
                         patch_blocks = _blocks_from_slots(
-                            slot_mapping, block_size_for_trace)
+                            trace_slot_mapping, block_size_for_trace)
                         if _autoscaling_kvcached_debug_verbose():
                             logger.warning(
                                 "[KVCACHED_MIGRATION_APPLY_TRACE] "
@@ -2691,10 +2750,11 @@ class DynamicKVSynchronizer():
                                 "blocks=%s slots_min=%s slots_max=%s "
                                 "meta_num_tokens=%s scheduler_trace=%s",
                                 self.rank, meta.id, meta.layer_ids,
-                                int(slot_mapping.numel()), block_size_for_trace,
+                                int(trace_slot_mapping.numel()),
+                                block_size_for_trace,
                                 patch_blocks,
-                                int(slot_mapping.min().item()),
-                                int(slot_mapping.max().item()),
+                                int(trace_slot_mapping.min().item()),
+                                int(trace_slot_mapping.max().item()),
                                 meta.num_tokens, scheduler_trace)
                         else:
                             logger.warning(
@@ -2703,25 +2763,50 @@ class DynamicKVSynchronizer():
                                 "slot_count=%s block_size=%s blocks_count=%s "
                                 "sample_blocks=%s slots_min=%s slots_max=%s "
                                 "meta_num_tokens=%s scheduler_trace=%s",
-                                self.rank, meta.id, int(slot_mapping.numel()),
+                                self.rank, meta.id,
+                                int(trace_slot_mapping.numel()),
                                 block_size_for_trace, len(patch_blocks),
                                 patch_blocks[:64],
-                                int(slot_mapping.min().item()),
-                                int(slot_mapping.max().item()),
+                                int(trace_slot_mapping.min().item()),
+                                int(trace_slot_mapping.max().item()),
                                 meta.num_tokens, scheduler_trace)
                         patch_trace_logged = True
-                    if use_kvcached_backend() and slot_mapping.numel() > 0:
-                        guard_kvcached_vmm_slots_mapped(
-                            f"migration_patch_apply:patch={meta.id}:"
-                            f"layer={layer_id}:trace={scheduler_trace}",
-                            self,
-                            slot_mapping,
-                            int(kv_cache.size(2)),
-                            layer_ids=[int(layer_id)],
-                            rank=self.rank,
-                            trace_info=scheduler_trace,
-                        )
-                    # 使用裁剪后的 slot_mapping，从 0 到 num_tokens
-                    self.kv_helper.put_kv_to_cache(self.model_executable, key, value, layer_id, kv_cache, slot_mapping, 0, slot_mapping.size(0))
-            self._sync_kvcached_stream("KV patch apply")
-        return meta.id
+                    for range_start, range_end in apply_ranges:
+                        if range_end <= range_start:
+                            continue
+                        layer_slot_mapping = slot_mapping[range_start:range_end]
+                        if (use_kvcached_backend()
+                                and layer_slot_mapping.numel() > 0
+                                and layer_block_size is not None):
+                            guard_kvcached_vmm_slots_mapped(
+                                f"migration_patch_apply:patch={meta.id}:"
+                                f"layer={layer_id}:trace={scheduler_trace}",
+                                self,
+                                layer_slot_mapping,
+                                int(layer_block_size),
+                                layer_ids=[int(layer_id)],
+                                rank=self.rank,
+                                trace_info=scheduler_trace,
+                            )
+                        if is_flexi:
+                            self.kv_helper.flexi_put_kv_to_cache(
+                                model_executable=self.model_executable,
+                                page_meta=page_meta,
+                                keys=key[range_start:range_end],
+                                values=value[range_start:range_end],
+                                key_cache_ptr=key_cache_ptr,
+                                value_cache_ptr=value_cache_ptr,
+                                layer=layer_id,
+                                slot_mapping=layer_slot_mapping,
+                            )
+                        else:
+                            self.kv_helper.put_kv_to_cache(
+                                self.model_executable,
+                                key[range_start:range_end],
+                                value[range_start:range_end], layer_id,
+                                kv_cache, layer_slot_mapping, 0,
+                                layer_slot_mapping.size(0))
+                    if use_kvcached_backend():
+                        self._sync_kvcached_stream(
+                            f"KV patch apply layer {layer_id}")
+        return 0 if applied_num_tokens is None else applied_num_tokens
