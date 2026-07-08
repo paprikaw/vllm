@@ -276,9 +276,10 @@ class KVCacheManager:
                 new_computed_blocks=new_computed_block_list,
             ))
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-            # Cannot allocate new blocks
-            return None
+        if num_blocks_to_allocate > 0:
+            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+                # Cannot allocate new blocks
+                return None
 
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
