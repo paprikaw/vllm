@@ -772,6 +772,16 @@ void PageAllocator::stop_prealloc_thread() {
   }
 }
 
+void PageAllocator::disable_prealloc_refill() {
+  std::lock_guard<std::mutex> lock(lock_);
+  min_reserved_pages_ = 0;
+  prealloc_needed_ = false;
+  LOGGER(INFO,
+         "Disabled page preallocation refill: reserved=%zu, "
+         "max_reserved_pages=%ld",
+         reserved_page_list_.size(), max_reserved_pages_);
+}
+
 void PageAllocator::prealloc_worker() {
   auto start_time = std::chrono::steady_clock::now();
 

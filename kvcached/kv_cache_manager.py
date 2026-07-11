@@ -445,12 +445,27 @@ class KVCacheManager:
             used_bytes / (1024**3))
 
     def _maybe_wait_for_sync_prealloc(self) -> None:
+        prealloc_mode = os.getenv("KVCACHED_PREALLOC_MODE",
+                                  "continuous").strip().lower()
+        if prealloc_mode not in {"continuous", "one_shot"}:
+            raise ValueError(
+                "KVCACHED_PREALLOC_MODE must be 'continuous' or "
+                f"'one_shot', got {prealloc_mode!r}")
+
         target_raw = os.getenv("KVCACHED_SYNC_PREALLOC_TARGET_PAGES")
         if not target_raw:
+            if prealloc_mode == "one_shot":
+                raise ValueError(
+                    "KVCACHED_PREALLOC_MODE=one_shot requires "
+                    "KVCACHED_SYNC_PREALLOC_TARGET_PAGES")
             return
 
         target_pages = int(target_raw)
         if target_pages <= 0:
+            if prealloc_mode == "one_shot":
+                raise ValueError(
+                    "KVCACHED_PREALLOC_MODE=one_shot requires a positive "
+                    "KVCACHED_SYNC_PREALLOC_TARGET_PAGES")
             self._log_allocator_state("sync-prealloc-disabled")
             return
 
@@ -466,7 +481,14 @@ class KVCacheManager:
         while time.monotonic() < deadline:
             reserved_pages = self.page_allocator.get_num_reserved_pages()
             if reserved_pages >= target_pages:
-                self._log_allocator_state("sync-prealloc-ready")
+                if prealloc_mode == "one_shot":
+                    # Keep the mapped reserve reusable without replenishing it
+                    # while requests are running.
+                    self.page_allocator.disable_prealloc_refill()
+                    self._log_allocator_state(
+                        "sync-prealloc-one-shot-ready")
+                else:
+                    self._log_allocator_state("sync-prealloc-ready")
                 return
             time.sleep(poll_s)
 

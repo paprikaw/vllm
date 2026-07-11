@@ -1,0 +1,105 @@
+# H100 PP2 migration comparison: authentic one-shot KVCacheD premap.
+# Map the native-VMM-equivalent 5616 allocator pages before serving, then
+# disable background refill while retaining and recycling those mapped pages.
+
+project: "qwen-h100-pp2-reconfig-kvcached-premap-oneshot-5616-20260711"
+type: "sweep_test"
+is_log_cover: true
+overwrite: true
+
+envs:
+  RAY_DEDUP_LOGS: "0"
+  NCCL_DEBUG: "INFO"
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+  VLLM_TORCH_PROFILER_DIR: "/home/bxb1/data/vllm_workbench/profiler/"
+  RAY_CGRAPH_get_timeout: "10000"
+  BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+  DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+  KV_SYNC_USE_CPU: "0"
+  VLLM_USE_CPU_MODEL: "0"
+  CUDA_LAUNCH_BLOCKING: "0"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+  VLLM_USE_RAY_COMPILED_DAG: "0"
+  NCCL_SOCKET_IFNAME: "bond0.3027"
+  GLOO_SOCKET_IFNAME: "bond0.3027"
+  VLLM_SERVER_DEV_MODE: "1"
+  VLLM_DISABLE_CUTLASS_FP8: "1"
+  VLLM_PAGE_ATTENTION_BLOCK_SIZE_KB: "128"
+  VLLM_KVCACHE_BACKEND: "kvcached"
+  VLLM_KVCACHED_SKIP_NOOP_PHYSICAL_TRIM: "1"
+  KVCACHED_PAGE_SIZE_MB: "2"
+  KVCACHED_CONTIGUOUS_LAYOUT: "false"
+  KVCACHED_LAYER_STACKING: "true"
+  KVCACHED_PHYSICAL_BLOCK_SIZE_KB: "128"
+  KVCACHED_MAX_CACHED_TOKENS: "-1"
+  KVCACHED_MIN_RESERVED_PAGES: "351"
+  KVCACHED_MAX_RESERVED_PAGES: "351"
+  KVCACHED_SYNC_PREALLOC_TARGET_PAGES: "5616"
+  KVCACHED_SYNC_PREALLOC_TIMEOUT_SEC: "240"
+  KVCACHED_SYNC_PREALLOC_POLL_SEC: "0.05"
+  KVCACHED_PREALLOC_MODE: "one_shot"
+  KVCACHED_LOG_LEVEL: "INFO"
+
+static_config:
+  model:
+    path: "/home/bxb1/data/huggingface/Qwen3-32B-FP8"
+    name: "Qwen3-32B-FP8"
+  network:
+    rank_to_ip:
+      0: "spartan-gpgpu011"
+      1: "spartan-gpgpu011"
+    rank_to_node:
+      0: "spartan-gpgpu011"
+      1: "spartan-gpgpu011"
+  vllm:
+    head_addr: "localhost"
+    pipeline_parallel_size: 2
+    gpu_memory_utilization: 0.95
+    disable_memory_overhead_monitor: true
+    max_model_len: 4000
+    chunked_prefill: true
+    enable_cuda_graph: false
+    enable_nsight: false
+    weight_chunk_size_mb: 5
+    max_num_batched_tokens: 8128
+  benchmark:
+    burstiness: 100.0
+    benchmark_script_path: "/home/bxb1/.codex/worktrees/2e12/vllm/benchmarks/benchmark_serving.py"
+    profile: false
+    print_outputs: true
+    repetition: 5
+    warmup:
+      enabled: false
+      num_total_requests: 25
+      input_length: 10000
+      output_length: 50
+      request_rate: 25
+
+sweep_configs:
+  - vllm:
+      attention_kernel: [direct]
+      fixed_num_gpu_blocks: [-1]
+      weight_chunk_size_mb: [160]
+      migration_approach: [async]
+      weight_loading_mode: [async]
+      block_size: [32]
+      use_vmm: [true]
+      enable_kv_resize: [true]
+      enable_cpu_weight_cache: [true]
+    benchmark_config:
+      - num_total_requests: 80
+        repetition: 1
+        pp_layer_config:
+          0: "16, 48"
+          40: "48, 16"
+        requests:
+          0:
+            request_rate: 4
+            input_lens: 512
+            output_lens: 16
+          40:
+            request_rate: 4
+            input_lens: 128
+            output_lens: 512

@@ -114,6 +114,7 @@ public:
   // Thread management
   void start_prealloc_thread();
   void stop_prealloc_thread();
+  void disable_prealloc_refill();
 
   // Callback function setters for multi-process support
   void set_broadcast_map_callback(BroadcastMapCallback callback);

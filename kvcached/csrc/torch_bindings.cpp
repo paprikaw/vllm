@@ -104,6 +104,12 @@ void page_allocator_stop_prealloc_thread(
   allocator->stop_prealloc_thread();
 }
 
+void page_allocator_disable_prealloc_refill(
+    std::shared_ptr<PageAllocator> allocator) {
+  py::gil_scoped_release release;
+  allocator->disable_prealloc_refill();
+}
+
 std::shared_ptr<InternalPage>
 page_allocator_alloc_page(std::shared_ptr<PageAllocator> allocator) {
   py::gil_scoped_release release;
@@ -261,6 +267,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_start_prealloc_thread)
       .def("stop_prealloc_thread",
            &kvcached::page_allocator_stop_prealloc_thread)
+      .def("disable_prealloc_refill",
+           &kvcached::page_allocator_disable_prealloc_refill)
       .def("alloc_page", &kvcached::page_allocator_alloc_page)
       .def("free_page", &kvcached::page_allocator_free_page)
       .def("free_pages", &kvcached::page_allocator_free_pages)
