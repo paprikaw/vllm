@@ -4204,6 +4204,9 @@ class DynamicConfig:
                 f"Invalid attention_kernel={self.attention_kernel!r}. "
                 f"Must be one of {self.VALID_ATTENTION_KERNELS}."
             )
+        if self.pipeline_autoscaling_enabled:
+            self.dynamic_communication_enabled = True
+        self.pipeline_autoscaling_enabled = self.dynamic_communication_enabled
     
     tester_start_step: Optional[int] = None
     """The step at which to start the memory stress tester. If None, the tester
@@ -4260,13 +4263,16 @@ class DynamicConfig:
     """Mapping from logical PP stage to global rank for VMXpert placement
     metadata. The executable placement is controlled by ParallelConfig."""
 
-    pipeline_autoscaling_enabled: bool = False
-    """Enable experimental pipeline autoscaling.
+    dynamic_communication_enabled: bool = False
+    """Enable dynamic pipeline communication.
 
     TP=1/DP=1 only. The underlying distributed world is a superset of all
     candidate PP ranks, while each PP config may activate only the ranks whose
     layer ranges are non-empty.
     """
+
+    pipeline_autoscaling_enabled: bool = False
+    """Deprecated alias for dynamic_communication_enabled."""
 
     autoscaling_candidate_ranks: Optional[list[int]] = None
     """Global ranks that may become active PP stages during autoscaling."""

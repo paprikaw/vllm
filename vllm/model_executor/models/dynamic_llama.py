@@ -69,8 +69,9 @@ class DynamicLlamaForCausalLM(LlamaForCausalLM, DynamicModelBase):
         self.model = DynamicLlamaModel(vllm_config=vllm_config,
                                        prefix=maybe_prefix(prefix, "model"))
 
-        is_autoscaling = vllm_config.dynamic_config.pipeline_autoscaling_enabled
-        if get_pp_group().is_last_rank or is_autoscaling:
+        use_dynamic_communication = (
+            vllm_config.dynamic_config.dynamic_communication_enabled)
+        if get_pp_group().is_last_rank or use_dynamic_communication:
             self.unpadded_vocab_size = config.vocab_size
             if lora_config:
                 self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
@@ -186,7 +187,7 @@ class DynamicLlamaModel(LlamaModel):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        if (vllm_config.dynamic_config.pipeline_autoscaling_enabled
+        if (vllm_config.dynamic_config.dynamic_communication_enabled
                 and isinstance(self.norm, PPMissingLayer)):
             self.norm = RMSNorm(self.config.hidden_size,
                                 eps=self.config.rms_norm_eps)

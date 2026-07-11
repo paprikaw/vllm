@@ -135,6 +135,7 @@ class DynamicEngineCore(EngineCore):
         self._placement_generation = 0
         self.cur_active_pp_ranks = self._active_ranks_for_config(
             self.cur_pp_layer_config)
+        self._active_pp_ranks_applied = False
         
         # Event to signal migration_thread to reset its request counter
         # This is triggered by set_pp_config between benchmark repetitions
@@ -238,7 +239,15 @@ class DynamicEngineCore(EngineCore):
             > 1,
             log_stats=self.log_stats,
         )
-        self._apply_active_pp_ranks_for_config(self.cur_pp_layer_config)
+        if getattr(vllm_config.dynamic_config,
+                   "dynamic_communication_enabled", False):
+            self._apply_active_pp_ranks_for_config(self.cur_pp_layer_config)
+        else:
+            self._active_pp_ranks_applied = True
+            logger.info(
+                "[reconfiguration placement] dynamic communication disabled; "
+                "using default active PP ranks %s",
+                self.cur_active_pp_ranks)
 
         # Setup MM Input Mapper.
         self.mm_input_cache_server = MirroredProcessingCache(
@@ -313,6 +322,17 @@ class DynamicEngineCore(EngineCore):
         update_workers: bool = True,
     ) -> None:
         active_ranks = self._active_ranks_for_config(pp_layer_config)
+        ranks_unchanged = active_ranks == getattr(
+            self, "cur_active_pp_ranks", [])
+        if (update_workers and ranks_unchanged
+                and getattr(self, "_active_pp_ranks_applied", False)
+                and not getattr(self.vllm_config.dynamic_config,
+                                "dynamic_communication_enabled", False)):
+            logger.info(
+                "[reconfiguration placement] active PP ranks unchanged=%s; "
+                "skipping worker placement update",
+                active_ranks)
+            return
         self.cur_active_pp_ranks = active_ranks
         self._placement_generation += 1
         if isinstance(self.model_executor, DynamicRayDistributedExecutor):
@@ -320,6 +340,7 @@ class DynamicEngineCore(EngineCore):
                 self.model_executor.set_active_pp_ranks(active_ranks)
             else:
                 self.model_executor.commit_active_pp_ranks_local(active_ranks)
+        self._active_pp_ranks_applied = True
         logger.info(
             "Applied pipeline autoscaling placement generation=%s active_ranks=%s",
             self._placement_generation, active_ranks)
@@ -796,16 +817,26 @@ class DynamicEngineCore(EngineCore):
         return bool(
             scheduler_output is not None
             and getattr(self.vllm_config.dynamic_config,
-                        "pipeline_autoscaling_enabled", False)
+                        "dynamic_communication_enabled", False)
             and getattr(scheduler_output, "is_sync_after_migration", False))
 
-    def _wait_for_autoscaling_sync_state(self) -> None:
+    def _is_async_migration_sync_batch(
+        self,
+        scheduler_output: Optional[DynamicSchedulerOutput],
+    ) -> bool:
+        return bool(
+            scheduler_output is not None
+            and getattr(scheduler_output, "is_sync_after_migration", False))
+
+    def _wait_for_async_migration_sync_state(self, reason: str) -> None:
         """Pause scheduling until the sync batch has applied all KV patches."""
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
         timeout_s = float(os.environ.get(
-            "VLLM_AUTOSCALING_SYNC_WAIT_TIMEOUT_S", "300"))
+            "VLLM_ASYNC_MIGRATION_SYNC_WAIT_TIMEOUT_S",
+            os.environ.get("VLLM_AUTOSCALING_SYNC_WAIT_TIMEOUT_S", "300")))
         poll_s = float(os.environ.get(
-            "VLLM_AUTOSCALING_SYNC_WAIT_INTERVAL_S", "0.01"))
+            "VLLM_ASYNC_MIGRATION_SYNC_WAIT_INTERVAL_S",
+            os.environ.get("VLLM_AUTOSCALING_SYNC_WAIT_INTERVAL_S", "0.01")))
         start = time.time()
         last_log = 0.0
 
@@ -815,22 +846,27 @@ class DynamicEngineCore(EngineCore):
                 state.get("all_patch_applied", False) for state in states)
             if patches_done:
                 logger.info(
-                    "[autoscaling sync] all KV patches applied in %s",
+                    "[%s sync] all KV patches applied in %s",
+                    reason,
                     human_readable_duration(time.time() - start))
                 return
 
             now = time.time()
             if now - start > timeout_s:
                 raise RuntimeError(
-                    "Timed out waiting for autoscaling KV patches to apply: "
+                    f"Timed out waiting for {reason} KV patches to apply: "
                     f"states={states}")
             if now - last_log >= 5.0:
                 logger.info(
-                    "[autoscaling sync] waiting before scheduling target "
-                    "batch: patches_done=%s states=%s",
+                    "[%s sync] waiting before scheduling target batch: "
+                    "patches_done=%s states=%s",
+                    reason,
                     patches_done, states)
                 last_log = now
             time.sleep(poll_s)
+
+    def _wait_for_autoscaling_sync_state(self) -> None:
+        self._wait_for_async_migration_sync_state("autoscaling")
 
     def _wait_for_worker_resize_cleanup_after_patch_done(
         self,
@@ -892,15 +928,20 @@ class DynamicEngineCore(EngineCore):
         self,
         scheduler_output: DynamicSchedulerOutput,
     ) -> None:
-        if not self._is_autoscaling_sync_batch(scheduler_output):
+        if not self._is_async_migration_sync_batch(scheduler_output):
             return
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        reason = (
+            "autoscaling"
+            if self._is_autoscaling_sync_batch(scheduler_output)
+            else "reconfiguration"
+        )
         sender_list = sorted(scheduler_output.sender_list or [])
         receiver_list = sorted(scheduler_output.receiver_list or [])
         logger.info(
-            "[autoscaling sync] finalizing migration on all workers: "
+            "[%s sync] finalizing migration on all workers: "
             "senders=%s receivers=%s total_tokens=%s new_kv_blocks=%s",
-            sender_list, receiver_list,
+            reason, sender_list, receiver_list,
             scheduler_output.total_migration_tokens,
             scheduler_output.new_kv_cache_block_num)
         self.model_executor.finalize_async_migration_after_sync(
@@ -913,12 +954,18 @@ class DynamicEngineCore(EngineCore):
         self,
         scheduler_output: DynamicSchedulerOutput,
     ) -> None:
-        if self._is_autoscaling_sync_batch(scheduler_output):
+        if self._is_async_migration_sync_batch(scheduler_output):
             self._autoscaling_schedule_paused = True
             self._autoscaling_schedule_pause_start = time.time()
+            reason = (
+                "autoscaling"
+                if self._is_autoscaling_sync_batch(scheduler_output)
+                else "reconfiguration"
+            )
             logger.info(
-                "[autoscaling sync] submitted sync batch; pausing scheduler "
-                "until all workers report KV patch application")
+                "[%s sync] submitted sync batch; pausing scheduler until all "
+                "workers report KV patch application",
+                reason)
 
     def _build_autoscaling_request_states_from_scheduler(
         self,
@@ -1004,11 +1051,13 @@ class DynamicEngineCore(EngineCore):
         self,
         scheduler_output: DynamicSchedulerOutput,
     ) -> None:
-        if not self._is_autoscaling_sync_batch(scheduler_output):
+        if not self._is_async_migration_sync_batch(scheduler_output):
             return
+        is_autoscaling_sync = self._is_autoscaling_sync_batch(scheduler_output)
+        reason = "autoscaling" if is_autoscaling_sync else "reconfiguration"
         self._finalize_autoscaling_sync_state_if_needed(scheduler_output)
         time_start_waiting_patches = time.time()
-        self._wait_for_autoscaling_sync_state()
+        self._wait_for_async_migration_sync_state(reason)
         logger.info(
             "[timeline]: after check KV patches applied process, time taken: %s",
             human_readable_duration(time.time() - time_start_waiting_patches))
@@ -1019,25 +1068,31 @@ class DynamicEngineCore(EngineCore):
             self.model_executor.wait_for_autoscaling_active_pp_ranks(
                 activation_generation)
         waited_cleanup = False
-        if self._wait_cleanup_before_autoscaling_schedule_release():
+        wait_cleanup_before_release = (
+            self._wait_cleanup_before_autoscaling_schedule_release()
+            if is_autoscaling_sync else True)
+        if wait_cleanup_before_release:
             if scheduler_output.new_kv_cache_block_num <= 0:
                 raise RuntimeError(
-                    "Autoscaling cleanup wait requested but "
+                    f"{reason} cleanup wait requested but "
                     "new_kv_cache_block_num is not set")
             logger.info(
-                "[autoscaling sync] waiting for worker cleanup/resize before "
-                "releasing scheduler pause")
+                "[%s sync] waiting for worker cleanup/resize before releasing "
+                "scheduler pause",
+                reason)
             self._wait_for_worker_resize_cleanup_after_patch_done(
                 scheduler_output.new_kv_cache_block_num, time.time())
             waited_cleanup = True
         assert isinstance(self.scheduler, DynamicScheduler)
-        self._apply_active_pp_ranks_for_config(
-            self.scheduler.pp_layer_config,
-            update_workers=(activation_generation < 0))
+        if is_autoscaling_sync:
+            self._apply_active_pp_ranks_for_config(
+                self.scheduler.pp_layer_config,
+                update_workers=(activation_generation < 0))
         self._autoscaling_schedule_paused = False
         if self._autoscaling_schedule_pause_start is not None:
             logger.info(
-                "[timeline]: autoscaling scheduler pause time taken: %s",
+                "[timeline]: %s scheduler pause time taken: %s",
+                reason,
                 human_readable_duration(time.time() -
                                         self._autoscaling_schedule_pause_start))
             self._autoscaling_schedule_pause_start = None
@@ -1045,12 +1100,14 @@ class DynamicEngineCore(EngineCore):
         self._migration_done_event.set()
         if waited_cleanup:
             logger.info(
-                "[autoscaling sync] scheduler pause released after KV patches "
-                "applied and worker cleanup/resize finished")
+                "[%s sync] scheduler pause released after KV patches applied "
+                "and worker cleanup/resize finished",
+                reason)
         else:
             logger.info(
-                "[autoscaling sync] scheduler pause released after KV patches "
-                "applied; worker cleanup/resize may continue asynchronously")
+                "[%s sync] scheduler pause released after KV patches applied; "
+                "worker cleanup/resize may continue asynchronously",
+                reason)
         if self._migration_timeline_start is not None:
             logger.info(
                 "[timeline]: migration process time taken: %s",
@@ -1090,18 +1147,14 @@ class DynamicEngineCore(EngineCore):
             if (not self._autoscaling_schedule_paused
                     and _safe_queue_size(self.batch_queue)
                     < self.batch_queue_size):
-                schedule_start = time.time()
                 scheduler_output = self.scheduler.dynamic_schedule()
-                schedule_time = time.time() - schedule_start
                 assert isinstance(scheduler_output, DynamicSchedulerOutput)
                 # if scheduler_output.total_migration_tokens > 0:
                     # logger.info(f"[forward]: scheduled a total {scheduler_output.total_migration_tokens} tokens, total_num_scheduled_tokens: {scheduler_output.total_num_scheduled_tokens}, is_sync_after_migration: {scheduler_output.is_sync_after_migration}")
                 if scheduler_output.total_num_scheduled_tokens > 0:
                     self._mark_autoscaling_active_pp_ranks_if_needed(
                         scheduler_output)
-                    exec_start = time.time()
                     future = execute_func(scheduler_output)
-                    exec_submit_time = time.time() - exec_start
                     logger.info(f"Scheduled tokens: {scheduler_output.total_num_scheduled_tokens}")
                     self.batch_queue.put_nowait(
                         (future, scheduler_output))  # type: ignore
@@ -1119,14 +1172,10 @@ class DynamicEngineCore(EngineCore):
             if not scheduled_batch and not self.batch_queue.empty():
                 future, scheduler_output = self.batch_queue.get_nowait()
                 # Blocking until the first result is available.
-                result_start = time.time()
                 model_output = future.result()
-                result_time = time.time() - result_start
                 self.batch_queue.task_done()
-                update_start = time.time()
                 engine_core_outputs = self.scheduler.update_from_output(
                     scheduler_output, model_output)
-                update_time = time.time() - update_start
                 assert isinstance(scheduler_output, DynamicSchedulerOutput)
                 self._finish_autoscaling_schedule_pause_if_needed(
                     scheduler_output)
@@ -1349,7 +1398,7 @@ class DynamicEngineCore(EngineCore):
                 adding_layer_num = sum(layers[1] - layers[0] + 1 for layers in adding_layer_list)
                 assess = self._assess_memory_for_layer_reconfiguration(rank, adding_layer_num, mem_infos[rank], self.cur_pp_layer_config)
                 if (self.vllm_config.dynamic_config.
-                        pipeline_autoscaling_enabled and is_flexi
+                        dynamic_communication_enabled and is_flexi
                         and adding_layer_num > 0):
                     deleting_layer_num = 0
                     if start_layer <= end_layer:
@@ -1608,8 +1657,6 @@ class DynamicEngineCore(EngineCore):
                 logger.info("No relevant applied tokens yet, waiting...")
                 return False
 
-            min_applied_token = min(relevant_applied_tokens)
-
             lag = [
                 self.scheduler.num_tokens_for_migration - applied
                 for applied in relevant_applied_tokens
@@ -1618,8 +1665,7 @@ class DynamicEngineCore(EngineCore):
                 "lag between sent and applied tokens: %s "
                 "(sync_threshold=%s)",
                 lag, token_to_send_threshold)
-            return (min_applied_token > 0
-                    and max(lag) <= token_to_send_threshold)
+            return max(lag) <= token_to_send_threshold
 
         '''
         Following checks the patch sending process and synchronize the kv cache when all tokens in the sender to be sent are less than the threshold
@@ -1670,7 +1716,7 @@ class DynamicEngineCore(EngineCore):
                         logger.info(f"[memory access] start to synchronize the kv cache after resizing from {self.scheduler.kv_cache_manager.num_gpu_blocks} to {resized_block_num} blocks")
 
                 idle_autoscaling_sync = (
-                    self.vllm_config.dynamic_config.pipeline_autoscaling_enabled
+                    self.vllm_config.dynamic_config.dynamic_communication_enabled
                     and self.scheduler.get_num_unfinished_requests() == 0)
                 idle_autoscaling_total_tokens = (
                     self.scheduler.num_tokens_for_migration)
@@ -1691,10 +1737,13 @@ class DynamicEngineCore(EngineCore):
                         self.scheduler.async_change_configuration(
                             pp_layer_config, resized_block_num)
                     self.cur_pp_layer_config = pp_layer_config
-                    if not self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+                    if idle_autoscaling_sync:
                         self._apply_active_pp_ranks_for_config(pp_layer_config)
-                    elif idle_autoscaling_sync:
-                        self._apply_active_pp_ranks_for_config(pp_layer_config)
+                    elif not self.vllm_config.dynamic_config.dynamic_communication_enabled:
+                        logger.info(
+                            "[reconfiguration async] queued PP config switch "
+                            "via scheduler output; existing compiled DAG "
+                            "remains active")
                     else:
                         logger.info(
                             "[autoscaling async] queued PP config switch via "
@@ -1705,7 +1754,7 @@ class DynamicEngineCore(EngineCore):
                 break
 
         assert resized_block_num != 0
-        if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+        if self.vllm_config.dynamic_config.dynamic_communication_enabled:
             if idle_autoscaling_sync:
                 logger.info(
                     "[autoscaling async] finalizing idle no-request migration "
@@ -1740,28 +1789,20 @@ class DynamicEngineCore(EngineCore):
                     resized_block_num, time.time())
             return
 
-        if resized_block_num == self.scheduler.kv_cache_manager.num_gpu_blocks:
-            logger.info(f"no need to resize kv cache during migration, directly synchronize the kv cache, sleep for 4 seconds")
-            time.sleep(4)
-            logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
-            self.migration_status = MigrationStatus.NOT_MIGRATING
-            self._migration_done_event.set()
-            return
-        time_start_checking_resizing_done = time.time()
-        # Checking if the resizing is done and needed to extend the block pool
-        while True:
-            time.sleep(0.3)
-            resizing_done = self.model_executor.get_is_kv_resizing_done()
-            logger.info(f"resizing_done status: {resizing_done}")
-            if all(resizing_done):
-                with self.scheduler.lock:
-                    self.scheduler.extend_block_pool(resized_block_num)
-                break
-
-        self.migration_status = MigrationStatus.NOT_MIGRATING
-        self._migration_done_event.set()
-        logger.info(f"[timeline]: after check resizing done process, time taken: {human_readable_duration(time.time() - time_start_checking_resizing_done)}")
-        logger.info(f"[timeline]: migration process time taken: {human_readable_duration(time.time() - time_start)}")
+        timeout_s = float(os.environ.get(
+            "VLLM_RECONFIGURATION_SYNC_WAIT_TIMEOUT_S",
+            os.environ.get(
+                "VLLM_ASYNC_MIGRATION_SYNC_WAIT_TIMEOUT_S",
+                os.environ.get("VLLM_AUTOSCALING_SYNC_WAIT_TIMEOUT_S",
+                               "300"))))
+        if not self._migration_done_event.wait(timeout=timeout_s):
+            raise RuntimeError(
+                "Timed out waiting for reconfiguration sync batch after KV "
+                "patches were applied")
+        logger.info(
+            "[reconfiguration async] sync batch completed and scheduler pause "
+            "released")
+        return
 
     def change_model_configuration_by_kv_transfer_async_fast(
         self,
@@ -1992,7 +2033,7 @@ class DynamicEngineCore(EngineCore):
                                                       resized_block_num)
 
         self.cur_pp_layer_config = pp_layer_config
-        if not self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+        if not self.vllm_config.dynamic_config.dynamic_communication_enabled:
             self._apply_active_pp_ranks_for_config(pp_layer_config)
         else:
             logger.info(

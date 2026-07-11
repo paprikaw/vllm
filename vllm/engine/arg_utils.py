@@ -362,7 +362,9 @@ class EngineArgs:
     ray_rank_to_node: Optional[Dict[int, str]] = ParallelConfig.ray_rank_to_node
     pipeline_stage_to_rank: Optional[Dict[int, int]] = \
         ParallelConfig.pipeline_stage_to_rank
-    pipeline_autoscaling_enabled: bool = DynamicConfig.pipeline_autoscaling_enabled
+    dynamic_communication_enabled: bool = DynamicConfig.dynamic_communication_enabled
+    pipeline_autoscaling_enabled: bool = \
+        DynamicConfig.pipeline_autoscaling_enabled
     autoscaling_candidate_ranks: Optional[list[int]] = \
         DynamicConfig.autoscaling_candidate_ranks
     autoscaling_sequence: Optional[list[dict[str, Any]]] = \
@@ -444,7 +446,8 @@ class EngineArgs:
             self.dynamic_config = DynamicConfig(**self.dynamic_config)
         if self.dynamic_config is None:
             self.dynamic_config = DynamicConfig()
-        if self.pipeline_autoscaling_enabled:
+        if self.dynamic_communication_enabled or self.pipeline_autoscaling_enabled:
+            self.dynamic_config.dynamic_communication_enabled = True
             self.dynamic_config.pipeline_autoscaling_enabled = True
         if self.autoscaling_candidate_ranks is not None:
             self.dynamic_config.autoscaling_candidate_ranks = (
@@ -668,9 +671,14 @@ class EngineArgs:
                  'Example: \'{"0": 0, "1": 1, "2": 2, "3": 3}\'. '
                  'With TP>1 values must be TP-group base ranks.')
         parallel_group.add_argument(
+            "--dynamic-communication-enabled",
+            action="store_true",
+            help="Enable dynamic pipeline communication for experimental "
+            "TP=1/DP=1 dynamic PP runs.")
+        parallel_group.add_argument(
             "--pipeline-autoscaling-enabled",
             action="store_true",
-            help="Enable experimental TP=1/DP=1 pipeline autoscaling.")
+            help="Deprecated alias for --dynamic-communication-enabled.")
         parallel_group.add_argument(
             "--autoscaling-candidate-ranks",
             type=json.loads,

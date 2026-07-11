@@ -8,6 +8,7 @@ import os
 import signal
 import shutil
 import subprocess
+import sys
 import time
 import threading
 import csv
@@ -832,7 +833,7 @@ def start_vllm(cfg: Config,  spec: ServerRunSpec, logm: LogManager, vars: Option
 
     # 启动服务
     serve_args = [
-        "vllm", "serve", cfg.model.path,
+        sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", cfg.model.path,
         "--pipeline-parallel-size", str(cfg.vllm.pipeline_parallel_size),
         "--gpu-memory-utilization", str(cfg.vllm.gpu_memory_utilization),
         "--max-model-len", str(cfg.vllm.max_model_len),
@@ -913,7 +914,7 @@ def start_vllm_with_raw_logging(cfg: Config, spec: ServerRunSpec, logm: LogManag
         env["VLLM_LAYERKV_RANK_TO_IP"] = _json.dumps(rank_to_ip)
 
     serve_args = [
-        "vllm", "serve", cfg.model.path,
+        sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", cfg.model.path,
         "--pipeline-parallel-size", str(cfg.vllm.pipeline_parallel_size),
         "--gpu-memory-utilization", str(cfg.vllm.gpu_memory_utilization),
         "--max-model-len", str(cfg.vllm.max_model_len),
@@ -1415,7 +1416,7 @@ def generate_experiment_specs(
             enable_kv_resize=exp_cfg.vllm.enable_kv_resize,
             log_kv_memory_stats=exp_cfg.vllm.log_kv_memory_stats,
             enable_cpu_weight_cache=exp_cfg.vllm.enable_cpu_weight_cache,
-            pipeline_autoscaling_enabled=exp_cfg.vllm.pipeline_autoscaling_enabled,
+            dynamic_communication_enabled=exp_cfg.vllm.dynamic_communication_enabled,
             autoscaling_candidate_ranks=exp_cfg.vllm.autoscaling_candidate_ranks,
             autoscaling_sequence=exp_cfg.vllm.autoscaling_sequence,
             autoscaling_policy=exp_cfg.vllm.autoscaling_policy,
@@ -1512,7 +1513,7 @@ def start_vllm_for_sweep(
     _apply_page_attention_block_env(env, spec)
     
     serve_args = [
-        "vllm", "serve", spec.model_path,
+        sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", spec.model_path,
         "--pipeline-parallel-size", str(spec.pipeline_parallel_size),
         "--gpu-memory-utilization", str(spec.gpu_memory_utilization),
         "--max-model-len", str(spec.max_model_len),
@@ -1626,8 +1627,8 @@ def start_benchmark_for_sweep(
     if dataset_name == "sharegpt" and sharegpt_output_len is not None:
         bench_args.extend(["--sharegpt-output-len", str(sharegpt_output_len)])
     
-    if spec.print_outputs:
-        bench_args.append("--print-outputs")
+    # Keep benchmark logs free of per-request generated text so the benchmark
+    # driver has the same I/O behavior as the legacy baseline launcher.
     if spec.profile:
         bench_args.append("--profile")
     if spec.save_result or spec.save_detailed:
@@ -2454,7 +2455,7 @@ def start_vllm_single_instance(
     _apply_page_attention_block_env(env, spec)
     
     serve_args = [
-        "vllm", "serve", spec.model_path,
+        sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", spec.model_path,
         "--pipeline-parallel-size", str(spec.pipeline_parallel_size),
         "--gpu-memory-utilization", str(spec.gpu_memory_utilization),
         "--max-model-len", str(spec.max_model_len),

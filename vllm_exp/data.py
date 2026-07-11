@@ -889,14 +889,23 @@ class StaticVllmCfg(BaseModel):
     When False, weights are loaded from disk on-demand during migration."""
     disable_memory_overhead_monitor: bool = False
     """Disable VMXpert memory overhead monitoring during migration."""
+    dynamic_communication_enabled: bool = False
+    """Enable dynamic pipeline communication."""
     pipeline_autoscaling_enabled: bool = False
-    """Enable experimental TP=1/DP=1 pipeline autoscaling."""
+    """Deprecated alias for dynamic_communication_enabled."""
     autoscaling_candidate_ranks: Optional[List[int]] = None
     """Candidate PP ranks that may become active during autoscaling."""
     autoscaling_sequence: Optional[List[Dict[str, Any]]] = None
     """Optional explicit multi-step autoscaling sequence."""
     autoscaling_policy: Optional[Dict[str, Any]] = None
     """Optional runtime autoscaling policy, e.g. KV pressure threshold."""
+
+    @model_validator(mode="after")
+    def normalize_dynamic_communication_alias(self) -> "StaticVllmCfg":
+        if self.pipeline_autoscaling_enabled:
+            self.dynamic_communication_enabled = True
+        self.pipeline_autoscaling_enabled = self.dynamic_communication_enabled
+        return self
 
 
 class StaticBenchCfg(BaseModel):
@@ -1182,11 +1191,17 @@ class ExpVllmConfig:
     """Whether to preload all weights into CPU memory at startup. Default True.
     When True, weights are preloaded to CPU pinned memory for faster GPU loading.
     When False, weights are loaded from disk on-demand during migration."""
+    dynamic_communication_enabled: bool = False
     pipeline_autoscaling_enabled: bool = False
     autoscaling_candidate_ranks: Optional[List[int]] = None
     autoscaling_sequence: Optional[List[Dict[str, Any]]] = None
     autoscaling_policy: Optional[Dict[str, Any]] = None
     pp_layer_config: Dict[int, str] = field(default_factory=dict)  # {0: "32,32", 100: "20,44"}
+
+    def __post_init__(self) -> None:
+        if self.pipeline_autoscaling_enabled:
+            self.dynamic_communication_enabled = True
+        self.pipeline_autoscaling_enabled = self.dynamic_communication_enabled
     
     @property
     def has_migration(self) -> bool:
@@ -1538,7 +1553,7 @@ class ExperimentConfig:
             enable_cpu_weight_cache=cpu_cache,
             log_kv_memory_stats=static_cfg.vllm.log_kv_memory_stats,
             disable_memory_overhead_monitor=static_cfg.vllm.disable_memory_overhead_monitor,
-            pipeline_autoscaling_enabled=static_cfg.vllm.pipeline_autoscaling_enabled,
+            dynamic_communication_enabled=static_cfg.vllm.dynamic_communication_enabled,
             autoscaling_candidate_ranks=static_cfg.vllm.autoscaling_candidate_ranks,
             autoscaling_sequence=static_cfg.vllm.autoscaling_sequence,
             autoscaling_policy=static_cfg.vllm.autoscaling_policy,
@@ -1659,10 +1674,16 @@ class VllmServerSpec:
     """Whether to preload all weights into CPU memory at startup. Default True.
     When True, weights are preloaded to CPU pinned memory for faster GPU loading.
     When False, weights are loaded from disk on-demand during migration."""
+    dynamic_communication_enabled: bool = False
     pipeline_autoscaling_enabled: bool = False
     autoscaling_candidate_ranks: Optional[List[int]] = None
     autoscaling_sequence: Optional[List[Dict[str, Any]]] = None
     autoscaling_policy: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if self.pipeline_autoscaling_enabled:
+            self.dynamic_communication_enabled = True
+        self.pipeline_autoscaling_enabled = self.dynamic_communication_enabled
     
     # Migration/Partition
     pp_layer_partition: str = ""
@@ -1702,7 +1723,7 @@ class VllmServerSpec:
             "enable_kv_resize": self.enable_kv_resize,
             "log_kv_memory_stats": self.log_kv_memory_stats,
             "enable_cpu_weight_cache": self.enable_cpu_weight_cache,
-            "pipeline_autoscaling_enabled": self.pipeline_autoscaling_enabled,
+            "dynamic_communication_enabled": self.dynamic_communication_enabled,
         }
         if self.autoscaling_candidate_ranks is not None:
             cfg["autoscaling_candidate_ranks"] = self.autoscaling_candidate_ranks

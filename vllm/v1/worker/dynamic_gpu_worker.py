@@ -518,7 +518,7 @@ class DynamicGPUWorker(Worker):
                     layer_list)
                 # 在这里更新kv_cache_group
                 if is_flexi:
-                    if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
+                    if self.vllm_config.dynamic_config.dynamic_communication_enabled:
                         self._autoscale_sender_key_cache_ptrs = list(
                             self.dynamic_kv_synchronizer.key_cache_ptrs)
                         self._autoscale_sender_value_cache_ptrs = list(
@@ -1841,7 +1841,7 @@ class DynamicGPUWorker(Worker):
                                  int(runtime_overhead))
 
         autoscaling_enabled = (
-            self.vllm_config.dynamic_config.pipeline_autoscaling_enabled)
+            self.vllm_config.dynamic_config.dynamic_communication_enabled)
         fbgate = getattr(getattr(self, "model_runner", None), "fbgate", None)
         if autoscaling_enabled and fbgate is not None:
             gate = getattr(fbgate, "exclusive_background", fbgate.background)
@@ -3105,20 +3105,6 @@ class DynamicGPUWorker(Worker):
             return None
         self.rank_to_layers_ids = src_to_plan[self.rank]
 
-        # In pipeline-autoscaling no-drain mode, sender ranks must keep the
-        # old PtrTable/key_cache_ptrs until old-config batches and KV sending
-        # are done. Preparing target PtrTables here is especially unsafe for
-        # shrink senders whose target layer count is zero.
-        if (use_direct_ptr_for_runtime(self.vllm_config)
-                and not self.vllm_config.dynamic_config.
-                pipeline_autoscaling_enabled):
-            self.model_runner.prepare_ptr_tables(num_layers)
-        elif use_direct_ptr_for_runtime(self.vllm_config):
-            logger.info(
-                "[autoscaling async] rank %s keeps existing PtrTable during "
-                "KV migration start; target_num_layers=%s",
-                self.rank, num_layers)
-        
         # 初始化 sender 线程计数
         with self._sender_threads_cv:
             self._num_active_sender_threads = len(self.rank_to_layers_ids)
@@ -3127,19 +3113,19 @@ class DynamicGPUWorker(Worker):
             sender_key_cache_ptrs = None
             sender_value_cache_ptrs = None
             sender_kv_caches = None
-            if (use_direct_ptr_for_runtime(self.vllm_config)
-                    and self.vllm_config.dynamic_config.
-                    pipeline_autoscaling_enabled):
+            if use_direct_ptr_for_runtime(self.vllm_config):
                 sender_layer_ids = sorted({
                     layer_id
                     for layer_ids in self.rank_to_layers_ids.values()
                     for layer_id in layer_ids
                 })
-                if self._kv_ptr_view_covers_layers(
+                if (self.vllm_config.dynamic_config.
+                        dynamic_communication_enabled
+                        and self._kv_ptr_view_covers_layers(
                         self._autoscale_sender_start_layer,
                         self._autoscale_sender_key_cache_ptrs,
                         self._autoscale_sender_value_cache_ptrs,
-                        sender_layer_ids):
+                        sender_layer_ids)):
                     sender_start_layer_id = self._autoscale_sender_start_layer
                     sender_key_cache_ptrs = self._autoscale_sender_key_cache_ptrs
                     sender_value_cache_ptrs = (
@@ -3179,6 +3165,20 @@ class DynamicGPUWorker(Worker):
                     "[autoscaling async] rank %s captured sender KV tensor "
                     "view at migration start: start_layer=%s, num_layers=%s",
                     self.rank, sender_start_layer_id, len(sender_kv_caches))
+
+        # Reconfiguration prepares the target PtrTable only after capturing the
+        # old sender pointer view. The pending table does not replace the live
+        # table until commit_ptr_tables(), but capturing first avoids accidental
+        # fallback to a target-local direct-pointer view during KV patch gather.
+        if (use_direct_ptr_for_runtime(self.vllm_config)
+                and not self.vllm_config.dynamic_config.
+                dynamic_communication_enabled):
+            self.model_runner.prepare_ptr_tables(num_layers)
+        elif use_direct_ptr_for_runtime(self.vllm_config):
+            logger.info(
+                "[autoscaling async] rank %s keeps existing PtrTable during "
+                "KV migration start; target_num_layers=%s",
+                self.rank, num_layers)
 
         def migration_thread(rank: int, layer_ids: list[int],
                              start_layer_id: int,
@@ -3305,7 +3305,7 @@ class DynamicGPUWorker(Worker):
                     _sync_current_cuda_stream(self.device)
             autoscaling_enabled = (
                 self.vllm_config.dynamic_config.
-                pipeline_autoscaling_enabled)
+                dynamic_communication_enabled)
             send_gate = self.model_runner.fbgate.background
             for layer_id in layer_ids:
                 time_start = time.time()
@@ -3434,14 +3434,14 @@ class DynamicGPUWorker(Worker):
                     live_block_ids_getter=(
                         self._autoscaling_live_request_block_ids
                         if self.vllm_config.dynamic_config.
-                        pipeline_autoscaling_enabled else None),
+                        dynamic_communication_enabled else None),
                     block_size=self.block_size):
                 time_start = time.time()
                 patch_payload_size = kv_patch.kv_payload.numel() * kv_patch.kv_payload.element_size()
                 patch_slot_mapping_size = kv_patch.slot_mapping.numel() * kv_patch.slot_mapping.element_size()
                 patch_send_context = (
                     nullcontext() if self.vllm_config.dynamic_config.
-                    pipeline_autoscaling_enabled else
+                    dynamic_communication_enabled else
                     self.model_runner.fbgate.background())
                 with patch_send_context:
                     self.dynamic_kv_synchronizer.send_kv_patch_to_rank(
@@ -3568,7 +3568,7 @@ class DynamicGPUWorker(Worker):
         num_layers = pp_layer_config[self.rank][1] - pp_layer_config[self.rank][0] + 1
         if (use_direct_ptr_for_runtime(self.vllm_config)
                 and not self.vllm_config.dynamic_config.
-                pipeline_autoscaling_enabled):
+                dynamic_communication_enabled):
             self.model_runner.prepare_ptr_tables(num_layers)
         elif use_direct_ptr_for_runtime(self.vllm_config):
             logger.info(
@@ -3671,7 +3671,7 @@ class DynamicGPUWorker(Worker):
             tmp_slot_mapping_dict: dict[int, torch.Tensor] = {}
             tmp_slot_token_num: int = 0
             autoscaling_enabled = (
-                self.vllm_config.dynamic_config.pipeline_autoscaling_enabled)
+                self.vllm_config.dynamic_config.dynamic_communication_enabled)
 
             while True:
                 # 1) Firstly wait for all tensor the be received
@@ -4173,16 +4173,12 @@ class DynamicGPUWorker(Worker):
             return
         assert scheduler_output.sender_list is not None
         assert scheduler_output.receiver_list is not None
-        if self.vllm_config.dynamic_config.pipeline_autoscaling_enabled:
-            logger.info(
-                "[autoscaling sync] rank %s defers migration finalization "
-                "to all-worker RPC", self.rank)
-            return
-        self._finalize_async_migration_after_sync(
-            list(scheduler_output.sender_list),
-            list(scheduler_output.receiver_list),
-            scheduler_output.total_migration_tokens,
-            scheduler_output.new_kv_cache_block_num)
+        reason = (
+            "autoscaling" if self.vllm_config.dynamic_config.
+            dynamic_communication_enabled else "reconfiguration")
+        logger.info(
+            "[%s sync] rank %s defers migration finalization to all-worker RPC",
+            reason, self.rank)
 
     def finalize_async_migration_after_sync(
         self,
@@ -4330,10 +4326,12 @@ class DynamicGPUWorker(Worker):
                             logger.info(f"[do_resize] Waiting for {self._num_active_sender_threads} sender threads...")
                             self._sender_threads_cv.wait(timeout=5.0)
 
-                    release_weights_immediately = (
-                        target_num_layers <= 0
-                        or self.vllm_config.dynamic_config.
-                        pipeline_autoscaling_enabled)
+                    # The driver calls this finalize path only after the sync
+                    # batch has completed and while scheduling is paused. No
+                    # old-topology forward can still use the sender-only
+                    # layers, and waiting for an after-inference release here
+                    # would deadlock with the scheduler pause.
+                    release_weights_immediately = True
                     detached_layers = self.remove_layers(
                         self.rank,
                         layer_ranges,
@@ -4346,7 +4344,7 @@ class DynamicGPUWorker(Worker):
                             "autoscaling=%s",
                             self.rank, target_num_layers,
                             self.vllm_config.dynamic_config.
-                            pipeline_autoscaling_enabled)
+                            dynamic_communication_enabled)
                     else:
                         deleted_layers_released = (
                             self._queue_deleted_model_layers_after_inference(

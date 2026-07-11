@@ -58,8 +58,9 @@ class DynamicQwen3ForCausalLM(Qwen3ForCausalLM, DynamicModelBase):
         self.model = DynamicQwen3Model(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
 
-        is_autoscaling = vllm_config.dynamic_config.pipeline_autoscaling_enabled
-        if get_pp_group().is_last_rank or is_autoscaling:
+        use_dynamic_communication = (
+            vllm_config.dynamic_config.dynamic_communication_enabled)
+        if get_pp_group().is_last_rank or use_dynamic_communication:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
@@ -166,7 +167,7 @@ class DynamicQwen3Model(Qwen3Model):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix)
-        if (vllm_config.dynamic_config.pipeline_autoscaling_enabled
+        if (vllm_config.dynamic_config.dynamic_communication_enabled
                 and isinstance(self.norm, PPMissingLayer)):
             self.norm = RMSNorm(self.config.hidden_size,
                                 eps=self.config.rms_norm_eps)

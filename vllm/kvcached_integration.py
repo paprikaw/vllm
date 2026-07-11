@@ -213,6 +213,11 @@ def _register_kvcached_migration_unmap_hook(kv_synchronizer: Any) -> None:
                 offsets,
                 group_id=group_id,
                 reason="kvcached worker ipc pre-unmap")
+            nccl_lock_getter = getattr(kv_synchronizer, "get_nccl_lock", None)
+            nccl_lock = (nccl_lock_getter()
+                         if nccl_lock_getter is not None else None)
+            if nccl_lock is not None:
+                stack.enter_context(nccl_lock)
             forward_context = getattr(kv_synchronizer,
                                       "_kvcached_pre_unmap_context", None)
             if forward_context is not None:
@@ -897,23 +902,28 @@ def _enhance_elastic_block_pool_for_dynamic_resize(
         page_allocator = self.kv_cache_manager.page_allocator
         prealloc_paused = False
         before_stats = self.kv_cache_manager.stats(target_blocks=target)
-
-        try:
-            page_allocator.stop_prealloc_thread()
-            prealloc_paused = True
-            self.kv_cache_manager.trim()
-            after_trim_stats = self.kv_cache_manager.stats(
-                target_blocks=target)
-        except Exception:
-            if prealloc_paused and not getattr(self.kv_cache_manager,
-                                               "_closed", False):
-                page_allocator.start_prealloc_thread()
-            logger.exception("KVCacheD pre-resize trim failed during %s",
-                             reason)
-            raise
+        skip_noop_trim = (
+            os.getenv("VLLM_KVCACHED_SKIP_NOOP_PHYSICAL_TRIM",
+                      "").strip().lower() in {"1", "true", "yes", "on"})
 
         if (target == current_virtual_blocks
                 and current_physical_limit == target_physical_pages):
+            if skip_noop_trim:
+                after_trim_stats = before_stats
+            else:
+                try:
+                    page_allocator.stop_prealloc_thread()
+                    prealloc_paused = True
+                    self.kv_cache_manager.trim()
+                    after_trim_stats = self.kv_cache_manager.stats(
+                        target_blocks=target)
+                except Exception:
+                    if prealloc_paused and not getattr(self.kv_cache_manager,
+                                                       "_closed", False):
+                        page_allocator.start_prealloc_thread()
+                    logger.exception(
+                        "KVCacheD pre-resize trim failed during %s", reason)
+                    raise
             try:
                 after_stats = self.kv_cache_manager.stats(
                     target_blocks=target)
@@ -925,9 +935,10 @@ def _enhance_elastic_block_pool_for_dynamic_resize(
                                                    "_closed", False):
                     page_allocator.start_prealloc_thread()
             logger.info(
-                "KVCacheD physical trim committed%s: target_blocks=%s "
+                "KVCacheD physical trim %s%s: target_blocks=%s "
                 "stats_before=%s stats_after_trim=%s stats_after=%s "
                 "pending_moves=%s",
+                "skipped" if skip_noop_trim else "committed",
                 f" ({reason})" if reason else "", target, before_stats,
                 after_trim_stats, after_stats, num_moves)
             _log_kvcached_fragmentation_stats(reason, target, before_stats,
@@ -935,6 +946,19 @@ def _enhance_elastic_block_pool_for_dynamic_resize(
             return True
 
         try:
+            try:
+                page_allocator.stop_prealloc_thread()
+                prealloc_paused = True
+                self.kv_cache_manager.trim()
+                after_trim_stats = self.kv_cache_manager.stats(
+                    target_blocks=target)
+            except Exception:
+                if prealloc_paused and not getattr(self.kv_cache_manager,
+                                                   "_closed", False):
+                    page_allocator.start_prealloc_thread()
+                logger.exception("KVCacheD pre-resize trim failed during %s",
+                                 reason)
+                raise
             ok = _resize_kvcached_pool(self, target)
             if not ok:
                 raise KVCacheDPhysicalResizePending(

@@ -520,7 +520,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
         self._run_workers("init_device")
         dynamic_config = self.vllm_config.dynamic_config
-        if getattr(dynamic_config, "pipeline_autoscaling_enabled", False):
+        if getattr(dynamic_config, "dynamic_communication_enabled", False):
             active_ranks = self._active_ranks_from_partition(
                 dynamic_config.pp_layer_partition)
             self._run_workers("set_active_pp_ranks", active_ranks)
@@ -540,7 +540,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                     assert len(self.pp_tp_workers[pp_rank]) == tp_rank
                     assert pp_rank < len(self.pp_tp_workers)
                     self.pp_tp_workers[pp_rank].append(self.workers[rank])
-            if getattr(dynamic_config, "pipeline_autoscaling_enabled", False):
+            if getattr(dynamic_config, "dynamic_communication_enabled", False):
                 self._set_active_pp_ranks_local(active_ranks)
 
         # This is the list of workers that are rank 0 of each TP group EXCEPT
@@ -575,27 +575,28 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         return [rank for rank, num_layers in enumerate(parts)
                 if num_layers > 0]
 
-    def _set_active_pp_ranks_local(self, active_ranks: Optional[list[int]]) -> None:
-        self.active_pp_ranks = list(active_ranks) if active_ranks else None
+    def _set_active_pp_ranks_local(
+        self,
+        active_ranks: Optional[list[int]],
+    ) -> None:
+        next_active_pp_ranks = list(active_ranks) if active_ranks else None
+        if next_active_pp_ranks == self.active_pp_ranks:
+            logger.info(
+                "Active PP worker chain already ranks %s; skipping update",
+                next_active_pp_ranks,
+            )
+            return
+        self.active_pp_ranks = next_active_pp_ranks
         if not self.use_ray_spmd_worker or not active_ranks:
             return
         if self.parallel_config.tensor_parallel_size != 1:
             raise NotImplementedError(
                 "pipeline autoscaling currently supports TP=1 only")
         if self.use_ray_compiled_dag:
-            if getattr(self, "forward_dag", None) is not None:
-                logger.info("Tearing down old compiled PP worker chain before "
-                            "switching active ranks")
-                self.forward_dag.teardown()
-            if getattr(self, "cpu_forward_dag", None) is not None:
-                logger.info("Tearing down old compiled CPU PP worker chain before "
-                            "switching active ranks")
-                self.cpu_forward_dag.teardown()
-            if self.workers:
-                ray.get([
-                    worker.reset_ray_compiled_dag_nccl_lock.remote()
-                    for worker in self.workers
-                ])
+            raise RuntimeError(
+                "Active PP rank updates require dynamic actor-chain execution "
+                "with VLLM_USE_RAY_COMPILED_DAG=0; compiled-DAG rebuild during "
+                "reconfiguration is no longer supported.")
         self.pp_tp_workers = [[self.workers[rank]] for rank in active_ranks]
         self.forward_dag = None
         self.cpu_forward_dag = None
@@ -742,8 +743,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         dynamic_config = self.vllm_config.dynamic_config
         use_dynamic_actor_chain = (
             envs.VLLM_USE_V1
-            and getattr(dynamic_config, "pipeline_autoscaling_enabled", False)
-            and not envs.VLLM_USE_RAY_COMPILED_DAG
+            and getattr(dynamic_config, "dynamic_communication_enabled", False)
         )
         if not use_dynamic_actor_chain:
             super()._init_executor()
@@ -752,8 +752,12 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
 
         self.forward_dag = None
         # V1 normally forces Ray Compiled DAG. Autoscaling needs the PP chain
-        # to be selected at runtime, so keep the SPMD actor pool but avoid
-        # compiling a static DAG topology.
+        # to be selected at runtime, so keep the SPMD actor pool and never
+        # rebuild a static DAG topology in the reconfiguration path.
+        if envs.VLLM_USE_RAY_COMPILED_DAG:
+            logger.info(
+                "Pipeline autoscaling ignores VLLM_USE_RAY_COMPILED_DAG=1 "
+                "and uses dynamic actor-chain execution")
         os.environ["VLLM_USE_RAY_SPMD_WORKER"] = "1"
         os.environ["VLLM_USE_RAY_COMPILED_DAG"] = "0"
         self.use_ray_compiled_dag = False
@@ -1000,7 +1004,7 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         active_ranks: Optional[list[int]],
     ) -> None:
         dynamic_config = self.vllm_config.dynamic_config
-        if not getattr(dynamic_config, "pipeline_autoscaling_enabled", False):
+        if not getattr(dynamic_config, "dynamic_communication_enabled", False):
             return
         if not active_ranks:
             return
