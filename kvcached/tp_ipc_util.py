@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import os
 import pickle
 import socket
@@ -12,6 +13,13 @@ from typing import Any, Callable, Dict, Iterable, cast
 
 from kvcached.utils import DEFAULT_IPC_NAME
 from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
+
+
+_WORKER_IPC_TRANSPORT_ENV = "KVCACHED_WORKER_IPC_TRANSPORT"
+_PP_RANK_TO_IP_ENV = "KVCACHED_PP_RANK_TO_IP"
+_WORKER_IPC_PORT_BASE_ENV = "KVCACHED_WORKER_IPC_PORT_BASE"
+_WORKER_IPC_PORT_STRIDE_ENV = "KVCACHED_WORKER_IPC_PORT_STRIDE"
+_WORKER_IPC_BIND_HOST_ENV = "KVCACHED_WORKER_IPC_BIND_HOST"
 
 
 def _current_cuda_device_index() -> int | None:
@@ -54,6 +62,53 @@ def _get_socket_dir_name() -> str:
 # Unix domain socket paths are limited to 108 characters on Linux, so we keep
 # the directory name short and validate the final socket path length below.
 SOCKET_DIR = os.path.join("/tmp", _get_socket_dir_name())
+
+
+def _use_tcp_worker_ipc() -> bool:
+    transport = os.getenv(_WORKER_IPC_TRANSPORT_ENV, "unix").strip().lower()
+    if transport not in {"unix", "tcp"}:
+        raise ValueError(
+            f"Unsupported {_WORKER_IPC_TRANSPORT_ENV}={transport!r}; "
+            "expected 'unix' or 'tcp'")
+    return transport == "tcp"
+
+
+def _get_pp_rank_to_ip() -> dict[int, str]:
+    raw = os.getenv(_PP_RANK_TO_IP_ENV, "")
+    if not raw:
+        raise RuntimeError(
+            f"{_PP_RANK_TO_IP_ENV} is required for TCP worker IPC")
+    try:
+        parsed = json.loads(raw)
+        mapping = {int(rank): str(host) for rank, host in parsed.items()}
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Invalid {_PP_RANK_TO_IP_ENV} JSON mapping: {raw!r}") from exc
+    if not mapping or any(not host for host in mapping.values()):
+        raise RuntimeError(f"{_PP_RANK_TO_IP_ENV} must not be empty")
+    return mapping
+
+
+def get_worker_tcp_address(rank: int, pp_rank: int = 0) -> tuple[str, int]:
+    mapping = _get_pp_rank_to_ip()
+    if pp_rank not in mapping:
+        raise RuntimeError(
+            f"No worker IPC host configured for PP rank {pp_rank} in "
+            f"{_PP_RANK_TO_IP_ENV}")
+    try:
+        base_port = int(os.environ[_WORKER_IPC_PORT_BASE_ENV])
+        stride = int(os.getenv(_WORKER_IPC_PORT_STRIDE_ENV, "32"))
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(
+            f"{_WORKER_IPC_PORT_BASE_ENV} must be an integer for TCP worker "
+            "IPC") from exc
+    if stride <= 0 or rank < 0 or rank >= stride:
+        raise RuntimeError(
+            f"Invalid worker IPC rank/stride: rank={rank}, stride={stride}")
+    port = base_port + pp_rank * stride + rank
+    if port <= 0 or port > 65535:
+        raise RuntimeError(f"Worker IPC TCP port is out of range: {port}")
+    return mapping[pp_rank], port
 
 
 def get_worker_socket_path(rank: int, pp_rank: int = 0) -> str:
@@ -103,10 +158,14 @@ Message = Dict[str, Any]
 PostMapCallback = Callable[[list[int], int], None]
 PreUnmapCallback = Callable[[list[int], int],
                             AbstractContextManager[Any] | None]
+WorkerOffsetFilter = Callable[[list[int], int], list[int]]
 _POST_MAP_CALLBACKS: list[PostMapCallback] = []
 _POST_MAP_CALLBACKS_LOCK = threading.Lock()
 _PRE_UNMAP_CALLBACKS: list[PreUnmapCallback] = []
 _PRE_UNMAP_CALLBACKS_LOCK = threading.Lock()
+_WORKER_OFFSET_FILTER: WorkerOffsetFilter | None = None
+_WORKER_MAPPING_LOCK = threading.RLock()
+_WORKER_MAPPED_OFFSETS: dict[int, set[int]] = {}
 
 
 def register_post_map_callback(callback: PostMapCallback) -> None:
@@ -125,6 +184,13 @@ def register_pre_unmap_callback(callback: PreUnmapCallback) -> None:
     with _PRE_UNMAP_CALLBACKS_LOCK:
         if callback not in _PRE_UNMAP_CALLBACKS:
             _PRE_UNMAP_CALLBACKS.append(callback)
+
+
+def register_worker_offset_filter(callback: WorkerOffsetFilter) -> None:
+    """Restrict scheduler-broadcast maps to this worker's PP-owned layers."""
+    global _WORKER_OFFSET_FILTER
+    with _WORKER_MAPPING_LOCK:
+        _WORKER_OFFSET_FILTER = callback
 
 
 def _notify_post_map_callbacks(
@@ -153,6 +219,80 @@ def _enter_pre_unmap_callbacks(
         stack.close()
         raise
     return stack
+
+
+def _normalize_offsets(offsets: Iterable[int]) -> list[int]:
+    return sorted({int(offset) for offset in offsets})
+
+
+def _map_worker_offsets(
+    offsets: Iterable[int],
+    group_id: int = 0,
+    *,
+    apply_filter: bool,
+) -> bool:
+    requested = _normalize_offsets(offsets)
+    with _WORKER_MAPPING_LOCK:
+        if apply_filter and _WORKER_OFFSET_FILTER is not None:
+            requested = _normalize_offsets(
+                _WORKER_OFFSET_FILTER(requested, group_id))
+        mapped = _WORKER_MAPPED_OFFSETS.setdefault(group_id, set())
+        pending = [offset for offset in requested if offset not in mapped]
+        if not pending:
+            return True
+        ok = map_to_kv_tensors(pending, group_id=group_id)
+        if not ok:
+            return False
+        mapped.update(pending)
+        _notify_post_map_callbacks(pending, group_id)
+        return True
+
+
+def map_worker_offsets_for_migration(
+    offsets: Iterable[int],
+    group_id: int = 0,
+) -> bool:
+    """Map explicit receiver offsets without applying current PP ownership."""
+    return _map_worker_offsets(offsets, group_id, apply_filter=False)
+
+
+def _unmap_worker_offsets(
+    offsets: Iterable[int],
+    group_id: int = 0,
+) -> bool:
+    requested = set(_normalize_offsets(offsets))
+    with _WORKER_MAPPING_LOCK:
+        mapped = _WORKER_MAPPED_OFFSETS.setdefault(group_id, set())
+        pending = sorted(requested.intersection(mapped))
+        if not pending:
+            return True
+        _synchronize_cuda_device()
+        with _enter_pre_unmap_callbacks(pending, group_id):
+            ok = unmap_from_kv_tensors(pending, group_id=group_id)
+        if not ok:
+            return False
+        mapped.difference_update(pending)
+        return True
+
+
+def unmap_worker_offsets_for_layer_groups(
+    group_indices: Iterable[int],
+    group_total_span: int,
+    group_id: int = 0,
+) -> bool:
+    """Release all locally mapped offsets belonging to layer groups."""
+    selected_groups = {int(group_idx) for group_idx in group_indices}
+    if not selected_groups:
+        return True
+    if group_total_span <= 0:
+        raise ValueError("group_total_span must be positive")
+    with _WORKER_MAPPING_LOCK:
+        mapped = _WORKER_MAPPED_OFFSETS.get(group_id, set())
+        offsets = [
+            offset for offset in mapped
+            if offset // group_total_span in selected_groups
+        ]
+    return _unmap_worker_offsets(offsets, group_id)
 
 
 def send_msg(sock: socket.socket, msg: Message) -> None:
@@ -196,24 +336,32 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
     pp_rank is used to create a PP-stage-specific subdirectory so that
     concurrent SGLang PP stages do not bind the same socket path.
     """
-    socket_dir = os.path.join(SOCKET_DIR, f"pp{pp_rank}") if pp_rank > 0 else SOCKET_DIR
-    os.makedirs(socket_dir, exist_ok=True)
-    socket_path = get_worker_socket_path(rank, pp_rank)
-
-    if os.path.exists(socket_path):
-        try:
-            os.remove(socket_path)
-        except OSError as e:
-            print(f"Error removing existing socket file {socket_path}: {e}")
-
     cuda_device_index = _current_cuda_device_index()
-    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server_sock.bind(socket_path)
+    if _use_tcp_worker_ipc():
+        _, port = get_worker_tcp_address(rank, pp_rank)
+        bind_host = os.getenv(_WORKER_IPC_BIND_HOST_ENV, "0.0.0.0")
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind((bind_host, port))
+        listener_address = f"tcp://{bind_host}:{port}"
+    else:
+        socket_dir = (os.path.join(SOCKET_DIR, f"pp{pp_rank}")
+                      if pp_rank > 0 else SOCKET_DIR)
+        os.makedirs(socket_dir, exist_ok=True)
+        socket_path = get_worker_socket_path(rank, pp_rank)
+        if os.path.exists(socket_path):
+            try:
+                os.remove(socket_path)
+            except OSError as e:
+                print(f"Error removing existing socket file {socket_path}: {e}")
+        server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server_sock.bind(socket_path)
+        listener_address = socket_path
     server_sock.listen()
 
     def listen_loop():
         _set_cuda_device(cuda_device_index)
-        print(f"Worker {rank} IPC listener started at {socket_path} "
+        print(f"Worker {rank} IPC listener started at {listener_address} "
               f"(cuda_device={cuda_device_index})")
         while True:
             conn, _ = server_sock.accept()
@@ -223,9 +371,8 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                 group_id: int = msg.get("group_id", 0)
                 if msg["cmd"] == "map_to_kv_tensors":
                     offsets = [int(offset) for offset in msg["offsets"]]
-                    ok = map_to_kv_tensors(offsets, group_id=group_id)
-                    if ok:
-                        _notify_post_map_callbacks(offsets, group_id)
+                    ok = _map_worker_offsets(
+                        offsets, group_id=group_id, apply_filter=True)
                     if ok:
                         send_msg(conn, {"status": "success"})
                     else:
@@ -235,10 +382,7 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                         })
                 elif msg["cmd"] == "unmap_from_kv_tensors":
                     offsets = [int(offset) for offset in msg["offsets"]]
-                    _synchronize_cuda_device()
-                    with _enter_pre_unmap_callbacks(offsets, group_id):
-                        ok = unmap_from_kv_tensors(offsets,
-                                                   group_id=group_id)
+                    ok = _unmap_worker_offsets(offsets, group_id=group_id)
                     if ok:
                         send_msg(conn, {"status": "success"})
                     else:
@@ -268,8 +412,12 @@ async def _send_and_receive_message(rank: int, message: Message, pp_rank: int = 
     """
     Send a message to the worker and receive a response asynchronously.
     """
-    socket_path = get_worker_socket_path(rank, pp_rank)
-    reader, writer = await asyncio.open_unix_connection(socket_path)
+    if _use_tcp_worker_ipc():
+        host, port = get_worker_tcp_address(rank, pp_rank)
+        reader, writer = await asyncio.open_connection(host, port)
+    else:
+        socket_path = get_worker_socket_path(rank, pp_rank)
+        reader, writer = await asyncio.open_unix_connection(socket_path)
 
     try:
         # Send map command
@@ -305,16 +453,45 @@ async def _broadcast_map_to_kv_tensors(tp_size: int,
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
+    successful_targets: list[tuple[int, int]] = []
+    failures: list[str] = []
     for (rank, target_pp_rank), response in zip(targets, responses):
         if isinstance(response, Exception):
-            raise RuntimeError(
+            failures.append(
                 f"Worker pp{target_pp_rank}/tp{rank} failed to map: "
                 f"{response}")
         elif not isinstance(response,
                             dict) or response.get("status") != "success":
-            raise RuntimeError(
+            failures.append(
                 f"Worker pp{target_pp_rank}/tp{rank} failed to map: "
                 f"{response}")
+        else:
+            successful_targets.append((rank, target_pp_rank))
+
+    if failures:
+        rollback_message = {
+            "cmd": "unmap_from_kv_tensors",
+            "offsets": offsets,
+            "group_id": group_id,
+        }
+        rollback_tasks = [
+            _send_and_receive_message(rank, rollback_message, target_pp_rank)
+            for rank, target_pp_rank in successful_targets
+        ]
+        rollback_responses = await asyncio.gather(
+            *rollback_tasks, return_exceptions=True)
+        rollback_failures = []
+        for (rank, target_pp_rank), response in zip(successful_targets,
+                                                    rollback_responses):
+            if (isinstance(response, Exception)
+                    or not isinstance(response, dict)
+                    or response.get("status") != "success"):
+                rollback_failures.append(
+                    f"pp{target_pp_rank}/tp{rank}: {response}")
+        detail = failures[0]
+        if rollback_failures:
+            detail += "; rollback failed for " + ", ".join(rollback_failures)
+        raise RuntimeError(detail)
 
 
 async def _broadcast_unmap_from_kv_tensors(tp_size: int,

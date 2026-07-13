@@ -173,7 +173,10 @@ def _set_kvcached_debug_geometry(owner: Any, geometry: dict[str, Any]) -> None:
     setattr(owner, "_kvcached_debug_geometry", geometry)
 
 
-def _register_kvcached_migration_unmap_hook(kv_synchronizer: Any) -> None:
+def _register_kvcached_migration_unmap_hook(
+    runner: Any,
+    kv_synchronizer: Any,
+) -> None:
     if getattr(kv_synchronizer, "_kvcached_unmap_hook_registered", False):
         return
     drop_slots = getattr(kv_synchronizer,
@@ -187,6 +190,7 @@ def _register_kvcached_migration_unmap_hook(kv_synchronizer: Any) -> None:
         from kvcached.tp_ipc_util import (
             register_post_map_callback,
             register_pre_unmap_callback,
+            register_worker_offset_filter,
         )
     except Exception as exc:
         logger.warning(
@@ -205,6 +209,14 @@ def _register_kvcached_migration_unmap_hook(kv_synchronizer: Any) -> None:
     def _on_worker_pre_unmap(offsets: list[int], group_id: int) -> Any:
         stack = ExitStack()
         try:
+            # Acquire the forward gate before page lifetime and NCCL. Sender
+            # snapshots intentionally do not take forward_lock, so holding a
+            # page-lifetime guard while waiting for forward can deadlock the
+            # sender needed to finish that forward's peer-side PP operation.
+            forward_context = getattr(kv_synchronizer,
+                                      "_kvcached_pre_unmap_context", None)
+            if forward_context is not None:
+                stack.enter_context(forward_context)
             page_context = getattr(
                 kv_synchronizer, "kvcached_page_lifetime_context", None)
             if page_context is not None:
@@ -218,10 +230,6 @@ def _register_kvcached_migration_unmap_hook(kv_synchronizer: Any) -> None:
                          if nccl_lock_getter is not None else None)
             if nccl_lock is not None:
                 stack.enter_context(nccl_lock)
-            forward_context = getattr(kv_synchronizer,
-                                      "_kvcached_pre_unmap_context", None)
-            if forward_context is not None:
-                stack.enter_context(forward_context)
         except BaseException:
             stack.close()
             raise
@@ -229,6 +237,23 @@ def _register_kvcached_migration_unmap_hook(kv_synchronizer: Any) -> None:
 
     register_post_map_callback(_on_worker_post_map)
     register_pre_unmap_callback(_on_worker_pre_unmap)
+
+    def _filter_worker_offsets(
+        offsets: list[int],
+        group_id: int,
+    ) -> list[int]:
+        del group_id
+        geometry = getattr(runner, "_kvcached_debug_geometry", {})
+        if not geometry.get("layer_group_layout"):
+            return offsets
+        group_total_span = int(geometry["group_total_span"])
+        owned_groups = _kvcached_owned_group_indices(runner)
+        return [
+            offset for offset in offsets
+            if int(offset) // group_total_span in owned_groups
+        ]
+
+    register_worker_offset_filter(_filter_worker_offsets)
     setattr(kv_synchronizer, "_kvcached_unmap_hook_registered", True)
 
 
@@ -294,8 +319,12 @@ def guard_kvcached_vmm_slots_mapped(
     group_id: int = 0,
     sync_before_check: bool = False,
     trace_info: Optional[dict[str, Any]] = None,
+    ensure_mapped: bool = False,
 ) -> None:
-    if not kvcached_vmm_guard_enabled() or not use_kvcached_backend():
+    if not use_kvcached_backend():
+        return
+    guard_enabled = kvcached_vmm_guard_enabled()
+    if not guard_enabled and not ensure_mapped:
         return
     block_ids, page_ids, offsets = _kvcached_slots_to_offsets(
         owner, slots, block_size, layer_ids=layer_ids)
@@ -303,6 +332,16 @@ def guard_kvcached_vmm_slots_mapped(
         return
     if sync_before_check and torch.cuda.is_available():
         torch.cuda.synchronize()
+    if ensure_mapped:
+        from kvcached.tp_ipc_util import map_worker_offsets_for_migration
+
+        if not map_worker_offsets_for_migration(offsets, group_id=group_id):
+            raise RuntimeError(
+                "KVCacheD failed to map receiver offsets before migration "
+                f"write: source={source}, rank={rank}, "
+                f"layer_ids={layer_ids}, offsets={offsets[:16]}")
+        if not guard_enabled:
+            return
     try:
         from kvcached.vmm_ops import debug_unmapped_offsets
     except Exception as exc:
@@ -631,6 +670,78 @@ def _kvcached_active_layer_names(
                     raise
         return names
     return sorted(forward_context, key=extract_layer_index)
+
+
+def _kvcached_owned_group_indices(runner: Any) -> set[int]:
+    geometry = getattr(runner, "_kvcached_debug_geometry", {})
+    if not geometry.get("layer_group_layout"):
+        return set()
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    forward_context = (
+        runner.vllm_config.compilation_config.static_forward_context)
+    layer_ids = {
+        int(extract_layer_index(name))
+        for name in _kvcached_active_layer_names(runner, forward_context)
+    }
+    granularity = max(1, int(geometry["layer_group_granularity"]))
+    groups: dict[int, set[int]] = {}
+    for layer_id in layer_ids:
+        groups.setdefault(layer_id // granularity, set()).add(layer_id)
+    incomplete = {
+        group_idx: sorted(group_layers)
+        for group_idx, group_layers in groups.items()
+        if len(group_layers) != granularity
+    }
+    if incomplete:
+        raise RuntimeError(
+            "KVCacheD layer-stacking requires PP ownership aligned to full "
+            f"layer groups (granularity={granularity}, "
+            f"incomplete_groups={incomplete})")
+    return set(groups)
+
+
+def release_kvcached_layer_groups(
+    runner: Any,
+    deleted_layer_ids: set[int],
+) -> None:
+    """Unmap migrated-out layer groups after their KV transfer completes."""
+    geometry = getattr(runner, "_kvcached_debug_geometry", {})
+    if not geometry.get("layer_group_layout") or not deleted_layer_ids:
+        return
+    granularity = max(1, int(geometry["layer_group_granularity"]))
+    deleted_groups: dict[int, set[int]] = {}
+    for layer_id in deleted_layer_ids:
+        deleted_groups.setdefault(layer_id // granularity, set()).add(layer_id)
+    incomplete = {
+        group_idx: sorted(group_layers)
+        for group_idx, group_layers in deleted_groups.items()
+        if len(group_layers) != granularity
+    }
+    if incomplete:
+        raise RuntimeError(
+            "KVCacheD cannot release a partial layer-stacking group: "
+            f"granularity={granularity}, incomplete_groups={incomplete}")
+    releasable_groups = set(deleted_groups).difference(
+        _kvcached_owned_group_indices(runner))
+    if not releasable_groups:
+        return
+    from kvcached.tp_ipc_util import (
+        unmap_worker_offsets_for_layer_groups,
+    )
+
+    ok = unmap_worker_offsets_for_layer_groups(
+        releasable_groups,
+        int(geometry["group_total_span"]),
+        group_id=int(geometry.get("group_id", 0)),
+    )
+    if not ok:
+        raise RuntimeError(
+            "KVCacheD failed to release migrated-out layer groups: "
+            f"groups={sorted(releasable_groups)}")
+    logger.info(
+        "KVCacheD released migrated-out layer groups: groups=%s layers=%s",
+        sorted(releasable_groups), sorted(deleted_layer_ids))
 
 
 def _call_with_supported_kwargs(cls: type, *args: Any, **kwargs: Any) -> Any:
@@ -1111,6 +1222,17 @@ def materialize_kvcached_received_kv_tensor(
             f"dst_shape={tuple(dst.shape)}, "
             f"payload_shape={tuple(kv_payload.shape)}")
 
+    block_size = int(dst.shape[2])
+    guard_kvcached_vmm_slots_mapped(
+        "materialize_kvcached_received_kv_tensor",
+        runner,
+        [block_id * block_size for block_id in range(payload_blocks)],
+        block_size,
+        layer_ids=[int(layer_id)],
+        rank=getattr(runner, "rank", None),
+        ensure_mapped=True,
+    )
+
     dst[:, :payload_blocks, ...].copy_(
         kv_payload.to(device=dst.device, dtype=dst.dtype, non_blocking=True))
     _remember_kvcached_layer_name(runner, int(layer_id))
@@ -1170,6 +1292,15 @@ def materialize_kvcached_sparse_received_kv_tensor(
         key_cache = dst[0]
         value_cache = dst[1]
         block_size = int(key_cache.size(1))
+        guard_kvcached_vmm_slots_mapped(
+            "materialize_kvcached_sparse_received_kv_tensor",
+            runner,
+            slot_mapping,
+            block_size,
+            layer_ids=[int(layer_id)],
+            rank=getattr(runner, "rank", None),
+            ensure_mapped=True,
+        )
         block_indices = torch.div(slot_mapping,
                                   block_size,
                                   rounding_mode="floor")
@@ -1493,7 +1624,7 @@ def _apply_dynamic_migration_kvcached_patches(
             _set_kvcached_debug_geometry(kv_synchronizer, debug_geometry)
             setattr(kv_synchronizer, "_kvcached_pre_unmap_context",
                     getattr(self, "forward_lock", None))
-            _register_kvcached_migration_unmap_hook(kv_synchronizer)
+            _register_kvcached_migration_unmap_hook(self, kv_synchronizer)
             if local_layer_names:
                 _rebind_kvcached_tensor_views(self, kv_synchronizer, num_blocks)
             else:
@@ -1611,7 +1742,7 @@ def _apply_dynamic_migration_kvcached_patches(
             _set_kvcached_debug_geometry(kv_synchronizer, debug_geometry)
             setattr(kv_synchronizer, "_kvcached_pre_unmap_context",
                     getattr(self, "forward_lock", None))
-            _register_kvcached_migration_unmap_hook(kv_synchronizer)
+            _register_kvcached_migration_unmap_hook(self, kv_synchronizer)
             self.grouped_handles = []
             self.key_handles = [[] for _ in local_layer_names]
             self.value_handles = [[] for _ in local_layer_names]

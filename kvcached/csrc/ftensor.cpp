@@ -94,15 +94,16 @@ bool FTensor::map(offset_t offset) {
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
+  auto page = make_unique_page(dev_, page_id, page_size_);
   CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_));
 
-  mapping_[page_id] = make_unique_page(dev_, page_id, page_size_);
-  mapping_[page_id]->map(vaddr);
+  page->map(vaddr);
   if (dev_.is_cuda()) {
     CHECK_RT(cudaMemset(vaddr, 0, page_size_));
   } else {
     std::memset(vaddr, 0, page_size_);
   }
+  mapping_.emplace(page_id, std::move(page));
   return true;
 }
 

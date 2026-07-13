@@ -1,0 +1,124 @@
+project: burstgpt-llama-day20-30min-kvcached-ondemand-static52-28-6c104f5
+type: sweep_test
+overwrite: true
+is_log_cover: true
+envs:
+  BENCHMARK_CONFIG_PATH: /home/bxb1/data/tmp/vllm_exp_day20_kvcached_static52-28/benchmark_config.json
+  CUDA_LAUNCH_BLOCKING: '0'
+  DEPLOYMENT_CONFIG_PATH: /home/bxb1/data/tmp/vllm_exp_day20_kvcached_static52-28/vllm_config.json
+  GLOO_SOCKET_IFNAME: bond0.3027
+  KV_SYNC_USE_CPU: '0'
+  NCCL_CUMEM_HOST_ENABLE: '0'
+  NCCL_DEBUG: INFO
+  NCCL_SOCKET_IFNAME: bond0.3027
+  PYTHONPATH: /home/bxb1/.codex/worktrees/c60f/vllm
+  PYTORCH_CUDA_ALLOC_CONF: max_split_size_mb:32
+  RAY_CGRAPH_get_timeout: '10000'
+  RAY_DEDUP_LOGS: '0'
+  VLLM_BURSTGPT_MODEL_FILTER: ALL
+  VLLM_BURSTGPT_ORDERED: '1'
+  VLLM_DISABLE_CUTLASS_FP8: '1'
+  VLLM_NCCL_SO_PATH: /apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5
+  VLLM_PAGE_ATTENTION_BLOCK_SIZE_KB: '512'
+  VLLM_SERVER_DEV_MODE: '1'
+  VLLM_TORCH_PROFILER_DIR: /home/bxb1/data/vllm_workbench/profiler/
+  VLLM_USE_CPU_MODEL: '0'
+  VLLM_USE_RAY_COMPILED_DAG: '0'
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: '0'
+  VLLM_KVCACHE_BACKEND: kvcached
+  VLLM_KVCACHED_SKIP_NOOP_PHYSICAL_TRIM: '1'
+  KVCACHED_PAGE_SIZE_MB: '2'
+  KVCACHED_IPC_NAME: burstgpt_day20_30min_ondemand_static52-28_6c104f5_20260712
+  KVCACHED_CONTIGUOUS_LAYOUT: 'false'
+  KVCACHED_LAYER_STACKING: 'true'
+  KVCACHED_PHYSICAL_BLOCK_SIZE_KB: '512'
+  KVCACHED_MAX_CACHED_TOKENS: '-1'
+  KVCACHED_MIN_RESERVED_PAGES: '0'
+  KVCACHED_MAX_RESERVED_PAGES: '0'
+  KVCACHED_LOG_LEVEL: INFO
+  VLLM_LAYERKV_PORT: '19105'
+  KVCACHED_PAGE_PREALLOC_ENABLED: 'false'
+  KVCACHED_WORKER_IPC_TRANSPORT: tcp
+  KVCACHED_PP_RANK_TO_IP: '{"0": "172.26.93.141", "1": "172.26.93.49"}'
+  KVCACHED_WORKER_IPC_PORT_BASE: '20105'
+static_config:
+  benchmark:
+    benchmark_script_path: /home/bxb1/.codex/worktrees/c60f/vllm/benchmarks/benchmark_serving.py
+    burstiness: 100.0
+    dataset_name: burstgpt
+    dataset_path: /data/gpfs/projects/punim2715/vllm_workbench/burstgpt_workload_search/day20_multi_reconfig_30min_20260708/day20_30min_cap500tok_1p5rps_selected.csv
+    print_outputs: false
+    profile: false
+    repetition: 1
+    restart_server_between_repetitions: false
+    warmup:
+      enabled: false
+    ignore_eos: true
+  model:
+    name: Llama-3.3-70B-Instruct-FP8
+    path: /data/gpfs/projects/punim2715/huggingface/Llama-3.3-70B-Instruct-FP8
+  network:
+    rank_to_ip:
+      0: 172.26.93.141
+      1: 172.26.93.49
+    rank_to_node:
+      0: 172.26.93.141
+      1: 172.26.93.49
+  vllm:
+    block_size: 128
+    chunked_prefill: true
+    enable_cpu_weight_cache: true
+    enable_cuda_graph: false
+    enable_kv_resize: true
+    enable_nsight: false
+    fixed_num_gpu_blocks: 112
+    gpu_memory_utilization: 0.95
+    head_addr: localhost
+    max_model_len: 4000
+    max_num_batched_tokens: 8128
+    migration_approach: async
+    pipeline_parallel_size: 2
+    use_vmm: true
+    weight_chunk_size_mb: 160
+    weight_loading_mode: async
+    port: 8105
+    disable_memory_overhead_monitor: true
+    dynamic_communication_enabled: false
+    pipeline_autoscaling_enabled: false
+sweep_configs:
+- vllm:
+    attention_kernel:
+    - direct
+    block_size:
+    - 128
+    enable_cpu_weight_cache:
+    - true
+    enable_kv_resize:
+    - true
+    fixed_num_gpu_blocks:
+    - 112
+    migration_approach:
+    - async
+    use_vmm:
+    - true
+    weight_chunk_size_mb:
+    - 160
+    weight_loading_mode:
+    - async
+  benchmark_config:
+  - num_total_requests: 2399
+    repetition: 1
+    pp_layer_config:
+      0: 52,28
+    requests:
+      0:
+        request_rate: 0.0
+        input_lens: 1
+        output_lens: 1
+        phase: trace_replay
+    arrival_trace:
+      mode: burstgpt_timestamp
+      model_filter: ALL
+      time_scale_factor: 1.0
+      max_total_tokens: 4000
+      max_replay_seconds: 1850

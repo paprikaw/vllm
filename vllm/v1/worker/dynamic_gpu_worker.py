@@ -29,6 +29,7 @@ from vllm.kvcached_integration import (
     materialize_kvcached_received_kv_tensor,
     materialize_kvcached_sparse_received_kv_tensor,
     maybe_apply_kvcached_vllm_patches,
+    release_kvcached_layer_groups,
     use_direct_ptr_for_runtime,
     use_flexi_kv_for_runtime,
     use_kvcached_backend,
@@ -3513,6 +3514,12 @@ class DynamicGPUWorker(Worker):
                 all_layer_ranges.extend(ranges)
             with self.model_runner.forward_lock:
                 caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free = self.atomic_shelve_kv_cache(self.rank, all_layer_ranges)
+            release_kvcached_layer_groups(
+                self.model_runner, {
+                    layer
+                    for start, end in all_layer_ranges
+                    for layer in range(start, end + 1)
+                })
             # memory_snapshot(f"rank{self.rank}_after_atomic_shelve", self.device)
             self.release_kv_cache_for_layers(self.rank, caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free)
             # memory_snapshot(f"rank{self.rank}_after_release_kv_cache", self.device)
@@ -4325,6 +4332,13 @@ class DynamicGPUWorker(Worker):
                         while self._num_active_sender_threads > 0:
                             logger.info(f"[do_resize] Waiting for {self._num_active_sender_threads} sender threads...")
                             self._sender_threads_cv.wait(timeout=5.0)
+
+                    release_kvcached_layer_groups(
+                        self.model_runner, {
+                            layer
+                            for start, end in layer_ranges
+                            for layer in range(start, end + 1)
+                        })
 
                     # The driver calls this finalize path only after the sync
                     # batch has completed and while scheduling is paused. No

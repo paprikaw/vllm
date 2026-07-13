@@ -216,7 +216,7 @@ def build_burstgpt_timestamp_intervals(
         reader = csv.DictReader(handle)
         for row in reader:
             try:
-                if row.get("Model") != model_filter:
+                if model_filter != "ALL" and row.get("Model") != model_filter:
                     continue
                 timestamp = float(row["Timestamp"])
                 request_tokens = int(float(row["Request tokens"]))
@@ -1912,7 +1912,11 @@ def main(args: argparse.Namespace):
                 output_len=args.sharegpt_output_len,
             ),
             "burstgpt": lambda: BurstGPTDataset(
-                random_seed=args.seed, dataset_path=args.dataset_path
+                random_seed=args.seed,
+                dataset_path=args.dataset_path,
+                model_filter=str(
+                    (getattr(benchmark_config, "arrival_trace", None) or {}).get(
+                        "model_filter", "GPT-4")),
             ).sample(tokenizer=tokenizer, num_requests=num_requests),
             "random": lambda: RandomDataset(dataset_path=args.dataset_path).sample(
                 tokenizer=tokenizer,

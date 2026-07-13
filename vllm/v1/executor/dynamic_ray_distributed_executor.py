@@ -434,6 +434,21 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         ]
 
         env_vars_to_copy.extend(current_platform.additional_env_vars)
+
+        # KVCacheD is selected by experiment-scoped environment variables that
+        # are not part of vllm.envs. Ray workers import vLLM before their final
+        # environment is installed, so carry the complete backend configuration
+        # explicitly and let the worker wrapper apply the patches afterwards.
+        kvcached_env_vars = [
+            name for name in os.environ
+            if name in {"VLLM_KVCACHE_BACKEND", "ENABLE_KVCACHED"}
+            or name.startswith("KVCACHED_")
+            or name.startswith("VLLM_KVCACHED_")
+        ]
+        for var in kvcached_env_vars:
+            if (var not in self.non_carry_over_env_vars
+                    and var not in env_vars_to_copy):
+                env_vars_to_copy.append(var)
         
         # Add NCCL/GLOO network interface env vars (critical for multi-node)
         nccl_env_vars = [

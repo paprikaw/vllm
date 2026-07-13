@@ -682,8 +682,21 @@ try:
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
 
+        def update_environment_variables(self, envs_list) -> None:
+            super().update_environment_variables(envs_list)
+            from vllm.kvcached_integration import (
+                maybe_apply_kvcached_vllm_patches,
+            )
+            maybe_apply_kvcached_vllm_patches("Ray worker env update")
+
         def reset_ray_compiled_dag_nccl_lock(self) -> None:
-            from ray.experimental.channel.nccl_group import set_global_nccl_lock
+            try:
+                from ray.experimental.channel.nccl_group import set_global_nccl_lock
+            except ImportError:
+                logger.debug(
+                    "Ray does not expose set_global_nccl_lock; skipping "
+                    "compiled DAG NCCL lock reset.")
+                return
             set_global_nccl_lock(None)
 
         def init_device(self):

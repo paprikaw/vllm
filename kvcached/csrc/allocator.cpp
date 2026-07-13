@@ -230,15 +230,20 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
     }
   };
   auto map_or_fail = [&](FTensor *ftensor, offset_t offset) {
-    if (!ftensor->map(offset)) {
+    try {
+      if (ftensor->map(offset)) {
+        mapped_offsets.emplace_back(ftensor, offset);
+        mapped_offset_refcounts_[offset]++;
+        return true;
+      }
       LOGGER(ERROR, "FTensorAllocator failed to map KV tensor offset=%ld",
              offset);
       rollback_mapped_offsets();
       return false;
+    } catch (...) {
+      rollback_mapped_offsets();
+      throw;
     }
-    mapped_offsets.emplace_back(ftensor, offset);
-    mapped_offset_refcounts_[offset]++;
-    return true;
   };
 
   if (contiguous_layout_ || layer_group_layout_) {

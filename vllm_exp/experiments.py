@@ -1514,6 +1514,7 @@ def start_vllm_for_sweep(
     
     serve_args = [
         sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", spec.model_path,
+        "--port", str(spec.port),
         "--pipeline-parallel-size", str(spec.pipeline_parallel_size),
         "--gpu-memory-utilization", str(spec.gpu_memory_utilization),
         "--max-model-len", str(spec.max_model_len),
@@ -2456,6 +2457,7 @@ def start_vllm_single_instance(
     
     serve_args = [
         sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", spec.model_path,
+        "--port", str(spec.port),
         "--pipeline-parallel-size", str(spec.pipeline_parallel_size),
         "--gpu-memory-utilization", str(spec.gpu_memory_utilization),
         "--max-model-len", str(spec.max_model_len),

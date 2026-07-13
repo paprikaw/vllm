@@ -518,11 +518,13 @@ class SonnetDataset(BenchmarkDataset):
 class BurstGPTDataset(BenchmarkDataset):
     """
     Implements the BurstGPT dataset.  Loads data from a CSV file and generates
-    sample requests based on synthetic prompt generation. Only rows with Model
-    "GPT-4" and positive response tokens are used.
+    sample requests based on synthetic prompt generation. Only rows matching
+    ``model_filter`` and with positive response tokens are used. ``ALL`` keeps
+    every model.
     """
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, model_filter: str = "GPT-4", **kwargs) -> None:
+        self.model_filter = model_filter
         super().__init__(**kwargs)
         self.load_data()
 
@@ -538,12 +540,10 @@ class BurstGPTDataset(BenchmarkDataset):
                 "using `pip install pandas`.") from e
 
         df = pd.read_csv(self.dataset_path)
-        # Filter to keep only GPT-4 rows.
-        gpt4_df = df[df["Model"] == "GPT-4"]
+        if self.model_filter != "ALL":
+            df = df[df["Model"] == self.model_filter]
         # Remove failed requests (where Response tokens is 0 or less).
-        gpt4_df = gpt4_df[gpt4_df["Response tokens"] > 0]
-        # Sample the desired number of rows.
-        self.data = gpt4_df
+        self.data = df[df["Response tokens"] > 0]
 
     def _sample_loaded_data(self, num_requests: int) -> list:
         if num_requests <= len(self.data):

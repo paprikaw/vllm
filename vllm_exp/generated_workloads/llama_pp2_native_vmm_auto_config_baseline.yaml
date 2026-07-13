@@ -1,0 +1,73 @@
+schema_version: 1
+description: >
+  Baseline for Llama PP2 native VMM experiments with automatically sized and
+  dynamically resizable KV blocks.
+
+required:
+  top_level:
+    type: sweep_test
+    is_log_cover: true
+    overwrite: true
+
+  envs:
+    RAY_DEDUP_LOGS: "0"
+    NCCL_DEBUG: INFO
+    NCCL_CUMEM_HOST_ENABLE: "0"
+    VLLM_NCCL_SO_PATH: /apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5
+    RAY_CGRAPH_get_timeout: "10000"
+    KV_SYNC_USE_CPU: "0"
+    VLLM_USE_CPU_MODEL: "0"
+    CUDA_LAUNCH_BLOCKING: "0"
+    PYTORCH_CUDA_ALLOC_CONF: max_split_size_mb:32
+    VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+    VLLM_USE_RAY_COMPILED_DAG: "0"
+    NCCL_SOCKET_IFNAME: bond0.3027
+    GLOO_SOCKET_IFNAME: bond0.3027
+    VLLM_SERVER_DEV_MODE: "1"
+    VLLM_DISABLE_CUTLASS_FP8: "1"
+    VLLM_PAGE_ATTENTION_BLOCK_SIZE_KB: "512"
+
+  static_config:
+    model:
+      path: /data/gpfs/projects/punim2715/huggingface/Llama-3.3-70B-Instruct-FP8
+      name: Llama-3.3-70B-Instruct-FP8
+    vllm:
+      head_addr: localhost
+      pipeline_parallel_size: 2
+      gpu_memory_utilization: 0.95
+      disable_memory_overhead_monitor: true
+      max_model_len: 4000
+      max_num_batched_tokens: 8128
+      chunked_prefill: true
+      enable_cuda_graph: false
+      enable_nsight: false
+      weight_chunk_size_mb: 160
+      migration_approach: async
+      weight_loading_mode: async
+      fixed_num_gpu_blocks: -1
+      block_size: 128
+      use_vmm: true
+      enable_kv_resize: true
+      enable_cpu_weight_cache: true
+    benchmark:
+      benchmark_script_path: /home/bxb1/.codex/worktrees/c60f/vllm/benchmarks/benchmark_serving.py
+      burstiness: 100.0
+      dataset_name: burstgpt
+      dataset_path: /data/gpfs/projects/punim2715/vllm_workbench/burstgpt_workload_search/day20_multi_reconfig_30min_20260708/day20_30min_cap500tok_1p5rps_selected.csv
+      print_outputs: false
+      profile: false
+      repetition: 1
+      warmup:
+        enabled: false
+
+  sweep_configs:
+    vllm:
+      attention_kernel: [direct]
+      fixed_num_gpu_blocks: [-1]
+      weight_chunk_size_mb: [160]
+      migration_approach: [async]
+      weight_loading_mode: [async]
+      block_size: [128]
+      use_vmm: [true]
+      enable_kv_resize: [true]
+      enable_cpu_weight_cache: [true]

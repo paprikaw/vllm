@@ -2023,13 +2023,13 @@ class DynamicKVSynchronizer():
         """Send a single KV tensor to a peer rank with deadlock-free protocol.
         
         Protocol:
-        1. Send meta without holding the local nccl_lock.
-        2. Wait for ACCEPT/REJECT from receiver.
-        3. If ACCEPT: acquire nccl_lock, send each NCCL payload and synchronize it before
-           enqueueing the next one, then release lock. The same lock is used
-           by PP NCCL, so this keeps KV and PP collectives mutually exclusive
-           on the local GPU.
-        4. If REJECT: backoff, retry from step 1.
+        1. Nonblocking-acquire the sender's local NCCL lock.
+        2. Send meta and wait for the receiver to acquire its lock and reply.
+        3. If ACCEPT: send all NCCL payloads, then release the local lock.
+        4. If REJECT or the local lock is busy: release/back off and retry.
+
+        Holding the sender lock before requesting receiver ACCEPT prevents a
+        distributed cycle between PP traffic and KV transfer traffic.
         """
         self.kv_cache_transfer_in_process[rank] = True
         # Ensure pipe exists before using it
@@ -2046,56 +2046,75 @@ class DynamicKVSynchronizer():
         
         while True:
             should_retry = False
-            # Keep the control-plane handshake outside the local NCCL lock.
-            # The receiver may wait for its local forward pass to drain before
-            # accepting, and holding this rank's PP/KV lock during that wait can
-            # block foreground PP progress.
-            self._send_meta_to_rank(rank, kv_tensor_meta)
-            logger.info(f"[send_kv_tensor_to_rank]: sent meta to rank {rank}, waiting for ACCEPT/REJECT")
-
-            while True:
-                response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
-                if (_kv_signal_matches(response, "ACCEPT", kv_tensor_meta)
-                        or _kv_signal_matches(response, "REJECT",
-                                              kv_tensor_meta)):
-                    break
-                logger.warning(
-                    "[send_kv_tensor_to_rank]: ignoring stale or mismatched "
-                    "signal from rank %s for current meta %s: %s",
-                    rank, _kv_signal_identity(kv_tensor_meta), response)
-
-            if _kv_signal_matches(response, "ACCEPT", kv_tensor_meta):
-                logger.info(f"[send_kv_tensor_to_rank]: received ACCEPT from rank {rank}")
-                execution_context = (cuda_op_lock if cuda_op_lock is not None
-                                     else nullcontext())
-                with execution_context:
-                    nccl_lock.acquire()
+            execution_context = (cuda_op_lock if cuda_op_lock is not None
+                                 else nullcontext())
+            with execution_context:
+                if not nccl_lock.acquire(blocking=False):
+                    should_retry = True
+                else:
                     try:
-                        if isinstance(kv_tensor_meta, KVTensorMeta):
-                            self._send_data_to_rank(rank, kv_tensor,
-                                                    wait_for_ack=False)
+                        # Acquire the sender lock before asking the receiver to
+                        # acquire its lock. Otherwise ACCEPT can create a cycle:
+                        # receiver waits for KV data while sender waits for a PP
+                        # operation that needs the receiver's lock.
+                        self._send_meta_to_rank(rank, kv_tensor_meta)
+                        logger.info(
+                            "[send_kv_tensor_to_rank]: sent meta to rank %s, "
+                            "waiting for ACCEPT/REJECT", rank)
+                        while True:
+                            response = pipe.signal_group.recv_obj(
+                                src=pipe.peer_rank)
+                            if (_kv_signal_matches(response, "ACCEPT",
+                                                   kv_tensor_meta)
+                                    or _kv_signal_matches(
+                                        response, "REJECT", kv_tensor_meta)):
+                                break
+                            logger.warning(
+                                "[send_kv_tensor_to_rank]: ignoring stale or "
+                                "mismatched signal from rank %s for current "
+                                "meta %s: %s", rank,
+                                _kv_signal_identity(kv_tensor_meta), response)
+
+                        if _kv_signal_matches(response, "ACCEPT",
+                                              kv_tensor_meta):
+                            logger.info(
+                                "[send_kv_tensor_to_rank]: received ACCEPT "
+                                "from rank %s", rank)
+                            if isinstance(kv_tensor_meta, KVTensorMeta):
+                                self._send_data_to_rank(
+                                    rank, kv_tensor, wait_for_ack=False)
+                            else:
+                                assert slot_mapping_to_send is not None
+                                self._send_slot_mapping_to_rank(
+                                    rank,
+                                    slot_mapping_to_send,
+                                    wait_current_stream=False)
+                                logger.info(
+                                    "[send_kv_tensor_to_rank]: sent slot "
+                                    "mapping to rank %s", rank)
+                                self._send_data_to_rank(
+                                    rank,
+                                    kv_tensor,
+                                    wait_for_ack=False,
+                                    wait_current_stream=False)
+                            logger.info(
+                                "[send_kv_tensor_to_rank]: sent kv tensor "
+                                "to rank %s", rank)
+                        elif _kv_signal_matches(response, "REJECT",
+                                                kv_tensor_meta):
+                            logger.info(
+                                "[send_kv_tensor_to_rank]: received REJECT "
+                                "from rank %s, retry in 5ms", rank)
+                            should_retry = True
                         else:
-                            assert slot_mapping_to_send is not None
-                            self._send_slot_mapping_to_rank(
-                                rank,
-                                slot_mapping_to_send,
-                                wait_current_stream=False)
-                            logger.info(f"[send_kv_tensor_to_rank]: sent slot mapping to rank {rank}")
-                            self._send_data_to_rank(rank, kv_tensor,
-                                                    wait_for_ack=False,
-                                                    wait_current_stream=False)
-                        logger.info(f"[send_kv_tensor_to_rank]: sent kv tensor to rank {rank}")
+                            raise RuntimeError(
+                                f"Unexpected response: {response}")
                     finally:
                         nccl_lock.release()
-                break  # Success
-            elif _kv_signal_matches(response, "REJECT", kv_tensor_meta):
-                logger.info(f"[send_kv_tensor_to_rank]: received REJECT from rank {rank}, retry in 5ms")
-                should_retry = True
-            else:
-                raise RuntimeError(f"Unexpected response: {response}")
             if should_retry:
                 time.sleep(retry_delay)
                 continue
+            break  # Success
         logger.info(f"[send_kv_tensor_to_rank]: completed sending to rank {rank}")
     
     def send_kv_patch_to_rank(self, 
@@ -2105,13 +2124,13 @@ class DynamicKVSynchronizer():
         """Send KV patch to target rank with deadlock-free protocol.
         
         Protocol:
-        1. Send meta without holding the local nccl_lock.
-        2. Wait for ACCEPT/REJECT from receiver.
-        3. If ACCEPT: acquire nccl_lock, send each NCCL payload and synchronize it before
-           enqueueing the next one, then release lock. The same lock is used
-           by PP NCCL, so this keeps KV and PP collectives mutually exclusive
-           on the local GPU.
-        4. If REJECT: backoff, retry from step 1.
+        1. Nonblocking-acquire the sender's local NCCL lock.
+        2. Send meta and wait for the receiver to acquire its lock and reply.
+        3. If ACCEPT: send all NCCL payloads, then release the local lock.
+        4. If REJECT or the local lock is busy: release/back off and retry.
+
+        Holding the sender lock before requesting receiver ACCEPT prevents a
+        distributed cycle between PP traffic and KV transfer traffic.
         """
         assert self.kv_cache_transfer_in_process[target_rank] == True, "The kv cache transfer in process of the rank should be True."
         meta, kv_payload, slot_mapping = kv_patches.meta, kv_patches.kv_payload, kv_patches.slot_mapping
@@ -2127,48 +2146,67 @@ class DynamicKVSynchronizer():
         
         while True:
             should_retry = False
-            self._send_meta_to_rank(target_rank, meta)
-            logger.info(f"sent meta to rank {target_rank}, patch id: {meta.id}, waiting for ACCEPT/REJECT")
-
-            while True:
-                response = pipe.signal_group.recv_obj(src=pipe.peer_rank)
-                if (_kv_signal_matches(response, "ACCEPT", meta)
-                        or _kv_signal_matches(response, "REJECT", meta)):
-                    break
-                logger.warning(
-                    "send_kv_patch_to_rank: ignoring stale or mismatched "
-                    "signal from rank %s for current meta %s: %s",
-                    target_rank, _kv_signal_identity(meta), response)
-
-            if _kv_signal_matches(response, "ACCEPT", meta):
-                logger.info(f"received ACCEPT from rank {target_rank}, sending data")
-                execution_context = (cuda_op_lock if cuda_op_lock is not None
-                                     else nullcontext())
-                with execution_context:
-                    nccl_lock.acquire()
+            execution_context = (cuda_op_lock if cuda_op_lock is not None
+                                 else nullcontext())
+            with execution_context:
+                if not nccl_lock.acquire(blocking=False):
+                    should_retry = True
+                else:
                     time_lock_acquired = time.time()
                     try:
-                        self._send_slot_mapping_to_rank(
-                            target_rank,
-                            slot_mapping_to_send,
-                            wait_current_stream=False)
-                        logger.info(f"sent slot mapping to rank {target_rank}, patch id: {meta.id}")
-                        self._send_data_to_rank(target_rank, kv_payload,
-                                                wait_for_ack=False,
-                                                wait_current_stream=False)
-                        logger.info(f"sent kv payload to rank {target_rank}, patch id: {meta.id}, shape:{kv_payload.shape}")
+                        self._send_meta_to_rank(target_rank, meta)
+                        logger.info(
+                            "sent meta to rank %s, patch id: %s, waiting "
+                            "for ACCEPT/REJECT", target_rank, meta.id)
+                        while True:
+                            response = pipe.signal_group.recv_obj(
+                                src=pipe.peer_rank)
+                            if (_kv_signal_matches(response, "ACCEPT", meta)
+                                    or _kv_signal_matches(
+                                        response, "REJECT", meta)):
+                                break
+                            logger.warning(
+                                "send_kv_patch_to_rank: ignoring stale or "
+                                "mismatched signal from rank %s for current "
+                                "meta %s: %s", target_rank,
+                                _kv_signal_identity(meta), response)
+
+                        if _kv_signal_matches(response, "ACCEPT", meta):
+                            logger.info(
+                                "received ACCEPT from rank %s, sending data",
+                                target_rank)
+                            self._send_slot_mapping_to_rank(
+                                target_rank,
+                                slot_mapping_to_send,
+                                wait_current_stream=False)
+                            logger.info(
+                                "sent slot mapping to rank %s, patch id: %s",
+                                target_rank, meta.id)
+                            self._send_data_to_rank(
+                                target_rank,
+                                kv_payload,
+                                wait_for_ack=False,
+                                wait_current_stream=False)
+                            logger.info(
+                                "sent kv payload to rank %s, patch id: %s, "
+                                "shape:%s", target_rank, meta.id,
+                                kv_payload.shape)
+                        elif _kv_signal_matches(response, "REJECT", meta):
+                            logger.info(
+                                "received REJECT from rank %s, retry in 5ms",
+                                target_rank)
+                            should_retry = True
+                        else:
+                            raise RuntimeError(
+                                f"Unexpected response: {response}")
                     finally:
                         nccl_lock.release()
-                self._wait_kv_patch_applied_ack(target_rank, meta.id)
-                break  # Success, exit loop
-            elif _kv_signal_matches(response, "REJECT", meta):
-                logger.info(f"received REJECT from rank {target_rank}, retry in 5ms")
-                should_retry = True
-            else:
-                raise RuntimeError(f"Unexpected response: {response}")
             if should_retry:
                 time.sleep(retry_delay)
-                continue  # Retry
+                continue
+            if _kv_signal_matches(response, "ACCEPT", meta):
+                self._wait_kv_patch_applied_ack(target_rank, meta.id)
+                break  # Success, exit loop
 
         logger.info(f"send_kv_patch_to_rank completed: time to acquire lock: {time_lock_acquired - time_start}, total time: {time.time() - time_start}")
         if meta.type == "kv_patch_finished":
@@ -2787,6 +2825,7 @@ class DynamicKVSynchronizer():
                                 layer_ids=[int(layer_id)],
                                 rank=self.rank,
                                 trace_info=scheduler_trace,
+                                ensure_mapped=True,
                             )
                         if is_flexi:
                             self.kv_helper.flexi_put_kv_to_cache(
