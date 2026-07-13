@@ -34,7 +34,7 @@ required:
     vllm:
       head_addr: localhost
       pipeline_parallel_size: 2
-      gpu_memory_utilization: 0.95
+      gpu_memory_utilization: 0.93
       disable_memory_overhead_monitor: true
       max_model_len: 4000
       max_num_batched_tokens: 8128

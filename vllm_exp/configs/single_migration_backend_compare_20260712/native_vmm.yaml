@@ -57,7 +57,7 @@ static_config:
     enable_kv_resize: true
     enable_nsight: false
     fixed_num_gpu_blocks: -1
-    gpu_memory_utilization: 0.95
+    gpu_memory_utilization: 0.93
     head_addr: localhost
     max_model_len: 4000
     max_num_batched_tokens: 8128
