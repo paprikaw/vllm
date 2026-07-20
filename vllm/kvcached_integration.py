@@ -14,7 +14,7 @@ import importlib.util
 import inspect
 import math
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -190,6 +190,7 @@ def _register_kvcached_migration_unmap_hook(
         from kvcached.tp_ipc_util import (
             register_post_map_callback,
             register_pre_unmap_callback,
+            register_pre_unmap_drain_callback,
             register_worker_offset_filter,
         )
     except Exception as exc:
@@ -206,17 +207,17 @@ def _register_kvcached_migration_unmap_hook(
                 group_id=group_id,
                 reason="kvcached worker ipc post-map")
 
+    def _on_worker_pre_unmap_drain(
+        offsets: list[int],
+        group_id: int,
+    ) -> Any:
+        del offsets, group_id
+        return getattr(kv_synchronizer,
+                       "_kvcached_pre_unmap_context", None)
+
     def _on_worker_pre_unmap(offsets: list[int], group_id: int) -> Any:
         stack = ExitStack()
         try:
-            # Acquire the forward gate before page lifetime and NCCL. Sender
-            # snapshots intentionally do not take forward_lock, so holding a
-            # page-lifetime guard while waiting for forward can deadlock the
-            # sender needed to finish that forward's peer-side PP operation.
-            forward_context = getattr(kv_synchronizer,
-                                      "_kvcached_pre_unmap_context", None)
-            if forward_context is not None:
-                stack.enter_context(forward_context)
             page_context = getattr(
                 kv_synchronizer, "kvcached_page_lifetime_context", None)
             if page_context is not None:
@@ -236,6 +237,7 @@ def _register_kvcached_migration_unmap_hook(
         return stack
 
     register_post_map_callback(_on_worker_post_map)
+    register_pre_unmap_drain_callback(_on_worker_pre_unmap_drain)
     register_pre_unmap_callback(_on_worker_pre_unmap)
 
     def _filter_worker_offsets(
@@ -371,6 +373,60 @@ def guard_kvcached_vmm_slots_mapped(
         f"source={source}, rank={rank}, layer_ids={layer_ids}, "
         f"unmapped_offsets={list(unmapped_offsets)[:16]}, "
         f"scheduler_trace={trace_info or {}}")
+
+
+@contextmanager
+def hold_kvcached_vmm_slots_mapped(
+    source: str,
+    owner: Any,
+    slots: Any,
+    block_size: int,
+    layer_ids: Optional[list[int]] = None,
+    rank: Optional[int] = None,
+    group_id: int = 0,
+    trace_info: Optional[dict[str, Any]] = None,
+):
+    """Keep one migration write mapped using the reclamation lock order.
+
+    This remains on-demand mapping: only pages referenced by ``slots`` are
+    materialized. Holding the mapping lock through page lifetime prevents a
+    concurrent allocator reclaim from inverting those locks or unmapping a
+    page between the mapping check and the CUDA write.
+    """
+    page_context = getattr(owner, "kvcached_page_lifetime_context", None)
+    page_context_factory = page_context or ExitStack
+
+    if not use_kvcached_backend():
+        with page_context_factory():
+            yield
+        return
+
+    _, _, offsets = _kvcached_slots_to_offsets(
+        owner, slots, block_size, layer_ids=layer_ids)
+    if not offsets:
+        with page_context_factory():
+            yield
+        return
+
+    from kvcached.tp_ipc_util import (
+        hold_worker_offsets_mapped_for_migration,
+    )
+
+    with hold_worker_offsets_mapped_for_migration(
+            offsets, group_id=group_id):
+        with page_context_factory():
+            guard_kvcached_vmm_slots_mapped(
+                source,
+                owner,
+                slots,
+                block_size,
+                layer_ids=layer_ids,
+                rank=rank,
+                group_id=group_id,
+                trace_info=trace_info,
+                ensure_mapped=False,
+            )
+            yield
 
 
 def _log_kvcached_fragmentation_stats(
@@ -642,6 +698,33 @@ def _remember_kvcached_layer_name(runner: Any, layer_id: int) -> None:
             exc_info=True)
 
 
+def remember_kvcached_layer_names(
+    runner: Any,
+    layer_ids: list[int],
+) -> None:
+    """Atomically register a complete set of migrated KVCacheD layers.
+
+    Layer-stacked KVCacheD validates ownership whenever its page allocator
+    broadcasts a new mapping.  Registering migrated layers one at a time can
+    expose a transient partial group (for example, layers 12--14 while layer
+    15 is being bound) to that concurrent callback.  Build the merged list
+    first and publish it with one attribute assignment instead.
+    """
+    layer_names = getattr(runner, "_kvcached_layer_names", None)
+    if layer_names is None or not layer_ids:
+        return
+
+    from vllm.model_executor.models.utils import extract_layer_index
+    from vllm.v1.utils import get_layer_name_for_index
+
+    forward_context = (
+        runner.vllm_config.compilation_config.static_forward_context)
+    merged = set(layer_names)
+    for layer_id in layer_ids:
+        merged.add(get_layer_name_for_index(int(layer_id), forward_context))
+    runner._kvcached_layer_names = sorted(merged, key=extract_layer_index)
+
+
 def _kvcached_active_layer_names(
     runner: Any,
     forward_context: dict[str, Any],
@@ -726,6 +809,29 @@ def release_kvcached_layer_groups(
         _kvcached_owned_group_indices(runner))
     if not releasable_groups:
         return
+
+    # Ownership changes mutate the regular-attention KV list incrementally
+    # (left padding for received layers, then removal of sent layers).  Rebuild
+    # every runner/synchronizer/Attention view from the global KVCacheD backing
+    # tensors before physically unmapping the old groups.  Otherwise a second
+    # left-grow/right-shrink migration can leave a stale view pointing into a
+    # group that is correctly classified as no longer owned.
+    kv_tensors = getattr(runner, "_kvcached_kv_tensors", None)
+    kv_synchronizer = getattr(
+        runner, "_kvcached_dynamic_kv_synchronizer", None)
+    forward_lock = getattr(runner, "forward_lock", None)
+    if kv_tensors and kv_synchronizer is not None and forward_lock is not None:
+        blocks_dim_idx = 1 if int(kv_tensors[0].shape[0]) == 2 else 0
+        virtual_num_blocks = int(kv_tensors[0].shape[blocks_dim_idx])
+        with forward_lock:
+            _rebind_kvcached_tensor_views(
+                runner, kv_synchronizer, virtual_num_blocks)
+        logger.info(
+            "KVCacheD rebound active tensor views before layer-group "
+            "release: active_layers=%s virtual_num_blocks=%s",
+            len(getattr(runner, "_kvcached_layer_names", []) or []),
+            virtual_num_blocks,
+        )
     from kvcached.tp_ipc_util import (
         unmap_worker_offsets_for_layer_groups,
     )
@@ -742,6 +848,39 @@ def release_kvcached_layer_groups(
     logger.info(
         "KVCacheD released migrated-out layer groups: groups=%s layers=%s",
         sorted(releasable_groups), sorted(deleted_layer_ids))
+
+
+def defer_kvcached_layer_groups(
+    runner: Any,
+    deleted_layer_ids: set[int],
+) -> None:
+    """Queue migrated-out layers until one target-topology PP batch drains."""
+    if not deleted_layer_ids:
+        return
+    pending = set(
+        getattr(runner, "_kvcached_deferred_release_layers", set()))
+    pending.update(int(layer_id) for layer_id in deleted_layer_ids)
+    runner._kvcached_deferred_release_layers = pending
+    logger.info(
+        "KVCacheD deferred migrated-out layer-group release until after "
+        "target-topology PP transfer: layers=%s",
+        sorted(pending),
+    )
+
+
+def release_deferred_kvcached_layer_groups(runner: Any) -> bool:
+    """Release one queued ownership generation after its PP stream drains."""
+    pending = set(
+        getattr(runner, "_kvcached_deferred_release_layers", set()))
+    if not pending:
+        return False
+    runner._kvcached_deferred_release_layers = set()
+    try:
+        release_kvcached_layer_groups(runner, pending)
+    except BaseException:
+        runner._kvcached_deferred_release_layers = pending
+        raise
+    return True
 
 
 def _call_with_supported_kwargs(cls: type, *args: Any, **kwargs: Any) -> Any:
@@ -1508,9 +1647,15 @@ def _apply_dynamic_migration_kvcached_patches(
                 async_sched=True,
                 vllm_config=_current_vllm_config_or_none(),
             )
+            logical_num_blocks = self.num_gpu_blocks
+            virtual_num_blocks = max(
+                logical_num_blocks,
+                int(os.getenv("VLLM_KVCACHED_VIRTUAL_NUM_BLOCKS",
+                              logical_num_blocks)),
+            )
             self.block_pool = _call_with_supported_kwargs(
                 ElasticBlockPool,
-                self.num_gpu_blocks,
+                virtual_num_blocks,
                 self.block_size,
                 cell_size=cell_size,
                 num_layers=num_layers,
@@ -1519,13 +1664,27 @@ def _apply_dynamic_migration_kvcached_patches(
                 max_cached_blocks=_get_max_cached_blocks(self.block_size),
                 physical_block_size=_physical_block_size(),
             )
+            if virtual_num_blocks != logical_num_blocks:
+                manager = self.block_pool.kv_cache_manager
+                initial_physical_bytes = (
+                    logical_num_blocks * manager.block_mem_size)
+                if not manager.resize(initial_physical_bytes):
+                    raise RuntimeError(
+                        "Could not apply initial KVCacheD physical limit: "
+                        f"logical={logical_num_blocks}, "
+                        f"virtual={virtual_num_blocks}")
+                self.block_pool.num_gpu_blocks = logical_num_blocks
+                self.block_pool._pending_physical_num_gpu_blocks = (
+                    logical_num_blocks)
             self.single_type_manager.block_pool = self.block_pool
             if hasattr(self.single_type_manager, "_null_block"):
                 self.single_type_manager._null_block = self.block_pool.null_block
             logger.info(
                 "KVCacheD dynamic KVCacheManager installed "
-                "(num_blocks=%s, local_layers=%s, backing_layers=%s)",
-                self.num_gpu_blocks, local_num_layers, num_layers)
+                "(num_blocks=%s, virtual_blocks=%s, local_layers=%s, "
+                "backing_layers=%s)",
+                self.num_gpu_blocks, virtual_num_blocks, local_num_layers,
+                num_layers)
 
         setattr(_patched_dynamic_mgr_init, "__kvcached_dynamic_mgr__", True)
         DynamicKVCacheManager.__init__ = _patched_dynamic_mgr_init

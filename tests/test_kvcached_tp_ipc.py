@@ -1,6 +1,8 @@
 import json
 import asyncio
 import sys
+import threading
+from contextlib import contextmanager
 from types import ModuleType
 
 import pytest
@@ -121,6 +123,51 @@ def test_worker_unmap_uses_recorded_offsets_after_ownership_changes(
     assert tp_ipc_util._WORKER_MAPPED_OFFSETS[0] == set()
 
 
+def test_worker_unmap_drains_cuda_while_lifetime_guards_are_held(monkeypatch):
+    events = []
+
+    @contextmanager
+    def drain_gate(offsets, group_id):
+        events.append(("drain_enter", list(offsets), group_id))
+        try:
+            yield
+        finally:
+            events.append(("drain_exit", list(offsets), group_id))
+
+    @contextmanager
+    def reclaim_guards(offsets, group_id):
+        events.append(("reclaim_enter", list(offsets), group_id))
+        try:
+            yield
+        finally:
+            events.append(("reclaim_exit", list(offsets), group_id))
+
+    monkeypatch.setattr(tp_ipc_util, "_enter_pre_unmap_drain_callbacks",
+                        drain_gate)
+    monkeypatch.setattr(tp_ipc_util, "_enter_pre_unmap_callbacks",
+                        reclaim_guards)
+    monkeypatch.setattr(tp_ipc_util, "_synchronize_cuda_device",
+                        lambda: events.append(("sync", )))
+    monkeypatch.setattr(
+        tp_ipc_util,
+        "unmap_from_kv_tensors",
+        lambda offsets, **kwargs: events.append(
+            ("unmap", list(offsets), kwargs["group_id"])) or True,
+    )
+    tp_ipc_util._WORKER_MAPPED_OFFSETS[0] = {100}
+
+    assert tp_ipc_util._unmap_worker_offsets([100], group_id=0)
+
+    assert events == [
+        ("drain_enter", [100], 0),
+        ("sync", ),
+        ("reclaim_enter", [100], 0),
+        ("unmap", [100], 0),
+        ("reclaim_exit", [100], 0),
+        ("drain_exit", [100], 0),
+    ]
+
+
 def test_migration_map_bypasses_current_ownership_filter(monkeypatch):
     mapped = []
     monkeypatch.setattr(
@@ -137,6 +184,39 @@ def test_migration_map_bypasses_current_ownership_filter(monkeypatch):
 
     assert mapped == [[200, 300]]
     assert tp_ipc_util._WORKER_MAPPED_OFFSETS[0] == {200, 300}
+
+
+def test_migration_mapping_context_blocks_concurrent_unmap(monkeypatch):
+    calls = []
+    unmap_started = threading.Event()
+    unmap_finished = threading.Event()
+    monkeypatch.setattr(
+        tp_ipc_util,
+        "map_to_kv_tensors",
+        lambda offsets, **kwargs: calls.append(("map", list(offsets))) or True,
+    )
+    monkeypatch.setattr(
+        tp_ipc_util,
+        "unmap_from_kv_tensors",
+        lambda offsets, **kwargs: calls.append(("unmap", list(offsets))) or True,
+    )
+    monkeypatch.setattr(tp_ipc_util, "_synchronize_cuda_device", lambda: None)
+
+    def unmap():
+        unmap_started.set()
+        tp_ipc_util._unmap_worker_offsets([200, 300], group_id=0)
+        unmap_finished.set()
+
+    with tp_ipc_util.hold_worker_offsets_mapped_for_migration(
+            [200, 300], group_id=0):
+        thread = threading.Thread(target=unmap)
+        thread.start()
+        assert unmap_started.wait(timeout=1)
+        assert not unmap_finished.wait(timeout=0.05)
+
+    assert unmap_finished.wait(timeout=1)
+    thread.join(timeout=1)
+    assert calls == [("map", [200, 300]), ("unmap", [200, 300])]
 
 
 def test_failed_worker_map_does_not_update_mapping_registry(monkeypatch):

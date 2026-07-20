@@ -151,3 +151,13 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    # Dynamic autoscaling handoff metadata. Standard schedulers leave these
+    # defaults unchanged; the dynamic scheduler conversion preserves them so
+    # the model runner can establish the target topology's final KV mapping
+    # barrier after rebuilding its input batch.
+    scheduler_step_id: int = -1
+    current_scheduler_output_version: int = -1
+    scheduler_request_free_epoch: int = -1
+    scheduler_block_free_epoch: int = -1
+    autoscaling_request_state_sync: bool = False

@@ -794,7 +794,10 @@ def wait_ready_or_fail(
     Prints error info if process dies early.
     """
     base_url = _normalize_loopback_base_url(base_url)
-    deadline = time.time() + timeout_s
+    # Keep the early-process-failure path consistent with wait_ready().  Large
+    # models can legitimately need more than the historical five-minute
+    # default while preloading the CPU weight cache.
+    deadline = time.time() + _server_ready_timeout(timeout_s)
     while time.time() < deadline:
         # Check if process died
         if proc.poll() is not None:

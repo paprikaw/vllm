@@ -37,6 +37,7 @@ private:
   torch::Dtype dtype_;
   torch::Device dev_;
   std::shared_ptr<Page> zero_page_;
+  bool zero_page_mapped_ = false;
 
   torch::Tensor tensor_;
   std::unordered_map<page_id_t, std::unique_ptr<Page>> mapping_;

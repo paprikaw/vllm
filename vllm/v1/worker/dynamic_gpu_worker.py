@@ -26,10 +26,13 @@ from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import (
 # from vllm.kv_allocator import allocate_with_cuda_async, free_cache, free_page_list, prepare_flexi_kv_ptrs
 from vllm.kv_allocator import kv_allocator
 from vllm.kvcached_integration import (
+    defer_kvcached_layer_groups,
     materialize_kvcached_received_kv_tensor,
     materialize_kvcached_sparse_received_kv_tensor,
     maybe_apply_kvcached_vllm_patches,
+    release_deferred_kvcached_layer_groups,
     release_kvcached_layer_groups,
+    remember_kvcached_layer_names,
     use_direct_ptr_for_runtime,
     use_flexi_kv_for_runtime,
     use_kvcached_backend,
@@ -856,7 +859,12 @@ class DynamicGPUWorker(Worker):
                 # threading.Thread(target=self.listen_to_kv_cache_tensor_and_patches, args=(rank,), daemon=True).start()
                 self.listen_to_kv_cache_tensor_and_patches(rank)
 
-    def dynamic_initialize_from_config(self, kv_cache_configs: list[KVCacheConfig], num_blocks: int) -> None:
+    def dynamic_initialize_from_config(
+        self,
+        kv_cache_configs: list[KVCacheConfig],
+        num_blocks: int,
+        virtual_num_blocks: Optional[int] = None,
+    ) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
         # For non-dynamic models, use the parent class's standard initialization
         if not self._is_dynamic_model():
@@ -898,6 +906,16 @@ class DynamicGPUWorker(Worker):
         self.block_size = kv_cache_spec.block_size
         self.per_block_kv_cache_bytes = kv_cache_spec.page_size_bytes  # K+V size per block per layer
         self.block_num = num_blocks
+        allocation_num_blocks = num_blocks
+        allocation_config = kv_cache_config
+        if use_kvcached_backend() and virtual_num_blocks is not None:
+            allocation_num_blocks = max(num_blocks, int(virtual_num_blocks))
+            allocation_config = deepcopy(kv_cache_config)
+            allocation_config.num_blocks = allocation_num_blocks
+            logger.info(
+                "KVCacheD reserving %s virtual KV blocks with initial "
+                "physical/logical limit %s",
+                allocation_num_blocks, num_blocks)
         
         # NOTE: Profile run and MemoryOverheadMonitor baseline initialization 
         # is now done in determine_available_memory() which is called before this.
@@ -913,11 +931,16 @@ class DynamicGPUWorker(Worker):
         with context:
             if use_flexi_kv_for_runtime(self.vllm_config):
                 logger.info("Using flexi flash attention dynamic initialize kv cache")
-                self.model_runner.dynamic_initialize_kv_cache_flexi(kv_cache_config, self.dynamic_kv_synchronizer, num_blocks)
+                self.model_runner.dynamic_initialize_kv_cache_flexi(
+                    allocation_config, self.dynamic_kv_synchronizer,
+                    allocation_num_blocks)
             else:
                 logger.info("Using standard flash attention dynamic initialize kv cache")
-                self.model_runner.dynamic_initialize_kv_cache(kv_cache_config, self.dynamic_kv_synchronizer, num_blocks)
-            self.dynamic_kv_synchronizer.create_slot_mappings(num_blocks * self.block_size)
+                self.model_runner.dynamic_initialize_kv_cache(
+                    allocation_config, self.dynamic_kv_synchronizer,
+                    allocation_num_blocks)
+            self.dynamic_kv_synchronizer.create_slot_mappings(
+                allocation_num_blocks * self.block_size)
 
     def set_env_var(self, key: str, value: str) -> None:
         """Update an environment variable in this worker process."""
@@ -1153,6 +1176,11 @@ class DynamicGPUWorker(Worker):
                 self.model_runner.kv_caches, self._kv_cache_start_layer())
         return result
 
+
+    @torch.inference_mode()
+    def initialize_intermediate_states(self) -> None:
+        """Initialize PP intermediate buffers without running a profile."""
+        self.model_runner.initialize_intermediate_states()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -3514,7 +3542,7 @@ class DynamicGPUWorker(Worker):
                 all_layer_ranges.extend(ranges)
             with self.model_runner.forward_lock:
                 caches_to_free_key, caches_to_free_value, ptrs_to_free_key, ptrs_to_free_value, handles_to_free_key, handles_to_free_value, grouped_handles_to_free = self.atomic_shelve_kv_cache(self.rank, all_layer_ranges)
-            release_kvcached_layer_groups(
+            defer_kvcached_layer_groups(
                 self.model_runner, {
                     layer
                     for start, end in all_layer_ranges
@@ -3694,10 +3722,10 @@ class DynamicGPUWorker(Worker):
                     self.is_all_patch_applied[from_rank] = False # 第一次接受到kv tensor时，需要将is_all_patch_applied设置为False，表示需要等待所有patch都应用完毕后才能进行配置的转换
                     tmp_slot_token_num = meta.num_tokens
                     if autoscaling_enabled:
-                        # The sender waits for our ACCEPT without holding its
-                        # local NCCL lock, so it is safe to wait here. This keeps
-                        # large NCCL receives from racing target-rank layer
-                        # loading and KV structure updates.
+                        # Resolve layer/KV structures before attempting the
+                        # local PP/KV reservation. This keeps large NCCL
+                        # receives from racing target-rank layer loading and KV
+                        # structure updates.
                         self._wait_for_kv_layer_structures_ready(
                             layers_to_be_received, from_rank)
                 if meta.type not in ("kv_tensor", "kv_tensor_sparse"):
@@ -3818,6 +3846,12 @@ class DynamicGPUWorker(Worker):
                 receiver_end_layer = (
                     receiver_start_layer + len(self.model_runner.kv_caches))
                 with self.model_runner.forward_lock:
+                    # Publish the full incoming layer groups before any lazy
+                    # page mapping.  KVCacheD's page allocator can broadcast
+                    # mappings concurrently with this bind loop, so per-layer
+                    # registration would expose invalid partial ownership.
+                    remember_kvcached_layer_names(self.model_runner,
+                                                   layer_ids)
                     for layer_id in layer_ids:
                         logger.info(f"current memory: {torch.cuda.mem_get_info()[0] / 1024 ** 3:.2f} GB, start to bind kv cache for layer {layer_id}")
                         kv_tensor = tmp_kv_tensors_dict[layer_id]
@@ -4175,6 +4209,26 @@ class DynamicGPUWorker(Worker):
             self, scheduler_output: "DynamicSchedulerOutput"):
         if not isinstance(self.model_runner.model, DynamicModelBase):
             return
+        if not scheduler_output.migration_in_process:
+            pending_layers = getattr(
+                self.model_runner,
+                "_kvcached_deferred_release_layers",
+                None,
+            )
+            if pending_layers:
+                # Explicit PP NCCL send/recv is asynchronous.  Reclaim the old
+                # KV virtual mappings only after one complete target-topology
+                # batch has crossed this rank and the whole device is drained.
+                # This bounds deferred mappings to one batch while avoiding a
+                # use-after-unmap in the next rank's hidden-state receive.
+                torch.cuda.synchronize(self.device)
+                release_deferred_kvcached_layer_groups(self.model_runner)
+                logger.info(
+                    "[autoscaling] rank %s released deferred KVCacheD layer "
+                    "groups after target-topology PP transfer",
+                    self.rank,
+                )
+            return
         if (not scheduler_output.migration_in_process
                 or not scheduler_output.is_sync_after_migration):
             return
@@ -4280,6 +4334,37 @@ class DynamicGPUWorker(Worker):
                 "before background cleanup/resize", self.rank)
 
         assert self.target_pp_layer_config is not None, "target_pp_layer_config must be set"
+        if is_sender:
+            target_start_layer, target_end_layer = (
+                self.target_pp_layer_config[self.rank])
+            resident_start_layer = (
+                self.model_runner.model.model.start_layer)
+            resident_end_layer = (
+                self.model_runner.model.model.end_layer)
+            cleanup_layer_ranges = list(layer_ranges)
+            if resident_end_layer > resident_start_layer:
+                if target_start_layer > target_end_layer:
+                    cleanup_layer_ranges.append(
+                        (resident_start_layer, resident_end_layer - 1))
+                else:
+                    if resident_start_layer < target_start_layer:
+                        cleanup_layer_ranges.append(
+                            (resident_start_layer, target_start_layer - 1))
+                    if target_end_layer + 1 < resident_end_layer:
+                        cleanup_layer_ranges.append(
+                            (target_end_layer + 1,
+                             resident_end_layer - 1))
+            expanded_cleanup_ranges = (
+                self._merge_contiguous_layer_ranges(cleanup_layer_ranges))
+            if expanded_cleanup_ranges != (
+                    self._merge_contiguous_layer_ranges(layer_ranges)):
+                logger.info(
+                    "[delete_layers] rank %s expanded sender cleanup from %s "
+                    "to %s for resident range [%s, %s) and target [%s, %s]",
+                    self.rank, layer_ranges, expanded_cleanup_ranges,
+                    resident_start_layer, resident_end_layer,
+                    target_start_layer, target_end_layer)
+            layer_ranges = expanded_cleanup_ranges
         caches_to_free_key = []
         caches_to_free_value = []
         ptrs_to_free_key = []
@@ -4333,7 +4418,7 @@ class DynamicGPUWorker(Worker):
                             logger.info(f"[do_resize] Waiting for {self._num_active_sender_threads} sender threads...")
                             self._sender_threads_cv.wait(timeout=5.0)
 
-                    release_kvcached_layer_groups(
+                    defer_kvcached_layer_groups(
                         self.model_runner, {
                             layer
                             for start, end in layer_ranges

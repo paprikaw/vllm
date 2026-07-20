@@ -363,7 +363,22 @@ class DynamicLlamaModel(LlamaModel):
                     layer_t0 = time.time()
                     
                     # Check input for NaN before layer
-                    input_has_nan = torch.isnan(hidden_states).any().item()
+                    try:
+                        input_has_nan = torch.isnan(
+                            hidden_states).any().item()
+                    except Exception:
+                        # This scalar check synchronizes the inference stream,
+                        # so it is the first reliable attribution point for an
+                        # asynchronous fault from the preceding layer (or the
+                        # PP receive for the first local layer).
+                        logger.exception(
+                            "CUDA failure surfaced before layer %d "
+                            "(scheduled range [%d, %d))",
+                            layer_idx,
+                            self.sched_start_layer,
+                            self.sched_end_layer,
+                        )
+                        raise
                     
                     try:
                         hidden_states, residual = layer(

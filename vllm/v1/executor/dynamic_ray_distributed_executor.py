@@ -465,6 +465,21 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             if var not in env_vars_to_copy:
                 env_vars_to_copy.append(var)
 
+        # Explicit dynamic-PP NCCL transport has a small set of opt-in
+        # correctness and diagnostic controls (blocking edge sync, sequence
+        # sentinels, edge tracing, pending-send limits, ...). These knobs are
+        # intentionally read in the Ray workers, so carrying only the two
+        # transport selector variables makes experiment-level settings appear
+        # enabled on the driver while silently remaining disabled on workers.
+        dynamic_pp_nccl_env_vars = [
+            name for name in os.environ
+            if name.startswith("VLLM_DYNAMIC_PP_NCCL_")
+        ]
+        for var in dynamic_pp_nccl_env_vars:
+            if (var not in self.non_carry_over_env_vars
+                    and var not in env_vars_to_copy):
+                env_vars_to_copy.append(var)
+
         # Critical env vars that MUST be copied to workers even if not in os.environ
         # These use vLLM's default values from envs.py
         critical_env_vars_with_defaults = {
@@ -1337,8 +1352,16 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         assert len(kv_cache_configs) == self.parallel_config.world_size, "kv_cache_configs must have the same length as world_size"
         self.collective_rpc("reinitialize_kv_cache", args=(kv_cache_configs,))
 
-    def dynamic_initialize_from_config(self, kv_cache_configs: list[KVCacheConfig], num_blocks: int) -> None:
-        self.collective_rpc("dynamic_initialize_from_config", args=(kv_cache_configs, num_blocks))
+    def dynamic_initialize_from_config(
+        self,
+        kv_cache_configs: list[KVCacheConfig],
+        num_blocks: int,
+        virtual_num_blocks: Optional[int] = None,
+    ) -> None:
+        self.collective_rpc(
+            "dynamic_initialize_from_config",
+            args=(kv_cache_configs, num_blocks, virtual_num_blocks),
+        )
 
     def set_env_var(self, key: str, value: str) -> None:
         """Broadcast an environment variable update to all workers."""

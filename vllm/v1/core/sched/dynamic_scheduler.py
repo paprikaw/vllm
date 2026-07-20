@@ -704,5 +704,14 @@ def create_from_dynamic_scheduler_output(dynamic_scheduler_output: DynamicSchedu
                 free_encoder_input_ids=dynamic_scheduler_output.free_encoder_input_ids,
                 structured_output_request_ids=dynamic_scheduler_output.structured_output_request_ids,
                 grammar_bitmask=dynamic_scheduler_output.grammar_bitmask,
-                kv_connector_metadata=dynamic_scheduler_output.kv_connector_metadata
+                kv_connector_metadata=dynamic_scheduler_output.kv_connector_metadata,
+                scheduler_step_id=dynamic_scheduler_output.scheduler_step_id,
+                current_scheduler_output_version=(
+                    dynamic_scheduler_output.current_scheduler_output_version),
+                scheduler_request_free_epoch=(
+                    dynamic_scheduler_output.scheduler_request_free_epoch),
+                scheduler_block_free_epoch=(
+                    dynamic_scheduler_output.scheduler_block_free_epoch),
+                autoscaling_request_state_sync=(
+                    dynamic_scheduler_output.autoscaling_request_state_sync),
             )

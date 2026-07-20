@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.dynamic_utils import (
 )
 from vllm.kvcached_integration import (
     guard_kvcached_vmm_slots_mapped,
+    hold_kvcached_vmm_slots_mapped,
     use_flexi_kv_for_runtime,
     use_kvcached_backend,
 )
@@ -489,14 +490,14 @@ class PairPipe:
                                                   world_size=2,
                                                   store_timeout=store_timeout_s)
         self.data_group = StatelessProcessGroup.create(host=host,
-                                                  port=port+100,
+                                                  port=port+1,
                                                   rank=pair_rank,
                                                   world_size=2,
                                                   store_timeout=store_timeout_s)
         # Separate signal group for kv_patch ready signals
         # This avoids protocol conflict where "ack" could be received by recv_meta()
         self.signal_group = StatelessProcessGroup.create(host=host,
-                                                  port=port+200,
+                                                  port=port+2,
                                                   rank=pair_rank,
                                                   world_size=2,
                                                   store_timeout=store_timeout_s)
@@ -1082,14 +1083,17 @@ class DynamicKVSynchronizer():
         else:
             ws = max(a, b) + 1
         pair_id = a * ws + b
-        # 为每一对 (a,b) 预留两个端口：0 -> a->b; 1 -> b->a
+        # Each directed PairPipe uses a three-port bundle for metadata, data,
+        # and patch-ready signaling. Reserve non-overlapping bundles for both
+        # directions of every rank pair.
         # 如果我向对端发送（self->peer），dir_bit 取决于 self 和 a/b 的关系
         if direction == 'send':
             dir_bit = 0 if self.rank == a else 1
         else:  # 'recv': peer -> self
             # 源是 peer_rank
             dir_bit = 0 if peer_rank == a else 1
-        return base + 2 * pair_id + dir_bit
+        bundle_id = 2 * pair_id + dir_bit
+        return base + 3 * bundle_id
 
     def _get_rank_ip(self, rank: int) -> str:
         # 优先使用 rank_to_ip，否则回退到 kv_ip 或 127.0.0.1
@@ -2696,8 +2700,15 @@ class DynamicKVSynchronizer():
             use_kvcached_backend() and slot_mapping.numel() > 0
             and patch_block_size is not None and int(patch_block_size) > 0)
         patch_page_context = (
-            self.kvcached_page_lifetime_context()
-            if should_hold_page_lifetime else nullcontext())
+            hold_kvcached_vmm_slots_mapped(
+                f"migration_patch_apply:patch={meta.id}",
+                self,
+                slot_mapping,
+                int(patch_block_size),
+                layer_ids=[int(layer_id) for layer_id in meta.layer_ids],
+                rank=self.rank,
+                trace_info=getattr(meta, "scheduler_trace", {}),
+            ) if should_hold_page_lifetime else nullcontext())
         if is_flexi:
             if key_cache_ptrs is None:
                 key_cache_ptrs = self.key_cache_ptrs
@@ -2825,7 +2836,7 @@ class DynamicKVSynchronizer():
                                 layer_ids=[int(layer_id)],
                                 rank=self.rank,
                                 trace_info=scheduler_trace,
-                                ensure_mapped=True,
+                                ensure_mapped=False,
                             )
                         if is_flexi:
                             self.kv_helper.flexi_put_kv_to_cache(

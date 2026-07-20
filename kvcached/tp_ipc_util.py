@@ -8,7 +8,7 @@ import pickle
 import socket
 import threading
 import uuid
-from contextlib import AbstractContextManager, ExitStack
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from typing import Any, Callable, Dict, Iterable, cast
 
 from kvcached.utils import DEFAULT_IPC_NAME
@@ -158,11 +158,15 @@ Message = Dict[str, Any]
 PostMapCallback = Callable[[list[int], int], None]
 PreUnmapCallback = Callable[[list[int], int],
                             AbstractContextManager[Any] | None]
+PreUnmapDrainCallback = Callable[[list[int], int],
+                                 AbstractContextManager[Any] | None]
 WorkerOffsetFilter = Callable[[list[int], int], list[int]]
 _POST_MAP_CALLBACKS: list[PostMapCallback] = []
 _POST_MAP_CALLBACKS_LOCK = threading.Lock()
 _PRE_UNMAP_CALLBACKS: list[PreUnmapCallback] = []
 _PRE_UNMAP_CALLBACKS_LOCK = threading.Lock()
+_PRE_UNMAP_DRAIN_CALLBACKS: list[PreUnmapDrainCallback] = []
+_PRE_UNMAP_DRAIN_CALLBACKS_LOCK = threading.Lock()
 _WORKER_OFFSET_FILTER: WorkerOffsetFilter | None = None
 _WORKER_MAPPING_LOCK = threading.RLock()
 _WORKER_MAPPED_OFFSETS: dict[int, set[int]] = {}
@@ -184,6 +188,14 @@ def register_pre_unmap_callback(callback: PreUnmapCallback) -> None:
     with _PRE_UNMAP_CALLBACKS_LOCK:
         if callback not in _PRE_UNMAP_CALLBACKS:
             _PRE_UNMAP_CALLBACKS.append(callback)
+
+
+def register_pre_unmap_drain_callback(
+        callback: PreUnmapDrainCallback) -> None:
+    """Register a lifetime gate held before CUDA is drained for unmap."""
+    with _PRE_UNMAP_DRAIN_CALLBACKS_LOCK:
+        if callback not in _PRE_UNMAP_DRAIN_CALLBACKS:
+            _PRE_UNMAP_DRAIN_CALLBACKS.append(callback)
 
 
 def register_worker_offset_filter(callback: WorkerOffsetFilter) -> None:
@@ -221,6 +233,24 @@ def _enter_pre_unmap_callbacks(
     return stack
 
 
+def _enter_pre_unmap_drain_callbacks(
+    offsets: list[int],
+    group_id: int,
+) -> ExitStack:
+    with _PRE_UNMAP_DRAIN_CALLBACKS_LOCK:
+        callbacks = list(_PRE_UNMAP_DRAIN_CALLBACKS)
+    stack = ExitStack()
+    try:
+        for callback in callbacks:
+            context = callback(offsets, group_id)
+            if context is not None:
+                stack.enter_context(context)
+    except BaseException:
+        stack.close()
+        raise
+    return stack
+
+
 def _normalize_offsets(offsets: Iterable[int]) -> list[int]:
     return sorted({int(offset) for offset in offsets})
 
@@ -240,8 +270,34 @@ def _map_worker_offsets(
         pending = [offset for offset in requested if offset not in mapped]
         if not pending:
             return True
-        ok = map_to_kv_tensors(pending, group_id=group_id)
+        try:
+            ok = map_to_kv_tensors(pending, group_id=group_id)
+        except RuntimeError as first_error:
+            # A multi-offset VMM map may fail after mapping only part of the
+            # batch. Roll back the whole pending set before retrying so an OOM
+            # cannot leak physical pages across scheduler retries.
+            try:
+                unmap_from_kv_tensors(pending, group_id=group_id)
+            except Exception:
+                pass
+            if "out of memory" not in str(first_error).lower():
+                raise
+            import torch
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            try:
+                ok = map_to_kv_tensors(pending, group_id=group_id)
+            except RuntimeError:
+                try:
+                    unmap_from_kv_tensors(pending, group_id=group_id)
+                except Exception:
+                    pass
+                raise
         if not ok:
+            try:
+                unmap_from_kv_tensors(pending, group_id=group_id)
+            except Exception:
+                pass
             return False
         mapped.update(pending)
         _notify_post_map_callbacks(pending, group_id)
@@ -256,23 +312,52 @@ def map_worker_offsets_for_migration(
     return _map_worker_offsets(offsets, group_id, apply_filter=False)
 
 
+@contextmanager
+def hold_worker_offsets_mapped_for_migration(
+    offsets: Iterable[int],
+    group_id: int = 0,
+):
+    """Map receiver offsets and prevent a concurrent unmap until exit.
+
+    The worker mapping lock is deliberately held across the caller's write.
+    This establishes one lock order for migration and page reclamation:
+    mapping lock first, then any page-lifetime/forward/NCCL guards acquired by
+    the caller.  Without this context a patch writer can hold page lifetime,
+    block on mapping, and deadlock an unmap listener that holds mapping while
+    waiting for page lifetime.
+    """
+    with _WORKER_MAPPING_LOCK:
+        if not _map_worker_offsets(offsets, group_id, apply_filter=False):
+            raise RuntimeError(
+                "Failed to map KVCacheD worker offsets for migration: "
+                f"group_id={group_id}, offsets={_normalize_offsets(offsets)}")
+        yield
+
+
 def _unmap_worker_offsets(
     offsets: Iterable[int],
     group_id: int = 0,
 ) -> bool:
     requested = set(_normalize_offsets(offsets))
-    with _WORKER_MAPPING_LOCK:
-        mapped = _WORKER_MAPPED_OFFSETS.setdefault(group_id, set())
-        pending = sorted(requested.intersection(mapped))
-        if not pending:
+    requested_list = sorted(requested)
+    # Close the enqueue-to-unmap race without holding the mapping lock while
+    # waiting for vLLM's foreground gate.  Once the gate is held, mapping is
+    # frozen, CUDA is drained, then the shorter page/NCCL reclamation guards
+    # are acquired only around the actual VMM unmap.  Acquiring the NCCL guard
+    # before synchronize can deadlock an in-flight PP transfer.
+    with _enter_pre_unmap_drain_callbacks(requested_list, group_id):
+        with _WORKER_MAPPING_LOCK:
+            mapped = _WORKER_MAPPED_OFFSETS.setdefault(group_id, set())
+            pending = sorted(requested.intersection(mapped))
+            if not pending:
+                return True
+            _synchronize_cuda_device()
+            with _enter_pre_unmap_callbacks(pending, group_id):
+                ok = unmap_from_kv_tensors(pending, group_id=group_id)
+            if not ok:
+                return False
+            mapped.difference_update(pending)
             return True
-        _synchronize_cuda_device()
-        with _enter_pre_unmap_callbacks(pending, group_id):
-            ok = unmap_from_kv_tensors(pending, group_id=group_id)
-        if not ok:
-            return False
-        mapped.difference_update(pending)
-        return True
 
 
 def unmap_worker_offsets_for_layer_groups(

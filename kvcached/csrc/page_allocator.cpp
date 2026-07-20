@@ -677,12 +677,26 @@ int64_t PageAllocator::get_physical_page_limit() const {
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
+  if (layer_group_layout_ &&
+      (world_size_ > 1 || should_use_worker_ipc())) {
+    // In worker-IPC mode, each rank maps only its currently owned PP layer
+    // groups. The scheduler process cannot infer aggregate capacity from its
+    // local cudaMemGetInfo(), and charging every logical page for all model
+    // layers undercounts PP capacity (e.g. by 10x for 8/80 owned layers).
+    // The analytical per-rank limit supplied by DynamicCore is authoritative;
+    // workers still report a mapping failure if that limit is not feasible.
+    return get_budget_map_capacity_unlocked();
+  }
+
   size_t avail_phy_mem_size, total_phy_mem_size;
   cudaMemGetInfo(&avail_phy_mem_size, &total_phy_mem_size);
 
   size_t headroom = total_phy_mem_size * (1.0 - gpu_utilization_);
+  // size_t subtraction wraps when the live free memory is below headroom.
+  // Saturate at zero so callers stop allocating instead of observing an
+  // effectively unbounded number of available pages.
   avail_phy_mem_size =
-      std::max(avail_phy_mem_size - headroom, static_cast<size_t>(0));
+      avail_phy_mem_size > headroom ? avail_phy_mem_size - headroom : 0;
 
   int64_t physical_bytes_per_logical_page =
       layer_group_layout_ ? num_layer_groups_ * map_page_size_

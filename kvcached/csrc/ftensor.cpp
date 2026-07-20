@@ -64,14 +64,38 @@ FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
 
 FTensor::~FTensor() {
   if (vaddr_) {
-    CUresult res = cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr_), size_);
-    if (res != CUDA_SUCCESS) {
-      const char *err = nullptr;
-      (void)cuGetErrorString(res, &err);
-      LOGGER(ERROR, "cuMemUnmap during FTensor cleanup failed: %s",
-             err ? err : "unknown");
+    // Sparse KV tensors intentionally leave unused virtual pages unmapped.
+    // Unmap only the pages that currently own physical memory; cuMemUnmap on
+    // the entire sparse reservation fails as soon as it encounters a hole.
+    for (const auto &[page_id, page] : mapping_) {
+      (void)page;
+      auto mapped_addr = static_cast<CUdeviceptr>(
+          reinterpret_cast<uintptr_t>(vaddr_) + page_id * page_size_);
+      CUresult res = cuMemUnmap(mapped_addr, page_size_);
+      if (res != CUDA_SUCCESS) {
+        const char *err = nullptr;
+        (void)cuGetErrorString(res, &err);
+        LOGGER(ERROR,
+               "cuMemUnmap during FTensor cleanup failed for page %ld: %s",
+               page_id, err ? err : "unknown");
+      }
     }
-    res = cuMemAddressFree(reinterpret_cast<CUdeviceptr>(vaddr_), size_);
+    if (zero_page_mapped_) {
+      CUresult res =
+          cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr_), page_size_);
+      if (res != CUDA_SUCCESS) {
+        const char *err = nullptr;
+        (void)cuGetErrorString(res, &err);
+        LOGGER(ERROR,
+               "cuMemUnmap during FTensor anchor cleanup failed: %s",
+               err ? err : "unknown");
+      }
+      zero_page_mapped_ = false;
+    }
+    mapping_.clear(); // Release physical handles after their mappings are gone.
+
+    CUresult res =
+        cuMemAddressFree(reinterpret_cast<CUdeviceptr>(vaddr_), size_);
     if (res != CUDA_SUCCESS) {
       const char *err = nullptr;
       (void)cuGetErrorString(res, &err);
@@ -79,7 +103,7 @@ FTensor::~FTensor() {
              err ? err : "unknown");
     }
   }
-  mapping_.clear(); // Free physical page handles after their mappings are gone.
+  mapping_.clear();
   zero_page_.reset();
 }
 
@@ -95,8 +119,10 @@ bool FTensor::map(offset_t offset) {
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
   auto page = make_unique_page(dev_, page_id, page_size_);
-  CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_));
-
+  if (page_id == 0 && zero_page_mapped_) {
+    CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_));
+    zero_page_mapped_ = false;
+  }
   page->map(vaddr);
   if (dev_.is_cuda()) {
     CHECK_RT(cudaMemset(vaddr, 0, page_size_));
@@ -119,9 +145,6 @@ bool FTensor::unmap(offset_t offset) {
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
   CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_));
-
-  // Map the zero page instead to ensure memory integrity.
-  map_(zero_page_.get(), offset);
 
   mapping_.erase(page_id);
   return true;
@@ -154,17 +177,14 @@ bool FTensor::init_with_zero_() {
          0);                       // Ensure alignment.
   assert(size_ % page_size_ == 0); // Ensure alignment.
 
-  bool succ = true;
-  for (size_t offset = 0; offset < size_; offset += page_size_) {
-    if (!map_(zero_page_.get(), offset, /* set_access = */ true)) {
-      succ = false;
-      break;
-    }
-  }
-  // if (succ)
-  //   set_access_(vaddr_, size_);
-
-  return succ;
+  // Keep the address range sparse. torch::from_blob needs the base pointer to
+  // resolve to the target CUDA device, so retain one zero-page anchor at offset
+  // zero. Mapping the shared zero page over the full reservation would still
+  // create one CUDA VMM mapping and page-table entry per page, which can OOM at
+  // startup for large reconfigurable KV capacities. Every other page is mapped
+  // and zeroed only when PageAllocator hands it to the scheduler.
+  zero_page_mapped_ = map_(zero_page_.get(), 0, /* set_access = */ true);
+  return zero_page_mapped_;
 }
 
 } // namespace kvcached

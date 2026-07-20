@@ -148,6 +148,72 @@ class DynamicGPUModelRunner(GPUModelRunner):
         self._pending_k_ptr_table: Optional["PtrTable"] = None
         self._pending_v_ptr_table: Optional["PtrTable"] = None
 
+    def _ensure_autoscaling_live_kvcached_blocks_mapped(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Map restored live KV blocks before the first target forward.
+
+        Migration-time mappings are based on the source-side transfer plan,
+        while the authoritative live block table is only available after the
+        target worker restores scheduler request state. Map every live block
+        for this rank's new layer range once at that handoff boundary so paged
+        attention cannot read a historical block that is still unmapped.
+        """
+        if not getattr(scheduler_output, "autoscaling_request_state_sync",
+                       False):
+            return
+        if not use_kvcached_backend():
+            return
+
+        block_table = self.input_batch.block_table[0]
+        live_blocks: set[int] = set()
+        for row_idx in range(self.input_batch.num_reqs):
+            num_blocks = int(block_table.num_blocks_per_row[row_idx])
+            live_blocks.update(
+                int(block_id)
+                for block_id in block_table.block_table_np[row_idx, :num_blocks]
+                if int(block_id) >= 0)
+        if not live_blocks:
+            return
+
+        kv_group_spec = self.kv_cache_config.kv_cache_groups[0]
+        block_size = int(kv_group_spec.kv_cache_spec.block_size)
+        sched_start, sched_end = self.model.get_sched_layers()
+        layer_ids = list(range(int(sched_start), int(sched_end)))
+        if not layer_ids:
+            return
+
+        try:
+            pp_rank = get_pp_group().rank
+        except Exception:
+            pp_rank = -1
+        scheduler_trace = {
+            "scheduler_step_id": getattr(scheduler_output,
+                                         "scheduler_step_id", -1),
+            "scheduler_output_version": getattr(
+                scheduler_output, "current_scheduler_output_version", -1),
+            "scheduler_request_free_epoch": getattr(
+                scheduler_output, "scheduler_request_free_epoch", -1),
+            "scheduler_block_free_epoch": getattr(
+                scheduler_output, "scheduler_block_free_epoch", -1),
+        }
+        guard_kvcached_vmm_slots_mapped(
+            "autoscaling_restored_live_blocks",
+            self,
+            [block_id * block_size for block_id in sorted(live_blocks)],
+            block_size,
+            layer_ids=layer_ids,
+            rank=pp_rank,
+            group_id=0,
+            trace_info=scheduler_trace,
+            ensure_mapped=True,
+        )
+        logger.info(
+            "KVCacheD mapped %d restored live blocks for PP rank %s "
+            "layers [%d, %d) before first target forward",
+            len(live_blocks), pp_rank, int(sched_start), int(sched_end))
+
     def _log_autoscaling_live_blocks_debug(
         self,
         scheduler_output: "SchedulerOutput",
@@ -790,6 +856,7 @@ class DynamicGPUModelRunner(GPUModelRunner):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
         self._update_states(scheduler_output)
+        self._ensure_autoscaling_live_kvcached_blocks_mapped(scheduler_output)
         self._log_autoscaling_live_blocks_debug(scheduler_output,
                                                 "post_update_states")
         if not scheduler_output.total_num_scheduled_tokens:

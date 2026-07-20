@@ -3,6 +3,7 @@ from vllm.v1.core.sched.dynamic_output import DynamicSchedulerOutput
 from .core import EngineCore
 import traceback
 import os
+import json
 import queue
 import signal
 import sys
@@ -414,7 +415,9 @@ class DynamicEngineCore(EngineCore):
         if total_layer_num <= 0:
             return LayerAddingAssessResult(True, True, sys.maxsize)
         block_size = self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        max_blocks_per_layer = self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, block_size, total_layer_num, mem_info.runtime_overhead_bytes)
+        max_blocks_per_layer = self._get_max_num_blocks(
+            mem_info.total_gpu_memory, mem_info.layer_size, block_size,
+            total_layer_num, self._manual_runtime_overhead_bytes(rank))
 
 
         total_gpu_memory = int(mem_info.total_gpu_memory)
@@ -539,6 +542,22 @@ class DynamicEngineCore(EngineCore):
                 f"{context}: KV resize did not free enough worker-visible "
                 "GPU memory for weight loading: " + "; ".join(failures))
 
+    def _manual_runtime_overhead_bytes(self, rank: int) -> int:
+        raw = os.getenv(
+            "VLLM_KV_MANUAL_RUNTIME_OVERHEAD_GB_BY_RANK", "{}")
+        try:
+            values = json.loads(raw)
+            overhead_gb = float(values.get(str(rank), values.get(rank, 0.0)))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "VLLM_KV_MANUAL_RUNTIME_OVERHEAD_GB_BY_RANK must be a "
+                f"JSON object of non-negative GiB values, got {raw!r}") from exc
+        if not math.isfinite(overhead_gb) or overhead_gb < 0:
+            raise ValueError(
+                "manual runtime overhead must be finite and non-negative, "
+                f"got rank={rank}, value={overhead_gb!r}")
+        return int(overhead_gb * 1024**3)
+
     def _get_max_num_blocks(self, total_gpu_memory: int, weight_size_per_layer: int, page_size: int, num_layers: int, runtime_overhead: int = 0) -> int:
         """Calculate max number of KV blocks per layer.
         
@@ -547,8 +566,7 @@ class DynamicEngineCore(EngineCore):
             weight_size_per_layer: Weight size per layer in bytes
             page_size: KV cache page/block size in bytes
             num_layers: Number of layers
-            runtime_overhead: Runtime overhead measured by profile_run (activations,
-                CUDA context, NCCL buffers, etc.) in bytes
+            runtime_overhead: Statically configured runtime overhead in bytes.
         
         Returns:
             Maximum number of blocks per layer
@@ -561,8 +579,100 @@ class DynamicEngineCore(EngineCore):
         total_weight_size = weight_size_per_layer * num_layers
         total_kv_cache = total_usable_memory - total_weight_size - runtime_overhead
         logger.info(f"[memory access] debug ------- get max num blocks: {total_kv_cache / 1024 ** 3:.2f} GB, num_layers: {num_layers}, block_size: {page_size}, total_gpu_memory: {total_gpu_memory / 1024 ** 3:.2f} GB, total_usable_memory: {total_usable_memory / 1024 ** 3:.2f} GB, weight_size_per_layer: {weight_size_per_layer / 1024 ** 3:.2f} GB, total_weight_size: {total_weight_size / 1024 ** 3:.2f} GB, runtime_overhead: {runtime_overhead / 1024 ** 3:.2f} GB")
-        max_blocks_per_layer = math.floor(total_kv_cache / (num_layers * page_size))
+        max_blocks_per_layer = math.floor(
+            total_kv_cache / (num_layers * page_size))
         return max_blocks_per_layer
+
+    def _build_analytical_kv_cache_configs(
+        self,
+        vllm_config: VllmConfig,
+        pp_layer_config: list[Tuple[int, int]],
+    ) -> tuple[int, list[KVCacheConfig]]:
+        """Build KV configs without a profile run.
+
+        Capacity is derived from total memory, layer weights, a configured
+        per-rank runtime overhead, and the concrete PP layer distribution.
+        The same calculation is therefore reusable during reconfiguration.
+        """
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        kv_cache_specs = self.model_executor.get_kv_cache_specs()
+        mem_infos = self.model_executor.get_workers_mem_info()
+        if len(kv_cache_specs) != len(mem_infos):
+            raise RuntimeError(
+                "KV spec and worker memory-info counts differ: "
+                f"{len(kv_cache_specs)} != {len(mem_infos)}")
+
+        reference_page_sizes = {
+            layer_spec.page_size_bytes
+            for kv_spec in kv_cache_specs
+            for layer_spec in kv_spec.values()
+        }
+        if len(reference_page_sizes) != 1:
+            raise RuntimeError(
+                "Analytical KV capacity requires one uniform page size "
+                f"across active ranks, got sizes={reference_page_sizes}")
+        reference_page_size = next(iter(reference_page_sizes))
+
+        fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
+        if fixed_blocks > 0:
+            max_blocks_per_layer = fixed_blocks
+            logger.info(
+                "[operation]: using fixed_num_gpu_blocks=%s for KV cache",
+                fixed_blocks)
+        else:
+            rank_limits: list[int] = []
+            for rank, (mem_info, layer_range, kv_spec) in enumerate(
+                    zip(mem_infos, pp_layer_config, kv_cache_specs)):
+                num_layers = layer_range[1] - layer_range[0] + 1
+                if num_layers <= 0:
+                    continue
+                page_sizes = {
+                    layer_spec.page_size_bytes
+                    for layer_spec in kv_spec.values()
+                }
+                if not page_sizes:
+                    page_size = reference_page_size
+                elif len(page_sizes) != 1:
+                    raise RuntimeError(
+                        "Analytical KV capacity requires a uniform page size "
+                        f"per rank, got rank={rank}, sizes={page_sizes}")
+                else:
+                    page_size = next(iter(page_sizes))
+                overhead = self._manual_runtime_overhead_bytes(rank)
+                limit = self._get_max_num_blocks(
+                    mem_info.total_gpu_memory, mem_info.layer_size,
+                    page_size, num_layers, overhead)
+                rank_limits.append(limit)
+                logger.info(
+                    "[analytical kv capacity] rank=%s layers=%s "
+                    "runtime_overhead=%.3f GiB limit=%s",
+                    rank, num_layers, overhead / 1024**3, limit)
+            if not rank_limits:
+                raise RuntimeError("No active layers found for KV cache")
+            max_blocks_per_layer = min(rank_limits)
+            if max_blocks_per_layer <= 0:
+                raise RuntimeError(
+                    "Analytical KV capacity is not positive: "
+                    f"rank_limits={rank_limits}")
+            logger.info(
+                "[operation]: analytical KV cache limit=%s, rank_limits=%s",
+                max_blocks_per_layer, rank_limits)
+
+        analytical_available_memory = [
+            max_blocks_per_layer * sum(
+                layer_spec.page_size_bytes
+                for layer_spec in kv_spec.values())
+            for kv_spec in kv_cache_specs
+        ]
+        kv_cache_configs = [
+            get_kv_cache_config(vllm_config, kv_spec, available_memory)
+            for kv_spec, available_memory in zip(
+                kv_cache_specs, analytical_available_memory)
+        ]
+        unify_kv_cache_configs(kv_cache_configs)
+        for config in kv_cache_configs:
+            config.num_blocks = max_blocks_per_layer
+        return max_blocks_per_layer, kv_cache_configs
 
     def _assess_memory_for_delete(
         self,
@@ -626,62 +736,31 @@ class DynamicEngineCore(EngineCore):
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
-
-        kv_cache_specs = self.model_executor.get_kv_cache_specs()
-
-        # Here we are not using kv_cache_config to initialize the kv cache
-        # We keep these logic just for compatibility with the parent class
-        # Also we want to invoke the profile run within determine_available_memory()
-        available_gpu_memory = self.model_executor.determine_available_memory()
-
-        assert len(kv_cache_specs) == len(available_gpu_memory)
-        # Get the kv cache tensor size
-        kv_cache_configs = [
-            get_kv_cache_config(vllm_config, kv_cache_spec_one_worker,
-                                available_gpu_memory_one_worker)
-            for kv_cache_spec_one_worker, available_gpu_memory_one_worker in
-            zip(kv_cache_specs, available_gpu_memory)
-        ]
-
-        # Since we use a shared centralized controller, we need the
-        # `kv_cache_config` to be consistent across all workers to make sure
-        # all the memory operators can be applied to all workers.
-        unify_kv_cache_configs(kv_cache_configs)
-
-        # All workers have the same kv_cache_config except layer names, so use
-        # an arbitrary one to initialize the scheduler.
-        assert all([
-            cfg.num_blocks == kv_cache_configs[0].num_blocks
-            for cfg in kv_cache_configs
-        ])
+        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        self.model_executor.collective_rpc("initialize_intermediate_states")
+        max_blocks_per_layer, kv_cache_configs = (
+            self._build_analytical_kv_cache_configs(
+                vllm_config, self.cur_pp_layer_config))
+        virtual_num_blocks = max_blocks_per_layer
+        for target_config in self._migration_alternative_configs.values():
+            target_blocks, _ = self._build_analytical_kv_cache_configs(
+                vllm_config, target_config)
+            virtual_num_blocks = max(virtual_num_blocks, target_blocks)
+        # KVCacheD reserves this many virtual blocks once at startup.  No
+        # physical pages are mapped by the reservation.  The scheduler and
+        # PageAllocator still start at max_blocks_per_layer and move to the
+        # target's analytical limit on each reconfiguration.
+        os.environ["VLLM_KVCACHED_VIRTUAL_NUM_BLOCKS"] = str(
+            virtual_num_blocks)
+        logger.info(
+            "[operation]: analytical KV virtual capacity=%s, "
+            "initial physical/logical limit=%s",
+            virtual_num_blocks, max_blocks_per_layer)
         num_cpu_blocks = 0
         self.scheduler_kv_cache_config = kv_cache_configs[0]
-
-        # rather than initialize from kv config, we invoke our own logic 
-        assert len(kv_cache_configs) >= 1 # Support PP>=1
-        assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
-        fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
-        if fixed_blocks > 0:
-            max_blocks_per_layer = fixed_blocks
-            logger.info(f"[operation]: using fixed_num_gpu_blocks={fixed_blocks} for kv cache initialization")
-        else:
-            mem_infos = self.model_executor.get_workers_mem_info()
-            max_blocks_per_layer = 6666666666
-            for rank, mem_info in enumerate(mem_infos):
-                num_layers_on_rank = self.cur_pp_layer_config[rank][1] - self.cur_pp_layer_config[rank][0] + 1
-                if num_layers_on_rank <= 0:
-                    continue
-                max_blocks_per_layer = min(max_blocks_per_layer, self._get_max_num_blocks(mem_info.total_gpu_memory, mem_info.layer_size, self.scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes, num_layers_on_rank, mem_info.runtime_overhead_bytes))
-            if max_blocks_per_layer == 6666666666:
-                raise RuntimeError("No active layers found for KV cache initialization")
-            logger.info(f"[operation]: initialize kv cache with max blocks per layer: {max_blocks_per_layer}")
         
-        # Update kv_cache_configs with the calculated max_blocks_per_layer
-        # This is necessary because unify_kv_cache_configs doesn't consider layer count differences
-        for cfg in kv_cache_configs:
-            cfg.num_blocks = max_blocks_per_layer
-        
-        self.model_executor.dynamic_initialize_from_config(kv_cache_configs, max_blocks_per_layer)
+        self.model_executor.dynamic_initialize_from_config(
+            kv_cache_configs, max_blocks_per_layer, virtual_num_blocks)
 
 
         # Override num_gpus in the kv cache
@@ -691,39 +770,18 @@ class DynamicEngineCore(EngineCore):
 
 
         elapsed = time.time() - start
-        logger.info(("init engine (profile, create kv cache, "
-                     "warmup model) took %.2f seconds"), elapsed)
+        logger.info(("init engine (analytical capacity, create kv cache) "
+                     "took %.2f seconds"), elapsed)
         return max_blocks_per_layer, num_cpu_blocks, self.scheduler_kv_cache_config
     def _reinitialize_kv_caches(
-            self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
+            self, vllm_config: VllmConfig,
+            pp_layer_config: list[Tuple[int, int]],
+    ) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
         assert(isinstance(self.model_executor, DynamicRayDistributedExecutor))
-        # Get all kv cache specs needed by the model
-        kv_cache_specs = self.model_executor.get_kv_cache_specs()
-        # print(f"kv_cache_specs: {kv_cache_specs}")
-        # Profiles the peak memory usage of the model to determine how much
-        # memory can be allocated for kv cache.
-        available_gpu_memory = self.model_executor.determine_available_memory()
-        # print(f"available_gpu_memory: {available_gpu_memory}")
-        assert len(kv_cache_specs) == len(available_gpu_memory)
-        # Get the kv cache tensor size
-        kv_cache_configs = [
-            get_kv_cache_config(vllm_config, kv_cache_spec_one_worker,
-                                available_gpu_memory_one_worker)
-            for kv_cache_spec_one_worker, available_gpu_memory_one_worker in
-            zip(kv_cache_specs, available_gpu_memory)
-        ]
-        # Since we use a shared centralized controller, we need the
-        # `kv_cache_config` to be consistent across all workers to make sure
-        # all the memory operators can be applied to all workers.
-        unify_kv_cache_configs(kv_cache_configs)
-
-        # All workers have the same kv_cache_config except layer names, so use
-        # an arbitrary one to initialize the scheduler.
-        assert all([
-            cfg.num_blocks == kv_cache_configs[0].num_blocks
-            for cfg in kv_cache_configs
-        ])
+        num_gpu_blocks, kv_cache_configs = (
+            self._build_analytical_kv_cache_configs(
+                vllm_config, pp_layer_config))
 
         # All layers have the same kv cache size
         # We assume this so we manage all kv cache tensor all together 
@@ -731,7 +789,6 @@ class DynamicEngineCore(EngineCore):
             sizes = [tensor.size for tensor in cfg.tensors.values()]
             assert all(s == sizes[0] for s in sizes), "Inconsistent KV sizes within config"
 
-        num_gpu_blocks = kv_cache_configs[0].num_blocks
         num_cpu_blocks = 0
         scheduler_kv_cache_config = kv_cache_configs[0]
 
@@ -750,8 +807,8 @@ class DynamicEngineCore(EngineCore):
         self.migration_status = MigrationStatus.NOT_MIGRATING
 
         elapsed = time.time() - start
-        logger.info(("init engine (profile, create kv cache, "
-                     "warmup model) took %.2f seconds"), elapsed)
+        logger.info(("reinit engine (analytical capacity, create kv cache) "
+                     "took %.2f seconds"), elapsed)
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
     def _drain_out_running_queue(
@@ -1273,7 +1330,8 @@ class DynamicEngineCore(EngineCore):
             weight_migration_time = time.time()
 
             # Reinitialize the kv cache
-            _, _, kv_cache_config = self._reinitialize_kv_caches(self.vllm_config)
+            _, _, kv_cache_config = self._reinitialize_kv_caches(
+                self.vllm_config, pp_layer_config)
             reinitialize_kv_cache_time = time.time()
             self.scheduler.re_initialize_kv_cache_manager(kv_cache_config)
             end_time = time.time()
@@ -1318,7 +1376,10 @@ class DynamicEngineCore(EngineCore):
             add_layers_fn(r, add_list)
         return weight_loading_mode
 
-    def change_model_configuration_by_kv_transfer_async(self, pp_layer_config: list[Tuple[int, int]]):
+    def change_model_configuration_by_kv_transfer_async(
+        self,
+        pp_layer_config: list[Tuple[int, int]],
+    ) -> list[EngineCoreOutputs]:
         """
         Our fancy implementation of model configuration change
         """
@@ -1327,6 +1388,7 @@ class DynamicEngineCore(EngineCore):
         self.migration_status = MigrationStatus.MIGRATING
         self._migration_done_event.clear()  # signal that migration is in progress
         assert isinstance(self.scheduler, DynamicScheduler)
+        engine_core_outputs: list[EngineCoreOutputs] = []
         is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
         is_kvcached = use_kvcached_backend()
         fixed_blocks = self.vllm_config.dynamic_config.fixed_num_gpu_blocks
@@ -1523,21 +1585,15 @@ class DynamicEngineCore(EngineCore):
             logger.info("No layers to add — skipping async migration (no-op)")
             self.migration_status = MigrationStatus.NOT_MIGRATING
             self._migration_done_event.set()
-            return
+            return engine_core_outputs
 
         commit_kvcached_physical_resize_if_needed(
             self.scheduler, "async pre-weight trim")
         self._verify_weight_memory_after_kv_resize(
             adding_per_rank, "async migration")
-        weight_loading_mode = self._dispatch_weight_loading(
-            adding_per_rank, migration_kind="async")
-        time_kv_compact_end = time.time()
 
-        logger.info(f"[timeline]: before start actual kv cache migration, time taken to dispatch {weight_loading_mode} weight loading, compact, resize kv cache: {human_readable_duration(time_kv_compact_end - time_start)}")
-
-        # 在异步传输/扩容前，抓取 KV cache 的快照，记录各请求的已计算 token 与 block 映射
-        # 用于后续传输完成后对齐新增 token，实现两 GPU 之间 KV 同步
-        # Ensure no in-flight work before snapshotting KV state
+        # Build the transfer plan before pausing scheduling.  Weight mutation
+        # itself is deferred until after all already-submitted PP work drains.
 
         # 计算 src->dst 传输对
         # 辅助函数：根据当前分片配置找到包含区间 [lo, hi] 的所有源 rank
@@ -1580,11 +1636,45 @@ class DynamicEngineCore(EngineCore):
         # Without need_compact the workers never compact and stay at version 0,
         # so the scheduler must not advance either.
         should_increase_version = allow_resize and need_compact
-        slot_mapping = self.scheduler.start_migration(sender_list, receiver_list, should_increase_version)
-        assert slot_mapping is not None if is_flexi else True
-        logical_kv_blocks = compacted_length if allow_resize and need_compact else None
-        self.model_executor.start_kv_cache_migration_async(
-            pp_layer_config, src_to_plan, slot_mapping, logical_kv_blocks)
+        # The scheduler snapshot, layer ownership, and worker KV snapshot must
+        # observe the same completed pipeline state.  With PP overlap enabled,
+        # drain already-submitted batches before any worker mutates its layers.
+        # Keep engine_lock held until every async add-layer thread has installed
+        # its full layer-stacking group and both KV snapshots have been created.
+        # This pauses scheduling during the transition without draining or
+        # preempting waiting requests.
+        with self.engine_lock:
+            drain_start = time.time()
+            drained_outputs = self._drain_out_running_queue()
+            engine_core_outputs.extend(drained_outputs)
+            logger.info(
+                "[async timeline]: drained %s in-flight PP batches in %s "
+                "before KV snapshot",
+                len(drained_outputs),
+                human_readable_duration(time.time() - drain_start))
+
+            weight_loading_mode = self._dispatch_weight_loading(
+                adding_per_rank, migration_kind="async")
+            if weight_loading_mode == "async":
+                logger.info(
+                    "[async migration] waiting for complete layer groups "
+                    "before KV snapshot")
+                self.model_executor.wait_for_all_async_add_layers()
+            time_kv_compact_end = time.time()
+            logger.info(
+                "[timeline]: before start actual KV migration, completed %s "
+                "weight loading, compact, and resize in %s",
+                weight_loading_mode,
+                human_readable_duration(time_kv_compact_end - time_start))
+
+            slot_mapping = self.scheduler.start_migration(
+                sender_list, receiver_list, should_increase_version)
+            assert slot_mapping is not None if is_flexi else True
+            logical_kv_blocks = (
+                compacted_length if allow_resize and need_compact else None)
+            self.model_executor.start_kv_cache_migration_async(
+                pp_layer_config, src_to_plan, slot_mapping,
+                logical_kv_blocks)
 
         time_kv_migration_end = time.time()
         logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
@@ -1773,7 +1863,7 @@ class DynamicEngineCore(EngineCore):
                     "[timeline]: migration process time taken: %s",
                     human_readable_duration(time.time() - time_start))
                 self._migration_timeline_start = None
-                return
+                return engine_core_outputs
             timeout_s = float(os.environ.get(
                 "VLLM_AUTOSCALING_SYNC_WAIT_TIMEOUT_S", "300"))
             if not self._migration_done_event.wait(timeout=timeout_s):
@@ -1787,7 +1877,7 @@ class DynamicEngineCore(EngineCore):
             else:
                 self._wait_for_worker_resize_cleanup_after_patch_done(
                     resized_block_num, time.time())
-            return
+            return engine_core_outputs
 
         timeout_s = float(os.environ.get(
             "VLLM_RECONFIGURATION_SYNC_WAIT_TIMEOUT_S",
@@ -1802,7 +1892,7 @@ class DynamicEngineCore(EngineCore):
         logger.info(
             "[reconfiguration async] sync batch completed and scheduler pause "
             "released")
-        return
+        return engine_core_outputs
 
     def change_model_configuration_by_kv_transfer_async_fast(
         self,
@@ -3162,7 +3252,14 @@ class DynamicEngineCoreProc(DynamicEngineCore):
                             logger.info(f"migration_thread: flushed {len(engine_core_outputs)} drain outputs to output_queue")
                         elif migration_mode == "async":
                             logger.info(f"Using async migration mode")
-                            self.change_model_configuration_by_kv_transfer_async(alternative_configs[target_config])
+                            engine_core_outputs = self.change_model_configuration_by_kv_transfer_async(alternative_configs[target_config])
+                            for output in engine_core_outputs:
+                                if output is not None:
+                                    self.output_queue.put_nowait(output)
+                            logger.info(
+                                "migration_thread: flushed %s async drain "
+                                "outputs to output_queue",
+                                len(engine_core_outputs))
                         elif migration_mode == "async_fast":
                             logger.info(f"Using async_fast migration mode")
                             engine_core_outputs = self.change_model_configuration_by_kv_transfer_async_fast(alternative_configs[target_config])
