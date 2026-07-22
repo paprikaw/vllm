@@ -488,7 +488,10 @@ class DynamicGPUModelRunner(GPUModelRunner):
         time_start = time.time()
         logger.debug("getting forward lock taking %s",
                      human_readable_duration(time.time() - time_start))
-        with self.fbgate.foreground():
+        # KVCacheD can revoke physical pages from a background IPC thread.
+        # The migration-aware foreground gate lets that thread establish a
+        # short enqueue fence while it synchronizes CUDA and unmaps pages.
+        with self.fbgate.migration_foreground():
             self.model.set_sched_layers(layer_config[0], layer_config[1])
             try:
                 result = self._execute_model(scheduler_output, intermediate_tensors)

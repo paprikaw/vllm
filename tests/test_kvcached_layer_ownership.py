@@ -218,7 +218,31 @@ def test_dynamic_scheduler_conversion_preserves_autoscaling_handoff():
     assert scheduler_output.autoscaling_request_state_sync is True
 
 
-def test_pre_unmap_uses_forward_then_nccl_lock_order(monkeypatch):
+def test_pre_unmap_context_uses_matching_exclusive_gate():
+    exclusive_context = object()
+    forward_lock = object()
+    runner = SimpleNamespace(
+        fbgate=SimpleNamespace(exclusive_background=exclusive_context),
+        forward_lock=forward_lock,
+    )
+
+    selected = (
+        kvcached_integration._kvcached_pre_unmap_context_for_runner(runner))
+
+    assert selected is exclusive_context
+
+
+def test_pre_unmap_context_falls_back_to_forward_lock():
+    forward_lock = object()
+    runner = SimpleNamespace(forward_lock=forward_lock)
+
+    selected = (
+        kvcached_integration._kvcached_pre_unmap_context_for_runner(runner))
+
+    assert selected is forward_lock
+
+
+def test_pre_unmap_uses_exclusive_then_nccl_lock_order(monkeypatch):
     events = []
     callbacks = {}
 
@@ -250,7 +274,7 @@ def test_pre_unmap_uses_forward_then_nccl_lock_order(monkeypatch):
         drop_slots_for_kvcached_unmap_offsets=(
             lambda offsets, **kwargs: events.append("drop")),
         kvcached_page_lifetime_context=lambda: recorded("page"),
-        _kvcached_pre_unmap_context=recorded("forward"),
+        _kvcached_pre_unmap_context=lambda: recorded("exclusive"),
         get_nccl_lock=lambda: recorded("nccl"),
     )
 
@@ -262,7 +286,7 @@ def test_pre_unmap_uses_forward_then_nccl_lock_order(monkeypatch):
             events.append("unmap")
 
     assert events == [
-        "enter:forward",
+        "enter:exclusive",
         "sync",
         "enter:page",
         "drop",
@@ -270,5 +294,5 @@ def test_pre_unmap_uses_forward_then_nccl_lock_order(monkeypatch):
         "unmap",
         "exit:nccl",
         "exit:page",
-        "exit:forward",
+        "exit:exclusive",
     ]

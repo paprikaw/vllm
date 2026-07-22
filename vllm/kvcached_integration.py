@@ -173,6 +173,22 @@ def _set_kvcached_debug_geometry(owner: Any, geometry: dict[str, Any]) -> None:
     setattr(owner, "_kvcached_debug_geometry", geometry)
 
 
+def _kvcached_pre_unmap_context_for_runner(runner: Any) -> Any:
+    """Return the gate that closes KVCacheD's enqueue-to-unmap race.
+
+    Dynamic inference is protected by ``fbgate.migration_foreground()``, not
+    by ``forward_lock``. Pair physical unmap with the matching exclusive
+    background gate so no new attention kernel can be enqueued between the
+    device synchronize and VMM unmap. Keep the legacy lock as a fallback for
+    runners that do not expose the foreground/background gate.
+    """
+    fbgate = getattr(runner, "fbgate", None)
+    exclusive_background = getattr(fbgate, "exclusive_background", None)
+    if exclusive_background is not None:
+        return exclusive_background
+    return getattr(runner, "forward_lock", None)
+
+
 def _register_kvcached_migration_unmap_hook(
     runner: Any,
     kv_synchronizer: Any,
@@ -212,8 +228,12 @@ def _register_kvcached_migration_unmap_hook(
         group_id: int,
     ) -> Any:
         del offsets, group_id
-        return getattr(kv_synchronizer,
-                       "_kvcached_pre_unmap_context", None)
+        context = getattr(kv_synchronizer,
+                          "_kvcached_pre_unmap_context", None)
+        # Locks are context managers themselves, while fbgate exposes a
+        # context-manager factory. Create a fresh exclusive context for every
+        # unmap; generator-based context managers cannot be reused.
+        return context() if callable(context) else context
 
     def _on_worker_pre_unmap(offsets: list[int], group_id: int) -> Any:
         stack = ExitStack()
@@ -1782,7 +1802,7 @@ def _apply_dynamic_migration_kvcached_patches(
             _set_kvcached_debug_geometry(self, debug_geometry)
             _set_kvcached_debug_geometry(kv_synchronizer, debug_geometry)
             setattr(kv_synchronizer, "_kvcached_pre_unmap_context",
-                    getattr(self, "forward_lock", None))
+                    _kvcached_pre_unmap_context_for_runner(self))
             _register_kvcached_migration_unmap_hook(self, kv_synchronizer)
             if local_layer_names:
                 _rebind_kvcached_tensor_views(self, kv_synchronizer, num_blocks)
@@ -1900,7 +1920,7 @@ def _apply_dynamic_migration_kvcached_patches(
             _set_kvcached_debug_geometry(self, debug_geometry)
             _set_kvcached_debug_geometry(kv_synchronizer, debug_geometry)
             setattr(kv_synchronizer, "_kvcached_pre_unmap_context",
-                    getattr(self, "forward_lock", None))
+                    _kvcached_pre_unmap_context_for_runner(self))
             _register_kvcached_migration_unmap_hook(self, kv_synchronizer)
             self.grouped_handles = []
             self.key_handles = [[] for _ in local_layer_names]
