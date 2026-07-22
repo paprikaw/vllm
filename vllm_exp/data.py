@@ -633,6 +633,8 @@ class SweepBenchmarkParams(BaseModel):
 
 class SweepVllmParams(BaseModel):
     """Individual vLLM parameters for parameter-sweep mode."""
+    max_num_batched_tokens: Optional[List[int]] = None
+    """List of scheduler token budgets to sweep. Changing this restarts the server."""
     attention_kernel: Optional[List[str]] = None
     """List of attention kernels to sweep: 'flash', 'flexi', 'direct'."""
     weight_chunk_size_mb: Optional[List[float]] = None
@@ -681,6 +683,7 @@ class SweepConfig(BaseModel):
     
     # Naming aliases for file naming - only for actual sweep parameters
     NAMING_ALIASES: ClassVar[Dict[str, str]] = {
+        "max_num_batched_tokens": "mbt",
         "attention_kernel": "kernel",
         "block_size": "blk",
         "use_vmm": "vmm",
@@ -719,6 +722,9 @@ class SweepConfig(BaseModel):
         
         # vLLM sweep parameters
         if self.vllm is not None:
+            if self.vllm.max_num_batched_tokens is not None:
+                axes['max_num_batched_tokens'] = (
+                    self.vllm.max_num_batched_tokens)
             if self.vllm.attention_kernel is not None:
                 axes['attention_kernel'] = self.vllm.attention_kernel
             if self.vllm.weight_chunk_size_mb is not None:
@@ -1322,6 +1328,7 @@ class ExperimentConfig:
     
     # Naming aliases for file naming
     NAMING_ALIASES: ClassVar[Dict[str, str]] = {
+        "max_num_batched_tokens": "mbt",
         "attention_kernel": "kernel",
         "pp_layer_partition": "pp",
         "request_rate": "rr",
@@ -1345,6 +1352,7 @@ class ExperimentConfig:
     def get_naming_vars(self) -> Dict[str, Any]:
         """Generate vars_mapping for file naming using NAMING_ALIASES."""
         vars_dict = {
+            "mbt": self.vllm.max_num_batched_tokens,
             "kernel": self.vllm.attention_kernel,
             "pp": self.vllm.pp_layer_partition,
             "rr": self.benchmark.request_rate,
@@ -1429,7 +1437,9 @@ class ExperimentConfig:
             
             # Reorder: put restart-requiring params first (outermost loops)
             # Order: block_size -> attention_kernel (block_size outermost)
-            restart_params = ['block_size', 'attention_kernel']
+            restart_params = [
+                'max_num_batched_tokens', 'block_size', 'attention_kernel'
+            ]
             for param in restart_params:
                 if param in axis_names:
                     axis_names.remove(param)
@@ -1443,6 +1453,8 @@ class ExperimentConfig:
                 
                 # Extract sweep parameters from combination
                 bench_cfg: SweepBenchmarkConfig = combo_dict['benchmark_config']
+                max_num_batched_tokens: Optional[int] = combo_dict.get(
+                    'max_num_batched_tokens')
                 attn_kernel: Optional[str] = combo_dict.get('attention_kernel')
                 weight_chunk_size: Optional[float] = combo_dict.get('weight_chunk_size_mb')
                 mig_approach: Optional[str] = combo_dict.get('migration_approach')
@@ -1455,13 +1467,18 @@ class ExperimentConfig:
                 
                 # Create ExperimentConfig from this combination
                 # Yield (sweep_config_index, experiment_config) tuple for server restart isolation
-                yield (sweep_config_index, cls._create_from_combo(static_cfg, bench_cfg, attn_kernel, weight_chunk_size, mig_approach, weight_loading_mode, fixed_blocks, block_sz, vmm_flag, kv_resize_flag, cpu_cache_flag))
+                yield (sweep_config_index, cls._create_from_combo(
+                    static_cfg, bench_cfg, max_num_batched_tokens,
+                    attn_kernel, weight_chunk_size, mig_approach,
+                    weight_loading_mode, fixed_blocks, block_sz, vmm_flag,
+                    kv_resize_flag, cpu_cache_flag))
     
     @classmethod
     def _create_from_combo(
         cls,
         static_cfg: 'StaticConfig',
         bench_cfg: SweepBenchmarkConfig,
+        max_num_batched_tokens: Optional[int] = None,
         attention_kernel: Optional[str] = None,
         weight_chunk_size_mb: Optional[float] = None,
         migration_approach: Optional[str] = None,
@@ -1479,6 +1496,7 @@ class ExperimentConfig:
         Args:
             static_cfg: Static configuration
             bench_cfg: Sweep benchmark configuration (from sweep axes)
+            max_num_batched_tokens: Scheduler token-budget sweep override
             attention_kernel: Override from sweep axis (if sweeping), otherwise use static
             weight_chunk_size_mb: Override from sweep axis (if sweeping), otherwise use static
             migration_approach: Override from sweep axis (if sweeping), otherwise use static
@@ -1490,6 +1508,9 @@ class ExperimentConfig:
             enable_cpu_weight_cache: Override from sweep axis (if sweeping), otherwise use static
         """
         # Resolve sweep overrides: sweep values override static values
+        batch_token_budget = (
+            max_num_batched_tokens if max_num_batched_tokens is not None
+            else static_cfg.vllm.max_num_batched_tokens)
         kernel = attention_kernel if attention_kernel is not None else static_cfg.vllm.attention_kernel
         chunk_size = weight_chunk_size_mb if weight_chunk_size_mb is not None else static_cfg.vllm.weight_chunk_size_mb
         mig_approach = migration_approach if migration_approach is not None else static_cfg.vllm.migration_approach
@@ -1534,7 +1555,7 @@ class ExperimentConfig:
             pipeline_parallel_size=static_cfg.vllm.pipeline_parallel_size,
             gpu_memory_utilization=static_cfg.vllm.gpu_memory_utilization,
             max_model_len=static_cfg.vllm.max_model_len,
-            max_num_batched_tokens=static_cfg.vllm.max_num_batched_tokens,
+            max_num_batched_tokens=batch_token_budget,
             max_num_seqs=static_cfg.vllm.max_num_seqs,
             block_size=blk_size,
             page_attention_block_size_bytes=page_attention_block_size_bytes,

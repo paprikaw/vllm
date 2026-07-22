@@ -2754,6 +2754,7 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
         # - attention_kernel (switching kernel requires restart)
         # - block_size (changing KV cache block size requires restart)
         # - migration_approach (user requires different migration modes to run on separate servers)
+        # - max_num_batched_tokens (scheduler token budget is fixed at startup)
         # - enable_cpu_weight_cache (changing CPU weight cache mode requires restart)
         # - enable_kv_resize (not switchable through set_pp_config API)
         
@@ -2761,6 +2762,7 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
             """Return a tuple of parameters that require server restart when changed."""
             return (
                 exp.sweep_config_index,
+                exp.vllm_spec.max_num_batched_tokens,
                 exp.vllm_spec.attention_kernel,
                 exp.vllm_spec.block_size,
                 exp.vllm_spec.migration_approach,
@@ -2780,9 +2782,11 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
         
         C.print(f"[bold cyan]Experiments grouped by server config: {len(server_groups)} groups[/]")
         for group_key, group_exps in server_groups:
-            sweep_idx, kernel, blk_size, migration_mode, use_vmm, cpu_cache, kv_resize = group_key
+            (sweep_idx, batch_tokens, kernel, blk_size, migration_mode,
+             use_vmm, cpu_cache, kv_resize) = group_key
             C.print(
-                f"  sweep[{sweep_idx}] kernel={kernel} block_size={blk_size} "
+                f"  sweep[{sweep_idx}] max_num_batched_tokens={batch_tokens} "
+                f"kernel={kernel} block_size={blk_size} "
                 f"migration_mode={migration_mode} vmm={use_vmm} cpu_cache={cpu_cache} "
                 f"kv_resize={kv_resize}: "
                 f"{len(group_exps)} experiments"
@@ -2790,7 +2794,9 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
         
         # Run experiments group by group, restarting server for each group
         for group_key, group_experiments in server_groups:
-            sweep_idx, kernel_val, block_size_val, migration_mode_val, use_vmm_val, cpu_cache_val, kv_resize_val = group_key
+            (sweep_idx, batch_tokens_val, kernel_val, block_size_val,
+             migration_mode_val, use_vmm_val, cpu_cache_val,
+             kv_resize_val) = group_key
             proc = None
             log_redirector = None
             
@@ -2798,6 +2804,7 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 C.print(f"\n[bold blue]{'='*60}[/]")
                 C.print(
                     f"[bold blue]Starting server for sweep[{sweep_idx}] kernel={kernel_val} "
+                    f"max_num_batched_tokens={batch_tokens_val} "
                     f"block_size={block_size_val} migration_mode={migration_mode_val} "
                     f"vmm={use_vmm_val} cpu_cache={cpu_cache_val} kv_resize={kv_resize_val}[/]"
                 )
@@ -2813,7 +2820,8 @@ def sweep_test_single_server(cfg: SweepTestConfig, logm: SweepLogManager):
                 vmm_str = f"_vmm{1 if use_vmm_val else 0}"
                 cpu_str = f"_cpu{1 if cpu_cache_val else 0}"
                 kv_resize_str = f"_kvresize{1 if kv_resize_val else 0}"
-                group_suffix = f"sweep{sweep_idx}_{kernel_val}{blk_str}{mig_mode_str}{vmm_str}{cpu_str}{kv_resize_str}"
+                batch_tokens_str = f"_mbt{batch_tokens_val}"
+                group_suffix = f"sweep{sweep_idx}_{kernel_val}{batch_tokens_str}{blk_str}{mig_mode_str}{vmm_str}{cpu_str}{kv_resize_str}"
                 global_metrics_path = logm.get_dir() / f"global_metrics_raw_{group_suffix}.csv"
                 first_exp.vllm_spec.metrics_csv_path = str(global_metrics_path)
                 
