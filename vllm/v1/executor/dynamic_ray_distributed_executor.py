@@ -226,6 +226,10 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
                     "VLLM_DYNAMIC_PP_RDT_TRANSPORT=nccl requires GPU Ray "
                     f"actors, got {current_platform.ray_device_key}.")
             ray_remote_kwargs["enable_tensor_transport"] = True
+        concurrency_groups = dict(
+            ray_remote_kwargs.get("concurrency_groups") or {})
+        concurrency_groups["migration_control"] = 1
+        ray_remote_kwargs["concurrency_groups"] = concurrency_groups
         logger.info("use_ray_spmd_worker: %s", self.use_ray_spmd_worker)
 
         # Create the workers.
@@ -1218,10 +1222,27 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         # fire-and-forget 异步发起，每个 worker 内部用线程执行
         self.collective_rpc("async_add_layers", args=(rank, layers_list))
 
+    def launch_async_add_layers(
+        self,
+        adding_per_rank: dict[int, list[Tuple[int, int]]],
+    ) -> list[Any]:
+        """Submit each async layer load through the control concurrency group.
+
+        The old per-rank collective sent one round to every actor for each
+        target rank. The dedicated control lane lets each target
+        start its loader thread without waiting behind queued forward calls.
+        """
+        refs = []
+        for rank, layers_list in adding_per_rank.items():
+            refs.append(
+                self.workers[rank].launch_async_add_layers_control.remote(
+                    rank, layers_list))
+        return refs
+
     def wait_for_all_async_add_layers(self):
         """Wait for all async_add_layers to complete on all workers."""
         self.collective_rpc("wait_for_async_add_layers")
-    
+
     def start_kv_cache_migration_async(
             self,
             pp_layer_config: list[Tuple[int, int]],
@@ -1233,6 +1254,33 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
             "start_kv_cache_migration_async",
             args=(pp_layer_config, src_to_plan, slot_mapping,
                   logical_num_blocks))
+
+    def wait_for_async_layer_loads_control(
+        self,
+        weight_launch_refs: list[Any],
+        adding_ranks: list[int],
+    ) -> None:
+        """Wait for all pre-cut control-lane layer loads to finish."""
+        start = time.time()
+        if weight_launch_refs:
+            ray.get(weight_launch_refs)
+        launch_ready = time.time()
+        logger.info(
+            "[autoscaling rpc timing] control-lane weight launch took "
+            "%.3fs for %s refs", launch_ready - start,
+            len(weight_launch_refs))
+
+        load_wait_refs = [
+            self.workers[rank].wait_for_async_add_layers_control.remote()
+            for rank in adding_ranks
+        ]
+        if load_wait_refs:
+            ray.get(load_wait_refs)
+        load_ready = time.time()
+        logger.info(
+            "[autoscaling rpc timing] pre-cut control-lane layer-load barrier "
+            "took "
+            "%.3fs for %s refs", load_ready - start, len(load_wait_refs))
 
     def get_is_kv_resizing_done(self) -> list[bool]:
         return self.collective_rpc("get_is_kv_resizing_done")
@@ -1322,8 +1370,22 @@ class DynamicRayDistributedExecutor(RayDistributedExecutor):
         - layer_size: bytes of a single layer's weights (recorded by model).
         - free_memory: current free GPU memory in bytes.
         - single_kv_tensor_size: bytes of one layer's KV cache tensor.
+
+        Memory metadata is independent of forward ordering, so submit it to
+        the migration control concurrency group. The worker method is a
+        read-only point-in-time query: it deliberately avoids CUDA stream
+        synchronization, process-wide GC, and model-mutation gates so it does
+        not recreate the forward-lane dependency inside the worker.
         """
-        return self.collective_rpc("get_mem_info")
+        start = time.time()
+        infos = ray.get([
+            worker.get_mem_info_control.remote()
+            for worker in self.workers
+        ])
+        logger.info(
+            "[autoscaling rpc timing] control-lane get_workers_mem_info "
+            "took %.3fs for %s workers", time.time() - start, len(infos))
+        return infos
     
     def compact_kv_cache(self, compacted_length: int, bitmap: bitarray) -> None:
         self.collective_rpc("compact_kv_cache", args=(compacted_length, bitmap))

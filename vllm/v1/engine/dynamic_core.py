@@ -1383,11 +1383,15 @@ class DynamicEngineCore(EngineCore):
         """
         Our fancy implementation of model configuration change
         """
+        migration_trigger_start = time.time()
         pp_layer_config = self._normalize_pp_layer_config(pp_layer_config)
         logger.info(f"Start migrating to new configuration {pp_layer_config}")
+        self._migration_timeline_start = migration_trigger_start
         self.migration_status = MigrationStatus.MIGRATING
         self._migration_done_event.clear()  # signal that migration is in progress
         assert isinstance(self.scheduler, DynamicScheduler)
+        # Layer loading uses the independent control lane. Migration setup stays
+        # on the forward lane so actor FIFO order forms the correctness fence.
         engine_core_outputs: list[EngineCoreOutputs] = []
         is_flexi = use_flexi_kv_for_runtime(self.vllm_config)
         is_kvcached = use_kvcached_backend()
@@ -1406,7 +1410,12 @@ class DynamicEngineCore(EngineCore):
         # 仍不足时再统一压缩 KV cache，最后再进行 add_layers
         # 先获取一次内存快照
         assert isinstance(self.model_executor, DynamicRayDistributedExecutor)
+        memory_info_start = time.time()
         mem_infos = self.model_executor.get_workers_mem_info()
+        logger.info(
+            "[async timeline]: pre-migration control-plane memory info "
+            "completed in %s",
+            human_readable_duration(time.time() - memory_info_start))
 
         # Adding/removing
         need_compact = False
@@ -1434,7 +1443,6 @@ class DynamicEngineCore(EngineCore):
 
         with self.engine_lock:
             time_start = time.time()
-            self._migration_timeline_start = time_start
             for rank, layers in enumerate(pp_layer_config):
                 # Skip ranks that are being deactivated (target start > end indicates inactive).
                 # These ranks will have their layers removed later; no layers are added here.
@@ -1592,8 +1600,9 @@ class DynamicEngineCore(EngineCore):
         self._verify_weight_memory_after_kv_resize(
             adding_per_rank, "async migration")
 
-        # Build the transfer plan before pausing scheduling.  Weight mutation
-        # itself is deferred until after all already-submitted PP work drains.
+        # Build the transfer plan before the pre-cut weight load. Scheduling is
+        # not globally paused; worker-local gates serialize CUDA/model mutation
+        # against forwards on each affected GPU.
 
         # 计算 src->dst 传输对
         # 辅助函数：根据当前分片配置找到包含区间 [lo, hi] 的所有源 rank
@@ -1636,48 +1645,65 @@ class DynamicEngineCore(EngineCore):
         # Without need_compact the workers never compact and stay at version 0,
         # so the scheduler must not advance either.
         should_increase_version = allow_resize and need_compact
-        # The scheduler snapshot, layer ownership, and worker KV snapshot must
-        # observe the same completed pipeline state.  With PP overlap enabled,
-        # drain already-submitted batches before any worker mutates its layers.
-        # Keep engine_lock held until every async add-layer thread has installed
-        # its full layer-stacking group and both KV snapshots have been created.
-        # This pauses scheduling during the transition without draining or
-        # preempting waiting requests.
-        with self.engine_lock:
-            drain_start = time.time()
-            drained_outputs = self._drain_out_running_queue()
-            engine_core_outputs.extend(drained_outputs)
-            logger.info(
-                "[async timeline]: drained %s in-flight PP batches in %s "
-                "before KV snapshot",
-                len(drained_outputs),
-                human_readable_duration(time.time() - drain_start))
 
-            weight_loading_mode = self._dispatch_weight_loading(
-                adding_per_rank, migration_kind="async")
-            if weight_loading_mode == "async":
+        # Preload target layers while the scheduler and workers still use the
+        # old topology. This is deliberately before scheduler.start_migration:
+        # otherwise forwards running during layer/KV structure mutation would
+        # publish migration patches with mappings from two different views.
+        # The dedicated control lane keeps loader launch/join RPCs independent
+        # of the actors' forward execution lane; the worker-side fair gate
+        # serializes each GPU's CUDA work without globally draining requests.
+        weight_loading_start = time.time()
+        weight_loading_mode = self._get_weight_loading_mode()
+        if weight_loading_mode == "async":
+            for rank, add_list in adding_per_rank.items():
+                total_layers = sum(hi - lo + 1 for lo, hi in add_list)
                 logger.info(
-                    "[async migration] waiting for complete layer groups "
-                    "before KV snapshot")
-                self.model_executor.wait_for_all_async_add_layers()
-            time_kv_compact_end = time.time()
-            logger.info(
-                "[timeline]: before start actual KV migration, completed %s "
-                "weight loading, compact, and resize in %s",
-                weight_loading_mode,
-                human_readable_duration(time_kv_compact_end - time_start))
+                    "[async] rank %s: pre-cut async adding layers %s "
+                    "(total_layers=%s)", rank, add_list, total_layers)
+            weight_launch_refs = self.model_executor.launch_async_add_layers(
+                adding_per_rank)
+            self.model_executor.wait_for_async_layer_loads_control(
+                weight_launch_refs, list(adding_per_rank))
+        else:
+            self._dispatch_weight_loading(
+                adding_per_rank, migration_kind="async")
+        logger.info(
+            "[async timeline]: pre-cut layer loading completed in %s",
+            human_readable_duration(time.time() - weight_loading_start))
 
+        # Establish the logical migration cut only after layer loading is
+        # complete. schedule() advances Request.num_computed_tokens when it
+        # submits work, so slot_mapping includes every pre-cut in-flight batch.
+        # Migration setup intentionally uses the ordinary forward actor lane:
+        # actor FIFO ordering makes completion of this fast collective the
+        # fence behind all pre-cut forwards. engine_lock prevents any post-cut
+        # forward from being scheduled until worker migration state is ready.
+        with self.engine_lock:
+            in_flight_batches = _safe_queue_size(self.batch_queue)
             slot_mapping = self.scheduler.start_migration(
                 sender_list, receiver_list, should_increase_version)
             assert slot_mapping is not None if is_flexi else True
+
+            time_kv_compact_end = time.time()
             logical_kv_blocks = (
                 compacted_length if allow_resize and need_compact else None)
             self.model_executor.start_kv_cache_migration_async(
                 pp_layer_config, src_to_plan, slot_mapping,
                 logical_kv_blocks)
+            logger.info(
+                "[async timeline]: submitted no-drain migration boundary "
+                "through the forward plane with %s in-flight PP batches and %s "
+                "initial KV slots in %s",
+                in_flight_batches,
+                0 if slot_mapping is None else len(slot_mapping),
+                human_readable_duration(time_kv_compact_end - time_start))
 
         time_kv_migration_end = time.time()
-        logger.info(f"[timeline]: after start kv cache migration, time taken: {human_readable_duration(time_kv_migration_end - time_kv_compact_end)}")
+        logger.info(
+            "[timeline]: no-drain worker migration launch became ready in %s",
+            human_readable_duration(time_kv_migration_end -
+                                    time_kv_compact_end))
 
         def sync_by_checking_buffer_status() -> bool:
             token_to_send_threshold = int(os.environ.get("VLLM_PATCH_ID_DIFF_THRESHOLD", 1024))

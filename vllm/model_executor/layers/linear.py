@@ -1700,7 +1700,7 @@ def chunked_copy_inplace(
         if start_idx >= total_elements:
             break
         if fbgate is not None:
-            with fbgate.background():
+            with fbgate.fair_background():
                 time_start = time.time()
                 dst_flat[start_idx:end_idx].copy_(
                     src_flat[start_idx:end_idx],
@@ -1726,4 +1726,3 @@ def human_readable_size(size: int) -> str:
         return f"{size / 1024 ** 2:.2f}MB"
 
     return f"{size / 1024 ** 3:.2f}GB"
-

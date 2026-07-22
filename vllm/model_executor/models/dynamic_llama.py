@@ -518,7 +518,7 @@ class DynamicLlamaModel(LlamaModel):
                     break
 
                 if self.fbgate is not None:
-                    with self.fbgate.background():
+                    with self.fbgate.fair_background():
                         weight_loader(param, loaded_weight, shard_id)
                 else:
                     weight_loader(param, loaded_weight, shard_id)
@@ -551,7 +551,7 @@ class DynamicLlamaModel(LlamaModel):
                     return
 
                 if self.fbgate is not None:
-                    with self.fbgate.background():
+                    with self.fbgate.fair_background():
                         weight_loader(param, loaded_weight)
                 else:
                     weight_loader(param, loaded_weight)

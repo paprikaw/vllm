@@ -478,24 +478,31 @@ class DynamicGPUWorker(Worker):
         
         with DeadlockTimeoutContext(self._layer_loaded_cv, "_layer_loaded_cv", timeout=2):
             assert self.migration_stream is not None
-            with torch.cuda.stream(self.migration_stream):
-                logger.info(f"start to load layer, current stream:{torch.cuda.current_stream()}")
-                # 记录扩容前的起始 layer，便于在 start_layer 左移时重排本地 kv 索引基准
-                old_start_layer = self.model_runner.model.model.start_layer
-                old_end_layer = self.model_runner.model.model.end_layer
-                old_kv_cache_start_layer = self._kv_cache_start_layer()
-                assert self.device is not None
-                enqueue_start = time.time()
-                self.model_runner.add_layers(layer_list, self.device)
-                logger.info(
-                    "[dynamic-load-worker]: add_layers enqueued layers=%s took=%s on stream=%s",
-                    layer_list,
-                    human_readable_duration(time.time() - enqueue_start),
-                    self.migration_stream,
-                )
+            fbgate = getattr(self.model_runner, "fbgate", None)
+            fair_load_gate = (
+                fbgate.fair_background()
+                if (self.vllm_config.dynamic_config.
+                    dynamic_communication_enabled and fbgate is not None)
+                else nullcontext())
+            with fair_load_gate:
+                with torch.cuda.stream(self.migration_stream):
+                    logger.info(f"start to load layer, current stream:{torch.cuda.current_stream()}")
+                    # 记录扩容前的起始 layer，便于在 start_layer 左移时重排本地 kv 索引基准
+                    old_start_layer = self.model_runner.model.model.start_layer
+                    old_end_layer = self.model_runner.model.model.end_layer
+                    old_kv_cache_start_layer = self._kv_cache_start_layer()
+                    assert self.device is not None
+                    enqueue_start = time.time()
+                    self.model_runner.add_layers(layer_list, self.device)
+                    logger.info(
+                        "[dynamic-load-worker]: add_layers enqueued layers=%s took=%s on stream=%s",
+                        layer_list,
+                        human_readable_duration(time.time() - enqueue_start),
+                        self.migration_stream,
+                    )
 
-            stream_sync_start = time.time()
-            self.migration_stream.synchronize()
+                stream_sync_start = time.time()
+                self.migration_stream.synchronize()
             free_after_weight_loading, _ = torch.cuda.mem_get_info()
             logger.info(
                 "[dynamic-load-worker]: migration_stream synchronize after add_layers layers=%s took=%s free_gpu_after=%.2fGB",
@@ -1815,7 +1822,7 @@ class DynamicGPUWorker(Worker):
     def release_kv_cache(self) -> None:
         self.model_runner.release_kv_cache()
 
-    def get_mem_info(self) -> WorkerMemInfo:
+    def get_mem_info(self, control_plane: bool = False) -> WorkerMemInfo:
         """Return per-layer weight size, current free GPU memory, one-layer
         KV cache tensor size, and runtime overhead (bytes).
 
@@ -1826,10 +1833,17 @@ class DynamicGPUWorker(Worker):
           (includes both K and V within the tensor shape).
         - runtime_overhead_bytes: overhead measured by profile_run (activations,
           CUDA context, NCCL buffers, etc.)
+
+        The control-plane variant is intentionally a read-only driver query:
+        it must not synchronize CUDA streams, run process-wide Python GC, or
+        enter the model-mutation gate while forwards are active.
         """
         def collect_mem_info() -> WorkerMemInfo:
-            _sync_current_cuda_stream(self.device)
-            gc.collect()  # Trigger Python GC to free any unreferenced memory
+            if not control_plane:
+                _sync_current_cuda_stream(self.device)
+                # GC can execute object finalizers, so never run it from a Ray
+                # control concurrency-group thread alongside model execution.
+                gc.collect()
             if hasattr(self.model_runner.model, 'get_layer_weight_size'):
                 layer_size = int(
                     self.model_runner.model.get_layer_weight_size())
@@ -1845,7 +1859,7 @@ class DynamicGPUWorker(Worker):
                 and self.model_runner.kv_caches[0].numel() != 0)
 
             # Free memory from driver
-            free_memory, _ = torch.cuda.mem_get_info()
+            free_memory, _ = torch.cuda.mem_get_info(self.device)
 
             # Size of a single KV cache tensor (for one layer) from model runner
             kv_tensor_size = 0
@@ -1868,6 +1882,9 @@ class DynamicGPUWorker(Worker):
             return WorkerMemInfo(layer_size, kv_tensor_size,
                                  int(free_memory), int(total_gpu_memory),
                                  int(runtime_overhead))
+
+        if control_plane:
+            return collect_mem_info()
 
         autoscaling_enabled = (
             self.vllm_config.dynamic_config.dynamic_communication_enabled)

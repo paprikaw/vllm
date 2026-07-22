@@ -14,7 +14,7 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.executor.ray_utils import RayWorkerWrapper
-from vllm.v1.utils import human_readable_duration
+from vllm.v1.utils import WorkerMemInfo, human_readable_duration
 from vllm.v1.worker.dynamic_gpu_worker import DynamicGPUWorker, DynamicGPUModelRunner
 import torch
 from vllm.v1.core.sched.dynamic_scheduler import create_from_dynamic_scheduler_output
@@ -688,6 +688,28 @@ try:
                 maybe_apply_kvcached_vllm_patches,
             )
             maybe_apply_kvcached_vllm_patches("Ray worker env update")
+
+        @ray.method(concurrency_group="migration_control")
+        def launch_async_add_layers_control(
+            self,
+            rank: int,
+            layer_list: list[Tuple[int, int]],
+        ) -> None:
+            """Start the loader thread without waiting behind forward RPCs."""
+            assert isinstance(self.worker, DynamicGPUWorker)
+            self.worker.async_add_layers(rank, layer_list)
+
+        @ray.method(concurrency_group="migration_control")
+        def wait_for_async_add_layers_control(self) -> None:
+            """Join loader threads without entering the forward RPC lane."""
+            assert isinstance(self.worker, DynamicGPUWorker)
+            self.worker.wait_for_async_add_layers()
+
+        @ray.method(concurrency_group="migration_control")
+        def get_mem_info_control(self) -> WorkerMemInfo:
+            """Read worker memory metadata outside the forward actor lane."""
+            assert isinstance(self.worker, DynamicGPUWorker)
+            return self.worker.get_mem_info(control_plane=True)
 
         def reset_ray_compiled_dag_nccl_lock(self) -> None:
             try:

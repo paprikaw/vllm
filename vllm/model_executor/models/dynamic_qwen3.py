@@ -443,7 +443,7 @@ class DynamicQwen3Model(Qwen3Model):
                     break
 
                 if self.fbgate is not None:
-                    with self.fbgate.background():
+                    with self.fbgate.fair_background():
                         time_start = time.time()
                         weight_loader(param, loaded_weight, shard_id)
                         logger.info(f"stacked params, loaded weight using weight loader: {weight_loader} for param: {name}, took {human_readable_duration(time.time() - time_start)}")
@@ -486,7 +486,7 @@ class DynamicQwen3Model(Qwen3Model):
                     loaded_params.add(name)
                     return
                 if self.fbgate is not None:
-                    with self.fbgate.background():
+                    with self.fbgate.fair_background():
                         time_start = time.time()
                         weight_loader(param, loaded_weight)
                         logger.info(f"loaded weight using weight loader: {weight_loader} for param: {name}, took {human_readable_duration(time.time() - time_start)}")
